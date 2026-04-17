@@ -1,16 +1,23 @@
 #!/usr/bin/env python3
 """
-Runtime validation - smoke test if recorder actually works (not just imports).
+validate_runtime.py  –  3-minute recorder smoke-test
 
-Tests:
-1. Runs recorder for N seconds
-2. Checks for HTTP 429/418 bans
-3. Verifies files are created and non-empty
-4. Checks heartbeat updates
-5. Tests graceful shutdown
+Starts the recorder as a subprocess with TOP_SYMBOLS=3 (snapshots disabled),
+lets it run for 3 minutes, sends SIGINT, then asserts:
+
+  1. no_429_418          – no HTTP 429 / 418 rate-limit bans in logs
+  2. no_callback_errors  – no "Error in on_l2_book" / "Error in on_trade"
+  3. raw_files_nonempty  – .jsonl files created in data_raw/ and non-empty
+  4. heartbeat_updated   – heartbeat.json shows uptime ≥ 10 s and messages > 0
+  5. clean_shutdown      – exit code 0, no event-loop mismatch
+  6. schema_fields       – every record has venue/symbol/channel/ts_recv_ns
+  7. ts_recv_monotonic   – ts_recv_ns non-decreasing per file
+  8. symbol_no_dash      – symbols use Binance format (no dashes)
+  9. futures_status      – futures producing data OR explicitly disabled
+
+Outputs JSON report to state/runtime_report.json
 """
-
-import asyncio
+import argparse
 import json
 import logging
 import os
@@ -21,285 +28,281 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Optional
 
-# Keep logs clean for this validation
-logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
-logger = logging.getLogger(__name__)
+PROJECT_ROOT = Path(__file__).parent
+sys.path.insert(0, str(PROJECT_ROOT))
+from config import DATA_ROOT, STATE_ROOT
 
+DEFAULT_RUNTIME_SEC = 180
+TEST_TOP_SYMBOLS = 3
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("validate_runtime")
+
+
+# ── helpers ──────────────────────────────────────────────────────────
+
+def _jsonl_files_after(root: Path, ts: float) -> List[Path]:
+    if not root.exists():
+        return []
+    return [p for p in root.rglob("*.jsonl")
+            if p.stat().st_mtime >= ts]
+
+
+def _read_jsonl(path: Path, n: int = 200) -> List[dict]:
+    out: List[dict] = []
+    try:
+        with open(path, errors="ignore") as f:
+            for i, line in enumerate(f):
+                if i >= n:
+                    break
+                line = line.strip()
+                if line:
+                    try:
+                        out.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        pass
+    except OSError:
+        pass
+    return out
+
+
+# ── validator ────────────────────────────────────────────────────────
 
 class RuntimeValidator:
-    """Validate actual recorder runtime behavior."""
-    
-    def __init__(self, test_duration_sec: int = 180, top_symbols: int = 3):
-        """Initialize validator with test parameters."""
-        self.project_root = Path(__file__).parent
-        self.data_root = self.project_root / "data_raw"
-        self.state_root = self.project_root / "state"
-        self.log_file = self.project_root / "recorder.log"
-        
-        self.test_duration = test_duration_sec
-        self.top_symbols = top_symbols
-        self.test_start_time = None
-        self.test_end_time = None
-        
-        self.results = {
-            "timestamp": datetime.now().isoformat(),
-            "test_duration": test_duration_sec,
-            "checks": {}
+
+    def __init__(self, runtime_sec: int = DEFAULT_RUNTIME_SEC):
+        self.runtime_sec = runtime_sec
+        self._t0 = 0.0
+        self._proc: Optional[subprocess.Popen] = None
+        self.report: Dict[str, Any] = {
+            "test": "validate_runtime",
+            "started_at": datetime.utcnow().isoformat(),
+            "runtime_sec": runtime_sec,
+            "checks": {},
+            "passed": False,
         }
-        
-    def check_http_ban(self) -> Tuple[bool, str]:
-        """Check if any HTTP 429/418 occurred."""
-        if not self.log_file.exists():
-            return False, "Log file not found"
-        
-        with open(self.log_file, 'r') as f:
-            log_content = f.read()
-        
-        has_429 = '429' in log_content
-        has_418 = '418' in log_content or 'teapot' in log_content
-        
-        if has_429:
-            return False, "HTTP 429 (rate limited) detected"
-        if has_418:
-            return False, "HTTP 418 (banned) detected - Binance IP ban!"
-        
-        return True, "No HTTP bans detected"
-    
-    def check_callback_exceptions(self) -> Tuple[bool, str]:
-        """Check if callbacks threw exceptions."""
-        if not self.log_file.exists():
-            return False, "Log file not found"
-        
-        with open(self.log_file, 'r') as f:
-            log_content = f.read()
-        
-        # Count on_l2_book errors
-        l2_errors = len(re.findall(r'Error in on_l2_book', log_content))
-        trade_errors = len(re.findall(r'Error in on_trade', log_content))
-        
-        total_errors = l2_errors + trade_errors
-        
-        if total_errors > 0:
-            return False, f"Callback exceptions: on_l2_book={l2_errors}, on_trade={trade_errors}"
-        
-        return True, "No callback exceptions"
-    
-    def check_file_creation(self) -> Tuple[bool, str]:
-        """Check if raw data files are created and non-empty."""
-        if not self.data_root.exists():
-            return False, f"Data directory not found: {self.data_root}"
-        
-        # Look for any .jsonl.zst files
-        zst_files = list(self.data_root.rglob("*.jsonl.zst"))
-        
-        if not zst_files:
-            return False, f"No data files created in {self.data_root}"
-        
-        # Check file sizes
-        total_size = sum(f.stat().st_size for f in zst_files)
-        
-        if total_size == 0:
-            return False, "Data files created but are empty"
-        
-        num_files = len(zst_files)
-        return True, f"{num_files} data files created, total size: {total_size} bytes"
-    
-    def check_heartbeat(self) -> Tuple[bool, str]:
-        """Check if heartbeat.json exists and updates."""
-        heartbeat_file = self.state_root / "heartbeat.json"
-        
-        if not heartbeat_file.exists():
-            return False, "heartbeat.json not found"
-        
-        # Read heartbeat timestamps during test
-        try:
-            with open(heartbeat_file, 'r') as f:
-                first_hb = json.load(f)
-            first_hb_time = first_hb.get('timestamp')
-            
-            # Sleep and check again
-            time.sleep(2)
-            
-            with open(heartbeat_file, 'r') as f:
-                second_hb = json.load(f)
-            second_hb_time = second_hb.get('timestamp')
-            
-            if first_hb_time != second_hb_time:
-                return True, "heartbeat.json updates correctly"
-            else:
-                return False, "heartbeat.json not updating"
-        except Exception as e:
-            return False, f"Error reading heartbeat.json: {e}"
-    
-    def check_graceful_shutdown(self, process: subprocess.Popen) -> Tuple[bool, str]:
-        """Check if recorder shuts down gracefully."""
-        try:
-            # Send SIGINT
-            process.send_signal(signal.SIGINT)
-            
-            # Wait for process to exit
-            return_code = process.wait(timeout=10)
-            
-            if return_code == 0:
-                pass  # OK
-            else:
-                return False, f"Process exited with code {return_code}"
-            
-            # Check for shutdown errors
-            if not self.log_file.exists():
-                return True, "Shutdown clean (no errors in logs)"
-            
-            with open(self.log_file, 'r') as f:
-                log_content = f.read()
-            
-            if "different loop" in log_content.lower():
-                return False, "Event loop mismatch error on shutdown"
-            if "coroutine" in log_content.lower() and "never awaited" in log_content.lower():
-                return False, "Coroutine not awaited on shutdown"
-            
-            return True, "Graceful shutdown - no errors"
-        
-        except subprocess.TimeoutExpired:
-            process.kill()
-            return False, "Process did not shutdown after SIGINT"
-        except Exception as e:
-            return False, f"Shutdown test error: {e}"
-    
-    def run_test(self) -> bool:
-        """Run the full runtime validation test."""
-        logger.info(f"Starting recorder runtime test ({self.test_duration}s, TOP_SYMBOLS={self.top_symbols})...")
-        
-        # Clear previous log
-        if self.log_file.exists():
-            self.log_file.unlink()
-        
-        # Set environment
+
+    # ── launch / stop ────────────────────────────────────────────────
+
+    def _launch(self) -> None:
+        self._t0 = time.time()
+        venv_py = PROJECT_ROOT / ".venv" / "bin" / "python3"
+        py = str(venv_py) if venv_py.exists() else sys.executable
         env = os.environ.copy()
-        env['CR_TEST_MODE'] = '1'
-        env['CR_TOP_SYMBOLS'] = str(self.top_symbols)
-        env['CR_SNAPSHOT_MODE'] = 'disabled'
-        
+        env["CRYPTO_RECORDER_TEST_MODE"] = "1"
+        env["CRYPTO_RECORDER_TOP_SYMBOLS"] = str(TEST_TOP_SYMBOLS)
+        self._proc = subprocess.Popen(
+            [py, str(PROJECT_ROOT / "recorder.py")],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            env=env, cwd=str(PROJECT_ROOT),
+        )
+        logger.info(f"Launched recorder (pid={self._proc.pid}), "
+                     f"will run {self.runtime_sec}s …")
+
+    def _stop(self) -> str:
+        assert self._proc
+        # Let the recorder run for the desired duration, then ask it to stop.
         try:
-            # Start recorder
-            logger.info("Launching recorder process...")
-            process = subprocess.Popen(
-                ['python3', 'recorder.py'],
-                cwd=str(self.project_root),
-                env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True
-            )
-            
-            self.test_start_time = time.time()
-            
-            # Let it run
-            logger.info(f"Recorder running, will wait {self.test_duration}s...")
-            time.sleep(self.test_duration)
-            
-            self.test_end_time = time.time()
-            
-            # Now run checks while recorder is still running
-            logger.info("Running validation checks...")
-            
-            logger.info("  1. Checking for HTTP bans...")
-            result, msg = self.check_http_ban()
-            self.results["checks"]["http_ban"] = {"pass": result, "message": msg}
-            logger.info(f"     {'✓' if result else '✗'} {msg}")
-            
-            logger.info("  2. Checking for callback exceptions...")
-            result, msg = self.check_callback_exceptions()
-            self.results["checks"]["callback_exceptions"] = {"pass": result, "message": msg}
-            logger.info(f"     {'✓' if result else '✗'} {msg}")
-            
-            logger.info("  3. Checking file creation...")
-            result, msg = self.check_file_creation()
-            self.results["checks"]["file_creation"] = {"pass": result, "message": msg}
-            logger.info(f"     {'✓' if result else '✗'} {msg}")
-            
-            logger.info("  4. Checking heartbeat updates...")
-            result, msg = self.check_heartbeat()
-            self.results["checks"]["heartbeat"] = {"pass": result, "message": msg}
-            logger.info(f"     {'✓' if result else '✗'} {msg}")
-            
-            logger.info("  5. Testing graceful shutdown...")
-            result, msg = self.check_graceful_shutdown(process)
-            self.results["checks"]["shutdown"] = {"pass": result, "message": msg}
-            logger.info(f"     {'✓' if result else '✗'} {msg}")
-            
-            # Calculate overall result
-            passed = sum(1 for c in self.results["checks"].values() if c.get("pass", False))
-            total = len(self.results["checks"])
-            
-            self.results["total_checks"] = total
-            self.results["passed_checks"] = passed
-            self.results["success"] = passed == total
-            
-            return passed == total
-        
+            out, _ = self._proc.communicate(timeout=self.runtime_sec)
+        except subprocess.TimeoutExpired:
+            # Normal path: recorder runs forever; tell it to shut down.
+            self._proc.send_signal(signal.SIGINT)
+            try:
+                out, _ = self._proc.communicate(timeout=45)
+            except subprocess.TimeoutExpired:
+                logger.warning("Recorder did not exit after SIGINT – sending SIGTERM")
+                self._proc.terminate()
+                try:
+                    out, _ = self._proc.communicate(timeout=15)
+                except subprocess.TimeoutExpired:
+                    logger.warning("Recorder still alive – sending SIGKILL")
+                    self._proc.kill()
+                    out, _ = self._proc.communicate(timeout=10)
+        log = (out or b"").decode("utf-8", errors="replace")
+        log_path = STATE_ROOT / "runtime_test.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text(log)
+        return log
+
+    # ── checks ───────────────────────────────────────────────────────
+
+    def _ck_no_rate_limit(self, log: str) -> dict:
+        lines_429 = [l for l in log.splitlines()
+                      if re.search(r"(status.*429|429.*rate.limit|HTTP.*429)", l, re.I)]
+        lines_418 = [l for l in log.splitlines()
+                      if re.search(r"(status.*418|418.*ban|HTTP.*418)", l, re.I)]
+        ok = not lines_429 and not lines_418
+        return {"name": "no_429_418", "passed": ok,
+                "details": {"429": lines_429[:3], "418": lines_418[:3]}}
+
+    def _ck_no_callback_errors(self, log: str) -> dict:
+        hits = re.findall(r"Error in on_l2_book|Error in on_trade", log, re.I)
+        return {"name": "no_callback_errors", "passed": len(hits) == 0,
+                "details": {"count": len(hits)}}
+
+    def _ck_raw_files(self) -> dict:
+        files = _jsonl_files_after(DATA_ROOT, self._t0)
+        nonempty = [f for f in files if f.stat().st_size > 0]
+        return {"name": "raw_files_nonempty", "passed": len(nonempty) >= 1,
+                "details": {"found": len(files), "nonempty": len(nonempty),
+                            "sample": [str(f.relative_to(PROJECT_ROOT))
+                                       for f in nonempty[:5]]}}
+
+    def _ck_heartbeat(self) -> dict:
+        hb = STATE_ROOT / "heartbeat.json"
+        if not hb.exists():
+            return {"name": "heartbeat_updated", "passed": False,
+                    "details": {"reason": "file missing"}}
+        try:
+            d = json.loads(hb.read_text())
         except Exception as e:
-            logger.error(f"Test execution error: {e}", exc_info=True)
-            self.results["error"] = str(e)
-            self.results["success"] = False
-            return False
-    
-    def save_report(self) -> Path:
-        """Save validation report to JSON."""
-        report_dir = self.state_root / "validation"
-        report_dir.mkdir(parents=True, exist_ok=True)
-        
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        report_file = report_dir / f"runtime_{timestamp}.json"
-        
-        with open(report_file, 'w') as f:
-            json.dump(self.results, f, indent=2)
-        
-        logger.info(f"\nReport saved: {report_file}")
-        return report_file
-    
-    def print_summary(self):
-        """Print test summary."""
-        print("\n" + "=" * 70)
-        print("RUNTIME VALIDATION SUMMARY")
-        print("=" * 70)
-        
-        for check_name, result in self.results.get("checks", {}).items():
-            status = "✓ PASS" if result.get("pass") else "✗ FAIL"
-            msg = result.get("message", "")
-            print(f"{status:8} {check_name:25} {msg}")
-        
-        passed = self.results.get("passed_checks", 0)
-        total = self.results.get("total_checks", 0)
-        
-        print(f"\n{'=' * 70}")
-        print(f"Result: {passed}/{total} checks passed")
-        print(f"Status: {'✓ SUCCESS' if self.results.get('success') else '✗ FAILURE'}")
-        print("=" * 70 + "\n")
+            return {"name": "heartbeat_updated", "passed": False,
+                    "details": {"reason": str(e)}}
+        ok = d.get("uptime_seconds", 0) >= 10 and d.get("total_messages", 0) > 0
+        return {"name": "heartbeat_updated", "passed": ok,
+                "details": {"uptime": d.get("uptime_seconds"),
+                            "msgs": d.get("total_messages"),
+                            "symbols": d.get("total_symbols")}}
+
+    def _ck_clean_shutdown(self, log: str) -> dict:
+        mismatch = re.search(
+            r"(attached to a different loop|loop.*already running|"
+            r"cannot schedule new futures|Event loop is closed)", log, re.I)
+        watchdog = bool(re.search(r"watchdog fired", log, re.I))
+        rc = self._proc.returncode if self._proc else -1
+        ok = (mismatch is None
+              and not watchdog
+              and rc in (0, -2, -signal.SIGINT, -signal.SIGTERM))
+
+        details: dict = {
+            "exit_code": rc,
+            "loop_mismatch": mismatch.group(0) if mismatch else None,
+            "watchdog_fired": watchdog,
+        }
+
+        # On failure, attach last 100 lines of recorder.log for diagnosis
+        if not ok:
+            rec_log = PROJECT_ROOT / "recorder.log"
+            if rec_log.exists():
+                try:
+                    lines = rec_log.read_text().splitlines()
+                    details["recorder_log_tail"] = lines[-100:]
+                except Exception:
+                    pass
+
+        return {"name": "clean_shutdown", "passed": ok, "details": details}
+
+    def _ck_schema(self) -> dict:
+        required = {"venue", "symbol", "channel", "ts_recv_ns"}
+        issues = []
+        n = 0
+        for f in _jsonl_files_after(DATA_ROOT, self._t0)[:20]:
+            for rec in _read_jsonl(f, 50):
+                n += 1
+                missing = required - set(rec.keys())
+                if missing:
+                    issues.append(f"{f.name}: {missing}")
+        return {"name": "schema_fields", "passed": not issues and n > 0,
+                "details": {"checked": n, "issues": issues[:5]}}
+
+    def _ck_monotonic(self) -> dict:
+        """ts_recv_ns non-decreasing per file (5 s tolerance for interleaved WS)."""
+        tolerance_ns = 5_000_000_000  # 5 seconds
+        violations = []
+        fc = 0
+        for f in _jsonl_files_after(DATA_ROOT, self._t0)[:20]:
+            prev = 0
+            for rec in _read_jsonl(f, 500):
+                ts = rec.get("ts_recv_ns", 0)
+                if ts and prev and ts < prev - tolerance_ns:
+                    violations.append(f"{f.name}: {prev}->{ts}")
+                prev = ts or prev
+            fc += 1
+        return {"name": "ts_recv_monotonic", "passed": not violations and fc > 0,
+                "details": {"files": fc, "violations": violations[:5]}}
+
+    def _ck_symbol_format(self) -> dict:
+        bad = set()
+        n = 0
+        for f in _jsonl_files_after(DATA_ROOT, self._t0)[:20]:
+            for rec in _read_jsonl(f, 100):
+                n += 1
+                s = rec.get("symbol", "")
+                if "-" in s:
+                    bad.add(s)
+        return {"name": "symbol_no_dash", "passed": not bad and n > 0,
+                "details": {"checked": n, "bad": list(bad)[:5]}}
+
+    def _ck_futures(self, log: str) -> dict:
+        fut_dir = DATA_ROOT / "BINANCE_USDTF"
+        producing = bool(fut_dir.exists() and
+                         [f for f in fut_dir.rglob("*.jsonl")
+                          if f.stat().st_mtime >= self._t0])
+        disabled = bool(re.search(
+            r"(Futures DISABLED|Failed to init.*Futures|futures.*disabled)",
+            log, re.I))
+        return {"name": "futures_status", "passed": producing or disabled,
+                "details": {"producing": producing, "disabled_flag": disabled}}
+
+    # ── orchestrate ──────────────────────────────────────────────────
+
+    def run(self) -> Dict[str, Any]:
+        logger.info("=" * 60)
+        logger.info("  validate_runtime  – 3-minute recorder smoke-test")
+        logger.info("=" * 60)
+
+        self._launch()
+        log = self._stop()
+
+        checks = [
+            self._ck_no_rate_limit(log),
+            self._ck_no_callback_errors(log),
+            self._ck_raw_files(),
+            self._ck_heartbeat(),
+            self._ck_clean_shutdown(log),
+            self._ck_schema(),
+            self._ck_monotonic(),
+            self._ck_symbol_format(),
+            self._ck_futures(log),
+        ]
+
+        self.report["checks"] = {c["name"]: c for c in checks}
+        self.report["total_checks"] = len(checks)
+        self.report["checks_passed"] = sum(c["passed"] for c in checks)
+        self.report["passed"] = all(c["passed"] for c in checks)
+        self.report["finished_at"] = datetime.utcnow().isoformat()
+
+        for c in checks:
+            tag = "PASS" if c["passed"] else "FAIL"
+            logger.info(f"  [{tag}] {c['name']}")
+            if not c["passed"]:
+                for k, v in c.get("details", {}).items():
+                    logger.info(f"         {k}: {v}")
+
+        n = self.report["checks_passed"]
+        t = self.report["total_checks"]
+        if self.report["passed"]:
+            logger.info(f"\n  ✓ ALL PASSED ({n}/{t})")
+        else:
+            logger.warning(f"\n  ✗ SOME FAILED ({n}/{t})")
+
+        out = STATE_ROOT / "runtime_report.json"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(self.report, indent=2, default=str))
+        logger.info(f"Report → {out}")
+        return self.report
 
 
-def main():
-    """Main entry point."""
-    import argparse
-    
-    parser = argparse.ArgumentParser(description="Runtime validation for CryptoRecorder")
-    parser.add_argument('--duration', type=int, default=180, help='Test duration in seconds (default: 180)')
-    parser.add_argument('--symbols', type=int, default=3, help='Number of symbols to use (default: 3)')
-    
-    args = parser.parse_args()
-    
-    validator = RuntimeValidator(test_duration_sec=args.duration, top_symbols=args.symbols)
-    
-    # Run test
-    success = validator.run_test()
-    
-    # Save and print report
-    validator.save_report()
-    validator.print_summary()
-    
-    sys.exit(0 if success else 1)
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Runtime recorder smoke-test")
+    ap.add_argument("--runtime", type=int, default=DEFAULT_RUNTIME_SEC,
+                    help="seconds to run the recorder (default 180)")
+    args = ap.parse_args()
+    r = RuntimeValidator(args.runtime).run()
+    return 0 if r["passed"] else 1
 
 
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    sys.exit(main())

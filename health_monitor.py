@@ -53,6 +53,11 @@ class HealthMonitor:
         self.start_time = time.time()
         self.last_heartbeat_file = STATE_ROOT / "heartbeat.json"
         self.reconnects_log = STATE_ROOT / "reconnects.log"
+        # Futures status – set by recorder before final heartbeat
+        self.futures_enabled: bool = True
+        self.futures_disabled_reason: str = ""
+        # Snapshot mode
+        self.snapshot_mode: str = "disabled"
     
     def record_message(self, venue: str, symbol: str, ts_event: int = None, 
                       update_id: int = None, channel: str = None) -> None:
@@ -119,6 +124,9 @@ class HealthMonitor:
                 'total_messages': total_messages,
                 'total_gaps': total_gaps,
                 'total_reconnects': self.reconnect_count,
+                'futures_enabled': self.futures_enabled,
+                'futures_disabled_reason': self.futures_disabled_reason,
+                'snapshot_mode': self.snapshot_mode,
                 'by_venue': dict(by_venue),
             }
             
@@ -131,13 +139,18 @@ class HealthMonitor:
     
     async def heartbeat_task(self) -> None:
         """Background task that writes heartbeat periodically."""
-        while True:
-            try:
-                await self.write_heartbeat()
-                await asyncio.sleep(HEARTBEAT_INTERVAL_SEC)
-            except Exception as e:
-                logger.error(f"Error in heartbeat task: {e}", exc_info=True)
-                await asyncio.sleep(HEARTBEAT_INTERVAL_SEC)
+        try:
+            while True:
+                try:
+                    await self.write_heartbeat()
+                    await asyncio.sleep(HEARTBEAT_INTERVAL_SEC)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.error(f"Error in heartbeat task: {e}", exc_info=True)
+                    await asyncio.sleep(HEARTBEAT_INTERVAL_SEC)
+        except asyncio.CancelledError:
+            pass  # clean exit on task cancellation
     
     def get_summary(self) -> dict:
         """Get a quick summary of current state."""

@@ -32,6 +32,7 @@ class FileRotator:
         self.current_files: Dict[str, Tuple[Path, float]] = {}  # key -> (file_path, creation_time)
         self.file_handles: Dict[str, object] = {}  # key -> file handle (if open)
         self.lock = asyncio.Lock()
+        self._shutting_down = False
     
     def get_file_key(self, venue: str, symbol: str, channel: str) -> str:
         """Generate unique key for a file."""
@@ -57,8 +58,8 @@ class FileRotator:
             elapsed_min = (time.time() - creation_time) / 60
             return elapsed_min >= ROTATION_INTERVAL_MIN
     
-    async def rotate_file(self, key: str) -> None:
-        """Close current file and compress it."""
+    async def rotate_file(self, key: str, compress: bool = True) -> None:
+        """Close current file and optionally compress it."""
         async with self.lock:
             if key not in self.current_files:
                 return
@@ -73,11 +74,11 @@ class FileRotator:
                     logger.warning(f"Error closing file {file_path}: {e}")
                 del self.file_handles[key]
             
-            # Compress file
-            if file_path.exists():
+            # Compress file (skip during shutdown to avoid blocking)
+            if compress and not self._shutting_down and file_path.exists():
                 try:
                     await self._compress_file(file_path)
-                    logger.info(f"Rotated and compressed: {file_path}")
+                    logger.debug(f"Rotated and compressed: {file_path}")
                 except Exception as e:
                     logger.error(f"Error compressing file {file_path}: {e}")
             
@@ -118,10 +119,11 @@ class FileRotator:
             return self.file_handles[key]
     
     async def close_all(self) -> None:
-        """Close all open files and compress them."""
-        async with self.lock:
-            for key in list(self.current_files.keys()):
-                await self.rotate_file(key)
+        """Close all open file handles.  Compression is skipped during shutdown."""
+        self._shutting_down = True
+        keys = list(self.current_files.keys())
+        for key in keys:
+            await self.rotate_file(key, compress=False)
 
 
 class AsyncWriter:
@@ -178,6 +180,8 @@ class AsyncWriter:
                     batch = []
                     self.last_flush_time = time.time()
                 
+            except asyncio.CancelledError:
+                break
             except Exception as e:
                 logger.error(
                     f"Error in writer task for {self.venue}/{self.symbol}/{self.channel}: {e}",
@@ -185,7 +189,12 @@ class AsyncWriter:
                 )
                 await asyncio.sleep(1)
         
-        # Flush remaining at shutdown
+        # Drain remaining queue items (non-blocking)
+        while not self.queue.empty():
+            try:
+                batch.append(self.queue.get_nowait())
+            except asyncio.QueueEmpty:
+                break
         if batch:
             await self._write_batch(batch)
     
@@ -239,21 +248,29 @@ class StorageManager:
         await writer.enqueue(record)
     
     async def shutdown(self) -> None:
-        """Shutdown all writers and close all files."""
+        """Shutdown all writers → flush → close files (no compression)."""
         logger.info("Shutting down storage manager...")
         
-        # Stop all writers
+        # 1. Signal all writers to stop accepting new records
         for writer in self.writers.values():
             await writer.shutdown()
         
-        # Wait for all writer tasks to complete
+        # 2. Wait for writer tasks to drain queues (with hard timeout)
         if self.writer_tasks:
-            await asyncio.gather(
-                *self.writer_tasks.values(),
-                return_exceptions=True
-            )
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*self.writer_tasks.values(),
+                                   return_exceptions=True),
+                    timeout=10)
+            except asyncio.TimeoutError:
+                logger.warning("Writer tasks did not finish in 10s – cancelling")
+                for t in self.writer_tasks.values():
+                    if not t.done():
+                        t.cancel()
+                await asyncio.gather(*self.writer_tasks.values(),
+                                     return_exceptions=True)
         
-        # Close and compress all files
+        # 3. Close file handles (compression skipped during shutdown)
         await self.rotator.close_all()
         logger.info("Storage manager shutdown complete")
     

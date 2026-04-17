@@ -1,56 +1,63 @@
 """
-Parquet catalog converter - RAW JSONL to Nautilus ParquetDataCatalog.
-Converts previous day's data from raw logs to Nautilus format for backtesting.
+Parquet catalog converter – RAW JSONL to Nautilus ParquetDataCatalog.
+
+Reads raw trade and depth JSONL(.zst) files for a given date, converts
+trades to a single Parquet file, reconstructs approximate L2 Depth-10
+snapshots from cryptofeed-normalised deltas (no REST snapshots needed),
+and writes them to NAUTILUS_CATALOG_ROOT.
 
 Usage:
-    python convert_yesterday.py                  # Convert yesterday
-    python convert_yesterday.py --date 2024-01-15  # Convert specific date
+    python convert_yesterday.py                      # Convert yesterday
+    python convert_yesterday.py --date 2026-04-17    # Convert specific date
 """
-import asyncio
+import argparse
 import gzip
 import json
 import logging
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import List, Dict, Optional, Generator
-from dataclasses import dataclass
+from typing import Dict, Generator, List, Optional, Set
+
 import zstandard as zstd
-import argparse
 
 try:
     import pandas as pd
-    import pyarrow as pa
-    import pyarrow.parquet as pq
+    import pyarrow  # noqa: F401 – presence check
 except ImportError:
-    print("ERROR: Please install pandas and pyarrow: pip install pandas pyarrow")
+    print("ERROR: pip install pandas pyarrow")
     exit(1)
 
 from config import (
-    META_ROOT,
-    STATE_ROOT,
     DATA_ROOT,
+    META_ROOT,
     NAUTILUS_CATALOG_ROOT,
-    CONVERTER_BATCH_SIZE,
+    STATE_ROOT,
 )
 
-# ============================================================================
+# ---------------------------------------------------------------------------
 # Logging
-# ============================================================================
+# ---------------------------------------------------------------------------
 
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Depth-10 snapshot interval (seconds).  One snapshot per symbol per interval.
+# ---------------------------------------------------------------------------
+DEPTH_SNAPSHOT_INTERVAL_SEC: float = 1.0
 
-# ============================================================================
-# Data Classes
-# ============================================================================
+
+# ===================================================================
+# Data classes  (public names – used by validate_converter_e2e.py)
+# ===================================================================
 
 @dataclass
 class RawRecord:
-    """Parsed raw record from JSONL"""
+    """Parsed raw record from JSONL."""
     venue: str
     symbol: str
     channel: str
@@ -61,7 +68,7 @@ class RawRecord:
 
 @dataclass
 class TradeTick:
-    """Converted trade tick for Nautilus"""
+    """Converted trade tick for Nautilus."""
     symbol: str
     venue: str
     ts_event_ns: int
@@ -73,176 +80,152 @@ class TradeTick:
 
 @dataclass
 class OrderBookLevel:
-    """L2 order book level"""
+    """Single price level."""
     price: float
     size: float
 
 
 @dataclass
 class OrderBookSnapshot:
-    """Reconstructed L2 order book state"""
+    """Reconstructed Depth-10 order-book state."""
     symbol: str
     venue: str
     ts_event_ms: int
     ts_recv_ns: int
-    bids: List[OrderBookLevel]
-    asks: List[OrderBookLevel]
+    bids: List[OrderBookLevel] = field(default_factory=list)
+    asks: List[OrderBookLevel] = field(default_factory=list)
 
 
-# ============================================================================
-# File I/O
-# ============================================================================
+# ===================================================================
+# File I/O – streaming reader
+# ===================================================================
 
 class RawDataReader:
-    """Read compressed JSONL files from raw data storage."""
-    
+    """Read JSONL / JSONL.zst / JSONL.gz files from raw data storage."""
+
     @staticmethod
-    def read_files_for_date(venue: str, symbol: str, channel: str, date: datetime) -> Generator[RawRecord, None, None]:
-        """Generator that yields records from all files for a given date."""
+    def read_files_for_date(
+        venue: str, symbol: str, channel: str, date: datetime,
+    ) -> Generator[RawRecord, None, None]:
+        """Yield records from all hourly files for *date*."""
         date_str = date.strftime("%Y-%m-%d")
         day_path = DATA_ROOT / venue / channel / symbol / date_str
-        
         if not day_path.exists():
-            logger.debug(f"Directory not found: {day_path}")
             return
-        
-        # Iterate over all hourly files
         for file_path in sorted(day_path.glob("*.jsonl*")):
             yield from RawDataReader._read_file(file_path)
-    
+
     @staticmethod
     def _read_file(file_path: Path) -> Generator[RawRecord, None, None]:
-        """Read single compressed file and yield records."""
         try:
-            if file_path.suffix == '.zst':
-                with zstd.open(file_path, 'rt', errors='ignore') as f:
-                    for line in f:
-                        if line.strip():
-                            yield RawDataReader._parse_line(line)
-            elif file_path.suffix == '.gz':
-                with gzip.open(file_path, 'rt', errors='ignore') as f:
-                    for line in f:
-                        if line.strip():
-                            yield RawDataReader._parse_line(line)
+            if file_path.suffix == ".zst":
+                opener = lambda: zstd.open(file_path, "rt", errors="ignore")
+            elif file_path.suffix == ".gz":
+                opener = lambda: gzip.open(file_path, "rt", errors="ignore")
             else:
-                with open(file_path, 'r', errors='ignore') as f:
-                    for line in f:
-                        if line.strip():
-                            yield RawDataReader._parse_line(line)
+                opener = lambda: open(file_path, "r", errors="ignore")
+
+            with opener() as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        yield RawDataReader._parse_line(line)
+                    except (json.JSONDecodeError, KeyError):
+                        pass
         except Exception as e:
-            logger.error(f"Error reading file {file_path}: {e}")
-    
+            logger.error(f"Error reading {file_path}: {e}")
+
     @staticmethod
     def _parse_line(line: str) -> RawRecord:
-        """Parse JSON line into RawRecord."""
-        data = json.loads(line)
+        d = json.loads(line)
         return RawRecord(
-            venue=data.get('venue'),
-            symbol=data.get('symbol'),
-            channel=data.get('channel'),
-            ts_recv_ns=data.get('ts_recv_ns'),
-            ts_event_ms=data.get('ts_event_ms'),
-            payload=data.get('payload', {})
+            venue=d.get("venue", ""),
+            symbol=d.get("symbol", ""),
+            channel=d.get("channel", ""),
+            ts_recv_ns=d.get("ts_recv_ns", 0),
+            ts_event_ms=d.get("ts_event_ms"),
+            payload=d.get("payload", {}),
         )
 
 
-# ============================================================================
-# Data Conversion
-# ============================================================================
+# ===================================================================
+# Trade conversion
+# ===================================================================
 
 class TradeConverter:
-    """Convert raw trades to Nautilus TradeTicks."""
-    
     @staticmethod
     def convert(record: RawRecord) -> Optional[TradeTick]:
-        """Convert a trade record."""
         try:
-            payload = record.payload
-            price = float(payload.get('price', 0))
-            quantity = float(payload.get('quantity', 0))
-            side = payload.get('side', 'BUY')
-            
-            # Use ts_event_ms if available, else ts_recv_ns
-            ts_event_ns = record.ts_event_ms * 1_000_000 if record.ts_event_ms else record.ts_recv_ns
-            
+            p = record.payload
+            price = float(p.get("price", 0))
+            qty = float(p.get("quantity", 0))
+            side = p.get("side", "buy")
+            ts_event_ns = (
+                record.ts_event_ms * 1_000_000
+                if record.ts_event_ms
+                else record.ts_recv_ns
+            )
             return TradeTick(
                 symbol=record.symbol,
                 venue=record.venue,
                 ts_event_ns=ts_event_ns,
                 ts_init_ns=record.ts_recv_ns,
                 price=price,
-                quantity=quantity,
+                quantity=qty,
                 side=side,
             )
         except Exception as e:
-            logger.error(f"Error converting trade: {e}")
+            logger.debug(f"trade convert error: {e}")
             return None
 
 
+# ===================================================================
+# Book reconstruction (delta-only, no REST snapshots)
+# ===================================================================
+
 class BookReconstructor:
-    """Reconstruct L2 order book from delta updates."""
-    
+    """Maintain an in-memory L2 book from delta updates.
+
+    Starts with an empty book and applies each delta in order.
+    This gives an *approximate* book — deterministic replay would
+    require the initial REST snapshot + Binance update-ID chain.
+    """
+
     def __init__(self, symbol: str, venue: str):
         self.symbol = symbol
         self.venue = venue
-        self.bids: Dict[float, float] = {}  # price -> size
-        self.asks: Dict[float, float] = {}  # price -> size
-        self.last_update_id = None
-        self.gaps = 0
-    
-    def load_snapshot(self, record: RawRecord) -> OrderBookSnapshot:
-        """Load a snapshot and reset book state."""
-        payload = record.payload
-        
-        # Load bids and asks from snapshot
-        bids = {float(p): float(s) for p, s in payload.get('bids', [])}
-        asks = {float(p): float(s) for p, s in payload.get('asks', [])}
-        
-        self.bids = bids
-        self.asks = asks
-        self.last_update_id = payload.get('lastUpdateId')
-        
-        # Return snapshot
-        bid_levels = sorted([OrderBookLevel(p, s) for p, s in bids.items()], key=lambda x: -x.price)
-        ask_levels = sorted([OrderBookLevel(p, s) for p, s in asks.items()], key=lambda x: x.price)
-        
-        return OrderBookSnapshot(
-            symbol=self.symbol,
-            venue=self.venue,
-            ts_event_ms=record.ts_event_ms or 0,
-            ts_recv_ns=record.ts_recv_ns,
-            bids=bid_levels,
-            asks=ask_levels,
-        )
-    
+        self.bids: Dict[float, float] = {}  # price → size
+        self.asks: Dict[float, float] = {}
+
     def apply_delta(self, record: RawRecord) -> OrderBookSnapshot:
-        """Apply delta update and return current state."""
+        """Apply a delta and return current Depth-10 state."""
         payload = record.payload
-        
-        # Apply bid deltas
-        for price_str, size_str in payload.get('bids', []):
-            price = float(price_str)
-            size = float(size_str)
-            
+
+        for price_s, size_s in payload.get("bids", []):
+            price, size = float(price_s), float(size_s)
             if size == 0:
                 self.bids.pop(price, None)
             else:
                 self.bids[price] = size
-        
-        # Apply ask deltas
-        for price_str, size_str in payload.get('asks', []):
-            price = float(price_str)
-            size = float(size_str)
-            
+
+        for price_s, size_s in payload.get("asks", []):
+            price, size = float(price_s), float(size_s)
             if size == 0:
                 self.asks.pop(price, None)
             else:
                 self.asks[price] = size
-        
-        # Return current state
-        bid_levels = sorted([OrderBookLevel(p, s) for p, s in self.bids.items()], key=lambda x: -x.price)[:10]
-        ask_levels = sorted([OrderBookLevel(p, s) for p, s in self.asks.items()], key=lambda x: x.price)[:10]
-        
+
+        bid_levels = sorted(
+            (OrderBookLevel(p, s) for p, s in self.bids.items()),
+            key=lambda x: -x.price,
+        )[:10]
+        ask_levels = sorted(
+            (OrderBookLevel(p, s) for p, s in self.asks.items()),
+            key=lambda x: x.price,
+        )[:10]
+
         return OrderBookSnapshot(
             symbol=self.symbol,
             venue=self.venue,
@@ -253,124 +236,207 @@ class BookReconstructor:
         )
 
 
-# ============================================================================
-# Parquet Writer
-# ============================================================================
+# ===================================================================
+# Parquet writer
+# ===================================================================
 
 class ParquetWriter:
-    """Write data to Nautilus ParquetDataCatalog."""
-    
-    def __init__(self):
-        NAUTILUS_CATALOG_ROOT.mkdir(parents=True, exist_ok=True)
-    
-    def write_trades(self, trades: List[TradeTick], date_str: str) -> None:
-        """Write trades to Parquet."""
+    """Write trades / depth Parquet files into a catalog directory."""
+
+    def __init__(self, root: Optional[Path] = None):
+        self.root = root or NAUTILUS_CATALOG_ROOT
+        self.root.mkdir(parents=True, exist_ok=True)
+
+    def write_trades(self, trades: List[TradeTick], date_str: str) -> int:
+        """Write trade ticks to a single sorted Parquet file.  Returns row count."""
         if not trades:
-            return
-        
-        df = pd.DataFrame([
+            return 0
+        df = pd.DataFrame(
             {
-                'symbol': t.symbol,
-                'venue': t.venue,
-                'ts_event_ns': t.ts_event_ns,
-                'ts_init_ns': t.ts_init_ns,
-                'price': t.price,
-                'quantity': t.quantity,
-                'side': t.side,
+                "symbol": [t.symbol for t in trades],
+                "venue": [t.venue for t in trades],
+                "ts_event_ns": [t.ts_event_ns for t in trades],
+                "ts_init_ns": [t.ts_init_ns for t in trades],
+                "price": [t.price for t in trades],
+                "quantity": [t.quantity for t in trades],
+                "side": [t.side for t in trades],
             }
-            for t in trades
-        ])
-        
-        output_file = NAUTILUS_CATALOG_ROOT / f"trades_{date_str}.parquet"
-        df.to_parquet(output_file, compression='snappy', index=False)
-        logger.info(f"Wrote {len(df)} trades to {output_file}")
-    
-    def write_depth(self, snapshots: List[OrderBookSnapshot], date_str: str) -> None:
-        """Write depth snapshots to Parquet."""
+        )
+        df.sort_values("ts_event_ns", inplace=True)
+        out = self.root / f"trades_{date_str}.parquet"
+        df.to_parquet(out, compression="snappy", index=False)
+        logger.info(f"Wrote {len(df)} trades → {out}")
+        return len(df)
+
+    def write_depth(self, snapshots: List[OrderBookSnapshot], date_str: str) -> int:
+        """Write Depth-10 snapshots to Parquet.  Returns row count."""
         if not snapshots:
-            return
-        
-        records = []
+            return 0
+
+        rows: List[dict] = []
         for snap in snapshots:
-            for i, bid in enumerate(snap.bids[:5]):
-                records.append({
-                    'symbol': snap.symbol,
-                    'venue': snap.venue,
-                    'ts_event_ms': snap.ts_event_ms,
-                    'bid_price_' + str(i): bid.price,
-                    'bid_size_' + str(i): bid.size,
-                })
-            for i, ask in enumerate(snap.asks[:5]):
-                if i < len(records):
-                    records[-1]['ask_price_' + str(i)] = ask.price
-                    records[-1]['ask_size_' + str(i)] = ask.size
-        
-        if records:
-            df = pd.DataFrame(records)
-            output_file = NAUTILUS_CATALOG_ROOT / f"depth_{date_str}.parquet"
-            df.to_parquet(output_file, compression='snappy', index=False)
-            logger.info(f"Wrote {len(df)} depth snapshots to {output_file}")
+            row: dict = {
+                "symbol": snap.symbol,
+                "venue": snap.venue,
+                "ts_event_ms": snap.ts_event_ms,
+                "ts_recv_ns": snap.ts_recv_ns,
+            }
+            for i, bid in enumerate(snap.bids[:10]):
+                row[f"bid_price_{i}"] = bid.price
+                row[f"bid_size_{i}"] = bid.size
+            for i, ask in enumerate(snap.asks[:10]):
+                row[f"ask_price_{i}"] = ask.price
+                row[f"ask_size_{i}"] = ask.size
+            rows.append(row)
+
+        df = pd.DataFrame(rows)
+        df.sort_values("ts_event_ms", inplace=True, na_position="first")
+        out = self.root / f"depth_{date_str}.parquet"
+        df.to_parquet(out, compression="snappy", index=False)
+        logger.info(f"Wrote {len(df)} depth snapshots → {out}")
+        return len(df)
 
 
-# ============================================================================
-# Main Converter
-# ============================================================================
+# ===================================================================
+# Symbol discovery from raw data on disk
+# ===================================================================
 
-async def convert_date(date: datetime) -> Dict:
-    """Convert a day's worth of data."""
-    logger.info(f"Converting data for {date.date()}...")
-    
+def _discover_symbols(date_str: str) -> Dict[str, Set[str]]:
+    """Return {venue: {symbol, …}} that have trade or depth data for *date_str*."""
+    result: Dict[str, Set[str]] = {}
+    if not DATA_ROOT.exists():
+        return result
+    for venue_dir in DATA_ROOT.iterdir():
+        if not venue_dir.is_dir():
+            continue
+        venue = venue_dir.name
+        syms: Set[str] = set()
+        for channel_dir in venue_dir.iterdir():
+            if not channel_dir.is_dir() or channel_dir.name == "exchangeinfo":
+                continue
+            for symbol_dir in channel_dir.iterdir():
+                if symbol_dir.is_dir() and (symbol_dir / date_str).is_dir():
+                    syms.add(symbol_dir.name)
+        if syms:
+            result[venue] = syms
+    return result
+
+
+# ===================================================================
+# Main conversion
+# ===================================================================
+
+def convert_date(date: datetime) -> Dict:
+    """Convert one day's raw data → Parquet.  Returns a report dict."""
     date_str = date.strftime("%Y-%m-%d")
-    report = {
-        'date': date_str,
-        'timestamp': datetime.utcnow().isoformat(),
-        'venues': {},
-        'total_trades': 0,
-        'total_depth_snapshots': 0,
-        'gaps_detected': 0,
-    }
-    
+    logger.info(f"Converting data for {date_str} …")
+
+    symbols_by_venue = _discover_symbols(date_str)
+    if not symbols_by_venue:
+        logger.warning(f"No raw data found for {date_str}")
+        return {"date": date_str, "status": "no_data"}
+
     writer = ParquetWriter()
-    
-    # Get universe for this date
-    universe_file = META_ROOT / "universe" / "BINANCE_SPOT" / f"{date_str}.json"
-    if not universe_file.exists():
-        logger.warning(f"Universe file not found for {date_str}")
-        return report
-    
-    with open(universe_file) as f:
-        universe = json.load(f)
-    
-    # Process each venue
-    for venue in universe['BINANCE_SPOT'] if 'BINANCE_SPOT' in universe else []:
-        for channel in ['trade', 'depth', 'snapshot']:
-            pass  # Placeholder for processing
-    
-    # Save report
+
+    all_trades: List[TradeTick] = []
+    all_depth: List[OrderBookSnapshot] = []
+    ts_min: Optional[int] = None
+    ts_max: Optional[int] = None
+    venue_reports: Dict[str, dict] = {}
+
+    for venue, symbols in sorted(symbols_by_venue.items()):
+        v_trades = 0
+        v_depth = 0
+
+        # ---- trades (stream per symbol) ----
+        for symbol in sorted(symbols):
+            for rec in RawDataReader.read_files_for_date(venue, symbol, "trade", date):
+                tick = TradeConverter.convert(rec)
+                if tick is None:
+                    continue
+                all_trades.append(tick)
+                v_trades += 1
+                ts = tick.ts_event_ns
+                if ts_min is None or ts < ts_min:
+                    ts_min = ts
+                if ts_max is None or ts > ts_max:
+                    ts_max = ts
+
+        # ---- depth (stream per symbol, emit 1-sec snapshots) ----
+        for symbol in sorted(symbols):
+            book = BookReconstructor(symbol, venue)
+            last_emit_ms: Optional[int] = None
+            interval_ms = int(DEPTH_SNAPSHOT_INTERVAL_SEC * 1000)
+
+            for rec in RawDataReader.read_files_for_date(venue, symbol, "depth", date):
+                snap = book.apply_delta(rec)
+                ts_ms = snap.ts_event_ms
+                if ts_ms == 0:
+                    continue
+                # emit at most one snapshot per interval
+                if last_emit_ms is None or (ts_ms - last_emit_ms) >= interval_ms:
+                    if snap.bids and snap.asks:
+                        all_depth.append(snap)
+                        v_depth += 1
+                        last_emit_ms = ts_ms
+
+        venue_reports[venue] = {
+            "symbols": sorted(symbols),
+            "trades": v_trades,
+            "depth_snapshots": v_depth,
+        }
+
+    # ---- write Parquet ----
+    n_trades = writer.write_trades(all_trades, date_str)
+    n_depth = writer.write_depth(all_depth, date_str)
+
+    # ---- report ----
+    report = {
+        "date": date_str,
+        "timestamp": datetime.now(tz=None).isoformat(),
+        "total_trades": n_trades,
+        "total_depth_snapshots": n_depth,
+        "venues": venue_reports,
+        "ts_range": {
+            "min_ns": ts_min,
+            "max_ns": ts_max,
+        },
+        "status": "ok" if (n_trades + n_depth) > 0 else "empty",
+    }
+
     report_file = STATE_ROOT / "convert_reports" / f"{date_str}.json"
     report_file.parent.mkdir(parents=True, exist_ok=True)
-    with open(report_file, 'w') as f:
-        json.dump(report, f, indent=2)
-    
-    logger.info(f"Conversion report saved to {report_file}")
+    report_file.write_text(json.dumps(report, indent=2, default=str))
+    logger.info(f"Report → {report_file}")
     return report
 
 
-async def main():
-    """Main entry point."""
-    parser = argparse.ArgumentParser(description="Convert raw Binance data to Nautilus Parquet")
-    parser.add_argument('--date', type=str, help='Date to convert (YYYY-MM-DD), defaults to yesterday')
-    args = parser.parse_args()
-    
+# ===================================================================
+# CLI
+# ===================================================================
+
+def main() -> None:
+    ap = argparse.ArgumentParser(
+        description="Convert raw Binance JSONL data to Nautilus Parquet",
+    )
+    ap.add_argument(
+        "--date",
+        type=str,
+        help="Date to convert (YYYY-MM-DD). Default: yesterday.",
+    )
+    args = ap.parse_args()
+
     if args.date:
         date = datetime.strptime(args.date, "%Y-%m-%d")
     else:
         date = datetime.utcnow() - timedelta(days=1)
-    
-    logger.info(f"Starting converter for {date.date()}")
-    report = await convert_date(date)
-    logger.info(f"Conversion complete: {json.dumps(report, indent=2)}")
+
+    report = convert_date(date)
+    logger.info(
+        f"Done: {report.get('total_trades', 0)} trades, "
+        f"{report.get('total_depth_snapshots', 0)} depth snapshots"
+    )
 
 
-if __name__ == '__main__':
-    asyncio.run(main())
+if __name__ == "__main__":
+    main()
