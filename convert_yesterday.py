@@ -76,6 +76,7 @@ class TradeTick:
     price: float
     quantity: float
     side: str
+    trade_id: Optional[str] = None
 
 
 @dataclass
@@ -175,6 +176,7 @@ class TradeConverter:
                 price=price,
                 quantity=qty,
                 side=side,
+                trade_id=p.get("trade_id"),
             )
         except Exception as e:
             logger.debug(f"trade convert error: {e}")
@@ -260,6 +262,7 @@ class ParquetWriter:
                 "price": [t.price for t in trades],
                 "quantity": [t.quantity for t in trades],
                 "side": [t.side for t in trades],
+                "trade_id": [t.trade_id for t in trades],
             }
         )
         df.sort_values("ts_event_ns", inplace=True)

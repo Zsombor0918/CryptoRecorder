@@ -32,7 +32,6 @@ class FileRotator:
         self.current_files: Dict[str, Tuple[Path, float]] = {}  # key -> (file_path, creation_time)
         self.file_handles: Dict[str, object] = {}  # key -> file handle (if open)
         self.lock = asyncio.Lock()
-        self._shutting_down = False
     
     def get_file_key(self, venue: str, symbol: str, channel: str) -> str:
         """Generate unique key for a file."""
@@ -58,11 +57,15 @@ class FileRotator:
             elapsed_min = (time.time() - creation_time) / 60
             return elapsed_min >= ROTATION_INTERVAL_MIN
     
-    async def rotate_file(self, key: str, compress: bool = True) -> None:
-        """Close current file and optionally compress it."""
+    async def rotate_file(self, key: str, compress: bool = True) -> Optional[Path]:
+        """Close current file and optionally compress it.
+        
+        Returns the path of the closed .jsonl file (before compression)
+        so the caller can compress it later if needed.
+        """
         async with self.lock:
             if key not in self.current_files:
-                return
+                return None
             
             file_path, _ = self.current_files[key]
             
@@ -74,29 +77,30 @@ class FileRotator:
                     logger.warning(f"Error closing file {file_path}: {e}")
                 del self.file_handles[key]
             
-            # Compress file (skip during shutdown to avoid blocking)
-            if compress and not self._shutting_down and file_path.exists():
+            del self.current_files[key]
+            
+            # Compress file
+            if compress and file_path.exists() and file_path.stat().st_size > 0:
                 try:
                     await self._compress_file(file_path)
                     logger.debug(f"Rotated and compressed: {file_path}")
                 except Exception as e:
                     logger.error(f"Error compressing file {file_path}: {e}")
+                    return file_path  # return uncompressed path for retry
             
-            del self.current_files[key]
+            return None
     
     async def _compress_file(self, file_path: Path) -> None:
-        """Compress file with zstd."""
+        """Compress file with zstd.  Only removes source on success."""
         loop = asyncio.get_event_loop()
         
         def compress():
-            try:
-                with open(file_path, 'rb') as f_in:
-                    with zstd.open(f"{file_path}.zst", 'wb', cctx=zstd.ZstdCompressor(level=3)) as f_out:
-                        f_out.write(f_in.read())
-                os.remove(file_path)
-            except Exception as e:
-                logger.error(f"Compression failed for {file_path}: {e}")
-                raise
+            dst = Path(f"{file_path}.zst")
+            with open(file_path, 'rb') as f_in:
+                with zstd.open(str(dst), 'wb', cctx=zstd.ZstdCompressor(level=3)) as f_out:
+                    f_out.write(f_in.read())
+            # Only delete source after successful write
+            os.remove(file_path)
         
         await loop.run_in_executor(None, compress)
     
@@ -118,12 +122,23 @@ class FileRotator:
             
             return self.file_handles[key]
     
-    async def close_all(self) -> None:
-        """Close all open file handles.  Compression is skipped during shutdown."""
-        self._shutting_down = True
+    async def close_all(self, compress: bool = True) -> int:
+        """Close all open file handles and optionally compress.
+        
+        Returns the number of files successfully compressed.
+        """
         keys = list(self.current_files.keys())
+        compressed = 0
+        failed = 0
         for key in keys:
-            await self.rotate_file(key, compress=False)
+            result = await self.rotate_file(key, compress=compress)
+            if result is None and compress:
+                compressed += 1
+            elif result is not None:
+                failed += 1
+        if compress:
+            logger.info(f"Shutdown compression: {compressed} files compressed, {failed} failed")
+        return compressed
 
 
 class AsyncWriter:
@@ -138,6 +153,7 @@ class AsyncWriter:
         self.queue: asyncio.Queue = asyncio.Queue(maxsize=QUEUE_MAX_SIZE)
         self.running = True
         self.write_count = 0
+        self.drop_count = 0
         self.last_flush_time = time.time()
     
     async def enqueue(self, record: dict) -> None:
@@ -148,8 +164,10 @@ class AsyncWriter:
                 timeout=1.0
             )
         except asyncio.TimeoutError:
+            self.drop_count += 1
             logger.warning(
-                f"Queue full for {self.venue}/{self.symbol}/{self.channel}, dropping record"
+                f"Queue full for {self.venue}/{self.symbol}/{self.channel}, "
+                f"dropping record (total drops: {self.drop_count})"
             )
     
     async def writer_task(self) -> None:
@@ -248,7 +266,7 @@ class StorageManager:
         await writer.enqueue(record)
     
     async def shutdown(self) -> None:
-        """Shutdown all writers → flush → close files (no compression)."""
+        """Shutdown all writers → flush → close & compress files."""
         logger.info("Shutting down storage manager...")
         
         # 1. Signal all writers to stop accepting new records
@@ -270,10 +288,18 @@ class StorageManager:
                 await asyncio.gather(*self.writer_tasks.values(),
                                      return_exceptions=True)
         
-        # 3. Close file handles (compression skipped during shutdown)
-        await self.rotator.close_all()
+        # 3. Close file handles and compress final hourly files
+        await self.rotator.close_all(compress=True)
         logger.info("Storage manager shutdown complete")
     
     def get_write_counts(self) -> Dict[str, int]:
         """Get write counts for all writers (for monitoring)."""
         return {key: writer.write_count for key, writer in self.writers.items()}
+    
+    def get_drop_counts(self) -> Dict[str, int]:
+        """Get drop counts for all writers (for monitoring)."""
+        return {key: writer.drop_count for key, writer in self.writers.items()}
+    
+    def get_total_drops(self) -> int:
+        """Total number of dropped records across all writers."""
+        return sum(w.drop_count for w in self.writers.values())

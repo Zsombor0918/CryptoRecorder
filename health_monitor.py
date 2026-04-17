@@ -58,6 +58,9 @@ class HealthMonitor:
         self.futures_disabled_reason: str = ""
         # Snapshot mode
         self.snapshot_mode: str = "disabled"
+        # Queue drop stats – updated from StorageManager before heartbeat writes
+        self.queue_drop_total: int = 0
+        self.queue_drop_by_writer: Dict[str, int] = {}
     
     def record_message(self, venue: str, symbol: str, ts_event: int = None, 
                       update_id: int = None, channel: str = None) -> None:
@@ -124,6 +127,8 @@ class HealthMonitor:
                 'total_messages': total_messages,
                 'total_gaps': total_gaps,
                 'total_reconnects': self.reconnect_count,
+                'queue_drop_total': self.queue_drop_total,
+                'queue_drop_by_writer': self.queue_drop_by_writer,
                 'futures_enabled': self.futures_enabled,
                 'futures_disabled_reason': self.futures_disabled_reason,
                 'snapshot_mode': self.snapshot_mode,
