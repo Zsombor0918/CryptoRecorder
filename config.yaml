@@ -1,0 +1,100 @@
+recorder:
+  # Data recording configuration
+  venues:
+    - binance_spot
+    - binance_usdtm
+
+  # Top 50 symbols for each venue
+  symbols:
+    binance_spot: &spot_symbols
+      - BTCUSDT
+      - ETHUSDT
+      - BNBUSDT
+      - XRPUSDT
+      - SOLUSDT
+      - ADAUSDT
+      - DOGEUSDT
+      - AVAXUSDT
+      - LINKUSDT
+      - LTCUSDT
+      - BCHUSDT
+      - UNIUSDT
+      - XLMUSDT
+      - FILUSDT
+      - DOTUSDT
+      - MATICUSDT
+      - TRXUSDT
+      - ATOMUSDT
+      - VETUSDT
+      - NEOUSDT
+      - ETCUSDT
+      - WAVESUSDT
+      - AAVEUSDT
+      - MKRUSDT
+      - KSMUSDT
+      - ALGOUSDT
+      - ICPUSDT
+      - SANDUSDT
+      - MANAUSDT
+      - WBTCUSDT
+      - CRVUSDT
+      - SNXUSDT
+      - YFIUSDT
+      - RENUSDT
+      - SUSHIUSDT
+      - ZECUSDT
+      - DASHUSDT
+      - ZILUSDT
+      - GRTUSDT
+      - CHZUSDT
+      - ENJUSDT
+      - GALAUSDT
+      - ARCUSDT
+      - LRCUSDT
+      - GTOUSDT
+      - CAKEUSDT
+      - ONEUSDT
+      - IOSTUSDT
+      - ZRXUSDT
+      - DENTUSDT
+
+    binance_usdtm: *spot_symbols
+
+  # Data channels
+  channels:
+    - L2_BOOK      # Order book deltas @100ms
+    - TRADES       # Trade stream
+    - SNAPSHOTS    # REST periodic snapshots
+
+  # L2 book depth interval: 100ms or 1000ms
+  depth_interval: "100ms"
+
+  # Recording settings
+  max_depth: 20      # Maximum depth to keep in memory
+  snapshot_interval_seconds: 600  # 10 minutes for order book REST snapshots
+  metadata_interval_seconds: 3600  # 1 hour for instrument metadata
+
+  # Storage
+  storage:
+    base_path: ~/data_raw
+    format: jsonl  # jsonl or msgpack
+    compression: zstd  # zstd, gzip, or none
+    
+    # File rotation
+    rotation_minutes: 60  # Rotate files every 60 minutes
+    
+    # Retention
+    retention_days: 30  # Keep raw data for 30 days
+    disk_limit_gb: 500  # Total disk budget
+    cleanup_threshold_gb: 450  # Start cleanup when disk use is above this
+
+  # Logging
+  logging:
+    level: INFO
+    file: recorder.log
+    
+  # Gap detection & resync
+  gap_detection:
+    enabled: true
+    max_retries: 3
+    retry_delay_ms: 1000

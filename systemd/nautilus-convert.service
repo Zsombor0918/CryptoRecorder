@@ -1,0 +1,21 @@
+[Unit]
+Description=Nautilus Data Converter (RAW to Parquet)
+Documentation=file:///home/zsom/services/CryptoRecorder/convert_yesterday.py
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=zsom
+WorkingDirectory=/home/zsom/services/CryptoRecorder
+ExecStart=/home/zsom/services/CryptoRecorder/.venv/bin/python convert_yesterday.py
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=nautilus-converter
+
+# Run with memory limit
+MemoryMax=4G
+CPUQuota=100%
+
+[Install]
+WantedBy=multi-user.target

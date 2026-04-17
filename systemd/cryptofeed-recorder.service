@@ -1,0 +1,27 @@
+[Unit]
+Description=Binance Market Data Recorder
+Documentation=file:///home/zsom/services/CryptoRecorder/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=zsom
+WorkingDirectory=/home/zsom/services/CryptoRecorder
+ExecStart=/home/zsom/services/CryptoRecorder/.venv/bin/python recorder.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=crypto-recorder
+
+# Resource limits
+MemoryMax=2G
+CPUQuota=50%
+
+# Security
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

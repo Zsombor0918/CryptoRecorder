@@ -1,0 +1,17 @@
+[Unit]
+Description=Nautilus Data Converter Timer (daily conversion at 00:10)
+Requires=nautilus-convert.service
+
+[Timer]
+# Run every day at 00:10 (10 minutes after midnight)
+OnCalendar=daily
+OnCalendar=*-*-* 00:10:00
+
+# If the system was off at 00:10, run as soon as possible after boot
+Persistent=true
+
+# Run with user accuracy (don't cluster with other timers)
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target
