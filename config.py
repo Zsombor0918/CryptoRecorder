@@ -13,8 +13,8 @@ DATA_ROOT: Final = PROJECT_ROOT / "data_raw"
 META_ROOT: Final = PROJECT_ROOT / "meta"
 STATE_ROOT: Final = PROJECT_ROOT / "state"
 
-# Data subdirectories
-CHANNELS: Final = ["depth", "trade", "snapshot", "exchangeinfo"]
+# Data subdirectories (snapshot removed – REST snapshots cause 429/418)
+CHANNELS: Final = ["depth", "trade", "exchangeinfo"]
 
 # Create required directories on import
 for directory in [DATA_ROOT, META_ROOT, STATE_ROOT, STATE_ROOT / "convert_reports"]:
@@ -37,8 +37,11 @@ VENUE_FULL_NAMES: Final = {
     "BINANCE_USDTF": "Binance USDT-M Futures",
 }
 
+import os as _os
+
 # Target number of symbols per venue (selected by 24h quote volume)
-TOP_SYMBOLS: Final = 50
+# Override with CRYPTO_RECORDER_TOP_SYMBOLS env var for testing
+TOP_SYMBOLS: Final = int(_os.environ.get("CRYPTO_RECORDER_TOP_SYMBOLS", "50"))
 
 # Base quote asset for universe selection
 QUOTE_ASSET_SPOT: Final = "USDT"

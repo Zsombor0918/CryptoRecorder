@@ -185,7 +185,6 @@ class SystemValidator:
             ('health_monitor', 'HealthMonitor'),
             ('binance_universe', 'UniverseSelector'),
             ('disk_monitor', 'DiskMonitor'),
-            ('disk_plan', 'DiskPlanner'),
         ]
         
         for module_name, class_name in modules:
@@ -203,30 +202,13 @@ class SystemValidator:
             from disk_monitor import DiskMonitor
             monitor = DiskMonitor(cfg)
             
-            # Test methods exist
             assert hasattr(monitor, 'check_disk_usage'), "check_disk_usage missing"
             assert hasattr(monitor, 'get_growth_rate'), "get_growth_rate missing"
             assert hasattr(monitor, 'disk_check_task'), "disk_check_task missing"
             
             return "DiskMonitor OK"
         
-        def check_disk_plan():
-            from disk_plan import DiskPlanner
-            planner = DiskPlanner(capacity_gb=500, analysis_days=30)
-            
-            # Test methods exist
-            assert hasattr(planner, 'generate_plan'), "generate_plan missing"
-            assert hasattr(planner, 'validate_plan'), "validate_plan missing"
-            
-            # Generate plan with default
-            plan = planner.generate_plan(measured_daily_gb=10.0)
-            assert 'recommended_config' in plan, "recommended_config missing"
-            assert 'DISK_SOFT_LIMIT_GB' in plan['recommended_config']
-            
-            return "DiskPlanner OK"
-        
         self.test("DiskMonitor functionality", check_disk_monitor)
-        self.test("DiskPlanner functionality", check_disk_plan)
     
     def validate_directories(self):
         """Validate directory structure."""
@@ -270,14 +252,13 @@ class SystemValidator:
         def check_imports():
             from recorder import (
                 storage_manager, health_monitor, disk_monitor,
-                feed_handler, background_tasks, shutdown_event
+                shutdown_event
             )
             return "Global variables defined"
         
         def check_classes():
-            from recorder import SnapshotFetcher, DiskManager
-            assert hasattr(SnapshotFetcher, 'maybe_fetch_snapshot')
-            assert hasattr(DiskManager, 'disk_check_task')
+            from recorder import MetadataFetcher
+            assert hasattr(MetadataFetcher, 'maybe_fetch_exchangeinfo')
             return "Required classes present"
         
         self.test("Recorder globals", check_imports)
