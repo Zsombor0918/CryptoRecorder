@@ -212,28 +212,37 @@ class DiskMonitor:
             logger.error(f"Error writing usage report: {e}")
     
     async def get_oldest_date_dir(self) -> Optional[Path]:
-        """Get oldest date directory in data_raw/."""
+        """Get oldest date directory in data_raw/.
+
+        Returns the actual date directory, e.g.:
+            data_raw/BINANCE_SPOT/depth/BTCUSDT/2026-04-15/
+        Only targets directories whose name looks like YYYY-MM-DD.
+        Never returns venue, channel, or symbol directories.
+        """
         try:
-            venue_dirs = list(self.data_root.glob("*/"))
-            date_dirs = set()
+            date_dirs = []
             
-            for venue_dir in venue_dirs:
-                channel_dirs = list(venue_dir.glob("*/"))
-                for channel_dir in channel_dirs:
-                    symbol_dirs = list(channel_dir.glob("*/"))
-                    for symbol_dir in symbol_dirs:
-                        date_subdirs = [
-                            d for d in symbol_dir.glob("*/")
-                            if d.is_dir() and len(d.name) == 10 and d.name[4] == '-'
-                        ]
-                        date_dirs.update(date_subdirs)
+            for venue_dir in self.data_root.glob("*/"):
+                if not venue_dir.is_dir():
+                    continue
+                for channel_dir in venue_dir.glob("*/"):
+                    if not channel_dir.is_dir():
+                        continue
+                    for symbol_dir in channel_dir.glob("*/"):
+                        if not symbol_dir.is_dir():
+                            continue
+                        for d in symbol_dir.iterdir():
+                            if (d.is_dir()
+                                    and len(d.name) == 10
+                                    and d.name[4] == '-'
+                                    and d.name[7] == '-'):
+                                date_dirs.append(d)
             
             if not date_dirs:
                 return None
             
-            # Return oldest date directory
-            oldest = min(date_dirs, key=lambda x: x.name)
-            return oldest.parent.parent.parent  # Go up to venue level
+            # Return the single oldest date directory
+            return min(date_dirs, key=lambda x: x.name)
         except Exception as e:
             logger.warning(f"Could not find oldest date dir: {e}")
             return None
@@ -274,7 +283,7 @@ class DiskMonitor:
                     oldest_dir
                 )
                 
-                logger.info(f"Deleting {oldest_dir.name} ({dir_size_gb:.1f}GB)...")
+                logger.info(f"Deleting oldest date dir {oldest_dir} ({dir_size_gb:.1f}GB)...")
                 
                 await asyncio.get_event_loop().run_in_executor(
                     None,

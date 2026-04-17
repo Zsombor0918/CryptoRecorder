@@ -5,15 +5,18 @@ validate_runtime.py  –  3-minute recorder smoke-test
 Starts the recorder as a subprocess with TOP_SYMBOLS=3 (snapshots disabled),
 lets it run for 3 minutes, sends SIGINT, then asserts:
 
-  1. no_429_418          – no HTTP 429 / 418 rate-limit bans in logs
-  2. no_callback_errors  – no "Error in on_l2_book" / "Error in on_trade"
-  3. raw_files_nonempty  – .jsonl files created in data_raw/ and non-empty
-  4. heartbeat_updated   – heartbeat.json shows uptime ≥ 10 s and messages > 0
-  5. clean_shutdown      – exit code 0, no event-loop mismatch
-  6. schema_fields       – every record has venue/symbol/channel/ts_recv_ns
-  7. ts_recv_monotonic   – ts_recv_ns non-decreasing per file
-  8. symbol_no_dash      – symbols use Binance format (no dashes)
-  9. futures_status      – futures producing data OR explicitly disabled
+  1. no_429_418           – no HTTP 429 / 418 rate-limit bans in logs
+  2. no_callback_errors   – no "Error in on_l2_book" / "Error in on_trade"
+  3. raw_files_nonempty   – .jsonl files created in data_raw/ and non-empty
+  4. heartbeat_updated    – heartbeat.json shows uptime ≥ 10 s and messages > 0
+  5. clean_shutdown       – exit code 0, no watchdog
+  6. no_async_pathology   – no "different loop" / "never awaited" / "loop closed"
+  7. schema_fields        – every record has venue/symbol/channel/ts_recv_ns
+  8. ts_recv_monotonic    – ts_recv_ns non-decreasing per file
+  9. symbol_no_dash       – symbols use Binance format (no dashes)
+ 10. futures_status       – futures recording OR explicitly degraded
+ 11. raw_files_compressed – shutdown compressed final .jsonl → .jsonl.zst
+ 12. queue_drops          – zero queue drops in heartbeat
 
 Outputs JSON report to state/runtime_report.json
 """
@@ -44,16 +47,25 @@ logger = logging.getLogger("validate_runtime")
 # ── helpers ──────────────────────────────────────────────────────────
 
 def _jsonl_files_after(root: Path, ts: float) -> List[Path]:
+    """Find .jsonl and .jsonl.zst files modified after ts."""
     if not root.exists():
         return []
-    return [p for p in root.rglob("*.jsonl")
-            if p.stat().st_mtime >= ts]
+    out = []
+    for p in root.rglob("*.jsonl*"):
+        if p.stat().st_mtime >= ts:
+            out.append(p)
+    return out
 
 
 def _read_jsonl(path: Path, n: int = 200) -> List[dict]:
+    import zstandard as zstd
     out: List[dict] = []
     try:
-        with open(path, errors="ignore") as f:
+        if path.suffix == ".zst":
+            opener = lambda: zstd.open(path, "rt", errors="ignore")
+        else:
+            opener = lambda: open(path, errors="ignore")
+        with opener() as f:
             for i, line in enumerate(f):
                 if i >= n:
                     break
@@ -236,15 +248,76 @@ class RuntimeValidator:
                 "details": {"checked": n, "bad": list(bad)[:5]}}
 
     def _ck_futures(self, log: str) -> dict:
+        """Futures check: producing data = full pass, disabled = DEGRADED (still passes smoke test)."""
         fut_dir = DATA_ROOT / "BINANCE_USDTF"
         producing = bool(fut_dir.exists() and
-                         [f for f in fut_dir.rglob("*.jsonl")
+                         [f for f in fut_dir.rglob("*.jsonl*")
                           if f.stat().st_mtime >= self._t0])
         disabled = bool(re.search(
             r"(Futures DISABLED|Failed to init.*Futures|futures.*disabled)",
             log, re.I))
+        # For the 3-min smoke test, degraded mode is acceptable (passes)
+        # but is clearly labelled so the scale validator can treat it differently.
+        if producing:
+            status = "recording"
+        elif disabled:
+            status = "degraded"
+        else:
+            status = "unknown"
         return {"name": "futures_status", "passed": producing or disabled,
-                "details": {"producing": producing, "disabled_flag": disabled}}
+                "details": {"status": status, "producing": producing,
+                            "disabled_flag": disabled}}
+
+    def _ck_clean_shutdown_logs(self, log: str) -> dict:
+        """Check for async pathologies in logs."""
+        patterns = [
+            (r"future belongs to a different loop", "future_different_loop"),
+            (r"attached to a different loop", "attached_different_loop"),
+            (r"never awaited", "never_awaited"),
+            (r"Event loop is closed", "loop_closed"),
+            (r"loop.*already running", "loop_already_running"),
+            (r"cannot schedule new futures", "cannot_schedule"),
+        ]
+        found = {}
+        for pattern, label in patterns:
+            hits = re.findall(pattern, log, re.I)
+            if hits:
+                found[label] = len(hits)
+        ok = len(found) == 0
+        return {"name": "no_async_pathology", "passed": ok,
+                "details": found if found else {"clean": True}}
+
+    def _ck_raw_files_compressed(self) -> dict:
+        """After shutdown, check that .jsonl files created during the run got compressed.
+        
+        During a short smoke test some files may still be open at shutdown time.
+        We just check that at least some .jsonl.zst exist if any data was written.
+        """
+        zst_files = list(DATA_ROOT.rglob("*.jsonl.zst"))
+        jsonl_files = [f for f in DATA_ROOT.rglob("*.jsonl")
+                       if f.stat().st_mtime >= self._t0]
+        zst_new = [f for f in zst_files if f.stat().st_mtime >= self._t0]
+        # Pass if: no leftover uncompressed .jsonl from this run,
+        # OR at least some .zst were created.
+        ok = len(jsonl_files) == 0 or len(zst_new) > 0
+        return {"name": "raw_files_compressed", "passed": ok,
+                "details": {"uncompressed_jsonl": len(jsonl_files),
+                            "compressed_zst": len(zst_new)}}
+
+    def _ck_queue_drops(self) -> dict:
+        """Check heartbeat for queue drops."""
+        hb = STATE_ROOT / "heartbeat.json"
+        if not hb.exists():
+            return {"name": "queue_drops", "passed": True,
+                    "details": {"reason": "no heartbeat"}}
+        try:
+            d = json.loads(hb.read_text())
+        except Exception:
+            return {"name": "queue_drops", "passed": True,
+                    "details": {"reason": "heartbeat unreadable"}}
+        drops = d.get("queue_drop_total", 0)
+        return {"name": "queue_drops", "passed": drops == 0,
+                "details": {"queue_drop_total": drops}}
 
     # ── orchestrate ──────────────────────────────────────────────────
 
@@ -262,10 +335,13 @@ class RuntimeValidator:
             self._ck_raw_files(),
             self._ck_heartbeat(),
             self._ck_clean_shutdown(log),
+            self._ck_clean_shutdown_logs(log),
             self._ck_schema(),
             self._ck_monotonic(),
             self._ck_symbol_format(),
             self._ck_futures(log),
+            self._ck_raw_files_compressed(),
+            self._ck_queue_drops(),
         ]
 
         self.report["checks"] = {c["name"]: c for c in checks}

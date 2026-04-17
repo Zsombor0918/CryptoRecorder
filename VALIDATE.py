@@ -2,12 +2,14 @@
 """
 VALIDATE.py  –  Master validation entrypoint for CryptoRecorder
 
-Three validators, three modes:
+Five validators, five modes:
 
-  python VALIDATE.py system     validate_system.py   (imports + config, ~5 s)
-  python VALIDATE.py runtime    validate_runtime.py   (live 3-min smoke-test)
+  python VALIDATE.py system     validate_system.py       (imports + config, ~5 s)
+  python VALIDATE.py runtime    validate_runtime.py      (live 3-min smoke-test)
+  python VALIDATE.py scale      validate_scale_50_50.py  (10-min 50/50 acceptance)
   python VALIDATE.py converter  validate_converter_e2e.py (parquet roundtrip)
-  python VALIDATE.py all        all three in sequence
+  python VALIDATE.py all        system + runtime + converter (quick suite)
+  python VALIDATE.py accept     system + runtime + scale + converter (full DoD)
 """
 import json
 import subprocess
@@ -105,6 +107,26 @@ def run_converter() -> bool:
     return passed
 
 
+def run_scale(runtime_sec: int = 600) -> bool:
+    print(f"\n{C.B}► Scale 50/50 acceptance (validate_scale_50_50.py, {runtime_sec}s){C._}")
+    ok, out = _run(
+        f"source .venv/bin/activate && python3 validate_scale_50_50.py --runtime {runtime_sec}",
+        timeout=runtime_sec + 120)
+    rpt = _load_report("scale_50_50_report.json")
+    passed = rpt.get("passed", False) if rpt else False
+    n = rpt.get("checks_passed", "?") if rpt else "?"
+    t = rpt.get("total_checks", "?") if rpt else "?"
+    if passed:
+        print(f"  {C.G}✓ scale checks passed ({n}/{t}){C._}")
+    else:
+        print(f"  {C.R}✗ scale checks failed ({n}/{t}){C._}")
+        if rpt:
+            for name, chk in rpt.get("checks", {}).items():
+                if not chk.get("passed"):
+                    print(f"    {C.R}✗ {name}{C._}")
+    return passed
+
+
 # ── summary ──────────────────────────────────────────────────────────
 
 def _save_and_print(results: Dict[str, bool]) -> int:
@@ -136,9 +158,11 @@ USAGE = f"""\
 {C.B}VALIDATE.py{C._}  –  CryptoRecorder validation
 
   python VALIDATE.py system       Import / config checks (~5 s)
-  python VALIDATE.py runtime      Live recorder 3-min smoke-test
+  python VALIDATE.py runtime      Live recorder 3-min smoke-test (12 checks)
+  python VALIDATE.py scale        50/50 scale 10-min acceptance test (11 checks)
   python VALIDATE.py converter    Converter E2E parquet roundtrip
-  python VALIDATE.py all          All three in order
+  python VALIDATE.py all          system + runtime + converter  (quick suite)
+  python VALIDATE.py accept       system + runtime + scale + converter  (full DoD)
   python VALIDATE.py --help       This message
 """
 
@@ -155,11 +179,18 @@ def main() -> int:
         results["system"] = run_system()
     elif mode == "runtime":
         results["runtime"] = run_runtime()
+    elif mode == "scale":
+        results["scale"] = run_scale()
     elif mode == "converter":
         results["converter"] = run_converter()
     elif mode == "all":
         results["system"] = run_system()
         results["runtime"] = run_runtime()
+        results["converter"] = run_converter()
+    elif mode == "accept":
+        results["system"] = run_system()
+        results["runtime"] = run_runtime()
+        results["scale"] = run_scale()
         results["converter"] = run_converter()
     else:
         print(f"Unknown mode: {mode}")

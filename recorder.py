@@ -434,14 +434,21 @@ async def shutdown(background_tasks: List[asyncio.Task]) -> None:
     if background_tasks:
         await asyncio.gather(*background_tasks, return_exceptions=True)
 
-    # 4. Flush writers → close files (compression skipped)
+    # 4. Flush writers → close & compress files
     if storage_manager:
         await storage_manager.shutdown()
     if disk_monitor:
         await disk_monitor.shutdown()
 
-    # 5. Final heartbeat
+    # 5. Final heartbeat (with queue drop stats)
     if health_monitor:
+        if storage_manager:
+            health_monitor.queue_drop_total = storage_manager.get_total_drops()
+            drops = storage_manager.get_drop_counts()
+            # Only include writers with drops > 0 to keep heartbeat small
+            health_monitor.queue_drop_by_writer = {
+                k: v for k, v in drops.items() if v > 0
+            }
         health_monitor.futures_enabled = futures_enabled
         health_monitor.futures_disabled_reason = futures_disabled_reason
         await health_monitor.write_heartbeat()
@@ -461,6 +468,27 @@ async def shutdown(background_tasks: List[asyncio.Task]) -> None:
 
     wd.cancel()
     logger.info("Recorder shutdown complete")
+
+
+# ============================================================================\n# Drop stats feeder (keeps heartbeat in sync with queue drops)\n# ============================================================================
+
+async def _update_drop_stats_task() -> None:
+    """Periodically copy queue drop counts from StorageManager to HealthMonitor."""
+    while not shutdown_event.is_set():
+        try:
+            if storage_manager and health_monitor:
+                health_monitor.queue_drop_total = storage_manager.get_total_drops()
+                drops = storage_manager.get_drop_counts()
+                health_monitor.queue_drop_by_writer = {
+                    k: v for k, v in drops.items() if v > 0
+                }
+        except Exception:
+            pass
+        try:
+            await asyncio.wait_for(shutdown_event.wait(), timeout=10)
+            break
+        except asyncio.TimeoutError:
+            pass
 
 
 # ============================================================================
@@ -489,6 +517,8 @@ async def main() -> None:
         # Background tasks  – all on the same loop
         background_tasks.append(
             asyncio.create_task(health_monitor.heartbeat_task()))
+        background_tasks.append(
+            asyncio.create_task(_update_drop_stats_task()))
         background_tasks.append(
             asyncio.create_task(disk_check_task()))
 
