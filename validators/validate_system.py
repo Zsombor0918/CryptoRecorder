@@ -6,18 +6,17 @@ Validates:
   - All imports and dependencies
   - Configuration loading and settings
   - Disk monitor functionality
-  - Disk plan generation
   - Recorder integration
-  - Converter module structure
+  - Converter script
   - All relative paths and directories
   - State directory creation
-  - Syntax validation of all modules
+  - Async functionality
 
 Usage:
-    python validate_system.py              # Run all validations
-    python validate_system.py --quick      # Quick checks only
-    python validate_system.py --verbose    # Detailed output
-    python validate_system.py --fix        # Auto-create missing directories
+    python validators/validate_system.py              # Run all validations
+    python validators/validate_system.py --quick      # Quick checks only
+    python validators/validate_system.py --verbose    # Detailed output
+    python validators/validate_system.py --fix        # Auto-create missing dirs
 
 Output:
     - Console report with ✓/✗ indicators
@@ -34,6 +33,10 @@ from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Tuple, Optional
 
+# Ensure project root is on sys.path so `from config import ...` works
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_PROJECT_ROOT))
+
 
 class SystemValidator:
     """Comprehensive system validator."""
@@ -42,7 +45,7 @@ class SystemValidator:
         self.verbose = verbose
         self.quick = quick
         self.fix = fix
-        self.project_root = Path(__file__).parent
+        self.project_root = Path(__file__).resolve().parent.parent
         self.results = {}
         self.passed = 0
         self.failed = 0
@@ -134,7 +137,7 @@ class SystemValidator:
         """Validate required dependencies are installed."""
         required = [
             'asyncio', 'aiohttp', 'cryptofeed', 'zstandard',
-            'yaml', 'pandas', 'pyarrow', 'logging'
+            'yaml', 'pandas', 'pyarrow', 'logging', 'nautilus_trader',
         ]
         
         for pkg in required:
@@ -226,12 +229,10 @@ class SystemValidator:
         self.test("Directory structure", check_root)
         
         def check_converter():
-            converter_dir = self.project_root / 'converter'
-            required_files = ['__init__.py', 'parsers.py', 'book_builder.py', 'nautilus_builder.py']
-            missing = [f for f in required_files if not (converter_dir / f).exists()]
-            if missing:
-                raise ValueError(f"Missing in converter/: {missing}")
-            return "Converter module complete"
+            converter_file = self.project_root / 'convert_yesterday.py'
+            if not converter_file.exists():
+                raise ValueError("convert_yesterday.py not found")
+            return "Converter script present"
         
         self.test("Converter module structure", check_converter)
         
@@ -266,27 +267,21 @@ class SystemValidator:
     
     def validate_converter(self):
         """Validate converter system."""
-        def check_converter_modules():
-            # Just check modules can be imported
-            import converter.parsers
-            import converter.book_builder
-            import converter.nautilus_builder
-            
-            # Check key classes/functions exist
-            assert hasattr(converter.parsers, 'JSONLReader'), "JSONLReader missing"
-            assert hasattr(converter.book_builder, 'LocalOrderBook'), "LocalOrderBook missing"
-            assert hasattr(converter.nautilus_builder, 'TradeTickBuilder'), "TradeTickBuilder missing"
-            
-            return "All converter modules present"
-        
-        self.test("Converter modules", check_converter_modules)
-        
+        def check_converter_imports():
+            from convert_yesterday import (
+                convert_date, resolve_universe, load_exchange_info,
+                build_instruments, convert_trades, convert_depth,
+            )
+            return "convert_yesterday.py imports OK"
+
+        self.test("Converter modules", check_converter_imports)
+
         def check_convert_script():
             convert_script = self.project_root / 'convert_yesterday.py'
             if not convert_script.exists():
                 raise FileNotFoundError("convert_yesterday.py not found")
             return "convert_yesterday.py present"
-        
+
         self.test("Converter entry point", check_convert_script)
     
     def validate_async(self):

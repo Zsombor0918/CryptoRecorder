@@ -2,14 +2,13 @@
 """
 VALIDATE.py  –  Master validation entrypoint for CryptoRecorder
 
-Five validators, five modes:
-
-  python VALIDATE.py system     validate_system.py       (imports + config, ~5 s)
-  python VALIDATE.py runtime    validate_runtime.py      (live 3-min smoke-test)
-  python VALIDATE.py scale      validate_scale_50_50.py  (10-min 50/50 acceptance)
-  python VALIDATE.py converter  validate_converter_e2e.py (parquet roundtrip)
-  python VALIDATE.py all        system + runtime + converter (quick suite)
-  python VALIDATE.py accept     system + runtime + scale + converter (full DoD)
+  python VALIDATE.py system     validators/validate_system.py       (~5 s)
+  python VALIDATE.py runtime    validators/validate_runtime.py      (3-min smoke)
+  python VALIDATE.py scale      validators/validate_scale_50_50.py  (10-min 50/50)
+  python VALIDATE.py nautilus   validators/validate_nautilus_catalog_e2e.py
+  python VALIDATE.py converter  validators/validate_converter_e2e.py (legacy)
+  python VALIDATE.py all        system + runtime + nautilus  (quick suite)
+  python VALIDATE.py accept     system + runtime + scale + nautilus  (full DoD)
 """
 import json
 import subprocess
@@ -61,7 +60,7 @@ def _load_report(name: str) -> Optional[dict]:
 
 def run_system() -> bool:
     print(f"\n{C.B}► System validation (validate_system.py){C._}")
-    ok, out = _run("source .venv/bin/activate && python3 validate_system.py --quick")
+    ok, out = _run("source .venv/bin/activate && python3 validators/validate_system.py --quick")
     if ok:
         print(f"  {C.G}✓ system checks passed{C._}")
     else:
@@ -73,7 +72,7 @@ def run_system() -> bool:
 def run_runtime(runtime_sec: int = 180) -> bool:
     print(f"\n{C.B}► Runtime smoke-test (validate_runtime.py, {runtime_sec}s){C._}")
     ok, out = _run(
-        f"source .venv/bin/activate && python3 validate_runtime.py --runtime {runtime_sec}",
+        f"source .venv/bin/activate && python3 validators/validate_runtime.py --runtime {runtime_sec}",
         timeout=runtime_sec + 60)
     rpt = _load_report("runtime_report.json")
     passed = rpt.get("passed", False) if rpt else False
@@ -92,7 +91,7 @@ def run_runtime(runtime_sec: int = 180) -> bool:
 
 def run_converter() -> bool:
     print(f"\n{C.B}► Converter E2E (validate_converter_e2e.py){C._}")
-    ok, out = _run("source .venv/bin/activate && python3 validate_converter_e2e.py")
+    ok, out = _run("source .venv/bin/activate && python3 validators/validate_converter_e2e.py")
     rpt = _load_report("converter_e2e_report.json")
     if rpt and rpt.get("skipped"):
         print(f"  {C.Y}⚠ skipped: {rpt.get('reason', '?')}{C._}")
@@ -110,7 +109,7 @@ def run_converter() -> bool:
 def run_scale(runtime_sec: int = 600) -> bool:
     print(f"\n{C.B}► Scale 50/50 acceptance (validate_scale_50_50.py, {runtime_sec}s){C._}")
     ok, out = _run(
-        f"source .venv/bin/activate && python3 validate_scale_50_50.py --runtime {runtime_sec}",
+        f"source .venv/bin/activate && python3 validators/validate_scale_50_50.py --runtime {runtime_sec}",
         timeout=runtime_sec + 120)
     rpt = _load_report("scale_50_50_report.json")
     passed = rpt.get("passed", False) if rpt else False
@@ -120,6 +119,37 @@ def run_scale(runtime_sec: int = 600) -> bool:
         print(f"  {C.G}✓ scale checks passed ({n}/{t}){C._}")
     else:
         print(f"  {C.R}✗ scale checks failed ({n}/{t}){C._}")
+        if rpt:
+            for name, chk in rpt.get("checks", {}).items():
+                if not chk.get("passed"):
+                    print(f"    {C.R}✗ {name}{C._}")
+    return passed
+
+
+def run_nautilus() -> bool:
+    print(f"\n{C.B}► Nautilus catalog E2E (validate_nautilus_catalog_e2e.py){C._}")
+    ok, out = _run("source .venv/bin/activate && python3 validators/validate_nautilus_catalog_e2e.py",
+                   timeout=360)
+    # Try to find the most recent report
+    val_dir = STATE / "validation"
+    rpt = None
+    if val_dir.exists():
+        reports = sorted(val_dir.glob("nautilus_catalog_e2e_*.json"), reverse=True)
+        if reports:
+            try:
+                rpt = json.loads(reports[0].read_text())
+            except Exception:
+                pass
+    if rpt and rpt.get("skipped"):
+        print(f"  {C.Y}⚠ skipped: {rpt.get('reason', '?')}{C._}")
+        return True
+    passed = rpt.get("passed", False) if rpt else False
+    n = rpt.get("checks_passed", "?") if rpt else "?"
+    t = rpt.get("total_checks", "?") if rpt else "?"
+    if passed:
+        print(f"  {C.G}✓ nautilus catalog checks passed ({n}/{t}){C._}")
+    else:
+        print(f"  {C.R}✗ nautilus catalog checks failed ({n}/{t}){C._}")
         if rpt:
             for name, chk in rpt.get("checks", {}).items():
                 if not chk.get("passed"):
@@ -160,9 +190,10 @@ USAGE = f"""\
   python VALIDATE.py system       Import / config checks (~5 s)
   python VALIDATE.py runtime      Live recorder 3-min smoke-test (12 checks)
   python VALIDATE.py scale        50/50 scale 10-min acceptance test (11 checks)
-  python VALIDATE.py converter    Converter E2E parquet roundtrip
-  python VALIDATE.py all          system + runtime + converter  (quick suite)
-  python VALIDATE.py accept       system + runtime + scale + converter  (full DoD)
+  python VALIDATE.py nautilus     Nautilus catalog E2E (9 checks)
+  python VALIDATE.py converter    Legacy converter E2E (7 checks)
+  python VALIDATE.py all          system + runtime + nautilus  (quick suite)
+  python VALIDATE.py accept       system + runtime + scale + nautilus  (full DoD)
   python VALIDATE.py --help       This message
 """
 
@@ -181,17 +212,19 @@ def main() -> int:
         results["runtime"] = run_runtime()
     elif mode == "scale":
         results["scale"] = run_scale()
+    elif mode == "nautilus":
+        results["nautilus"] = run_nautilus()
     elif mode == "converter":
         results["converter"] = run_converter()
     elif mode == "all":
         results["system"] = run_system()
         results["runtime"] = run_runtime()
-        results["converter"] = run_converter()
+        results["nautilus"] = run_nautilus()
     elif mode == "accept":
         results["system"] = run_system()
         results["runtime"] = run_runtime()
         results["scale"] = run_scale()
-        results["converter"] = run_converter()
+        results["nautilus"] = run_nautilus()
     else:
         print(f"Unknown mode: {mode}")
         print(USAGE)

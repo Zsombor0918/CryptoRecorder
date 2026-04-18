@@ -12,11 +12,11 @@ venv/
 
 # Data & state
 data_raw/
-data_converted/
 state/
 *.log
 *.jsonl
 *.jsonl.zst
+*.jsonl.gz
 
 # IDE
 .vscode/
