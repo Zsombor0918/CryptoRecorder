@@ -17,8 +17,8 @@ pip install -r requirements.txt
 sudo apt-get install -y build-essential python3-dev g++
 
 python recorder.py                       # start recording (Ctrl-C to stop)
-python VALIDATE.py all                   # quick suite: system + runtime + nautilus
-python VALIDATE.py accept               # full DoD: system + runtime + scale + nautilus
+python VALIDATE.py all                   # quick suite: system + runtime + nautilus + purge
+python VALIDATE.py accept               # full DoD: + scale acceptance
 python convert_yesterday.py              # convert yesterday's raw → Nautilus catalog
 ```
 
@@ -92,8 +92,13 @@ This is sufficient for:
 
 - The book starts empty — the first few snapshots may be incomplete until
   enough deltas have been received.
-- Gaps from reconnects are not detected or repaired.
+- **Gap detection is approximate**: inactivity > 30 s triggers a gap counter
+  and book reset, but we cannot detect shorter reconnect gaps or distinguish
+  genuine low-activity periods from actual feed drops.
 - This is **approximate** reconstruction, not bit-exact Binance replay.
+- The converter reads the universe from `meta/universe/` (recorder-written
+  dict format); symbols without raw data produce instruments but zero
+  trades/depth — this is expected.
 
 ### Determinism Roadmap (Phase 2)
 
@@ -114,6 +119,10 @@ python convert_yesterday.py --date YYYY-MM-DD --staging  # atomic: write to temp
 
 Reads raw JSONL (plain or zstd-compressed) for the given date and writes
 directly to a **NautilusTrader `ParquetDataCatalog`** at `~/nautilus_data/catalog/`.
+
+Idempotent re-runs are safe: the converter uses **date-scoped purge** to
+delete only Parquet files whose time range overlaps the target date before
+writing — other days' data in the catalog is never touched.
 
 ### What the converter produces
 
@@ -225,6 +234,7 @@ These four properties are explicitly validated by the test suite:
 | Property | Validator | What it proves |
 |----------|-----------|----------------|
 | **Purge safety** | `validate_purge_safety.py` | Cleanup deletes only target date dirs; never parents, other dates, or catalog |
+| **Date-scoped catalog purge** | `test_purge_date_scoped.py` | Converter purge deletes only Parquet files overlapping target date; other days' data for same instrument survives |
 | **Instrument ID consistency** | `instrument_id_mapping` + `instrument_venue_mapping` | Every trade/depth object references a valid instrument; spot = `SYM.BINANCE`, futures = `SYM-PERP.BINANCE` |
 | **Idempotent conversion** | `idempotency_counts` | Running converter twice yields identical instrument/trade/depth counts — no duplication |
 | **Gap-suspected reporting** | `gap_fields_valid` + `gap_rate_sane` + `gap_per_symbol` | Report contains `gaps_suspected`, `book_resets_total`, `gap_rate`, per-symbol breakdown; Phase 1 approximate only |
@@ -239,7 +249,7 @@ These four properties are explicitly validated by the test suite:
 |------|----------|
 | Raw data | `data_raw/{VENUE}/{channel}/{SYMBOL}/{YYYY-MM-DD}/{hour}.jsonl.zst` |
 | Nautilus catalog | `~/nautilus_data/catalog/` (ParquetDataCatalog) |
-| Universe cache | `meta/universe/{VENUE}/{YYYY-MM-DD}.json` |
+| Universe cache | `meta/universe/{VENUE}/{YYYY-MM-DD}.json` (dict format: `{BINANCE_SPOT: [...], BINANCE_USDTF: [...]}`) |
 | Heartbeat | `state/heartbeat.json` |
 | Recorder log | `recorder.log` |
 | Systemd units | `systemd/` |
@@ -292,11 +302,11 @@ binance_universe.py       Top-N symbol selection by 24h volume
 convert_yesterday.py      CLI entry point for daily conversion
 converter/
   readers.py              Streaming JSONL/zst/gz decompression
-  universe.py             Universe resolution (meta/ + disk fallback)
+  universe.py             Universe resolution (dict + list meta format; disk fallback)
   instruments.py          Build Nautilus instruments from exchangeInfo
   trades.py               Raw → TradeTick conversion
   book.py                 L2 delta → OrderBookDepth10 (gap detection)
-  catalog.py              Idempotent catalog write helpers
+  catalog.py              Date-scoped idempotent catalog purge
 VALIDATE.py               Unified validation entry point
 validators/
   validate_system.py        Dependency & config checks
@@ -304,6 +314,9 @@ validators/
   validate_scale_50_50.py   10-min 50/50 scale acceptance (11 checks)
   validate_nautilus_catalog_e2e.py  Nautilus catalog E2E (16 checks)
   validate_purge_safety.py  Purge safety proof (6 checks)
+tests/
+  test_universe_resolution.py  Universe format unit tests (4 checks)
+  test_purge_date_scoped.py    Date-scoped purge unit tests (5 checks)
 systemd/                  Service & timer units for production
 ```
 

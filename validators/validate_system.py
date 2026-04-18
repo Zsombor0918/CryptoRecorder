@@ -273,7 +273,7 @@ class SystemValidator:
             from converter.instruments import build_instruments, load_exchange_info
             from converter.trades import convert_trades
             from converter.book import convert_depth, BookReconstructor
-            from converter.catalog import purge_catalog_data
+            from converter.catalog import purge_catalog_data, purge_catalog_date_range
             return "converter package imports OK"
 
         self.test("Converter package", check_converter_package)

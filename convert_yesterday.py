@@ -29,7 +29,7 @@ from nautilus_trader.persistence.catalog import ParquetDataCatalog
 
 from config import NAUTILUS_CATALOG_ROOT, STATE_ROOT
 from converter.book import convert_depth
-from converter.catalog import purge_catalog_data
+from converter.catalog import purge_catalog_date_range
 from converter.instruments import build_instruments, load_exchange_info
 from converter.trades import convert_trades
 from converter.universe import resolve_universe
@@ -89,9 +89,10 @@ def convert_date(
         insts = build_instruments(venue, syms, einfo)
         all_instruments.extend(insts)
 
-    # ── purge existing catalog data (idempotency) ─────────────────────
+    # ── purge existing catalog data (date-scoped idempotency) ─────────
     if not staging:
-        purge_catalog_data(work_root, all_instruments)
+        iid_list = [inst.id for inst in all_instruments]
+        purge_catalog_date_range(work_root, iid_list, date_str)
 
     if all_instruments:
         catalog.write_data(all_instruments)
