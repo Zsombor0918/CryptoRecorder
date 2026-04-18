@@ -3,7 +3,8 @@
 24/7 market-data recording pipeline for Binance Spot and USDT-M Futures.
 Captures **L2 order-book deltas** and **trades** via cryptofeed, stores them as
 append-only JSONL with hourly rotation and zstd compression, and converts
-daily to Parquet for later NautilusTrader backtesting.
+daily to a **Nautilus-native `ParquetDataCatalog`** for direct
+NautilusTrader backtesting.
 
 ---
 
@@ -16,9 +17,9 @@ pip install -r requirements.txt
 sudo apt-get install -y build-essential python3-dev g++
 
 python recorder.py                       # start recording (Ctrl-C to stop)
-python VALIDATE.py all                   # quick suite: system + runtime + converter
-python VALIDATE.py accept               # full DoD: system + runtime + scale + converter
-python convert_yesterday.py              # convert yesterday's raw data → Parquet
+python VALIDATE.py all                   # quick suite: system + runtime + nautilus
+python VALIDATE.py accept               # full DoD: system + runtime + scale + nautilus
+python convert_yesterday.py              # convert yesterday's raw → Nautilus catalog
 ```
 
 ---
@@ -34,8 +35,10 @@ Binance WS (cryptofeed)
   recorder.py  ──→  data_raw/{VENUE}/{channel}/{SYMBOL}/{date}/{hour}.jsonl.zst
         │
         ▼  (daily, or on demand)
-  convert_yesterday.py  ──→  ~/nautilus_data/catalog/trades_YYYY-MM-DD.parquet
-                              ~/nautilus_data/catalog/depth_YYYY-MM-DD.parquet
+  convert_yesterday.py  ──→  ~/nautilus_data/catalog/  (Nautilus ParquetDataCatalog)
+                              ├── data/trade_ticks/{INSTRUMENT_ID}/
+                              ├── data/order_book_depths/{INSTRUMENT_ID}/
+                              └── data/general/{instrument_class}/
 ```
 
 ### What Is Recorded
@@ -102,24 +105,39 @@ For bit-exact L2 replay, the following would be needed:
 
 ---
 
-## Converter
+## Converter (Nautilus-Native Catalog)
 
 ```bash
-python convert_yesterday.py --date YYYY-MM-DD
+python convert_yesterday.py --date YYYY-MM-DD         # convert one day
+python convert_yesterday.py --date YYYY-MM-DD --staging  # atomic: write to temp, rename on success
 ```
 
-Reads raw JSONL (plain or zstd-compressed) for the given date, produces:
+Reads raw JSONL (plain or zstd-compressed) for the given date and writes
+directly to a **NautilusTrader `ParquetDataCatalog`** at `~/nautilus_data/catalog/`.
 
-- `trades_YYYY-MM-DD.parquet` — all trades sorted by `ts_event_ns`
-  (columns: symbol, venue, ts_event_ns, ts_init_ns, price, quantity, side, trade_id)
-- `depth_YYYY-MM-DD.parquet` — Depth-10 snapshots at ~1 s interval
-  (columns: symbol, venue, ts_event_ms, ts_recv_ns, bid_price_0..9, bid_size_0..9,
-  ask_price_0..9, ask_size_0..9)
+### What the converter produces
 
-Output is plain Parquet (snappy compression), written to `~/nautilus_data/catalog/`.
-These are **not** a NautilusTrader `ParquetDataCatalog` structure — they are
-flat files that can be loaded with `pd.read_parquet()` and transformed for
-Nautilus ingestion in a separate step.
+| Nautilus Type | Source | Notes |
+|---------------|--------|-------|
+| `TradeTick` | `trade` channel | `Price.from_str()`, `Quantity.from_str()`, `AggressorSide`, `TradeId` |
+| `OrderBookDepth10` | `depth` channel deltas | `BookReconstructor` replays deltas → 10-level snapshots at 1 s intervals |
+| `CurrencyPair` | `exchangeInfo` (spot) | tick size, step size, min qty, min notional from Binance filters |
+| `CryptoPerpetual` | `exchangeInfo` (futures) | + `settlement_currency`, `is_inverse`, `multiplier` |
+
+### Instrument IDs
+
+- Spot: `BTCUSDT.BINANCE`
+- Futures: `BTCUSDT-PERP.BINANCE`
+
+### Reading the catalog in Nautilus
+
+```python
+from nautilus_trader.persistence.catalog import ParquetDataCatalog
+catalog = ParquetDataCatalog("~/nautilus_data/catalog")
+catalog.instruments()              # CurrencyPair / CryptoPerpetual objects
+catalog.trade_ticks()              # TradeTick objects
+catalog.order_book_depth10()       # OrderBookDepth10 objects
+```
 
 A conversion report is written to `state/convert_reports/YYYY-MM-DD.json`.
 
@@ -153,9 +171,10 @@ Each async writer tracks dropped records (when the queue is full).  Drops are:
 python VALIDATE.py system      # imports, config, directory structure (~5 s)
 python VALIDATE.py runtime     # 3-min live smoke-test (12 checks)
 python VALIDATE.py scale       # 10-min 50/50 acceptance test (11 checks)
-python VALIDATE.py converter   # end-to-end raw → Parquet conversion check
-python VALIDATE.py all         # system + runtime + converter (quick suite)
-python VALIDATE.py accept      # system + runtime + scale + converter (full DoD)
+python VALIDATE.py nautilus    # Nautilus catalog E2E (9 checks)
+python VALIDATE.py converter   # legacy (delegates to nautilus)
+python VALIDATE.py all         # system + runtime + nautilus (quick suite)
+python VALIDATE.py accept      # system + runtime + scale + nautilus (full DoD)
 ```
 
 Reports are written to `state/`:
@@ -165,7 +184,7 @@ Reports are written to `state/`:
 | `state/validation_report.json` | System check results |
 | `state/runtime_report.json` | Runtime smoke-test |
 | `state/scale_50_50_report.json` | Scale acceptance test |
-| `state/converter_e2e_report.json` | Converter E2E |
+| `state/validation/nautilus_catalog_e2e_*.json` | Nautilus catalog E2E |
 | `state/master_validation_report.json` | Aggregated pass/fail |
 
 ### Runtime Smoke-Test Checks (12)
@@ -182,6 +201,12 @@ Reports are written to `state/`:
 `queue_drops` · `reconnect_count` · `no_reconnect_storm` ·
 `clean_shutdown` · `raw_files_compressed`
 
+### Nautilus Catalog E2E Checks (9)
+
+`catalog_exists` · `instruments_exist` · `trades_nonempty` ·
+`trades_5min_slice` · `depth10_nonempty` · `depth10_5min_slice` ·
+`time_bounds` · `objects_are_nautilus` · `idempotency`
+
 ---
 
 ## Operations
@@ -191,7 +216,7 @@ Reports are written to `state/`:
 | What | Location |
 |------|----------|
 | Raw data | `data_raw/{VENUE}/{channel}/{SYMBOL}/{YYYY-MM-DD}/{hour}.jsonl.zst` |
-| Parquet output | `~/nautilus_data/catalog/` |
+| Nautilus catalog | `~/nautilus_data/catalog/` (ParquetDataCatalog) |
 | Universe cache | `meta/universe/{VENUE}/{YYYY-MM-DD}.json` |
 | Heartbeat | `state/heartbeat.json` |
 | Recorder log | `recorder.log` |
@@ -240,13 +265,14 @@ storage.py                Hourly file rotation, zstd compression, async writers
 health_monitor.py         Heartbeat, per-symbol stats, queue drop tracking
 disk_monitor.py           Disk usage checks, automatic date-dir cleanup
 binance_universe.py       Top-N symbol selection by 24h volume
-convert_yesterday.py      Daily raw → Parquet converter (approximate L2)
-converter/                Book reconstruction & Nautilus builders
+convert_yesterday.py      Daily raw → Nautilus catalog converter
 VALIDATE.py               Unified validation entry point
-validate_system.py        Dependency & config checks
-validate_runtime.py       3-min live smoke-test (12 checks)
-validate_scale_50_50.py   10-min 50/50 scale acceptance (11 checks)
-validate_converter_e2e.py Converter pipeline E2E
+validators/
+  validate_system.py        Dependency & config checks
+  validate_runtime.py       3-min live smoke-test (12 checks)
+  validate_scale_50_50.py   10-min 50/50 scale acceptance (11 checks)
+  validate_nautilus_catalog_e2e.py  Nautilus catalog E2E (9 checks)
+  validate_converter_e2e.py Legacy stub (delegates to nautilus)
 systemd/                  Service & timer units for production
 ```
 
