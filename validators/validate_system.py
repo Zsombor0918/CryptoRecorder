@@ -266,23 +266,23 @@ class SystemValidator:
         self.test("Recorder classes", check_classes)
     
     def validate_converter(self):
-        """Validate converter system."""
-        def check_converter_imports():
-            from convert_yesterday import (
-                convert_date, resolve_universe, load_exchange_info,
-                build_instruments, convert_trades, convert_depth,
-            )
+        """Validate converter package and entry point."""
+        def check_converter_package():
+            from converter.readers import stream_raw_records
+            from converter.universe import resolve_universe
+            from converter.instruments import build_instruments, load_exchange_info
+            from converter.trades import convert_trades
+            from converter.book import convert_depth, BookReconstructor
+            from converter.catalog import purge_catalog_data
+            return "converter package imports OK"
+
+        self.test("Converter package", check_converter_package)
+
+        def check_converter_cli():
+            from convert_yesterday import convert_date
             return "convert_yesterday.py imports OK"
 
-        self.test("Converter modules", check_converter_imports)
-
-        def check_convert_script():
-            convert_script = self.project_root / 'convert_yesterday.py'
-            if not convert_script.exists():
-                raise FileNotFoundError("convert_yesterday.py not found")
-            return "convert_yesterday.py present"
-
-        self.test("Converter entry point", check_convert_script)
+        self.test("Converter entry point", check_converter_cli)
     
     def validate_async(self):
         """Validate async functionality."""

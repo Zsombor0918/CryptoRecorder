@@ -190,7 +190,7 @@ USAGE = f"""\
   python VALIDATE.py system       Import / config checks (~5 s)
   python VALIDATE.py runtime      Live recorder 3-min smoke-test (12 checks)
   python VALIDATE.py scale        50/50 scale 10-min acceptance test (11 checks)
-  python VALIDATE.py nautilus     Nautilus catalog E2E (9 checks)
+  python VALIDATE.py nautilus     Nautilus catalog E2E (12 checks)
   python VALIDATE.py converter    Legacy converter E2E (7 checks)
   python VALIDATE.py all          system + runtime + nautilus  (quick suite)
   python VALIDATE.py accept       system + runtime + scale + nautilus  (full DoD)

@@ -201,11 +201,12 @@ Reports are written to `state/`:
 `queue_drops` · `reconnect_count` · `no_reconnect_storm` ·
 `clean_shutdown` · `raw_files_compressed`
 
-### Nautilus Catalog E2E Checks (9)
+### Nautilus Catalog E2E Checks (12)
 
-`catalog_exists` · `instruments_exist` · `trades_nonempty` ·
-`trades_5min_slice` · `depth10_nonempty` · `depth10_5min_slice` ·
-`time_bounds` · `objects_are_nautilus` · `idempotency`
+`converter_exit_zero` · `catalog_exists` · `report_valid` ·
+`instruments_exist` · `trades_nonempty` · `trades_5min_slice` ·
+`depth10_nonempty` · `depth10_5min_slice` · `time_bounds` ·
+`objects_are_nautilus` · `instrument_consistency` · `idempotency`
 
 ---
 
@@ -265,14 +266,20 @@ storage.py                Hourly file rotation, zstd compression, async writers
 health_monitor.py         Heartbeat, per-symbol stats, queue drop tracking
 disk_monitor.py           Disk usage checks, automatic date-dir cleanup
 binance_universe.py       Top-N symbol selection by 24h volume
-convert_yesterday.py      Daily raw → Nautilus catalog converter
+convert_yesterday.py      CLI entry point for daily conversion
+converter/
+  readers.py              Streaming JSONL/zst/gz decompression
+  universe.py             Universe resolution (meta/ + disk fallback)
+  instruments.py          Build Nautilus instruments from exchangeInfo
+  trades.py               Raw → TradeTick conversion
+  book.py                 L2 delta → OrderBookDepth10 (gap detection)
+  catalog.py              Idempotent catalog write helpers
 VALIDATE.py               Unified validation entry point
 validators/
   validate_system.py        Dependency & config checks
   validate_runtime.py       3-min live smoke-test (12 checks)
   validate_scale_50_50.py   10-min 50/50 scale acceptance (11 checks)
-  validate_nautilus_catalog_e2e.py  Nautilus catalog E2E (9 checks)
-  validate_converter_e2e.py Legacy stub (delegates to nautilus)
+  validate_nautilus_catalog_e2e.py  Nautilus catalog E2E (12 checks)
 systemd/                  Service & timer units for production
 ```
 
