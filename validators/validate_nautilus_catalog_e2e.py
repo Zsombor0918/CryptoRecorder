@@ -269,10 +269,25 @@ class NautilusCatalogValidator:
         self._all_instrument_ids = {str(i.id) for i in self._instruments}
         ok = len(self._instruments) > 0
         ids = [str(i.id) for i in self._instruments]
+
+        # Pick a sample instrument that has actual trade data
+        # (universe may include symbols without raw data for this date)
         if self._instruments:
-            self._sample_iid = self._instruments[0].id
+            for inst in self._instruments:
+                try:
+                    trades = self._catalog.trade_ticks(instrument_ids=[inst.id])
+                    if trades:
+                        self._sample_iid = inst.id
+                        break
+                except Exception:
+                    continue
+            if self._sample_iid is None:
+                self._sample_iid = self._instruments[0].id
+
         return {"name": "instruments_exist", "passed": ok,
-                "details": {"count": len(self._instruments), "ids": ids[:10]}}
+                "details": {"count": len(self._instruments),
+                            "sample_instrument": str(self._sample_iid) if self._sample_iid else None,
+                            "ids": ids[:10]}}
 
     def _ck_trades_nonempty(self) -> dict:
         if not self._sample_iid:
