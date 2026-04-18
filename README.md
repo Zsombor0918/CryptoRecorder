@@ -171,10 +171,11 @@ Each async writer tracks dropped records (when the queue is full).  Drops are:
 python VALIDATE.py system      # imports, config, directory structure (~5 s)
 python VALIDATE.py runtime     # 3-min live smoke-test (12 checks)
 python VALIDATE.py scale       # 10-min 50/50 acceptance test (11 checks)
-python VALIDATE.py nautilus    # Nautilus catalog E2E (9 checks)
+python VALIDATE.py nautilus    # Nautilus catalog E2E (16 checks)
+python VALIDATE.py purge       # Purge safety proof (6 checks)
 python VALIDATE.py converter   # legacy (delegates to nautilus)
-python VALIDATE.py all         # system + runtime + nautilus (quick suite)
-python VALIDATE.py accept      # system + runtime + scale + nautilus (full DoD)
+python VALIDATE.py all         # system + runtime + nautilus + purge (quick suite)
+python VALIDATE.py accept      # system + runtime + scale + nautilus + purge (full DoD)
 ```
 
 Reports are written to `state/`:
@@ -185,6 +186,7 @@ Reports are written to `state/`:
 | `state/runtime_report.json` | Runtime smoke-test |
 | `state/scale_50_50_report.json` | Scale acceptance test |
 | `state/validation/nautilus_catalog_e2e_*.json` | Nautilus catalog E2E |
+| `state/validation/purge_safety.json` | Purge safety proof |
 | `state/master_validation_report.json` | Aggregated pass/fail |
 
 ### Runtime Smoke-Test Checks (12)
@@ -201,12 +203,31 @@ Reports are written to `state/`:
 `queue_drops` · `reconnect_count` · `no_reconnect_storm` ·
 `clean_shutdown` · `raw_files_compressed`
 
-### Nautilus Catalog E2E Checks (12)
+### Nautilus Catalog E2E Checks (16)
 
 `converter_exit_zero` · `catalog_exists` · `report_valid` ·
 `instruments_exist` · `trades_nonempty` · `trades_5min_slice` ·
 `depth10_nonempty` · `depth10_5min_slice` · `time_bounds` ·
-`objects_are_nautilus` · `instrument_consistency` · `idempotency`
+`objects_are_nautilus` · `instrument_id_mapping` ·
+`instrument_venue_mapping` · `idempotency_counts` ·
+`gap_fields_valid` · `gap_rate_sane` · `gap_per_symbol`
+
+### Purge Safety Checks (6)
+
+`synthetic_tree_created` · `purge_oldest_only` ·
+`newer_dates_survive` · `parent_dirs_survive` ·
+`catalog_untouched` · `report_paths_correct`
+
+### Acceptance Properties
+
+These four properties are explicitly validated by the test suite:
+
+| Property | Validator | What it proves |
+|----------|-----------|----------------|
+| **Purge safety** | `validate_purge_safety.py` | Cleanup deletes only target date dirs; never parents, other dates, or catalog |
+| **Instrument ID consistency** | `instrument_id_mapping` + `instrument_venue_mapping` | Every trade/depth object references a valid instrument; spot = `SYM.BINANCE`, futures = `SYM-PERP.BINANCE` |
+| **Idempotent conversion** | `idempotency_counts` | Running converter twice yields identical instrument/trade/depth counts — no duplication |
+| **Gap-suspected reporting** | `gap_fields_valid` + `gap_rate_sane` + `gap_per_symbol` | Report contains `gaps_suspected`, `book_resets_total`, `gap_rate`, per-symbol breakdown; Phase 1 approximate only |
 
 ---
 
@@ -230,6 +251,8 @@ Reports are written to `state/`:
   deleted automatically (never the catalog or venue/channel structure)
 - Raw retention default: **7 days**
 - Cleanup target: **350 GB**
+- **Purge safety proof**: validated by `VALIDATE.py purge` — builds synthetic
+  tree, purges oldest date, asserts newer dates + parent dirs + catalog untouched
 
 ### Useful Commands
 
@@ -279,7 +302,8 @@ validators/
   validate_system.py        Dependency & config checks
   validate_runtime.py       3-min live smoke-test (12 checks)
   validate_scale_50_50.py   10-min 50/50 scale acceptance (11 checks)
-  validate_nautilus_catalog_e2e.py  Nautilus catalog E2E (12 checks)
+  validate_nautilus_catalog_e2e.py  Nautilus catalog E2E (16 checks)
+  validate_purge_safety.py  Purge safety proof (6 checks)
 systemd/                  Service & timer units for production
 ```
 

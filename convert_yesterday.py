@@ -109,7 +109,9 @@ def convert_date(
     total_depth = 0
     total_bad = 0
     total_gaps = 0
+    total_resets = 0
     venue_reports: Dict[str, dict] = {}
+    per_symbol_gaps: Dict[str, Dict[str, int]] = {}  # {"VENUE/SYM": {gaps, resets}}
     ts_ranges: Dict[str, Dict[str, Optional[int]]] = {
         "trade": {"start_ns": None, "end_ns": None},
         "depth": {"start_ns": None, "end_ns": None},
@@ -120,6 +122,7 @@ def convert_date(
         v_trades = 0
         v_depth = 0
         v_gaps = 0
+        v_resets = 0
         v_symbols: List[str] = []
 
         for symbol in sorted(symbols):
@@ -143,11 +146,17 @@ def convert_date(
                 _update_ts_range(ts_ranges["trade"], t_first, t_last)
 
             # ── depth ─────────────────────────────────────────────────
-            snaps, bad_d, gaps, d_first, d_last = convert_depth(
+            snaps, bad_d, gaps, resets, d_first, d_last = convert_depth(
                 venue, symbol, date_str, iid, pp, sp,
             )
             total_bad += bad_d
             v_gaps += gaps
+            v_resets += resets
+            if gaps > 0 or resets > 0:
+                per_symbol_gaps[f"{venue}/{symbol}"] = {
+                    "gaps_suspected": gaps,
+                    "book_resets": resets,
+                }
             if snaps:
                 snaps.sort(key=lambda s: s.ts_init)
                 for i in range(0, len(snaps), WRITE_BATCH_SIZE):
@@ -158,12 +167,14 @@ def convert_date(
         total_trades += v_trades
         total_depth += v_depth
         total_gaps += v_gaps
+        total_resets += v_resets
         symbols_processed[venue] = v_symbols
         venue_reports[venue] = {
             "symbols": v_symbols,
             "trades_written": v_trades,
             "depth_snapshots_written": v_depth,
             "gaps_suspected": v_gaps,
+            "book_resets": v_resets,
         }
 
     # ── staging → atomic rename ───────────────────────────────────────
@@ -178,7 +189,16 @@ def convert_date(
     elif staging:
         if staging_dir.exists():
             shutil.rmtree(staging_dir)
+    # ── gap rate ─────────────────────────────────────────────────────
+    total_symbols = sum(len(s) for s in symbols_processed.values())
+    gap_rate = round(total_gaps / total_depth, 6) if total_depth > 0 else 0.0
 
+    # ── top offenders (symbols with most gaps) ─────────────────────
+    top_gap_offenders = sorted(
+        per_symbol_gaps.items(),
+        key=lambda kv: kv[1]["gaps_suspected"],
+        reverse=True,
+    )[:5]  # top 5
     # ── report ────────────────────────────────────────────────────────
     elapsed = time.time() - t0
     report = {
@@ -191,6 +211,9 @@ def convert_date(
         "total_depth_snapshots_written": total_depth,
         "bad_lines": total_bad,
         "gaps_suspected": total_gaps,
+        "book_resets_total": total_resets,
+        "gap_rate": gap_rate,
+        "per_symbol_gaps": dict(top_gap_offenders),
         "futures_enabled": "BINANCE_USDTF" in universe,
         "symbols_processed": symbols_processed,
         "venues": venue_reports,

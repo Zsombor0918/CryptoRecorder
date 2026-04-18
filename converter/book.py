@@ -62,6 +62,7 @@ class BookReconstructor:
         self.bids: Dict[float, float] = {}
         self.asks: Dict[float, float] = {}
         self.gaps_suspected: int = 0
+        self.book_resets: int = 0
         self._last_ts_ns: Optional[int] = None
 
     def apply_delta(self, rec: dict, ts_ns: int) -> None:
@@ -71,6 +72,7 @@ class BookReconstructor:
             gap = ts_ns - self._last_ts_ns
             if gap > self.gap_threshold_ns:
                 self.gaps_suspected += 1
+                self.book_resets += 1
                 logger.debug(
                     f"Gap suspected for {self.instrument_id}: "
                     f"{gap / 1e9:.1f}s since last update (threshold "
@@ -161,7 +163,7 @@ def convert_depth(
     """Stream-convert raw depth deltas → 1-second OrderBookDepth10 snapshots.
 
     Returns ``(snapshot_list, bad_line_count, gaps_suspected,
-               first_ts_ns, last_ts_ns)``.
+               book_resets, first_ts_ns, last_ts_ns)``.
     """
     book = BookReconstructor(instrument_id, price_prec, size_prec)
     snapshots: List[OrderBookDepth10] = []
@@ -195,4 +197,4 @@ def convert_depth(
         except Exception:
             bad += 1
 
-    return snapshots, bad, book.gaps_suspected, first_ts, last_ts
+    return snapshots, bad, book.gaps_suspected, book.book_resets, first_ts, last_ts
