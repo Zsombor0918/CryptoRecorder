@@ -5,10 +5,11 @@ VALIDATE.py  –  Master validation entrypoint for CryptoRecorder
   python VALIDATE.py system     validators/validate_system.py       (~5 s)
   python VALIDATE.py runtime    validators/validate_runtime.py      (3-min smoke)
   python VALIDATE.py scale      validators/validate_scale_50_50.py  (10-min 50/50)
-  python VALIDATE.py nautilus   validators/validate_nautilus_catalog_e2e.py
+  python VALIDATE.py nautilus   validators/validate_nautilus_catalog_e2e.py (16 checks)
+  python VALIDATE.py purge      validators/validate_purge_safety.py (6 checks)
   python VALIDATE.py converter  validators/validate_converter_e2e.py (legacy)
-  python VALIDATE.py all        system + runtime + nautilus  (quick suite)
-  python VALIDATE.py accept     system + runtime + scale + nautilus  (full DoD)
+  python VALIDATE.py all        system + runtime + nautilus + purge  (quick suite)
+  python VALIDATE.py accept     system + runtime + scale + nautilus + purge  (full DoD)
 """
 import json
 import subprocess
@@ -157,6 +158,33 @@ def run_nautilus() -> bool:
     return passed
 
 
+def run_purge() -> bool:
+    print(f"\n{C.B}► Purge safety (validate_purge_safety.py){C._}")
+    ok, out = _run("source .venv/bin/activate && python3 validators/validate_purge_safety.py",
+                   timeout=60)
+    val_dir = STATE / "validation"
+    rpt = None
+    if val_dir.exists():
+        rp = val_dir / "purge_safety.json"
+        if rp.exists():
+            try:
+                rpt = json.loads(rp.read_text())
+            except Exception:
+                pass
+    passed = rpt.get("passed", False) if rpt else False
+    n = rpt.get("checks_passed", "?") if rpt else "?"
+    t = rpt.get("total_checks", "?") if rpt else "?"
+    if passed:
+        print(f"  {C.G}✓ purge safety checks passed ({n}/{t}){C._}")
+    else:
+        print(f"  {C.R}✗ purge safety checks failed ({n}/{t}){C._}")
+        if rpt:
+            for name, chk in rpt.get("checks", {}).items():
+                if not chk.get("passed"):
+                    print(f"    {C.R}✗ {name}{C._}")
+    return passed
+
+
 # ── summary ──────────────────────────────────────────────────────────
 
 def _save_and_print(results: Dict[str, bool]) -> int:
@@ -190,10 +218,11 @@ USAGE = f"""\
   python VALIDATE.py system       Import / config checks (~5 s)
   python VALIDATE.py runtime      Live recorder 3-min smoke-test (12 checks)
   python VALIDATE.py scale        50/50 scale 10-min acceptance test (11 checks)
-  python VALIDATE.py nautilus     Nautilus catalog E2E (12 checks)
+  python VALIDATE.py nautilus     Nautilus catalog E2E (16 checks)
+  python VALIDATE.py purge        Purge safety proof (6 checks)
   python VALIDATE.py converter    Legacy converter E2E (7 checks)
-  python VALIDATE.py all          system + runtime + nautilus  (quick suite)
-  python VALIDATE.py accept       system + runtime + scale + nautilus  (full DoD)
+  python VALIDATE.py all          system + runtime + nautilus + purge  (quick suite)
+  python VALIDATE.py accept       system + runtime + scale + nautilus + purge  (full DoD)
   python VALIDATE.py --help       This message
 """
 
@@ -214,17 +243,21 @@ def main() -> int:
         results["scale"] = run_scale()
     elif mode == "nautilus":
         results["nautilus"] = run_nautilus()
+    elif mode == "purge":
+        results["purge"] = run_purge()
     elif mode == "converter":
         results["converter"] = run_converter()
     elif mode == "all":
         results["system"] = run_system()
         results["runtime"] = run_runtime()
         results["nautilus"] = run_nautilus()
+        results["purge"] = run_purge()
     elif mode == "accept":
         results["system"] = run_system()
         results["runtime"] = run_runtime()
         results["scale"] = run_scale()
         results["nautilus"] = run_nautilus()
+        results["purge"] = run_purge()
     else:
         print(f"Unknown mode: {mode}")
         print(USAGE)

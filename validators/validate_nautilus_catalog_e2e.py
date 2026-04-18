@@ -6,19 +6,23 @@ Runs the converter for a given date then queries the resulting
 ParquetDataCatalog to prove that Nautilus-native objects are
 queryable and internally consistent.
 
-Checks (12):
-   1. converter_exit_zero   – converter exits 0
-   2. catalog_exists        – catalog directory is non-empty
-   3. report_valid          – convert report exists with required fields
-   4. instruments_exist     – catalog.instruments() returns objects
-   5. trades_nonempty       – trade_ticks query returns ≥1 row
-   6. trades_5min_slice     – 5-minute window query returns results
-   7. depth10_nonempty      – order_book_depth10 query returns ≥1 row
-   8. depth10_5min_slice    – 5-minute window query returns results
-   9. time_bounds           – ts_event within [day_start, day_start+36h]
-  10. objects_are_nautilus   – types are real Nautilus model types
-  11. instrument_consistency – instrument IDs used in data exist in catalog
-  12. idempotency           – re-running converter does not corrupt catalog
+Checks (16):
+   1.  converter_exit_zero        – converter exits 0
+   2.  catalog_exists             – catalog directory is non-empty
+   3.  report_valid               – convert report exists with required fields
+   4.  instruments_exist          – catalog.instruments() returns objects
+   5.  trades_nonempty            – trade_ticks query returns ≥1 row
+   6.  trades_5min_slice          – 5-minute window query returns results
+   7.  depth10_nonempty           – order_book_depth10 query returns ≥1 row
+   8.  depth10_5min_slice         – 5-minute window query returns results
+   9.  time_bounds                – ts_event within [day_start, day_start+36h]
+  10.  objects_are_nautilus        – types are real Nautilus model types
+  11.  instrument_id_mapping       – ALL trades+depth reference valid instruments
+  12.  instrument_venue_mapping    – spot/futures instrument IDs use correct conventions
+  13.  idempotency_counts          – re-run yields identical counts (no duplication)
+  14.  gap_fields_valid            – report includes gap/reset counters, gap_rate
+  15.  gap_rate_sane               – gap_rate is non-negative and < 1.0
+  16.  gap_per_symbol              – per-symbol gap breakdown present & non-negative
 
 Report → state/validation/nautilus_catalog_e2e_{date}.json
 """
@@ -103,10 +107,13 @@ class NautilusCatalogValidator:
         }
         self._catalog = None
         self._instruments = []
+        self._all_instrument_ids: Set[str] = set()
         self._sample_iid = None
         self._converter_ok = False
         self._date_str: Optional[str] = None
         self._convert_report: Optional[dict] = None
+        # Counts captured after first run (for idempotency)
+        self._run1_counts: Optional[dict] = None
 
     def run(self) -> Dict[str, Any]:
         logger.info("=" * 60)
@@ -119,7 +126,6 @@ class NautilusCatalogValidator:
             self._skip("no raw data")
             return self.report
 
-        # Try each date until conversion succeeds (today may be incomplete)
         for dt in candidates:
             logger.info(f"  Trying date: {dt}")
             ok, err = _run_converter(dt)
@@ -145,6 +151,9 @@ class NautilusCatalogValidator:
             self._skip(f"Cannot open catalog: {e}")
             return self.report
 
+        # ── capture run-1 counts ──────────────────────────────────────
+        self._run1_counts = self._query_catalog_counts()
+
         # ── run all checks ────────────────────────────────────────────
         checks: List[dict] = [
             self._ck_converter_exit_zero(),
@@ -157,8 +166,12 @@ class NautilusCatalogValidator:
             self._ck_depth10_5min(),
             self._ck_time_bounds(),
             self._ck_objects_nautilus(),
-            self._ck_instrument_consistency(),
-            self._ck_idempotency(),
+            self._ck_instrument_id_mapping(),
+            self._ck_instrument_venue_mapping(),
+            self._ck_idempotency_counts(),
+            self._ck_gap_fields_valid(),
+            self._ck_gap_rate_sane(),
+            self._ck_gap_per_symbol(),
         ]
 
         self.report["checks"] = {c["name"]: c for c in checks}
@@ -196,10 +209,33 @@ class NautilusCatalogValidator:
         out.write_text(json.dumps(self.report, indent=2, default=str))
         logger.info(f"Report → {out}")
 
+    def _query_catalog_counts(self) -> dict:
+        """Query instrument, trade, depth counts from current catalog state."""
+        from nautilus_trader.persistence.catalog import ParquetDataCatalog
+        cat = ParquetDataCatalog(str(NAUTILUS_CATALOG_ROOT))
+        instruments = cat.instruments()
+        total_trades = 0
+        total_depth = 0
+        for inst in instruments:
+            try:
+                trades = cat.trade_ticks(instrument_ids=[inst.id])
+                total_trades += len(trades)
+            except Exception:
+                pass
+            try:
+                depth = cat.order_book_depth10(instrument_ids=[inst.id])
+                total_depth += len(depth)
+            except Exception:
+                pass
+        return {
+            "instruments": len(instruments),
+            "trades": total_trades,
+            "depth": total_depth,
+        }
+
     # ── individual checks ─────────────────────────────────────────────
 
     def _ck_converter_exit_zero(self) -> dict:
-        """Converter must exit 0."""
         return {"name": "converter_exit_zero", "passed": self._converter_ok}
 
     def _ck_catalog_exists(self) -> dict:
@@ -208,7 +244,6 @@ class NautilusCatalogValidator:
                 "details": {"path": str(NAUTILUS_CATALOG_ROOT)}}
 
     def _ck_report_valid(self) -> dict:
-        """Convert report must exist with required fields."""
         rpt = self._convert_report
         if rpt is None:
             return {"name": "report_valid", "passed": False,
@@ -216,7 +251,8 @@ class NautilusCatalogValidator:
         required = [
             "date", "runtime_sec", "status", "instruments_written",
             "total_trades_written", "total_depth_snapshots_written",
-            "bad_lines", "gaps_suspected", "symbols_processed",
+            "bad_lines", "gaps_suspected", "book_resets_total",
+            "gap_rate", "per_symbol_gaps", "symbols_processed",
             "venues", "ts_ranges",
         ]
         missing = [f for f in required if f not in rpt]
@@ -230,6 +266,7 @@ class NautilusCatalogValidator:
         except Exception as e:
             return {"name": "instruments_exist", "passed": False,
                     "details": {"error": str(e)}}
+        self._all_instrument_ids = {str(i.id) for i in self._instruments}
         ok = len(self._instruments) > 0
         ids = [str(i.id) for i in self._instruments]
         if self._instruments:
@@ -300,11 +337,9 @@ class NautilusCatalogValidator:
                     "details": {"error": str(e)}}
 
     def _ck_time_bounds(self) -> dict:
-        """Trades/depth within [day_start, day_start + 36h]."""
         dt = datetime.strptime(self._date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
         day_start_ns = int(dt.timestamp() * 1e9)
         day_end_ns = int((dt + timedelta(hours=36)).timestamp() * 1e9)
-
         issues = []
         if self._sample_iid:
             try:
@@ -330,10 +365,8 @@ class NautilusCatalogValidator:
                 "details": {"issues": issues}}
 
     def _ck_objects_nautilus(self) -> dict:
-        """Verify objects are real Nautilus model types."""
         from nautilus_trader.model.data import OrderBookDepth10 as NT_Depth10
         from nautilus_trader.model.data import TradeTick as NT_TradeTick
-
         checks = {}
         if self._sample_iid:
             try:
@@ -347,52 +380,211 @@ class NautilusCatalogValidator:
                     checks["depth_is_nautilus"] = isinstance(depth[0], NT_Depth10)
             except Exception as e:
                 checks["error"] = str(e)
-
         ok = checks.get("trade_is_nautilus", False) and checks.get("depth_is_nautilus", False)
         return {"name": "objects_are_nautilus", "passed": ok, "details": checks}
 
-    def _ck_instrument_consistency(self) -> dict:
-        """Instrument IDs used in trade/depth data must exist in catalog instruments."""
-        catalog_iids = {str(i.id) for i in self._instruments}
-        issues = []
+    # ── NEW: instrument_id full mapping proof (req 2) ─────────────────
 
-        if self._sample_iid:
+    def _ck_instrument_id_mapping(self) -> dict:
+        """Every trade and depth object must reference an instrument in the catalog."""
+        if not self._all_instrument_ids:
+            return {"name": "instrument_id_mapping", "passed": False,
+                    "details": {"reason": "no instruments loaded"}}
+
+        total_trades_checked = 0
+        total_depth_checked = 0
+        invalid_refs = 0
+        issues: List[str] = []
+
+        for inst in self._instruments:
+            iid = inst.id
+            iid_str = str(iid)
             try:
-                trades = self._catalog.trade_ticks(instrument_ids=[self._sample_iid])
-                if trades:
-                    trade_iid = str(trades[0].instrument_id)
-                    if trade_iid not in catalog_iids:
-                        issues.append(f"trade instrument_id {trade_iid} not in catalog instruments")
+                trades = self._catalog.trade_ticks(instrument_ids=[iid])
+                for t in trades:
+                    total_trades_checked += 1
+                    if str(t.instrument_id) not in self._all_instrument_ids:
+                        invalid_refs += 1
+                        if len(issues) < 5:
+                            issues.append(f"trade ref {t.instrument_id} not in instruments")
+            except Exception:
+                pass
+            try:
+                depth = self._catalog.order_book_depth10(instrument_ids=[iid])
+                for d in depth:
+                    total_depth_checked += 1
+                    if str(d.instrument_id) not in self._all_instrument_ids:
+                        invalid_refs += 1
+                        if len(issues) < 5:
+                            issues.append(f"depth ref {d.instrument_id} not in instruments")
+            except Exception:
+                pass
 
-                depth = self._catalog.order_book_depth10(instrument_ids=[self._sample_iid])
-                if depth:
-                    depth_iid = str(depth[0].instrument_id)
-                    if depth_iid not in catalog_iids:
-                        issues.append(f"depth instrument_id {depth_iid} not in catalog instruments")
-            except Exception as e:
-                issues.append(str(e))
+        ok = (invalid_refs == 0
+              and total_trades_checked > 0
+              and total_depth_checked > 0)
+        return {
+            "name": "instrument_id_mapping",
+            "passed": ok,
+            "details": {
+                "instruments_found": len(self._all_instrument_ids),
+                "trades_checked": total_trades_checked,
+                "depth_checked": total_depth_checked,
+                "invalid_instrument_refs": invalid_refs,
+                "issues": issues,
+            },
+        }
 
-        ok = len(issues) == 0 and len(catalog_iids) > 0
-        return {"name": "instrument_consistency", "passed": ok,
-                "details": {"catalog_instruments": len(catalog_iids), "issues": issues}}
+    def _ck_instrument_venue_mapping(self) -> dict:
+        """Spot instruments must be SYM.BINANCE, futures must be SYM-PERP.BINANCE."""
+        from nautilus_trader.model.instruments import CryptoPerpetual, CurrencyPair
+        issues: List[str] = []
+        for inst in self._instruments:
+            iid_str = str(inst.id)
+            if isinstance(inst, CryptoPerpetual):
+                if "-PERP.BINANCE" not in iid_str:
+                    issues.append(f"Futures instrument {iid_str} missing -PERP suffix")
+            elif isinstance(inst, CurrencyPair):
+                if "-PERP" in iid_str:
+                    issues.append(f"Spot instrument {iid_str} has -PERP suffix")
+                if ".BINANCE" not in iid_str:
+                    issues.append(f"Spot instrument {iid_str} missing .BINANCE venue")
+        ok = len(issues) == 0 and len(self._instruments) > 0
+        return {"name": "instrument_venue_mapping", "passed": ok,
+                "details": {"instruments_checked": len(self._instruments),
+                            "issues": issues}}
 
-    def _ck_idempotency(self) -> dict:
-        """Re-run conversion; verify catalog is not corrupted."""
+    # ── NEW: idempotency with count comparison (req 3) ────────────────
+
+    def _ck_idempotency_counts(self) -> dict:
+        """Re-run conversion, compare counts — must be identical (no duplication)."""
         try:
-            ok1, _ = _run_converter(self._date_str)
-            if not ok1:
-                return {"name": "idempotency", "passed": False,
-                        "details": {"reason": "second conversion failed"}}
+            run1 = self._run1_counts
+            if not run1 or run1["instruments"] == 0:
+                return {"name": "idempotency_counts", "passed": False,
+                        "details": {"reason": "run-1 counts unavailable"}}
 
-            from nautilus_trader.persistence.catalog import ParquetDataCatalog
-            cat2 = ParquetDataCatalog(str(NAUTILUS_CATALOG_ROOT))
-            instruments2 = cat2.instruments()
-            ok = len(instruments2) > 0
-            return {"name": "idempotency", "passed": ok,
-                    "details": {"instruments_after_rerun": len(instruments2)}}
+            # Second conversion run
+            ok2, err2 = _run_converter(self._date_str)
+            if not ok2:
+                return {"name": "idempotency_counts", "passed": False,
+                        "details": {"reason": f"second conversion failed: {err2[:200]}"}}
+
+            run2 = self._query_catalog_counts()
+
+            instruments_match = run1["instruments"] == run2["instruments"]
+            trades_match = run1["trades"] == run2["trades"]
+            depth_match = run1["depth"] == run2["depth"]
+            ok = instruments_match and trades_match and depth_match
+
+            return {
+                "name": "idempotency_counts",
+                "passed": ok,
+                "details": {
+                    "run1": run1,
+                    "run2": run2,
+                    "instruments_match": instruments_match,
+                    "trades_match": trades_match,
+                    "depth_match": depth_match,
+                },
+            }
         except Exception as e:
-            return {"name": "idempotency", "passed": False,
+            return {"name": "idempotency_counts", "passed": False,
                     "details": {"error": str(e)}}
+
+    # ── NEW: gap validation checks (req 4) ────────────────────────────
+
+    def _ck_gap_fields_valid(self) -> dict:
+        """Report must contain gap/reset counters and gap_rate."""
+        rpt = self._convert_report
+        if not rpt:
+            return {"name": "gap_fields_valid", "passed": False,
+                    "details": {"reason": "no report"}}
+
+        required = ["gaps_suspected", "book_resets_total", "gap_rate", "per_symbol_gaps"]
+        missing = [f for f in required if f not in rpt]
+
+        # Check venue-level reports also contain gap/reset fields
+        venue_missing = []
+        for vname, vdata in rpt.get("venues", {}).items():
+            if "gaps_suspected" not in vdata:
+                venue_missing.append(f"{vname}.gaps_suspected")
+            if "book_resets" not in vdata:
+                venue_missing.append(f"{vname}.book_resets")
+
+        ok = len(missing) == 0 and len(venue_missing) == 0
+        return {"name": "gap_fields_valid", "passed": ok,
+                "details": {"missing_top_level": missing,
+                            "missing_venue_level": venue_missing}}
+
+    def _ck_gap_rate_sane(self) -> dict:
+        """gap_rate must be non-negative and < 1.0 (less than 100%).
+
+        gaps_suspected and book_resets_total must be non-negative integers.
+        """
+        rpt = self._convert_report
+        if not rpt:
+            return {"name": "gap_rate_sane", "passed": False,
+                    "details": {"reason": "no report"}}
+
+        issues: List[str] = []
+        gaps = rpt.get("gaps_suspected")
+        resets = rpt.get("book_resets_total")
+        rate = rpt.get("gap_rate")
+
+        if not isinstance(gaps, (int, float)) or gaps < 0:
+            issues.append(f"gaps_suspected invalid: {gaps}")
+        if not isinstance(resets, (int, float)) or resets < 0:
+            issues.append(f"book_resets_total invalid: {resets}")
+        if not isinstance(rate, (int, float)) or rate < 0:
+            issues.append(f"gap_rate invalid: {rate}")
+        elif rate >= 1.0:
+            issues.append(f"gap_rate >= 1.0: {rate} (100%+ depth records are gaps?)")
+
+        ok = len(issues) == 0
+        return {"name": "gap_rate_sane", "passed": ok,
+                "details": {
+                    "gaps_suspected": gaps,
+                    "book_resets_total": resets,
+                    "gap_rate": rate,
+                    "issues": issues,
+                }}
+
+    def _ck_gap_per_symbol(self) -> dict:
+        """per_symbol_gaps breakdown must be present and values non-negative."""
+        rpt = self._convert_report
+        if not rpt:
+            return {"name": "gap_per_symbol", "passed": False,
+                    "details": {"reason": "no report"}}
+
+        psg = rpt.get("per_symbol_gaps")
+        if not isinstance(psg, dict):
+            return {"name": "gap_per_symbol", "passed": False,
+                    "details": {"reason": f"per_symbol_gaps is {type(psg).__name__}, expected dict"}}
+
+        issues: List[str] = []
+        for sym_key, counts in psg.items():
+            if not isinstance(counts, dict):
+                issues.append(f"{sym_key}: value not a dict")
+                continue
+            gs = counts.get("gaps_suspected", -1)
+            br = counts.get("book_resets", -1)
+            if not isinstance(gs, (int, float)) or gs < 0:
+                issues.append(f"{sym_key}: gaps_suspected invalid ({gs})")
+            if not isinstance(br, (int, float)) or br < 0:
+                issues.append(f"{sym_key}: book_resets invalid ({br})")
+
+        # per_symbol_gaps can be empty if no gaps exist — that's fine
+        ok = len(issues) == 0
+        return {"name": "gap_per_symbol", "passed": ok,
+                "details": {
+                    "symbols_with_gaps": len(psg),
+                    "total_gaps_from_breakdown": sum(
+                        c.get("gaps_suspected", 0) for c in psg.values()
+                        if isinstance(c, dict)
+                    ),
+                    "issues": issues,
+                }}
 
 
 # ── CLI ──────────────────────────────────────────────────────────────
