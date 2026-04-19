@@ -13,7 +13,7 @@ import signal
 import sys
 import time
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
 from cryptofeed import FeedHandler
@@ -37,7 +37,7 @@ from config import (
     BINANCE_FUTURES_REST,
     TOP_SYMBOLS,
 )
-from binance_universe import UniverseSelector
+from binance_universe import UniverseSelector, partition_known_unsupported_symbols
 from disk_monitor import DiskMonitor
 from health_monitor import HealthMonitor
 from storage import StorageManager
@@ -71,6 +71,9 @@ futures_disabled_reason: str = ""
 # Configurable watchdog timeout (seconds)
 SHUTDOWN_WATCHDOG_SEC: int = int(os.environ.get(
     "CRYPTO_RECORDER_WATCHDOG_SEC", "120"))
+
+SPOT_COVERAGE_WARN_RATIO: float = 0.90
+FUTURES_COVERAGE_WARN_RATIO: float = 0.80
 
 
 # ============================================================================
@@ -107,6 +110,131 @@ def _from_cf_symbol(sym: str) -> str:
     """Strip the dash/PERP that cryptofeed inserts: BTC-USDT-PERP → BTCUSDT."""
     s = sym.replace("-PERP", "")
     return s.replace("-", "")
+
+
+def _find_suspicious_symbols(venue: str, raw_symbols: List[str], quote: str = "USDT") -> List[str]:
+    """Warn about unusual symbol shapes without blocking them."""
+    warnings: List[str] = []
+    for symbol in raw_symbols:
+        reasons: List[str] = []
+        has_non_ascii = not symbol.isascii()
+        if has_non_ascii:
+            reasons.append("contains non-ASCII characters")
+
+        if symbol.endswith(quote) and len(symbol) > len(quote):
+            base = symbol[:-len(quote)]
+            if len(base) < 2:
+                reasons.append(f"base asset shorter than 2 chars ({base!r})")
+            if base.isascii() and not all(ch.isalnum() for ch in base):
+                reasons.append("unexpected base asset characters")
+        else:
+            reasons.append(f"unexpected symbol structure for quote {quote}")
+
+        if reasons:
+            warnings.append(f"{venue} suspicious symbol {symbol}: {'; '.join(reasons)}")
+    return warnings
+
+
+def _make_venue_coverage(venue: str, requested_raw: List[str], suspicious_warnings: List[str]) -> Dict[str, Any]:
+    return {
+        "venue": venue,
+        "requested_raw": list(requested_raw),
+        "requested_count": len(requested_raw),
+        "filtered_raw": [],
+        "filtered_cf": [],
+        "filtered_count": 0,
+        "dropped_raw": [],
+        "dropped_cf": [],
+        "dropped_count": 0,
+        "active_raw": [],
+        "active_cf": [],
+        "active_count": 0,
+        "coverage_ratio": 0.0,
+        "warnings": list(suspicious_warnings),
+    }
+
+
+def _emit_symbol_audit_logs(label: str, requested_raw: List[str], warnings: List[str]) -> None:
+    """Log requested symbols and suspicious selections before feed init."""
+    logger.info(f"{label} requested: {len(requested_raw)}")
+    logger.debug(f"{label} requested symbols (raw): {', '.join(requested_raw)}")
+    for warning in warnings:
+        logger.warning(warning)
+
+
+def _finalize_venue_coverage(
+    label: str,
+    coverage: Dict[str, Any],
+    *,
+    warn_ratio: float,
+) -> None:
+    """Derive counts and emit startup coverage summary logs."""
+    coverage["filtered_count"] = len(coverage["filtered_raw"])
+    coverage["dropped_count"] = len(coverage["dropped_raw"])
+    coverage["active_count"] = len(coverage["active_raw"])
+    requested = coverage["requested_count"]
+    coverage["coverage_ratio"] = (
+        round(coverage["active_count"] / requested, 4) if requested else 0.0
+    )
+    coverage["dropped_all_raw"] = coverage["filtered_raw"] + coverage["dropped_raw"]
+    coverage["dropped_all_cf"] = coverage["filtered_cf"] + coverage["dropped_cf"]
+
+    logger.info(f"{label} requested: {requested}")
+    logger.info(f"{label} filtered unsupported: {coverage['filtered_count']}")
+    if coverage["filtered_raw"]:
+        logger.info(
+            f"Filtered {label.lower()} symbols (raw): "
+            + ", ".join(coverage["filtered_raw"])
+        )
+        logger.debug(
+            f"Filtered {label.lower()} symbols (cryptofeed): "
+            + ", ".join(coverage["filtered_cf"])
+        )
+
+    if label == "Futures":
+        logger.info(f"{label} dropped unsupported: {coverage['dropped_count']}")
+    else:
+        logger.info(f"{label} dropped during init: {coverage['dropped_count']}")
+
+    if coverage["dropped_raw"]:
+        logger.info(
+            f"Dropped {label.lower()} symbols (raw): "
+            + ", ".join(coverage["dropped_raw"])
+        )
+        logger.debug(
+            f"Dropped {label.lower()} symbols (cryptofeed): "
+            + ", ".join(coverage["dropped_cf"])
+        )
+
+    logger.info(f"{label} active: {coverage['active_count']}")
+    if label == "Futures":
+        logger.info(f"Futures runtime dropped after setup: {coverage['dropped_count']}")
+    logger.debug(
+        f"Active {label.lower()} symbols (raw): "
+        + ", ".join(coverage["active_raw"])
+    )
+    logger.debug(
+        f"Active {label.lower()} symbols (cryptofeed): "
+        + ", ".join(coverage["active_cf"])
+    )
+
+    if requested and coverage["coverage_ratio"] < warn_ratio:
+        logger.warning(
+            f"{label} coverage low: {coverage['active_count']}/{requested} "
+            f"active ({coverage['coverage_ratio']:.0%})"
+        )
+        if coverage["dropped_all_raw"]:
+            logger.warning(
+                f"{label} startup losses: " + ", ".join(coverage["dropped_all_raw"])
+            )
+
+
+def _persist_startup_coverage(coverage: Dict[str, Any]) -> None:
+    """Write startup coverage summary for later audit."""
+    out = config.STATE_ROOT / "startup_coverage.json"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(coverage, indent=2, ensure_ascii=False))
+    logger.info(f"Startup coverage report → {out}")
 
 
 # ============================================================================
@@ -295,17 +423,7 @@ async def metadata_task(venues: List[str]) -> None:
 # Initialisation
 # ============================================================================
 
-def _filter_symbols(symbols: List[str]) -> List[str]:
-    """Remove symbols known to be unsupported by cryptofeed."""
-    bad = {'USDCUSDT', 'EURC', 'EURI', 'FDUSD'}
-    out = [s for s in symbols if not any(b in s for b in bad)]
-    removed = len(symbols) - len(out)
-    if removed:
-        logger.info(f"Filtered {removed} unsupported symbols")
-    return out
-
-
-async def initialize() -> Dict[str, List[str]]:
+async def initialize() -> Dict[str, Any]:
     """Create infrastructure objects and fetch the trading universe."""
     global storage_manager, health_monitor, disk_monitor, shutdown_event
 
@@ -329,33 +447,126 @@ async def initialize() -> Dict[str, List[str]]:
     spot_n = len(universe.get('BINANCE_SPOT', []))
     fut_n = len(universe.get('BINANCE_USDTF', []))
     logger.info(f"Universe: Spot={spot_n}, Futures={fut_n}")
+    _emit_symbol_audit_logs(
+        "Spot",
+        universe.get('BINANCE_SPOT', []),
+        _find_suspicious_symbols("BINANCE_SPOT", universe.get('BINANCE_SPOT', [])),
+    )
+    _emit_symbol_audit_logs(
+        "Futures",
+        universe.get('BINANCE_USDTF', []),
+        _find_suspicious_symbols("BINANCE_USDTF", universe.get('BINANCE_USDTF', [])),
+    )
     return universe
 
 
-def _setup_feeds(universe: Dict[str, List[str]]) -> FeedHandler:
+def _setup_feeds(universe: Dict[str, Any]) -> Tuple[FeedHandler, Dict[str, Any]]:
     """Build FeedHandler with Spot + (optional) Futures feeds."""
     global futures_enabled, futures_disabled_reason
 
+    import re as _re
+
+    futures_enabled = True
+    futures_disabled_reason = ""
     fh = FeedHandler()
+    coverage: Dict[str, Any] = {
+        "timestamp": datetime.utcnow().isoformat(),
+        "spot": _make_venue_coverage(
+            "BINANCE_SPOT",
+            universe.get('BINANCE_SPOT', []),
+            _find_suspicious_symbols("BINANCE_SPOT", universe.get('BINANCE_SPOT', [])),
+        ),
+        "futures": _make_venue_coverage(
+            "BINANCE_USDTF",
+            universe.get('BINANCE_USDTF', []),
+            _find_suspicious_symbols("BINANCE_USDTF", universe.get('BINANCE_USDTF', [])),
+        ),
+        "warnings": [],
+    }
+    coverage["warnings"].extend(coverage["spot"]["warnings"])
+    coverage["warnings"].extend(coverage["futures"]["warnings"])
+    selection_metadata = universe.get("selection_metadata", {}) if isinstance(universe, dict) else {}
+    spot_selection = selection_metadata.get("BINANCE_SPOT", {}) if isinstance(selection_metadata, dict) else {}
+    fut_selection = selection_metadata.get("BINANCE_USDTF", {}) if isinstance(selection_metadata, dict) else {}
+    coverage["spot_candidate_pool"] = spot_selection.get("candidate_pool_count", 0)
+    coverage["futures_candidate_pool"] = fut_selection.get("candidate_pool_count", 0)
+    coverage["spot_rejected_pre_filter_count"] = spot_selection.get("rejected_pre_filter_count", 0)
+    coverage["futures_rejected_pre_filter_count"] = fut_selection.get("rejected_pre_filter_count", 0)
+    coverage["spot_rejected_pre_filter_sample"] = spot_selection.get("rejected_pre_filter_sample", [])
+    coverage["futures_rejected_pre_filter_sample"] = fut_selection.get("rejected_pre_filter_sample", [])
+    coverage["futures_candidate_pool_raw_count"] = fut_selection.get("candidate_pool_raw_count", 0)
+    coverage["futures_candidate_pool_after_sanity_count"] = fut_selection.get("candidate_pool_after_sanity_count", 0)
+    coverage["futures_candidate_pool_after_support_check_count"] = fut_selection.get("candidate_pool_after_support_check_count", 0)
+    coverage["futures_support_precheck_rejected_count"] = fut_selection.get("support_precheck_rejected_count", 0)
+    coverage["futures_support_precheck_rejected_sample"] = fut_selection.get("support_precheck_rejected_sample", [])
+    coverage["futures_support_precheck_available"] = fut_selection.get("support_precheck_available", False)
+    coverage["futures_support_precheck_error"] = fut_selection.get("support_precheck_error")
+    coverage["spot"]["candidate_pool"] = coverage["spot_candidate_pool"]
+    coverage["futures"]["candidate_pool"] = coverage["futures_candidate_pool"]
+    coverage["spot"]["rejected_pre_filter_count"] = coverage["spot_rejected_pre_filter_count"]
+    coverage["futures"]["rejected_pre_filter_count"] = coverage["futures_rejected_pre_filter_count"]
+    coverage["spot"]["rejected_pre_filter_sample"] = coverage["spot_rejected_pre_filter_sample"]
+    coverage["futures"]["rejected_pre_filter_sample"] = coverage["futures_rejected_pre_filter_sample"]
+    coverage["futures"]["candidate_pool_raw_count"] = coverage["futures_candidate_pool_raw_count"]
+    coverage["futures"]["candidate_pool_after_sanity_count"] = coverage["futures_candidate_pool_after_sanity_count"]
+    coverage["futures"]["candidate_pool_after_support_check_count"] = coverage["futures_candidate_pool_after_support_check_count"]
+    coverage["futures"]["support_precheck_rejected_count"] = coverage["futures_support_precheck_rejected_count"]
+    coverage["futures"]["support_precheck_rejected_sample"] = coverage["futures_support_precheck_rejected_sample"]
+    coverage["futures"]["support_precheck_available"] = coverage["futures_support_precheck_available"]
+    coverage["futures"]["support_precheck_error"] = coverage["futures_support_precheck_error"]
 
     # ── Spot ──
-    spot_raw = _filter_symbols(universe.get('BINANCE_SPOT', []))
+    spot_cov = coverage["spot"]
+    spot_raw, spot_filtered = partition_known_unsupported_symbols(universe.get('BINANCE_SPOT', []))
+    spot_cov["filtered_raw"] = list(spot_filtered)
+    spot_cov["filtered_cf"] = _to_cf_symbols(spot_filtered)
     spot_cf = _to_cf_symbols(spot_raw)
     if spot_cf:
-        try:
-            fh.add_feed(Binance(
-                symbols=spot_cf,
-                channels=[L2_BOOK, TRADES],
-                callbacks={L2_BOOK: on_l2_book, TRADES: on_trade},
-                depth_interval=f"{DEPTH_INTERVAL_MS}ms",
-            ))
-            logger.info(f"Added {len(spot_cf)} Binance Spot symbols")
-        except Exception as e:
-            logger.error(f"Failed to initialise Binance Spot: {e}")
+        remaining = list(spot_cf)
+        max_removals = len(remaining)
+        for _attempt in range(max_removals):
+            if not remaining:
+                logger.warning("Spot DISABLED – no valid symbols remained")
+                break
+            try:
+                fh.add_feed(Binance(
+                    symbols=remaining,
+                    channels=[L2_BOOK, TRADES],
+                    callbacks={L2_BOOK: on_l2_book, TRADES: on_trade},
+                    depth_interval=f"{DEPTH_INTERVAL_MS}ms",
+                ))
+                spot_cov["active_cf"] = list(remaining)
+                spot_cov["active_raw"] = [_from_cf_symbol(sym) for sym in remaining]
+                break
+            except Exception as e:
+                m = _re.match(r'(.+) is not supported on', str(e))
+                if m:
+                    bad = m.group(1)
+                    remaining = [s for s in remaining if s != bad]
+                    bad_raw = _from_cf_symbol(bad)
+                    if bad not in spot_cov["dropped_cf"]:
+                        spot_cov["dropped_cf"].append(bad)
+                    if bad_raw not in spot_cov["dropped_raw"]:
+                        spot_cov["dropped_raw"].append(bad_raw)
+                    logger.info(
+                        f"Removed unsupported spot symbol: raw={bad_raw} cf={bad}"
+                    )
+                else:
+                    logger.error(f"Failed to initialise Binance Spot: {e}")
+                    break
+        else:
+            logger.warning("Spot DISABLED – no valid symbols remained")
+    _finalize_venue_coverage(
+        "Spot",
+        spot_cov,
+        warn_ratio=SPOT_COVERAGE_WARN_RATIO,
+    )
 
     # ── Futures (retry loop: strip symbols unknown to cryptofeed) ──
-    import re as _re
-    fut_raw = _filter_symbols(universe.get('BINANCE_USDTF', []))
+    fut_cov = coverage["futures"]
+    fut_raw, fut_filtered = partition_known_unsupported_symbols(universe.get('BINANCE_USDTF', []))
+    fut_cov["filtered_raw"] = list(fut_filtered)
+    fut_cov["filtered_cf"] = _to_cf_futures_symbols(fut_filtered)
     fut_cf = _to_cf_futures_symbols(fut_raw)
     if fut_cf:
         remaining = list(fut_cf)
@@ -372,14 +583,22 @@ def _setup_feeds(universe: Dict[str, List[str]]) -> FeedHandler:
                     channels=[L2_BOOK, TRADES],
                     callbacks={L2_BOOK: on_l2_book, TRADES: on_trade},
                 ))
-                logger.info(f"Added {len(remaining)} Binance Futures symbols")
+                fut_cov["active_cf"] = list(remaining)
+                fut_cov["active_raw"] = [_from_cf_symbol(sym) for sym in remaining]
                 break
             except Exception as e:
                 m = _re.match(r'(.+) is not supported on', str(e))
                 if m:
                     bad = m.group(1)
                     remaining = [s for s in remaining if s != bad]
-                    logger.debug(f"Removed unsupported futures symbol: {bad}")
+                    bad_raw = _from_cf_symbol(bad)
+                    if bad not in fut_cov["dropped_cf"]:
+                        fut_cov["dropped_cf"].append(bad)
+                    if bad_raw not in fut_cov["dropped_raw"]:
+                        fut_cov["dropped_raw"].append(bad_raw)
+                    logger.info(
+                        f"Removed unsupported futures symbol: raw={bad_raw} cf={bad}"
+                    )
                 else:
                     futures_enabled = False
                     futures_disabled_reason = str(e)
@@ -390,8 +609,21 @@ def _setup_feeds(universe: Dict[str, List[str]]) -> FeedHandler:
             futures_enabled = False
             futures_disabled_reason = "all futures symbols unsupported"
             logger.warning("Futures DISABLED – no valid symbols remained")
+    _finalize_venue_coverage(
+        "Futures",
+        fut_cov,
+        warn_ratio=FUTURES_COVERAGE_WARN_RATIO,
+    )
 
-    return fh
+    logger.info(
+        "Startup coverage summary | "
+        f"Spot requested={spot_cov['requested_count']} filtered={spot_cov['filtered_count']} "
+        f"dropped={spot_cov['dropped_count']} active={spot_cov['active_count']} | "
+        f"Futures requested={fut_cov['requested_count']} filtered={fut_cov['filtered_count']} "
+        f"dropped={fut_cov['dropped_count']} active={fut_cov['active_count']}"
+    )
+
+    return fh, coverage
 
 
 # ============================================================================
@@ -508,8 +740,13 @@ async def main() -> None:
     try:
         global feed_handler
         universe = await initialize()
-        fh = _setup_feeds(universe)
+        fh, startup_coverage = _setup_feeds(universe)
         feed_handler = fh
+
+        health_monitor.futures_enabled = futures_enabled
+        health_monitor.futures_disabled_reason = futures_disabled_reason
+        health_monitor.set_startup_coverage(startup_coverage)
+        _persist_startup_coverage(startup_coverage)
 
         if not futures_enabled:
             logger.warning(f"FUTURES DISABLED: {futures_disabled_reason}")
@@ -522,9 +759,12 @@ async def main() -> None:
         background_tasks.append(
             asyncio.create_task(disk_check_task()))
 
-        active_venues = ["BINANCE_SPOT"]
-        if futures_enabled:
+        active_venues: List[str] = []
+        if startup_coverage["spot"]["active_count"] > 0:
+            active_venues.append("BINANCE_SPOT")
+        if futures_enabled and startup_coverage["futures"]["active_count"] > 0:
             active_venues.append("BINANCE_USDTF")
+        logger.info(f"Metadata active venues: {active_venues}")
         background_tasks.append(
             asyncio.create_task(metadata_task(active_venues)))
 
