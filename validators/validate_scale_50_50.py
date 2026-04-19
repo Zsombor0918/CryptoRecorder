@@ -16,6 +16,7 @@ then validates production-grade behaviour:
   9. no_reconnect_storm    – no burst of reconnects in a short window
  10. clean_shutdown        – exit code 0, no watchdog / async pathology
  11. raw_files_compressed  – final .jsonl files compressed to .jsonl.zst
+ 12. heartbeat_venue_counts – top-level spot/futures counts exist and match by_venue
 
 Report -> state/scale_50_50_report.json
 """
@@ -196,6 +197,40 @@ class ScaleValidator:
         return {"name": "queue_drops", "passed": ok,
                 "details": {"queue_drop_total": drops, "threshold": MAX_QUEUE_DROPS}}
 
+    def _ck_heartbeat_venue_counts(self) -> dict:
+        hb = STATE_ROOT / "heartbeat.json"
+        if not hb.exists():
+            return {"name": "heartbeat_venue_counts", "passed": False,
+                    "details": {"reason": "file missing"}}
+        try:
+            d = json.loads(hb.read_text())
+        except Exception as e:
+            return {"name": "heartbeat_venue_counts", "passed": False,
+                    "details": {"reason": str(e)}}
+
+        issues = []
+        by_venue = d.get("by_venue")
+        if not isinstance(by_venue, dict):
+            issues.append(f"by_venue is {type(by_venue).__name__}, expected dict")
+            by_venue = {}
+
+        counts = {
+            "spot_symbols_active": d.get("spot_symbols_active"),
+            "futures_symbols_active": d.get("futures_symbols_active"),
+        }
+        expected = {
+            "spot_symbols_active": len(by_venue.get("BINANCE_SPOT", [])),
+            "futures_symbols_active": len(by_venue.get("BINANCE_USDTF", [])),
+        }
+        for key, value in counts.items():
+            if not isinstance(value, int) or value < 0:
+                issues.append(f"{key} invalid: {value!r}")
+            elif value != expected[key]:
+                issues.append(f"{key}={value}, expected {expected[key]}")
+
+        return {"name": "heartbeat_venue_counts", "passed": not issues,
+                "details": {"issues": issues, **counts}}
+
     def _ck_reconnect_count(self, log: str) -> dict:
         count_match = re.findall(r"Reconnect #(\d+)", log)
         count = int(count_match[-1]) if count_match else 0
@@ -283,6 +318,7 @@ class ScaleValidator:
             self._ck_no_reconnect_storm(log),
             self._ck_clean_shutdown(log),
             self._ck_raw_files_compressed(),
+            self._ck_heartbeat_venue_counts(),
         ]
 
         self.report["checks"] = {c["name"]: c for c in checks}

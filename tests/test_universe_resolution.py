@@ -78,6 +78,18 @@ def test_dict_format():
             "BINANCE_USDTF": FUT_SYMBOLS,
             "timestamp": "2099-01-01T00:00:00",
             "top_count": 50,
+            "candidate_pool_size": 120,
+            "filter_version": "v3_futures_support_precheck",
+            "selection_metadata": {
+                "BINANCE_SPOT": {
+                    "selected_count": len(SPOT_SYMBOLS),
+                    "configured_candidate_pool_size": 120,
+                },
+                "BINANCE_USDTF": {
+                    "selected_count": len(FUT_SYMBOLS),
+                    "configured_candidate_pool_size": 200,
+                },
+            },
         }
         _write_meta(tmpdir, "BINANCE_SPOT", recorder_dict)
         _write_meta(tmpdir, "BINANCE_USDTF", recorder_dict)

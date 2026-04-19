@@ -43,6 +43,29 @@ import os as _os
 # Override with CRYPTO_RECORDER_TOP_SYMBOLS env var for testing
 TOP_SYMBOLS: Final = int(_os.environ.get("CRYPTO_RECORDER_TOP_SYMBOLS", "50"))
 
+# Universe selection uses a larger ranked candidate pool before applying
+# sanity/support filters, then keeps the best TOP_SYMBOLS survivors.
+TOP_SYMBOL_CANDIDATES: Final = int(
+    _os.environ.get("CRYPTO_RECORDER_TOP_SYMBOL_CANDIDATES", "120")
+)
+FUTURES_TOP_SYMBOL_CANDIDATES: Final = int(
+    _os.environ.get("CRYPTO_RECORDER_FUTURES_TOP_SYMBOL_CANDIDATES", "200")
+)
+
+# Selection policy metadata written into the cached universe files.
+UNIVERSE_FILTER_VERSION: Final = "v3_futures_support_precheck"
+UNIVERSE_REJECT_SAMPLE_SIZE: Final = 12
+
+# Symbols/base assets known to cause cryptofeed friction and worth dropping early.
+KNOWN_UNSUPPORTED_FULL_SYMBOLS: Final = (
+    "USDCUSDT",
+)
+KNOWN_UNSUPPORTED_BASE_ASSETS: Final = (
+    "EURC",
+    "EURI",
+    "FDUSD",
+)
+
 # Base quote asset for universe selection
 QUOTE_ASSET_SPOT: Final = "USDT"
 QUOTE_ASSET_FUTURES: Final = "USDT"  # For USDT-M perpetuals

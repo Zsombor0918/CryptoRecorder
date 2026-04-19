@@ -8,15 +8,16 @@ Wants=network-online.target
 Type=simple
 User=zsom
 WorkingDirectory=/home/zsom/services/CryptoRecorder
+Environment="CRYPTO_RECORDER_TOP_SYMBOLS=50"
 ExecStart=/home/zsom/services/CryptoRecorder/.venv/bin/python recorder.py
-Restart=on-failure
+Restart=always
 RestartSec=10
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=crypto-recorder
 
 # Resource limits
-MemoryMax=2G
+MemoryMax=8G
 CPUQuota=50%
 
 # Security

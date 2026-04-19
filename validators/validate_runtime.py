@@ -17,6 +17,7 @@ lets it run for 3 minutes, sends SIGINT, then asserts:
  10. futures_status       – futures recording OR explicitly degraded
  11. raw_files_compressed – shutdown compressed final .jsonl → .jsonl.zst
  12. queue_drops          – zero queue drops in heartbeat
+ 13. heartbeat_venue_counts – top-level spot/futures counts exist and match by_venue
 
 Outputs JSON report to state/runtime_report.json
 """
@@ -319,6 +320,41 @@ class RuntimeValidator:
         return {"name": "queue_drops", "passed": drops == 0,
                 "details": {"queue_drop_total": drops}}
 
+    def _ck_heartbeat_venue_counts(self) -> dict:
+        """Top-level spot/futures counts must exist and match by_venue."""
+        hb = STATE_ROOT / "heartbeat.json"
+        if not hb.exists():
+            return {"name": "heartbeat_venue_counts", "passed": False,
+                    "details": {"reason": "file missing"}}
+        try:
+            d = json.loads(hb.read_text())
+        except Exception as e:
+            return {"name": "heartbeat_venue_counts", "passed": False,
+                    "details": {"reason": str(e)}}
+
+        issues = []
+        by_venue = d.get("by_venue")
+        if not isinstance(by_venue, dict):
+            issues.append(f"by_venue is {type(by_venue).__name__}, expected dict")
+            by_venue = {}
+
+        counts = {
+            "spot_symbols_active": d.get("spot_symbols_active"),
+            "futures_symbols_active": d.get("futures_symbols_active"),
+        }
+        expected = {
+            "spot_symbols_active": len(by_venue.get("BINANCE_SPOT", [])),
+            "futures_symbols_active": len(by_venue.get("BINANCE_USDTF", [])),
+        }
+        for key, value in counts.items():
+            if not isinstance(value, int) or value < 0:
+                issues.append(f"{key} invalid: {value!r}")
+            elif value != expected[key]:
+                issues.append(f"{key}={value}, expected {expected[key]}")
+
+        return {"name": "heartbeat_venue_counts", "passed": not issues,
+                "details": {"issues": issues, **counts}}
+
     # ── orchestrate ──────────────────────────────────────────────────
 
     def run(self) -> Dict[str, Any]:
@@ -342,6 +378,7 @@ class RuntimeValidator:
             self._ck_futures(log),
             self._ck_raw_files_compressed(),
             self._ck_queue_drops(),
+            self._ck_heartbeat_venue_counts(),
         ]
 
         self.report["checks"] = {c["name"]: c for c in checks}

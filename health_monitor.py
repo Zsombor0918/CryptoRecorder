@@ -7,7 +7,7 @@ import logging
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import DefaultDict, Dict
+from typing import Any, DefaultDict, Dict, List
 from collections import defaultdict
 
 from config import (
@@ -40,7 +40,7 @@ class SymbolStats:
             'last_ts_event': self.last_ts_event,
             'last_update_id': self.last_update_id,
             'gap_count': self.gap_count,
-            'last_heartbeat': datetime.fromtimestamp(self.last_heartbeat).isoformat(),
+            'last_heartbeat': datetime.utcfromtimestamp(self.last_heartbeat).isoformat(),
         }
 
 
@@ -61,6 +61,12 @@ class HealthMonitor:
         # Queue drop stats – updated from StorageManager before heartbeat writes
         self.queue_drop_total: int = 0
         self.queue_drop_by_writer: Dict[str, int] = {}
+        # Startup coverage / symbol-loss visibility
+        self.spot_symbols_requested: int = 0
+        self.futures_symbols_requested: int = 0
+        self.spot_symbols_dropped_list: List[str] = []
+        self.futures_symbols_dropped_list: List[str] = []
+        self.startup_coverage: Dict[str, Any] = {}
     
     def record_message(self, venue: str, symbol: str, ts_event: int = None, 
                       update_id: int = None, channel: str = None) -> None:
@@ -105,25 +111,57 @@ class HealthMonitor:
                 f.write(message + '\n')
         except Exception as e:
             logger.error(f"Error writing to reconnects log: {e}")
+
+    def set_startup_coverage(self, coverage: Dict[str, Any]) -> None:
+        """Store startup coverage summary for heartbeat export."""
+        self.startup_coverage = coverage
+        spot = coverage.get("spot", {})
+        futures = coverage.get("futures", {})
+        self.spot_symbols_requested = int(spot.get("requested_count", 0) or 0)
+        self.futures_symbols_requested = int(futures.get("requested_count", 0) or 0)
+        self.spot_symbols_dropped_list = list(spot.get("dropped_all_raw", []))
+        self.futures_symbols_dropped_list = list(futures.get("dropped_all_raw", []))
     
     async def write_heartbeat(self) -> None:
         """Write heartbeat with current stats."""
         try:
-            uptime_sec = time.time() - self.start_time
+            now = time.time()
+            uptime_sec = now - self.start_time
             
             # Group stats by venue
             by_venue: DefaultDict[str, list] = defaultdict(list)
             for (venue, symbol), stats in self.symbol_stats.items():
+                stats.last_heartbeat = now
                 by_venue[venue].append(stats.to_dict())
             
             # Aggregate stats
             total_messages = sum(stats.message_count for stats in self.symbol_stats.values())
             total_gaps = sum(stats.gap_count for stats in self.symbol_stats.values())
+            spot_symbols_active = len(by_venue.get("BINANCE_SPOT", []))
+            futures_symbols_active = len(by_venue.get("BINANCE_USDTF", []))
+            spot_coverage_ratio = (
+                round(spot_symbols_active / self.spot_symbols_requested, 4)
+                if self.spot_symbols_requested else None
+            )
+            futures_coverage_ratio = (
+                round(futures_symbols_active / self.futures_symbols_requested, 4)
+                if self.futures_symbols_requested else None
+            )
             
             heartbeat = {
                 'timestamp': datetime.utcnow().isoformat(),
                 'uptime_seconds': uptime_sec,
                 'total_symbols': len(self.symbol_stats),
+                'spot_symbols_active': spot_symbols_active,
+                'futures_symbols_active': futures_symbols_active,
+                'spot_symbols_requested': self.spot_symbols_requested,
+                'futures_symbols_requested': self.futures_symbols_requested,
+                'spot_symbols_dropped': len(self.spot_symbols_dropped_list),
+                'futures_symbols_dropped': len(self.futures_symbols_dropped_list),
+                'spot_symbols_dropped_list': self.spot_symbols_dropped_list,
+                'futures_symbols_dropped_list': self.futures_symbols_dropped_list,
+                'spot_coverage_ratio': spot_coverage_ratio,
+                'futures_coverage_ratio': futures_coverage_ratio,
                 'total_messages': total_messages,
                 'total_gaps': total_gaps,
                 'total_reconnects': self.reconnect_count,
