@@ -1,53 +1,45 @@
-#!/usr/bin/env python3
-"""
-tests/test_universe_selection_quality.py — Verify universe sanity filtering.
-
-Usage:
-    python tests/test_universe_selection_quality.py
-"""
 from __future__ import annotations
 
-import sys
-from pathlib import Path
+from binance_universe import (
+    UniverseSelector,
+    is_reasonable_symbol,
+    partition_known_unsupported_symbols,
+)
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(PROJECT_ROOT))
+
+def test_reasonable_standard_symbol_passes() -> None:
+    ok, reason = is_reasonable_symbol("BTCUSDT", "spot")
+    assert ok is True
+    assert reason == "ok"
 
 
-def run_tests() -> int:
-    from binance_universe import (
-        UniverseSelector,
-        is_reasonable_symbol,
-        partition_known_unsupported_symbols,
+def test_numeric_prefix_symbol_is_allowed_for_futures() -> None:
+    ok, reason = is_reasonable_symbol("1000PEPEUSDT", "futures")
+    assert ok is True
+    assert reason == "ok"
+
+
+def test_short_base_symbol_is_rejected() -> None:
+    ok, reason = is_reasonable_symbol("UUSDT", "spot")
+    assert ok is False
+    assert "shorter than 2 chars" in reason
+
+
+def test_non_ascii_symbol_is_rejected() -> None:
+    ok, reason = is_reasonable_symbol("币安人生USDT", "spot")
+    assert ok is False
+    assert "non-ASCII" in reason
+
+
+def test_known_unsupported_symbols_are_partitioned() -> None:
+    kept, removed = partition_known_unsupported_symbols(
+        ["BTCUSDT", "FDUSDUSDT", "ETHUSDT"]
     )
+    assert kept == ["BTCUSDT", "ETHUSDT"]
+    assert removed == ["FDUSDUSDT"]
 
-    results = []
 
-    ok1, reason1 = is_reasonable_symbol("BTCUSDT", "spot")
-    res1 = ok1 and reason1 == "ok"
-    print(f"  [{'PASS' if res1 else 'FAIL'}] standard_symbol ({reason1})")
-    results.append(res1)
-
-    ok2, reason2 = is_reasonable_symbol("1000PEPEUSDT", "futures")
-    res2 = ok2 and reason2 == "ok"
-    print(f"  [{'PASS' if res2 else 'FAIL'}] numeric_prefix_allowed ({reason2})")
-    results.append(res2)
-
-    ok3, reason3 = is_reasonable_symbol("UUSDT", "spot")
-    res3 = (ok3 is False) and "shorter than 2 chars" in reason3
-    print(f"  [{'PASS' if res3 else 'FAIL'}] short_base_rejected ({reason3})")
-    results.append(res3)
-
-    ok4, reason4 = is_reasonable_symbol("币安人生USDT", "spot")
-    res4 = (ok4 is False) and "non-ASCII" in reason4
-    print(f"  [{'PASS' if res4 else 'FAIL'}] non_ascii_rejected ({reason4})")
-    results.append(res4)
-
-    kept, removed = partition_known_unsupported_symbols(["BTCUSDT", "FDUSDUSDT", "ETHUSDT"])
-    res5 = kept == ["BTCUSDT", "ETHUSDT"] and removed == ["FDUSDUSDT"]
-    print(f"  [{'PASS' if res5 else 'FAIL'}] known_unsupported_partition (kept={kept}, removed={removed})")
-    results.append(res5)
-
+def test_selection_pipeline_reports_rejections_consistently() -> None:
     selector = UniverseSelector()
     fake_tickers = [
         {"symbol": "BTCUSDT", "quoteVolume": "1000"},
@@ -59,24 +51,14 @@ def run_tests() -> int:
         {"symbol": "AGIXBTC", "quoteVolume": "400"},
     ]
     selected, metadata = selector._select_from_tickers(fake_tickers, "spot")
-    res6 = selected[:3] == ["BTCUSDT", "ETHUSDT", "1000PEPEUSDT"]
-    res6 = res6 and metadata["eligible_count"] == 3
-    res6 = res6 and metadata["survivor_count"] == 3
-    res6 = res6 and metadata["pre_filter_rejected_count"] == 3
-    res6 = res6 and metadata["rejected_pre_filter_count"] == 3
-    rejected_symbols = {item["symbol"] for item in metadata["pre_filter_rejected_sample"]}
-    res6 = res6 and {"币安人生USDT", "UUSDT", "FDUSDUSDT"}.issubset(rejected_symbols)
-    print(
-        f"  [{'PASS' if res6 else 'FAIL'}] selection_pipeline "
-        f"(selected={selected[:3]}, rejected={metadata['pre_filter_rejected_sample']})"
-    )
-    results.append(res6)
 
-    passed = sum(results)
-    total = len(results)
-    print(f"\n  {passed}/{total} passed")
-    return 0 if passed == total else 1
+    assert selected[:3] == ["BTCUSDT", "ETHUSDT", "1000PEPEUSDT"]
+    assert metadata["eligible_count"] == 3
+    assert metadata["survivor_count"] == 3
+    assert metadata["pre_filter_rejected_count"] == 3
+    assert metadata["rejected_pre_filter_count"] == 3
 
-
-if __name__ == "__main__":
-    raise SystemExit(run_tests())
+    rejected_symbols = {
+        item["symbol"] for item in metadata["pre_filter_rejected_sample"]
+    }
+    assert {"币安人生USDT", "UUSDT", "FDUSDUSDT"}.issubset(rejected_symbols)
