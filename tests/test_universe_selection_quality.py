@@ -60,13 +60,15 @@ def run_tests() -> int:
     ]
     selected, metadata = selector._select_from_tickers(fake_tickers, "spot")
     res6 = selected[:3] == ["BTCUSDT", "ETHUSDT", "1000PEPEUSDT"]
+    res6 = res6 and metadata["eligible_count"] == 3
     res6 = res6 and metadata["survivor_count"] == 3
+    res6 = res6 and metadata["pre_filter_rejected_count"] == 3
     res6 = res6 and metadata["rejected_pre_filter_count"] == 3
-    rejected_symbols = {item["symbol"] for item in metadata["rejected_pre_filter_sample"]}
+    rejected_symbols = {item["symbol"] for item in metadata["pre_filter_rejected_sample"]}
     res6 = res6 and {"币安人生USDT", "UUSDT", "FDUSDUSDT"}.issubset(rejected_symbols)
     print(
         f"  [{'PASS' if res6 else 'FAIL'}] selection_pipeline "
-        f"(selected={selected[:3]}, rejected={metadata['rejected_pre_filter_sample']})"
+        f"(selected={selected[:3]}, rejected={metadata['pre_filter_rejected_sample']})"
     )
     results.append(res6)
 

@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """
-convert_yesterday.py — CLI entry-point for the Nautilus catalog converter.
+convert_yesterday.py — Legacy-compatible CLI entrypoint for the Nautilus converter.
 
 Reads raw trade and depth JSONL(.zst) for a given UTC date, builds Nautilus
 Instrument objects from exchangeInfo, converts trades to TradeTick,
 reconstructs approximate L2 Depth-10 snapshots from cryptofeed-normalised
 deltas, and writes everything into a ParquetDataCatalog.
+
+Preferred CLI name:
+    python convert_day.py --date 2026-04-17
 
 Usage:
     python convert_yesterday.py                          # yesterday UTC
@@ -22,7 +25,7 @@ import shutil
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from nautilus_trader.model.instruments import CryptoPerpetual
 from nautilus_trader.persistence.catalog import ParquetDataCatalog
@@ -270,10 +273,11 @@ def _save_report(report: dict) -> dict:
 # CLI
 # ===================================================================
 
-def main() -> None:
-    ap = argparse.ArgumentParser(
-        description="Convert raw Binance JSONL → Nautilus ParquetDataCatalog",
-    )
+def _build_arg_parser(*, legacy_entrypoint: bool) -> argparse.ArgumentParser:
+    description = "Convert raw Binance JSONL -> Nautilus ParquetDataCatalog"
+    if legacy_entrypoint:
+        description += " (legacy-compatible CLI; prefer convert_day.py)"
+    ap = argparse.ArgumentParser(description=description)
     ap.add_argument(
         "--date", type=str,
         help="Date to convert (YYYY-MM-DD). Default: yesterday UTC.",
@@ -282,7 +286,16 @@ def main() -> None:
         "--staging", action="store_true",
         help="Write to staging dir, then atomically rename on success.",
     )
-    args = ap.parse_args()
+    return ap
+
+
+def main(
+    argv: Optional[Sequence[str]] = None,
+    *,
+    legacy_entrypoint: bool = True,
+) -> int:
+    ap = _build_arg_parser(legacy_entrypoint=legacy_entrypoint)
+    args = ap.parse_args(argv)
 
     if args.date:
         date = datetime.strptime(args.date, "%Y-%m-%d")
@@ -290,8 +303,8 @@ def main() -> None:
         date = datetime.now(tz=timezone.utc) - timedelta(days=1)
 
     report = convert_date(date, staging=args.staging)
-    raise SystemExit(0 if report.get("status") in ("ok", "no_data") else 1)
+    return 0 if report.get("status") in ("ok", "no_data") else 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

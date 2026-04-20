@@ -38,11 +38,11 @@ def run_tests() -> int:
         hm.set_startup_coverage({
             "spot": {
                 "requested_count": 5,
-                "dropped_all_raw": ["UTKUSDT", "USDCUSDT"],
+                "runtime_dropped_raw": ["UTKUSDT", "USDCUSDT"],
             },
             "futures": {
                 "requested_count": 4,
-                "dropped_all_raw": ["AGIXUSDT"],
+                "runtime_dropped_raw": ["AGIXUSDT"],
             },
         })
         hm.record_message("BINANCE_SPOT", "BTCUSDT", ts_event=1)

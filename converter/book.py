@@ -159,7 +159,7 @@ def convert_depth(
     size_prec: int,
     *,
     snapshot_interval_sec: float = DEPTH_SNAPSHOT_INTERVAL_SEC,
-) -> Tuple[List[OrderBookDepth10], int, int, Optional[int], Optional[int]]:
+) -> Tuple[List[OrderBookDepth10], int, int, int, Optional[int], Optional[int]]:
     """Stream-convert raw depth deltas → 1-second OrderBookDepth10 snapshots.
 
     Returns ``(snapshot_list, bad_line_count, gaps_suspected,

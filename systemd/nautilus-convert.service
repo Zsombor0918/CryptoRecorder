@@ -1,6 +1,6 @@
 [Unit]
 Description=Nautilus Data Converter (RAW to Parquet)
-Documentation=file:///home/zsom/services/CryptoRecorder/convert_yesterday.py
+Documentation=file:///home/zsom/services/CryptoRecorder/convert_day.py
 After=network-online.target
 Wants=network-online.target
 
@@ -8,7 +8,7 @@ Wants=network-online.target
 Type=oneshot
 User=zsom
 WorkingDirectory=/home/zsom/services/CryptoRecorder
-ExecStart=/home/zsom/services/CryptoRecorder/.venv/bin/python convert_yesterday.py
+ExecStart=/home/zsom/services/CryptoRecorder/.venv/bin/python convert_day.py
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=nautilus-converter

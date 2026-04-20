@@ -1,15 +1,12 @@
 #!/usr/bin/env python3
 """
-VALIDATE.py  –  Master validation entrypoint for CryptoRecorder
+VALIDATE.py  –  Master validation entrypoint for CryptoRecorder.
 
-  python VALIDATE.py system     validators/validate_system.py       (~5 s)
-  python VALIDATE.py runtime    validators/validate_runtime.py      (3-min smoke)
-  python VALIDATE.py scale      validators/validate_scale_50_50.py  (10-min 50/50)
-  python VALIDATE.py nautilus   validators/validate_nautilus_catalog_e2e.py (16 checks)
-  python VALIDATE.py purge      validators/validate_purge_safety.py (6 checks)
-  python VALIDATE.py converter  validators/validate_converter_e2e.py (legacy)
-  python VALIDATE.py all        system + runtime + nautilus + purge  (quick suite)
-  python VALIDATE.py accept     system + runtime + scale + nautilus + purge  (full DoD)
+Preferred validator entrypoints live under ``validators/`` with short names:
+``system.py``, ``runtime.py``, ``scale.py``, ``nautilus_catalog.py``,
+``purge_safety.py``, and ``converter.py``.
+
+Legacy ``validate_*.py`` filenames remain in the repository for compatibility.
 """
 import json
 import subprocess
@@ -31,6 +28,15 @@ class C:
 PROJECT = Path(__file__).parent
 STATE   = PROJECT / "state"
 STATE.mkdir(exist_ok=True)
+
+VALIDATOR_SCRIPTS = {
+    "system": PROJECT / "validators" / "system.py",
+    "runtime": PROJECT / "validators" / "runtime.py",
+    "scale": PROJECT / "validators" / "scale.py",
+    "nautilus": PROJECT / "validators" / "nautilus_catalog.py",
+    "purge": PROJECT / "validators" / "purge_safety.py",
+    "converter": PROJECT / "validators" / "converter.py",
+}
 
 
 # ── runner ───────────────────────────────────────────────────────────
@@ -57,11 +63,18 @@ def _load_report(name: str) -> Optional[dict]:
         return None
 
 
+def _validator_cmd(name: str, *args: str) -> str:
+    script = VALIDATOR_SCRIPTS[name].relative_to(PROJECT)
+    parts = ["source .venv/bin/activate", "&&", "python3", str(script)]
+    parts.extend(args)
+    return " ".join(parts)
+
+
 # ── individual validators ────────────────────────────────────────────
 
 def run_system() -> bool:
-    print(f"\n{C.B}► System validation (validate_system.py){C._}")
-    ok, out = _run("source .venv/bin/activate && python3 validators/validate_system.py --quick")
+    print(f"\n{C.B}► System validation (validators/system.py){C._}")
+    ok, out = _run(_validator_cmd("system", "--quick"))
     if ok:
         print(f"  {C.G}✓ system checks passed{C._}")
     else:
@@ -71,10 +84,8 @@ def run_system() -> bool:
 
 
 def run_runtime(runtime_sec: int = 180) -> bool:
-    print(f"\n{C.B}► Runtime smoke-test (validate_runtime.py, {runtime_sec}s){C._}")
-    ok, out = _run(
-        f"source .venv/bin/activate && python3 validators/validate_runtime.py --runtime {runtime_sec}",
-        timeout=runtime_sec + 60)
+    print(f"\n{C.B}► Runtime smoke-test (validators/runtime.py, {runtime_sec}s){C._}")
+    ok, out = _run(_validator_cmd("runtime", "--runtime", str(runtime_sec)), timeout=runtime_sec + 60)
     rpt = _load_report("runtime_report.json")
     passed = rpt.get("passed", False) if rpt else False
     n = rpt.get("checks_passed", "?") if rpt else "?"
@@ -91,13 +102,21 @@ def run_runtime(runtime_sec: int = 180) -> bool:
 
 
 def run_converter() -> bool:
-    print(f"\n{C.B}► Converter E2E (validate_converter_e2e.py){C._}")
-    ok, out = _run("source .venv/bin/activate && python3 validators/validate_converter_e2e.py")
-    rpt = _load_report("converter_e2e_report.json")
+    print(f"\n{C.B}► Converter compatibility mode (validators/converter.py){C._}")
+    ok, out = _run(_validator_cmd("converter"))
+    val_dir = STATE / "validation"
+    rpt = None
+    if val_dir.exists():
+        reports = sorted(val_dir.glob("nautilus_catalog_e2e_*.json"), reverse=True)
+        if reports:
+            try:
+                rpt = json.loads(reports[0].read_text())
+            except Exception:
+                pass
     if rpt and rpt.get("skipped"):
         print(f"  {C.Y}⚠ skipped: {rpt.get('reason', '?')}{C._}")
         return True  # skip ≠ failure
-    passed = rpt.get("passed", False) if rpt else False
+    passed = rpt.get("passed", False) if rpt else ok
     n = rpt.get("checks_passed", "?") if rpt else "?"
     t = rpt.get("total_checks", "?") if rpt else "?"
     if passed:
@@ -108,10 +127,8 @@ def run_converter() -> bool:
 
 
 def run_scale(runtime_sec: int = 600) -> bool:
-    print(f"\n{C.B}► Scale 50/50 acceptance (validate_scale_50_50.py, {runtime_sec}s){C._}")
-    ok, out = _run(
-        f"source .venv/bin/activate && python3 validators/validate_scale_50_50.py --runtime {runtime_sec}",
-        timeout=runtime_sec + 120)
+    print(f"\n{C.B}► Scale 50/50 acceptance (validators/scale.py, {runtime_sec}s){C._}")
+    ok, out = _run(_validator_cmd("scale", "--runtime", str(runtime_sec)), timeout=runtime_sec + 120)
     rpt = _load_report("scale_50_50_report.json")
     passed = rpt.get("passed", False) if rpt else False
     n = rpt.get("checks_passed", "?") if rpt else "?"
@@ -128,9 +145,8 @@ def run_scale(runtime_sec: int = 600) -> bool:
 
 
 def run_nautilus() -> bool:
-    print(f"\n{C.B}► Nautilus catalog E2E (validate_nautilus_catalog_e2e.py){C._}")
-    ok, out = _run("source .venv/bin/activate && python3 validators/validate_nautilus_catalog_e2e.py",
-                   timeout=360)
+    print(f"\n{C.B}► Nautilus catalog E2E (validators/nautilus_catalog.py){C._}")
+    ok, out = _run(_validator_cmd("nautilus"), timeout=360)
     # Try to find the most recent report
     val_dir = STATE / "validation"
     rpt = None
@@ -159,9 +175,8 @@ def run_nautilus() -> bool:
 
 
 def run_purge() -> bool:
-    print(f"\n{C.B}► Purge safety (validate_purge_safety.py){C._}")
-    ok, out = _run("source .venv/bin/activate && python3 validators/validate_purge_safety.py",
-                   timeout=60)
+    print(f"\n{C.B}► Purge safety (validators/purge_safety.py){C._}")
+    ok, out = _run(_validator_cmd("purge"), timeout=60)
     val_dir = STATE / "validation"
     rpt = None
     if val_dir.exists():
@@ -216,11 +231,11 @@ USAGE = f"""\
 {C.B}VALIDATE.py{C._}  –  CryptoRecorder validation
 
   python VALIDATE.py system       Import / config checks (~5 s)
-  python VALIDATE.py runtime      Live recorder 3-min smoke-test (12 checks)
-  python VALIDATE.py scale        50/50 scale 10-min acceptance test (11 checks)
-  python VALIDATE.py nautilus     Nautilus catalog E2E (16 checks)
-  python VALIDATE.py purge        Purge safety proof (6 checks)
-  python VALIDATE.py converter    Legacy converter E2E (7 checks)
+  python VALIDATE.py runtime      Live recorder smoke-test
+  python VALIDATE.py scale        50/50 scale acceptance test
+  python VALIDATE.py nautilus     Nautilus catalog E2E
+  python VALIDATE.py purge        Purge safety proof
+  python VALIDATE.py converter    Legacy alias for converter validation
   python VALIDATE.py all          system + runtime + nautilus + purge  (quick suite)
   python VALIDATE.py accept       system + runtime + scale + nautilus + purge  (full DoD)
   python VALIDATE.py --help       This message

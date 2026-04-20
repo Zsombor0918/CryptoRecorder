@@ -118,6 +118,49 @@ class UniverseSelector:
         self.universe_path = META_ROOT / "universe"
         self.universe_path.mkdir(parents=True, exist_ok=True)
         self._futures_support_mapping_cache: Dict[str, str] | None = None
+
+    def _empty_selection_metadata(
+        self,
+        venue_type: str,
+        *,
+        support_precheck_available: bool | None = None,
+        support_precheck_error: str | None = None,
+    ) -> Dict[str, Any]:
+        """Return a zeroed selection-metadata payload for failures/fallbacks."""
+        metadata: Dict[str, Any] = {
+            "venue": _venue_key(venue_type),
+            "configured_candidate_pool_size": _candidate_pool_size(venue_type),
+            "requested_count": TOP_SYMBOLS,
+            "eligible_count": 0,
+            "survivor_count": 0,  # legacy alias
+            "selected_count": 0,
+            "selected_sample": [],
+            "pre_filter_rejected_count": 0,
+            "pre_filter_rejected_sample": [],
+            "rejected_pre_filter_count": 0,  # legacy alias
+            "rejected_pre_filter_sample": [],  # legacy alias
+            "candidate_pool_count": 0,
+            "candidate_pool_raw_count": 0,
+            "candidate_pool_after_sanity_count": 0,
+            "candidate_pool_after_support_check_count": 0,
+        }
+
+        if venue_type == "futures":
+            metadata.update({
+                "support_precheck_available": bool(support_precheck_available),
+                "support_precheck_error": support_precheck_error,
+                "support_precheck_rejected_count": 0,
+                "support_precheck_rejected_sample": [],
+            })
+        else:
+            metadata.update({
+                "support_precheck_available": False,
+                "support_precheck_error": None,
+                "support_precheck_rejected_count": 0,
+                "support_precheck_rejected_sample": [],
+            })
+
+        return metadata
     
     async def get_or_select_universe(self, force_refresh: bool = False) -> dict:
         """
@@ -224,10 +267,14 @@ class UniverseSelector:
         for venue_type in ("spot", "futures"):
             venue = _venue_key(venue_type)
             meta = selection_metadata.get(venue, {})
+            rejected_count = meta.get(
+                "pre_filter_rejected_count",
+                meta.get("rejected_pre_filter_count", "?"),
+            )
             logger.info(
                 f"Cached {venue_type} universe: selected={meta.get('selected_count', len(cached.get(venue, [])))} "
                 f"from pool={meta.get('candidate_pool_count', '?')} "
-                f"rejected={meta.get('rejected_pre_filter_count', '?')} "
+                f"pre_filter_rejected={rejected_count} "
                 f"support_rejected={meta.get('support_precheck_rejected_count', '?')} "
                 f"filter_version={cached.get('filter_version')}"
             )
@@ -301,6 +348,7 @@ class UniverseSelector:
         if self._futures_support_mapping_cache is not None:
             return self._futures_support_mapping_cache, None
 
+        last_error: str | None = None
         try:
             mapping = BinanceFutures.symbol_mapping(refresh=False)
             if not isinstance(mapping, dict):
@@ -308,7 +356,21 @@ class UniverseSelector:
             self._futures_support_mapping_cache = mapping
             return mapping, None
         except Exception as e:
-            return None, str(e)
+            last_error = str(e)
+
+        # Best-effort second attempt: force a refresh if no cached mapping was available.
+        # Failure still degrades gracefully to sanity-only selection.
+        try:
+            mapping = BinanceFutures.symbol_mapping(refresh=True)
+            if not isinstance(mapping, dict):
+                raise TypeError(f"unexpected symbol mapping type {type(mapping).__name__}")
+            self._futures_support_mapping_cache = mapping
+            return mapping, None
+        except Exception as e:
+            err = str(e)
+            if last_error:
+                err = f"initial lookup failed ({last_error}); refresh failed ({err})"
+            return None, err
 
     def _apply_futures_support_precheck(
         self,
@@ -374,9 +436,12 @@ class UniverseSelector:
             "candidate_pool_after_sanity_count": len(sanity_candidates),
             "candidate_pool_after_support_check_count": len(support_candidates),
             "requested_count": TOP_SYMBOLS,
+            "eligible_count": len(support_candidates),
             "survivor_count": len(support_candidates),
             "selected_count": len(selected),
             "selected_sample": selected[:10],
+            "pre_filter_rejected_count": len(sanity_rejected),
+            "pre_filter_rejected_sample": rejected_sample,
             "rejected_pre_filter_count": len(sanity_rejected),
             "rejected_pre_filter_sample": rejected_sample,
             "support_precheck_available": support_precheck_available,
@@ -395,10 +460,10 @@ class UniverseSelector:
             f"{venue_type.capitalize()} candidate pool used: {len(candidate_pool)} "
             f"(configured {configured_candidate_pool_size})"
         )
-        logger.info(f"{venue_type.capitalize()} rejected by pre-filter: {len(sanity_rejected)}")
+        logger.info(f"{venue_type.capitalize()} pre_filter_rejected: {len(sanity_rejected)}")
         if rejected_sample:
             logger.info(
-                f"{venue_type.capitalize()} rejected sample: "
+                f"{venue_type.capitalize()} pre-filter rejected sample: "
                 + ", ".join(
                     f"{item['symbol']} ({item['reason']})" for item in rejected_sample
                 )
@@ -433,7 +498,7 @@ class UniverseSelector:
         )
         if len(support_candidates) < TOP_SYMBOLS:
             logger.warning(
-                f"{venue_type.capitalize()} survivors below target: {len(support_candidates)}/{TOP_SYMBOLS}"
+                f"{venue_type.capitalize()} eligible_count below target: {len(support_candidates)}/{TOP_SYMBOLS}"
             )
 
         return selected[:TOP_SYMBOLS], metadata
@@ -450,42 +515,14 @@ class UniverseSelector:
                 ) as resp:
                     if resp.status != 200:
                         logger.error(f"Failed to fetch spot tickers: {resp.status}")
-                        return [], {
-                            "venue": "BINANCE_SPOT",
-                            "configured_candidate_pool_size": _candidate_pool_size("spot"),
-                            "requested_count": TOP_SYMBOLS,
-                            "survivor_count": 0,
-                            "selected_count": 0,
-                            "rejected_pre_filter_count": 0,
-                            "rejected_pre_filter_sample": [],
-                            "support_precheck_rejected_count": 0,
-                            "support_precheck_rejected_sample": [],
-                            "candidate_pool_count": 0,
-                            "candidate_pool_raw_count": 0,
-                            "candidate_pool_after_sanity_count": 0,
-                            "candidate_pool_after_support_check_count": 0,
-                        }
+                        return [], self._empty_selection_metadata("spot")
                     
                     data = await resp.json()
             return self._select_from_tickers(data, "spot")
             
         except Exception as e:
             logger.error(f"Error selecting spot symbols: {e}", exc_info=True)
-            return [], {
-                "venue": "BINANCE_SPOT",
-                "configured_candidate_pool_size": _candidate_pool_size("spot"),
-                "requested_count": TOP_SYMBOLS,
-                "survivor_count": 0,
-                "selected_count": 0,
-                "rejected_pre_filter_count": 0,
-                "rejected_pre_filter_sample": [],
-                "support_precheck_rejected_count": 0,
-                "support_precheck_rejected_sample": [],
-                "candidate_pool_count": 0,
-                "candidate_pool_raw_count": 0,
-                "candidate_pool_after_sanity_count": 0,
-                "candidate_pool_after_support_check_count": 0,
-            }
+            return [], self._empty_selection_metadata("spot")
     
     async def _select_futures_symbols(self) -> Tuple[List[str], Dict[str, Any]]:
         """Select top symbols from Binance USDT-M Futures."""
@@ -499,43 +536,15 @@ class UniverseSelector:
                 ) as resp:
                     if resp.status != 200:
                         logger.error(f"Failed to fetch futures tickers: {resp.status}")
-                        return [], {
-                            "venue": "BINANCE_USDTF",
-                            "configured_candidate_pool_size": _candidate_pool_size("futures"),
-                            "requested_count": TOP_SYMBOLS,
-                            "survivor_count": 0,
-                            "selected_count": 0,
-                            "rejected_pre_filter_count": 0,
-                            "rejected_pre_filter_sample": [],
-                            "support_precheck_available": False,
-                            "support_precheck_error": None,
-                            "support_precheck_rejected_count": 0,
-                            "support_precheck_rejected_sample": [],
-                            "candidate_pool_count": 0,
-                            "candidate_pool_raw_count": 0,
-                            "candidate_pool_after_sanity_count": 0,
-                            "candidate_pool_after_support_check_count": 0,
-                        }
+                        return [], self._empty_selection_metadata("futures")
                     
                     data = await resp.json()
             return self._select_from_tickers(data, "futures")
             
         except Exception as e:
             logger.error(f"Error selecting futures symbols: {e}", exc_info=True)
-            return [], {
-                "venue": "BINANCE_USDTF",
-                "configured_candidate_pool_size": _candidate_pool_size("futures"),
-                "requested_count": TOP_SYMBOLS,
-                "survivor_count": 0,
-                "selected_count": 0,
-                "rejected_pre_filter_count": 0,
-                "rejected_pre_filter_sample": [],
-                "support_precheck_available": False,
-                "support_precheck_error": str(e),
-                "support_precheck_rejected_count": 0,
-                "support_precheck_rejected_sample": [],
-                "candidate_pool_count": 0,
-                "candidate_pool_raw_count": 0,
-                "candidate_pool_after_sanity_count": 0,
-                "candidate_pool_after_support_check_count": 0,
-            }
+            return [], self._empty_selection_metadata(
+                "futures",
+                support_precheck_available=False,
+                support_precheck_error=str(e),
+            )

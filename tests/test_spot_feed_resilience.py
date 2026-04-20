@@ -86,7 +86,10 @@ def run_tests() -> int:
         spot_cov = coverage["spot"]
         ok3 = (
             spot_cov["requested_count"] == 3
+            and spot_cov["selected_count"] == 3
             and spot_cov["dropped_raw"] == ["UTKUSDT"]
+            and spot_cov["runtime_dropped_raw"] == ["UTKUSDT"]
+            and spot_cov["runtime_dropped_count"] == 1
             and spot_cov["active_raw"] == ["BTCUSDT", "ETHUSDT"]
         )
         print(
@@ -104,7 +107,9 @@ def run_tests() -> int:
         fut_cov = coverage["futures"]
         ok5 = (
             fut_cov["requested_count"] == 2
+            and fut_cov["selected_count"] == 2
             and fut_cov["dropped_raw"] == []
+            and fut_cov["runtime_dropped_count"] == 0
             and fut_cov["active_raw"] == ["BTCUSDT", "ETHUSDT"]
         )
         print(
