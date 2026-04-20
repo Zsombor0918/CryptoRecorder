@@ -9,10 +9,6 @@ Preferred validator modules now use the short names under `validators/`:
 - `validators/scale.py`
 - `validators/nautilus_catalog.py`
 - `validators/purge_safety.py`
-- `validators/converter.py`
-
-Legacy `validate_*.py` filenames are still present so older commands and
-references do not break.
 
 ## Modes
 
@@ -34,7 +30,7 @@ python VALIDATE.py accept
 - `scale`: heavier live acceptance run
 - `nautilus`: conversion + catalog checks
 - `purge`: date-scoped purge safety checks
-- `converter`: legacy alias that delegates to `nautilus`
+- `converter`: alias that delegates to `nautilus`
 - `all`: quick multi-check suite
 - `accept`: broader acceptance suite
 

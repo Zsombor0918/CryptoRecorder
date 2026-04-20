@@ -2,15 +2,109 @@
   "BINANCE_SPOT": [
     "BTCUSDT",
     "ETHUSDT",
-    "SOLUSDT"
+    "SOLUSDT",
+    "XRPUSDT",
+    "USD1USDT",
+    "DOGEUSDT",
+    "TREEUSDT",
+    "ZECUSDT",
+    "AAVEUSDT",
+    "TRXUSDT",
+    "BNBUSDT",
+    "RLUSDUSDT",
+    "HIGHUSDT",
+    "ORDIUSDT",
+    "PEPEUSDT",
+    "ENJUSDT",
+    "BOMEUSDT",
+    "ADAUSDT",
+    "SUIUSDT",
+    "LINKUSDT",
+    "AVAXUSDT",
+    "BLURUSDT",
+    "TAOUSDT",
+    "ZROUSDT",
+    "PHBUSDT",
+    "MOVEUSDT",
+    "USDEUSDT",
+    "NEARUSDT",
+    "PAXGUSDT",
+    "ENAUSDT",
+    "EURUSDT",
+    "TONUSDT",
+    "CFGUSDT",
+    "GUNUSDT",
+    "REQUSDT",
+    "PROMUSDT",
+    "BIOUSDT",
+    "LTCUSDT",
+    "GTCUSDT",
+    "GIGGLEUSDT",
+    "NEIROUSDT",
+    "ARKMUSDT",
+    "WLDUSDT",
+    "UNIUSDT",
+    "PENGUUSDT",
+    "ASTERUSDT",
+    "UTKUSDT",
+    "APTUSDT",
+    "DASHUSDT",
+    "SPKUSDT"
   ],
   "BINANCE_USDTF": [
     "BTCUSDT",
     "ETHUSDT",
-    "RAVEUSDT"
+    "RAVEUSDT",
+    "SOLUSDT",
+    "PIEVERSEUSDT",
+    "XRPUSDT",
+    "DOGEUSDT",
+    "ZECUSDT",
+    "HIGHUSDT",
+    "HYPEUSDT",
+    "AAVEUSDT",
+    "1000PEPEUSDT",
+    "ORDIUSDT",
+    "BNBUSDT",
+    "BLURUSDT",
+    "ENJUSDT",
+    "BOMEUSDT",
+    "GWEIUSDT",
+    "ADAUSDT",
+    "TAOUSDT",
+    "PHBUSDT",
+    "SUIUSDT",
+    "PROMUSDT",
+    "ENAUSDT",
+    "BASEDUSDT",
+    "AVAXUSDT",
+    "SIRENUSDT",
+    "GTCUSDT",
+    "LINKUSDT",
+    "BULLAUSDT",
+    "MOVEUSDT",
+    "TRXUSDT",
+    "NEARUSDT",
+    "DOTUSDT",
+    "ZROUSDT",
+    "GENIUSUSDT",
+    "BIOUSDT",
+    "RIVERUSDT",
+    "FILUSDT",
+    "PAXGUSDT",
+    "GRIFFAINUSDT",
+    "GUAUSDT",
+    "TRUMPUSDT",
+    "BCHUSDT",
+    "WLDUSDT",
+    "CFGUSDT",
+    "DEXEUSDT",
+    "LTCUSDT",
+    "EDGEUSDT",
+    "CRVUSDT"
   ],
-  "timestamp": "2026-04-20T00:05:49.381023",
-  "top_count": 3,
+  "timestamp": "2026-04-20T00:12:15.678579",
+  "top_count": 50,
   "candidate_pool_size": 120,
   "candidate_pool_sizes": {
     "BINANCE_SPOT": 120,
@@ -18,12 +112,12 @@
   },
   "filter_version": "v3_futures_support_precheck",
   "requested_counts": {
-    "BINANCE_SPOT": 3,
-    "BINANCE_USDTF": 3
+    "BINANCE_SPOT": 50,
+    "BINANCE_USDTF": 50
   },
   "selected_counts": {
-    "BINANCE_SPOT": 3,
-    "BINANCE_USDTF": 3
+    "BINANCE_SPOT": 50,
+    "BINANCE_USDTF": 50
   },
   "selection_metadata": {
     "BINANCE_SPOT": {
@@ -37,46 +131,53 @@
       "candidate_pool_raw_count": 120,
       "candidate_pool_after_sanity_count": 114,
       "candidate_pool_after_support_check_count": 114,
-      "requested_count": 3,
+      "requested_count": 50,
       "eligible_count": 114,
       "survivor_count": 114,
-      "selected_count": 3,
+      "selected_count": 50,
       "selected_sample": [
         "BTCUSDT",
         "ETHUSDT",
-        "SOLUSDT"
+        "SOLUSDT",
+        "XRPUSDT",
+        "USD1USDT",
+        "DOGEUSDT",
+        "TREEUSDT",
+        "ZECUSDT",
+        "AAVEUSDT",
+        "TRXUSDT"
       ],
       "pre_filter_rejected_count": 6,
       "pre_filter_rejected_sample": [
         {
           "symbol": "USDCUSDT",
           "reason": "known unsupported symbol USDCUSDT",
-          "quote_volume": 1711969118.4492
+          "quote_volume": 1712619302.69617
         },
         {
           "symbol": "\u5e01\u5b89\u4eba\u751fUSDT",
           "reason": "contains non-ASCII characters",
-          "quote_volume": 114223117.92434
+          "quote_volume": 114130795.54379
         },
         {
           "symbol": "FDUSDUSDT",
           "reason": "known unsupported base asset FDUSD",
-          "quote_volume": 29099625.5725
+          "quote_volume": 29090324.3156
         },
         {
           "symbol": "UUSDT",
           "reason": "base asset shorter than 2 chars ('U')",
-          "quote_volume": 16505787.1348
+          "quote_volume": 16577811.3287
         },
         {
           "symbol": "DUSDT",
           "reason": "base asset shorter than 2 chars ('D')",
-          "quote_volume": 4852744.35233
+          "quote_volume": 4855888.69021
         },
         {
           "symbol": "WUSDT",
           "reason": "base asset shorter than 2 chars ('W')",
-          "quote_volume": 4246989.76731
+          "quote_volume": 4260655.55903
         }
       ],
       "rejected_pre_filter_count": 6,
@@ -84,32 +185,32 @@
         {
           "symbol": "USDCUSDT",
           "reason": "known unsupported symbol USDCUSDT",
-          "quote_volume": 1711969118.4492
+          "quote_volume": 1712619302.69617
         },
         {
           "symbol": "\u5e01\u5b89\u4eba\u751fUSDT",
           "reason": "contains non-ASCII characters",
-          "quote_volume": 114223117.92434
+          "quote_volume": 114130795.54379
         },
         {
           "symbol": "FDUSDUSDT",
           "reason": "known unsupported base asset FDUSD",
-          "quote_volume": 29099625.5725
+          "quote_volume": 29090324.3156
         },
         {
           "symbol": "UUSDT",
           "reason": "base asset shorter than 2 chars ('U')",
-          "quote_volume": 16505787.1348
+          "quote_volume": 16577811.3287
         },
         {
           "symbol": "DUSDT",
           "reason": "base asset shorter than 2 chars ('D')",
-          "quote_volume": 4852744.35233
+          "quote_volume": 4855888.69021
         },
         {
           "symbol": "WUSDT",
           "reason": "base asset shorter than 2 chars ('W')",
-          "quote_volume": 4246989.76731
+          "quote_volume": 4260655.55903
         }
       ],
       "support_precheck_available": false,
@@ -128,26 +229,33 @@
       "candidate_pool_raw_count": 200,
       "candidate_pool_after_sanity_count": 193,
       "candidate_pool_after_support_check_count": 139,
-      "requested_count": 3,
+      "requested_count": 50,
       "eligible_count": 139,
       "survivor_count": 139,
-      "selected_count": 3,
+      "selected_count": 50,
       "selected_sample": [
         "BTCUSDT",
         "ETHUSDT",
-        "RAVEUSDT"
+        "RAVEUSDT",
+        "SOLUSDT",
+        "PIEVERSEUSDT",
+        "XRPUSDT",
+        "DOGEUSDT",
+        "ZECUSDT",
+        "HIGHUSDT",
+        "HYPEUSDT"
       ],
       "pre_filter_rejected_count": 7,
       "pre_filter_rejected_sample": [
         {
           "symbol": "\u5e01\u5b89\u4eba\u751fUSDT",
           "reason": "contains non-ASCII characters",
-          "quote_volume": 431624954.84976
+          "quote_volume": 431418782.45388
         },
         {
           "symbol": "MUSDT",
           "reason": "base asset shorter than 2 chars ('M')",
-          "quote_volume": 88029765.5969
+          "quote_volume": 88077959.7377
         },
         {
           "symbol": "42USDT",
@@ -157,22 +265,22 @@
         {
           "symbol": "\u6211\u8e0f\u9a6c\u6765\u4e86USDT",
           "reason": "contains non-ASCII characters",
-          "quote_volume": 26167111.942765
+          "quote_volume": 25953804.389855
         },
         {
           "symbol": "HUSDT",
           "reason": "base asset shorter than 2 chars ('H')",
-          "quote_volume": 15537890.58635
+          "quote_volume": 15547920.27487
         },
         {
           "symbol": "DUSDT",
           "reason": "base asset shorter than 2 chars ('D')",
-          "quote_volume": 14095111.942842
+          "quote_volume": 14089951.073789
         },
         {
           "symbol": "WUSDT",
           "reason": "base asset shorter than 2 chars ('W')",
-          "quote_volume": 12611046.840074
+          "quote_volume": 12622534.682333
         }
       ],
       "rejected_pre_filter_count": 7,
@@ -180,12 +288,12 @@
         {
           "symbol": "\u5e01\u5b89\u4eba\u751fUSDT",
           "reason": "contains non-ASCII characters",
-          "quote_volume": 431624954.84976
+          "quote_volume": 431418782.45388
         },
         {
           "symbol": "MUSDT",
           "reason": "base asset shorter than 2 chars ('M')",
-          "quote_volume": 88029765.5969
+          "quote_volume": 88077959.7377
         },
         {
           "symbol": "42USDT",
@@ -195,22 +303,22 @@
         {
           "symbol": "\u6211\u8e0f\u9a6c\u6765\u4e86USDT",
           "reason": "contains non-ASCII characters",
-          "quote_volume": 26167111.942765
+          "quote_volume": 25953804.389855
         },
         {
           "symbol": "HUSDT",
           "reason": "base asset shorter than 2 chars ('H')",
-          "quote_volume": 15537890.58635
+          "quote_volume": 15547920.27487
         },
         {
           "symbol": "DUSDT",
           "reason": "base asset shorter than 2 chars ('D')",
-          "quote_volume": 14095111.942842
+          "quote_volume": 14089951.073789
         },
         {
           "symbol": "WUSDT",
           "reason": "base asset shorter than 2 chars ('W')",
-          "quote_volume": 12611046.840074
+          "quote_volume": 12622534.682333
         }
       ],
       "support_precheck_available": true,
@@ -227,7 +335,7 @@
           "symbol": "CLUSDT",
           "cf_symbol": "CL-USDT-PERP",
           "reason": "missing from cryptofeed BinanceFutures symbol_mapping",
-          "quote_volume": 493521113.1096
+          "quote_volume": 501478339.7549
         },
         {
           "symbol": "BNXUSDT",
@@ -239,7 +347,7 @@
           "symbol": "XAUUSDT",
           "cf_symbol": "XAU-USDT-PERP",
           "reason": "missing from cryptofeed BinanceFutures symbol_mapping",
-          "quote_volume": 417430724.28
+          "quote_volume": 425551654.79
         },
         {
           "symbol": "ALPHAUSDT",
@@ -251,13 +359,13 @@
           "symbol": "XAGUSDT",
           "cf_symbol": "XAG-USDT-PERP",
           "reason": "missing from cryptofeed BinanceFutures symbol_mapping",
-          "quote_volume": 310182978.7251
+          "quote_volume": 315682255.6808
         },
         {
           "symbol": "BZUSDT",
           "cf_symbol": "BZ-USDT-PERP",
           "reason": "missing from cryptofeed BinanceFutures symbol_mapping",
-          "quote_volume": 220800766.4714
+          "quote_volume": 222890010.24
         },
         {
           "symbol": "PORT3USDT",

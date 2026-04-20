@@ -119,7 +119,7 @@ def purge_catalog_date_range(
     return purged
 
 
-# ── legacy alias (kept for validate_system.py import compat) ─────────
+# ── compatibility alias (kept for system.py import compat) ───────────
 
 def purge_catalog_data(catalog_root: Path, instruments) -> int:
     """Legacy entry point — delegates to date-scoped purge.

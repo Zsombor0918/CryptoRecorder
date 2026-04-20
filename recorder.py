@@ -41,6 +41,7 @@ from binance_universe import UniverseSelector, partition_known_unsupported_symbo
 from disk_monitor import DiskMonitor
 from health_monitor import HealthMonitor
 from storage import StorageManager
+from time_utils import local_now_iso
 
 # ============================================================================
 # Logging
@@ -479,7 +480,7 @@ def _setup_feeds(universe: Dict[str, Any]) -> Tuple[FeedHandler, Dict[str, Any]]
     futures_disabled_reason = ""
     fh = FeedHandler()
     coverage: Dict[str, Any] = {
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": local_now_iso(),
         "spot": _make_venue_coverage(
             "BINANCE_SPOT",
             universe.get('BINANCE_SPOT', []),

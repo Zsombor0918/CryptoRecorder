@@ -4,9 +4,7 @@ VALIDATE.py  –  Master validation entrypoint for CryptoRecorder.
 
 Preferred validator entrypoints live under ``validators/`` with short names:
 ``system.py``, ``runtime.py``, ``scale.py``, ``nautilus_catalog.py``,
-``purge_safety.py``, and ``converter.py``.
-
-Legacy ``validate_*.py`` filenames remain in the repository for compatibility.
+and ``purge_safety.py``.
 """
 import json
 import subprocess
@@ -14,6 +12,8 @@ import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional, Tuple
+
+from time_utils import local_now_iso
 
 # ── colours ──────────────────────────────────────────────────────────
 
@@ -35,7 +35,6 @@ VALIDATOR_SCRIPTS = {
     "scale": PROJECT / "validators" / "scale.py",
     "nautilus": PROJECT / "validators" / "nautilus_catalog.py",
     "purge": PROJECT / "validators" / "purge_safety.py",
-    "converter": PROJECT / "validators" / "converter.py",
 }
 
 
@@ -102,8 +101,8 @@ def run_runtime(runtime_sec: int = 180) -> bool:
 
 
 def run_converter() -> bool:
-    print(f"\n{C.B}► Converter compatibility mode (validators/converter.py){C._}")
-    ok, out = _run(_validator_cmd("converter"))
+    print(f"\n{C.B}► Converter alias (validators/nautilus_catalog.py){C._}")
+    ok, out = _run(_validator_cmd("nautilus"))
     val_dir = STATE / "validation"
     rpt = None
     if val_dir.exists():
@@ -204,7 +203,7 @@ def run_purge() -> bool:
 
 def _save_and_print(results: Dict[str, bool]) -> int:
     report = {
-        "timestamp": datetime.now().isoformat(),
+        "timestamp": local_now_iso(),
         "results": {k: {"passed": v} for k, v in results.items()},
         "total": len(results),
         "passed": sum(results.values()),
@@ -235,7 +234,7 @@ USAGE = f"""\
   python VALIDATE.py scale        50/50 scale acceptance test
   python VALIDATE.py nautilus     Nautilus catalog E2E
   python VALIDATE.py purge        Purge safety proof
-  python VALIDATE.py converter    Legacy alias for converter validation
+  python VALIDATE.py converter    Alias of `nautilus`
   python VALIDATE.py all          system + runtime + nautilus + purge  (quick suite)
   python VALIDATE.py accept       system + runtime + scale + nautilus + purge  (full DoD)
   python VALIDATE.py --help       This message

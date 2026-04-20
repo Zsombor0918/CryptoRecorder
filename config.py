@@ -102,6 +102,9 @@ HEARTBEAT_INTERVAL_SEC: Final = 30
 # Health check interval (seconds)
 HEALTH_CHECK_INTERVAL_SEC: Final = 10
 
+# Human-facing timestamps in reports/heartbeat use Hungary local time.
+REPORT_TIMEZONE_NAME: Final = "Europe/Budapest"
+
 # ============================================================================
 # Disk management
 # ============================================================================

@@ -43,12 +43,6 @@ python recorder.py
 python convert_day.py --date YYYY-MM-DD
 ```
 
-Legacy-compatible command:
-
-```bash
-python convert_yesterday.py --date YYYY-MM-DD
-```
-
 ## Service install (optional)
 
 ```bash
@@ -60,8 +54,7 @@ sudo systemctl enable --now cryptofeed-recorder
 sudo systemctl enable --now nautilus-convert.timer
 ```
 
-The service units now use `convert_day.py` as the preferred converter CLI.
-`convert_yesterday.py` remains available as a legacy-compatible wrapper.
+The service units use `convert_day.py` as the converter CLI.
 
 ## Useful checks
 
