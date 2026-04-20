@@ -1,23 +1,4 @@
-#!/usr/bin/env python3
-"""
-tests/test_spot_feed_resilience.py — Prove spot feed survives one bad symbol.
-
-Scenario:
-  1. Spot universe contains one unsupported symbol.
-  2. _setup_feeds() strips only the bad symbol and still adds the spot feed.
-  3. Coverage summary reports requested/dropped/active symbols correctly.
-  4. Futures feed still adds normally.
-
-Usage:
-    python tests/test_spot_feed_resilience.py
-"""
 from __future__ import annotations
-
-import sys
-from pathlib import Path
-
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(PROJECT_ROOT))
 
 
 class DummyFeedHandler:
@@ -51,7 +32,7 @@ class DummyFuturesFeed:
         self.callbacks = callbacks
 
 
-def run_tests() -> int:
+def test_spot_feed_survives_one_bad_symbol() -> None:
     import recorder
 
     original_feed_handler = recorder.FeedHandler
@@ -73,68 +54,34 @@ def run_tests() -> int:
         }
         fh, coverage = recorder._setup_feeds(universe)
 
-        ok1 = len(fh.feeds) == 2
-        print(f"  [{'PASS' if ok1 else 'FAIL'}] both_feeds_added (count={len(fh.feeds)})")
+        assert len(fh.feeds) == 2
 
-        spot_feed = fh.feeds[0] if fh.feeds else None
-        ok2 = spot_feed is not None and spot_feed.symbols == ["BTC-USDT", "ETH-USDT"]
-        print(
-            f"  [{'PASS' if ok2 else 'FAIL'}] bad_spot_symbol_stripped "
-            f"(spot_symbols={getattr(spot_feed, 'symbols', None)})"
-        )
+        spot_feed = fh.feeds[0]
+        assert spot_feed.symbols == ["BTC-USDT", "ETH-USDT"]
 
         spot_cov = coverage["spot"]
-        ok3 = (
-            spot_cov["requested_count"] == 3
-            and spot_cov["selected_count"] == 3
-            and spot_cov["dropped_raw"] == ["UTKUSDT"]
-            and spot_cov["runtime_dropped_raw"] == ["UTKUSDT"]
-            and spot_cov["runtime_dropped_count"] == 1
-            and spot_cov["active_raw"] == ["BTCUSDT", "ETHUSDT"]
-        )
-        print(
-            f"  [{'PASS' if ok3 else 'FAIL'}] spot_coverage_summary "
-            f"(coverage={spot_cov})"
-        )
+        assert spot_cov["requested_count"] == 3
+        assert spot_cov["selected_count"] == 3
+        assert spot_cov["dropped_raw"] == ["UTKUSDT"]
+        assert spot_cov["runtime_dropped_raw"] == ["UTKUSDT"]
+        assert spot_cov["runtime_dropped_count"] == 1
+        assert spot_cov["active_raw"] == ["BTCUSDT", "ETHUSDT"]
 
-        fut_feed = fh.feeds[1] if len(fh.feeds) > 1 else None
-        ok4 = fut_feed is not None and fut_feed.symbols == ["BTC-USDT-PERP", "ETH-USDT-PERP"]
-        print(
-            f"  [{'PASS' if ok4 else 'FAIL'}] futures_feed_untouched "
-            f"(futures_symbols={getattr(fut_feed, 'symbols', None)})"
-        )
+        fut_feed = fh.feeds[1]
+        assert fut_feed.symbols == ["BTC-USDT-PERP", "ETH-USDT-PERP"]
 
         fut_cov = coverage["futures"]
-        ok5 = (
-            fut_cov["requested_count"] == 2
-            and fut_cov["selected_count"] == 2
-            and fut_cov["dropped_raw"] == []
-            and fut_cov["runtime_dropped_count"] == 0
-            and fut_cov["active_raw"] == ["BTCUSDT", "ETHUSDT"]
-        )
-        print(
-            f"  [{'PASS' if ok5 else 'FAIL'}] futures_coverage_summary "
-            f"(coverage={fut_cov})"
-        )
+        assert fut_cov["requested_count"] == 2
+        assert fut_cov["selected_count"] == 2
+        assert fut_cov["dropped_raw"] == []
+        assert fut_cov["runtime_dropped_count"] == 0
+        assert fut_cov["active_raw"] == ["BTCUSDT", "ETHUSDT"]
 
-        ok6 = recorder.futures_enabled is True and recorder.futures_disabled_reason == ""
-        print(
-            f"  [{'PASS' if ok6 else 'FAIL'}] futures_status_unchanged "
-            f"(enabled={recorder.futures_enabled}, reason={recorder.futures_disabled_reason!r})"
-        )
-
-        results = [ok1, ok2, ok3, ok4, ok5, ok6]
-        passed = sum(results)
-        total = len(results)
-        print(f"\n  {passed}/{total} passed")
-        return 0 if passed == total else 1
+        assert recorder.futures_enabled is True
+        assert recorder.futures_disabled_reason == ""
     finally:
         recorder.FeedHandler = original_feed_handler
         recorder.Binance = original_spot
         recorder.BinanceFutures = original_futures
         recorder.futures_enabled = original_futures_enabled
         recorder.futures_disabled_reason = original_futures_disabled_reason
-
-
-if __name__ == "__main__":
-    raise SystemExit(run_tests())

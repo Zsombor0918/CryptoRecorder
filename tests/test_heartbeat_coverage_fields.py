@@ -1,107 +1,74 @@
-#!/usr/bin/env python3
-"""
-tests/test_heartbeat_coverage_fields.py — Verify top-level heartbeat venue fields.
-
-Usage:
-    python tests/test_heartbeat_coverage_fields.py
-"""
 from __future__ import annotations
 
 import asyncio
 import importlib
 import json
 import shutil
-import sys
 import tempfile
 from datetime import datetime
 from pathlib import Path
-
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(PROJECT_ROOT))
 
 
 def _patch_state_root(tmpdir: Path):
     import config
 
+    original_state_root = config.STATE_ROOT
     config.STATE_ROOT = tmpdir / "state"
     config.STATE_ROOT.mkdir(parents=True, exist_ok=True)
 
     import health_monitor
+
     importlib.reload(health_monitor)
-    return health_monitor
+    return config, health_monitor, original_state_root
 
 
-def run_tests() -> int:
+def test_heartbeat_coverage_fields_are_exposed_consistently() -> None:
     tmpdir = Path(tempfile.mkdtemp(prefix="heartbeat_cov_"))
     try:
-        health_monitor = _patch_state_root(tmpdir)
-        hm = health_monitor.HealthMonitor()
-        hm.set_startup_coverage({
-            "spot": {
-                "requested_count": 5,
-                "runtime_dropped_raw": ["UTKUSDT", "USDCUSDT"],
-            },
-            "futures": {
-                "requested_count": 4,
-                "runtime_dropped_raw": ["AGIXUSDT"],
-            },
-        })
-        hm.record_message("BINANCE_SPOT", "BTCUSDT", ts_event=1)
-        hm.record_message("BINANCE_SPOT", "ETHUSDT", ts_event=2)
-        hm.record_message("BINANCE_USDTF", "BTCUSDT", ts_event=3)
+        config, health_monitor, original_state_root = _patch_state_root(tmpdir)
+        try:
+            hm = health_monitor.HealthMonitor()
+            hm.set_startup_coverage({
+                "spot": {
+                    "requested_count": 5,
+                    "runtime_dropped_raw": ["UTKUSDT", "USDCUSDT"],
+                },
+                "futures": {
+                    "requested_count": 4,
+                    "runtime_dropped_raw": ["AGIXUSDT"],
+                },
+            })
+            hm.record_message("BINANCE_SPOT", "BTCUSDT", ts_event=1)
+            hm.record_message("BINANCE_SPOT", "ETHUSDT", ts_event=2)
+            hm.record_message("BINANCE_USDTF", "BTCUSDT", ts_event=3)
 
-        asyncio.run(hm.write_heartbeat())
+            asyncio.run(hm.write_heartbeat())
 
-        hb = json.loads((tmpdir / "state" / "heartbeat.json").read_text())
-        ok1 = hb["spot_symbols_active"] == 2 and hb["futures_symbols_active"] == 1
-        print(
-            f"  [{'PASS' if ok1 else 'FAIL'}] active_counts "
-            f"(spot={hb.get('spot_symbols_active')}, futures={hb.get('futures_symbols_active')})"
-        )
+            hb = json.loads((tmpdir / "state" / "heartbeat.json").read_text())
+            assert hb["spot_symbols_active"] == 2
+            assert hb["futures_symbols_active"] == 1
+            assert hb["spot_symbols_requested"] == 5
+            assert hb["futures_symbols_requested"] == 4
+            assert hb["spot_symbols_dropped"] == 2
+            assert hb["futures_symbols_dropped"] == 1
+            assert hb["spot_symbols_dropped_list"] == ["UTKUSDT", "USDCUSDT"]
+            assert hb["futures_symbols_dropped_list"] == ["AGIXUSDT"]
+            assert hb["spot_coverage_ratio"] == 0.4
+            assert hb["futures_coverage_ratio"] == 0.25
 
-        ok2 = hb["spot_symbols_requested"] == 5 and hb["futures_symbols_requested"] == 4
-        print(
-            f"  [{'PASS' if ok2 else 'FAIL'}] requested_counts "
-            f"(spot={hb.get('spot_symbols_requested')}, futures={hb.get('futures_symbols_requested')})"
-        )
+            hb_ts = datetime.fromisoformat(hb["timestamp"])
+            sym_ts = datetime.fromisoformat(
+                hb["by_venue"]["BINANCE_SPOT"][0]["last_heartbeat"]
+            )
+            allowed_offsets = {3600.0, 7200.0}
+            assert hb_ts.utcoffset() is not None
+            assert hb_ts.utcoffset().total_seconds() in allowed_offsets
+            assert sym_ts.utcoffset() is not None
+            assert sym_ts.utcoffset().total_seconds() in allowed_offsets
+        finally:
+            config.STATE_ROOT = original_state_root
+            import health_monitor as restored_health_monitor
 
-        ok3 = hb["spot_symbols_dropped"] == 2 and hb["futures_symbols_dropped"] == 1
-        print(
-            f"  [{'PASS' if ok3 else 'FAIL'}] dropped_counts "
-            f"(spot={hb.get('spot_symbols_dropped')}, futures={hb.get('futures_symbols_dropped')})"
-        )
-
-        ok4 = hb["spot_symbols_dropped_list"] == ["UTKUSDT", "USDCUSDT"]
-        ok4 = ok4 and hb["futures_symbols_dropped_list"] == ["AGIXUSDT"]
-        print(
-            f"  [{'PASS' if ok4 else 'FAIL'}] dropped_lists "
-            f"(spot={hb.get('spot_symbols_dropped_list')}, futures={hb.get('futures_symbols_dropped_list')})"
-        )
-
-        ok5 = hb["spot_coverage_ratio"] == 0.4 and hb["futures_coverage_ratio"] == 0.25
-        print(
-            f"  [{'PASS' if ok5 else 'FAIL'}] coverage_ratio "
-            f"(spot={hb.get('spot_coverage_ratio')}, futures={hb.get('futures_coverage_ratio')})"
-        )
-
-        hb_ts = datetime.fromisoformat(hb["timestamp"])
-        sym_ts = datetime.fromisoformat(hb["by_venue"]["BINANCE_SPOT"][0]["last_heartbeat"])
-        allowed_offsets = {3600.0, 7200.0}
-        ok6 = hb_ts.utcoffset() is not None and hb_ts.utcoffset().total_seconds() in allowed_offsets
-        ok6 = ok6 and sym_ts.utcoffset() is not None and sym_ts.utcoffset().total_seconds() in allowed_offsets
-        print(
-            f"  [{'PASS' if ok6 else 'FAIL'}] timezone_offset "
-            f"(heartbeat={hb.get('timestamp')}, last_heartbeat={hb['by_venue']['BINANCE_SPOT'][0]['last_heartbeat']})"
-        )
-
-        results = [ok1, ok2, ok3, ok4, ok5, ok6]
-        passed = sum(results)
-        total = len(results)
-        print(f"\n  {passed}/{total} passed")
-        return 0 if passed == total else 1
+            importlib.reload(restored_health_monitor)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
-
-
-if __name__ == "__main__":
-    raise SystemExit(run_tests())
