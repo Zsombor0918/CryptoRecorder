@@ -1,6 +1,7 @@
 """
-Configuration and constants for Binance Market Data Recorder.
+Configuration and constants for CryptoRecorder.
 """
+import os
 from pathlib import Path
 from typing import Final
 
@@ -28,7 +29,7 @@ BINANCE_SPOT_REST: Final = "https://api.binance.com"
 BINANCE_FUTURES_REST: Final = "https://fapi.binance.com"
 
 # ============================================================================
-# Venues & Symbols
+# Venue / selection policy
 # ============================================================================
 
 VENUES: Final = ["BINANCE_SPOT", "BINANCE_USDTF"]
@@ -37,19 +38,17 @@ VENUE_FULL_NAMES: Final = {
     "BINANCE_USDTF": "Binance USDT-M Futures",
 }
 
-import os as _os
-
 # Target number of symbols per venue (selected by 24h quote volume)
 # Override with CRYPTO_RECORDER_TOP_SYMBOLS env var for testing
-TOP_SYMBOLS: Final = int(_os.environ.get("CRYPTO_RECORDER_TOP_SYMBOLS", "50"))
+TOP_SYMBOLS: Final = int(os.environ.get("CRYPTO_RECORDER_TOP_SYMBOLS", "50"))
 
 # Universe selection uses a larger ranked candidate pool before applying
 # sanity/support filters, then keeps the best TOP_SYMBOLS survivors.
 TOP_SYMBOL_CANDIDATES: Final = int(
-    _os.environ.get("CRYPTO_RECORDER_TOP_SYMBOL_CANDIDATES", "120")
+    os.environ.get("CRYPTO_RECORDER_TOP_SYMBOL_CANDIDATES", "120")
 )
 FUTURES_TOP_SYMBOL_CANDIDATES: Final = int(
-    _os.environ.get("CRYPTO_RECORDER_FUTURES_TOP_SYMBOL_CANDIDATES", "200")
+    os.environ.get("CRYPTO_RECORDER_FUTURES_TOP_SYMBOL_CANDIDATES", "200")
 )
 
 # Selection policy metadata written into the cached universe files.
@@ -71,14 +70,14 @@ QUOTE_ASSET_SPOT: Final = "USDT"
 QUOTE_ASSET_FUTURES: Final = "USDT"  # For USDT-M perpetuals
 
 # ============================================================================
-# Stream Configuration
+# Recorder runtime
 # ============================================================================
 
 # WebSocket depth update frequency (100ms or 1000ms)
 DEPTH_INTERVAL_MS: Final = 100
 
-# REST snapshot interval (seconds)
-SNAPSHOT_INTERVAL_SEC: Final = 600  # 10 minutes
+# Legacy placeholder kept for config compatibility; REST snapshots stay disabled.
+SNAPSHOT_INTERVAL_SEC: Final = 600
 
 # Exchange info fetch interval (seconds)
 EXCHANGEINFO_INTERVAL_SEC: Final = 21600  # 6 hours
@@ -94,7 +93,7 @@ ROTATION_INTERVAL_MIN: Final = 60  # Hourly rotation
 COMPRESSION_FORMAT: Final = "zstd"
 
 # ============================================================================
-# Monitoring & Health
+# Monitoring / observability
 # ============================================================================
 
 # Heartbeat interval (seconds)
@@ -104,16 +103,16 @@ HEARTBEAT_INTERVAL_SEC: Final = 30
 HEALTH_CHECK_INTERVAL_SEC: Final = 10
 
 # ============================================================================
-# Disk Management (expanded to 500GB capacity)
+# Disk management
 # ============================================================================
 
 # Disk usage check interval (seconds)
 DISK_CHECK_INTERVAL_SEC: Final = 600  # 10 minutes
 
-# Disk usage limits (GB) - for 500GB total capacity
-DISK_SOFT_LIMIT_GB: Final = 400  # Warn at 80% (400GB)
-DISK_HARD_LIMIT_GB: Final = 480  # Critical at 96% (480GB)
-DISK_CLEANUP_TARGET_GB: Final = 350  # Clean down to 70% (350GB)
+# Disk usage limits (GB)
+DISK_SOFT_LIMIT_GB: Final = 400
+DISK_HARD_LIMIT_GB: Final = 480
+DISK_CLEANUP_TARGET_GB: Final = 350
 
 # ============================================================================
 # Logging Configuration
@@ -124,7 +123,7 @@ LOG_FILE: Final = PROJECT_ROOT / "recorder.log"
 LOG_FORMAT: Final = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 
 # ============================================================================
-# Queue Configuration
+# Queue / writer backpressure
 # ============================================================================
 
 # Max size of in-memory queues (to prevent memory bloat)
@@ -137,7 +136,7 @@ WRITER_BATCH_SIZE: Final = 100
 WRITER_FLUSH_INTERVAL_SEC: Final = 5
 
 # ============================================================================
-# Network Configuration
+# Network / reconnect
 # ============================================================================
 
 # API request timeout (seconds)
@@ -152,21 +151,21 @@ RECONNECT_MAX_DELAY_SEC: Final = 60
 RECONNECT_MAX_ATTEMPTS: Final = 0  # 0 = unlimited
 
 # ============================================================================
-# Converter Configuration (for Nautilus conversion)
+# Converter / catalog output
 # ============================================================================
 
 NAUTILUS_CATALOG_ROOT: Final = PROJECT_ROOT.parent / "nautilus_data" / "catalog"
 CONVERTER_BATCH_SIZE: Final = 1000
 
-# Raw data retention days (converter will not delete raw data < this many days old)
+# Raw data retention days for disk cleanup.
 RAW_RETENTION_DAYS: Final = 7
 
 # ============================================================================
-# Test Mode Configuration (for validation/smoke testing)
+# Validation / test mode
 # ============================================================================
 
-# Test mode overrides (set via environment or direct import)
+# Validation helpers kept here so smoke tests share one source of truth.
 TEST_MODE: Final = False
 TEST_MODE_SYMBOLS: Final = 3  # Use only 3 symbols in test mode
-TEST_MODE_SNAPSHOT_INTERVAL_SEC: Final = 60  # Faster snapshots in test (vs 600s)
+TEST_MODE_SNAPSHOT_INTERVAL_SEC: Final = 60  # Legacy placeholder, snapshots disabled.
 TEST_MODE_HEARTBEAT_INTERVAL_SEC: Final = 5  # Faster heartbeat in test (vs 30s)

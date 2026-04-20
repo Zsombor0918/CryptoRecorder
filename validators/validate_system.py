@@ -229,10 +229,13 @@ class SystemValidator:
         self.test("Directory structure", check_root)
         
         def check_converter():
-            converter_file = self.project_root / 'convert_yesterday.py'
-            if not converter_file.exists():
-                raise ValueError("convert_yesterday.py not found")
-            return "Converter script present"
+            preferred_cli = self.project_root / 'convert_day.py'
+            legacy_cli = self.project_root / 'convert_yesterday.py'
+            if not preferred_cli.exists():
+                raise ValueError("convert_day.py not found")
+            if not legacy_cli.exists():
+                raise ValueError("convert_yesterday.py compatibility wrapper not found")
+            return "Converter CLIs present (preferred + legacy wrapper)"
         
         self.test("Converter module structure", check_converter)
         
@@ -280,7 +283,8 @@ class SystemValidator:
 
         def check_converter_cli():
             from convert_yesterday import convert_date
-            return "convert_yesterday.py imports OK"
+            from convert_day import main
+            return "convert_day.py and convert_yesterday.py import OK"
 
         self.test("Converter entry point", check_converter_cli)
     

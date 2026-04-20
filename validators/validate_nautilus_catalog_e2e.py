@@ -75,7 +75,7 @@ def _run_converter(date_str: str) -> tuple[bool, str]:
     venv_py = PROJECT_ROOT / ".venv" / "bin" / "python3"
     py = str(venv_py) if venv_py.exists() else sys.executable
     result = subprocess.run(
-        [py, str(PROJECT_ROOT / "convert_yesterday.py"), "--date", date_str],
+        [py, str(PROJECT_ROOT / "convert_day.py"), "--date", date_str],
         capture_output=True, text=True, cwd=str(PROJECT_ROOT), timeout=300,
     )
     if result.returncode != 0:

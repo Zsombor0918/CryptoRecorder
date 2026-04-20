@@ -13,7 +13,6 @@ from collections import defaultdict
 from config import (
     STATE_ROOT,
     HEARTBEAT_INTERVAL_SEC,
-    HEALTH_CHECK_INTERVAL_SEC,
 )
 
 logger = logging.getLogger(__name__)
@@ -119,8 +118,12 @@ class HealthMonitor:
         futures = coverage.get("futures", {})
         self.spot_symbols_requested = int(spot.get("requested_count", 0) or 0)
         self.futures_symbols_requested = int(futures.get("requested_count", 0) or 0)
-        self.spot_symbols_dropped_list = list(spot.get("dropped_all_raw", []))
-        self.futures_symbols_dropped_list = list(futures.get("dropped_all_raw", []))
+        self.spot_symbols_dropped_list = list(
+            spot.get("runtime_dropped_raw", spot.get("dropped_all_raw", []))
+        )
+        self.futures_symbols_dropped_list = list(
+            futures.get("runtime_dropped_raw", futures.get("dropped_all_raw", []))
+        )
     
     async def write_heartbeat(self) -> None:
         """Write heartbeat with current stats."""

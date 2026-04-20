@@ -140,12 +140,17 @@ def _make_venue_coverage(venue: str, requested_raw: List[str], suspicious_warnin
         "venue": venue,
         "requested_raw": list(requested_raw),
         "requested_count": len(requested_raw),
+        "selected_raw": list(requested_raw),
+        "selected_count": len(requested_raw),
         "filtered_raw": [],
         "filtered_cf": [],
         "filtered_count": 0,
         "dropped_raw": [],
         "dropped_cf": [],
         "dropped_count": 0,
+        "runtime_dropped_raw": [],
+        "runtime_dropped_cf": [],
+        "runtime_dropped_count": 0,
         "active_raw": [],
         "active_cf": [],
         "active_count": 0,
@@ -169,6 +174,8 @@ def _finalize_venue_coverage(
     warn_ratio: float,
 ) -> None:
     """Derive counts and emit startup coverage summary logs."""
+    coverage["selected_raw"] = list(coverage.get("requested_raw", []))
+    coverage["selected_count"] = int(coverage.get("requested_count", 0) or 0)
     coverage["filtered_count"] = len(coverage["filtered_raw"])
     coverage["dropped_count"] = len(coverage["dropped_raw"])
     coverage["active_count"] = len(coverage["active_raw"])
@@ -178,9 +185,12 @@ def _finalize_venue_coverage(
     )
     coverage["dropped_all_raw"] = coverage["filtered_raw"] + coverage["dropped_raw"]
     coverage["dropped_all_cf"] = coverage["filtered_cf"] + coverage["dropped_cf"]
+    coverage["runtime_dropped_raw"] = list(coverage["dropped_all_raw"])
+    coverage["runtime_dropped_cf"] = list(coverage["dropped_all_cf"])
+    coverage["runtime_dropped_count"] = len(coverage["runtime_dropped_raw"])
 
     logger.info(f"{label} requested: {requested}")
-    logger.info(f"{label} filtered unsupported: {coverage['filtered_count']}")
+    logger.info(f"{label} startup known-unsupported: {coverage['filtered_count']}")
     if coverage["filtered_raw"]:
         logger.info(
             f"Filtered {label.lower()} symbols (raw): "
@@ -191,10 +201,7 @@ def _finalize_venue_coverage(
             + ", ".join(coverage["filtered_cf"])
         )
 
-    if label == "Futures":
-        logger.info(f"{label} dropped unsupported: {coverage['dropped_count']}")
-    else:
-        logger.info(f"{label} dropped during init: {coverage['dropped_count']}")
+    logger.info(f"{label} runtime dropped during init: {coverage['dropped_count']}")
 
     if coverage["dropped_raw"]:
         logger.info(
@@ -208,7 +215,9 @@ def _finalize_venue_coverage(
 
     logger.info(f"{label} active: {coverage['active_count']}")
     if label == "Futures":
-        logger.info(f"Futures runtime dropped after setup: {coverage['dropped_count']}")
+        logger.info(
+            f"Futures runtime_dropped after setup: {coverage['runtime_dropped_count']}"
+        )
     logger.debug(
         f"Active {label.lower()} symbols (raw): "
         + ", ".join(coverage["active_raw"])
@@ -490,10 +499,30 @@ def _setup_feeds(universe: Dict[str, Any]) -> Tuple[FeedHandler, Dict[str, Any]]
     fut_selection = selection_metadata.get("BINANCE_USDTF", {}) if isinstance(selection_metadata, dict) else {}
     coverage["spot_candidate_pool"] = spot_selection.get("candidate_pool_count", 0)
     coverage["futures_candidate_pool"] = fut_selection.get("candidate_pool_count", 0)
-    coverage["spot_rejected_pre_filter_count"] = spot_selection.get("rejected_pre_filter_count", 0)
-    coverage["futures_rejected_pre_filter_count"] = fut_selection.get("rejected_pre_filter_count", 0)
-    coverage["spot_rejected_pre_filter_sample"] = spot_selection.get("rejected_pre_filter_sample", [])
-    coverage["futures_rejected_pre_filter_sample"] = fut_selection.get("rejected_pre_filter_sample", [])
+    spot_pre_filter_rejected_count = spot_selection.get(
+        "pre_filter_rejected_count",
+        spot_selection.get("rejected_pre_filter_count", 0),
+    )
+    futures_pre_filter_rejected_count = fut_selection.get(
+        "pre_filter_rejected_count",
+        fut_selection.get("rejected_pre_filter_count", 0),
+    )
+    spot_pre_filter_rejected_sample = spot_selection.get(
+        "pre_filter_rejected_sample",
+        spot_selection.get("rejected_pre_filter_sample", []),
+    )
+    futures_pre_filter_rejected_sample = fut_selection.get(
+        "pre_filter_rejected_sample",
+        fut_selection.get("rejected_pre_filter_sample", []),
+    )
+    coverage["spot_pre_filter_rejected_count"] = spot_pre_filter_rejected_count
+    coverage["futures_pre_filter_rejected_count"] = futures_pre_filter_rejected_count
+    coverage["spot_pre_filter_rejected_sample"] = spot_pre_filter_rejected_sample
+    coverage["futures_pre_filter_rejected_sample"] = futures_pre_filter_rejected_sample
+    coverage["spot_rejected_pre_filter_count"] = spot_pre_filter_rejected_count
+    coverage["futures_rejected_pre_filter_count"] = futures_pre_filter_rejected_count
+    coverage["spot_rejected_pre_filter_sample"] = spot_pre_filter_rejected_sample
+    coverage["futures_rejected_pre_filter_sample"] = futures_pre_filter_rejected_sample
     coverage["futures_candidate_pool_raw_count"] = fut_selection.get("candidate_pool_raw_count", 0)
     coverage["futures_candidate_pool_after_sanity_count"] = fut_selection.get("candidate_pool_after_sanity_count", 0)
     coverage["futures_candidate_pool_after_support_check_count"] = fut_selection.get("candidate_pool_after_support_check_count", 0)
@@ -503,6 +532,10 @@ def _setup_feeds(universe: Dict[str, Any]) -> Tuple[FeedHandler, Dict[str, Any]]
     coverage["futures_support_precheck_error"] = fut_selection.get("support_precheck_error")
     coverage["spot"]["candidate_pool"] = coverage["spot_candidate_pool"]
     coverage["futures"]["candidate_pool"] = coverage["futures_candidate_pool"]
+    coverage["spot"]["pre_filter_rejected_count"] = coverage["spot_pre_filter_rejected_count"]
+    coverage["futures"]["pre_filter_rejected_count"] = coverage["futures_pre_filter_rejected_count"]
+    coverage["spot"]["pre_filter_rejected_sample"] = coverage["spot_pre_filter_rejected_sample"]
+    coverage["futures"]["pre_filter_rejected_sample"] = coverage["futures_pre_filter_rejected_sample"]
     coverage["spot"]["rejected_pre_filter_count"] = coverage["spot_rejected_pre_filter_count"]
     coverage["futures"]["rejected_pre_filter_count"] = coverage["futures_rejected_pre_filter_count"]
     coverage["spot"]["rejected_pre_filter_sample"] = coverage["spot_rejected_pre_filter_sample"]
@@ -617,10 +650,12 @@ def _setup_feeds(universe: Dict[str, Any]) -> Tuple[FeedHandler, Dict[str, Any]]
 
     logger.info(
         "Startup coverage summary | "
-        f"Spot requested={spot_cov['requested_count']} filtered={spot_cov['filtered_count']} "
-        f"dropped={spot_cov['dropped_count']} active={spot_cov['active_count']} | "
-        f"Futures requested={fut_cov['requested_count']} filtered={fut_cov['filtered_count']} "
-        f"dropped={fut_cov['dropped_count']} active={fut_cov['active_count']}"
+        f"Spot selected={spot_cov['selected_count']} "
+        f"pre_filter_rejected={coverage['spot_pre_filter_rejected_count']} "
+        f"runtime_dropped={spot_cov['runtime_dropped_count']} active={spot_cov['active_count']} | "
+        f"Futures selected={fut_cov['selected_count']} "
+        f"pre_filter_rejected={coverage['futures_pre_filter_rejected_count']} "
+        f"runtime_dropped={fut_cov['runtime_dropped_count']} active={fut_cov['active_count']}"
     )
 
     return fh, coverage
