@@ -45,16 +45,8 @@ Setup details and service installation live in [INSTALL.md](INSTALL.md).
 
 ## Conversion
 
-Recommended CLI name:
-
 ```bash
 python convert_day.py --date YYYY-MM-DD
-```
-
-Backward-compatible legacy entrypoint still works:
-
-```bash
-python convert_yesterday.py --date YYYY-MM-DD
 ```
 
 ## Validation entrypoint
@@ -74,12 +66,12 @@ python VALIDATE.py accept
 Preferred validator modules now live under `validators/system.py`,
 `validators/runtime.py`, `validators/scale.py`,
 `validators/nautilus_catalog.py`, and `validators/purge_safety.py`.
-Legacy `validate_*.py` filenames are still kept for compatibility.
+`python VALIDATE.py converter` remains available as an alias of `nautilus`.
 
 ## Repository map (high level)
 
 - `recorder.py` – recorder runtime entrypoint
-- `convert_day.py` / `convert_yesterday.py` – conversion CLIs
+- `convert_day.py` – conversion CLI
 - `converter/` – conversion internals
 - `validators/` – validator implementations
 - `state/` – runtime reports (`heartbeat.json`, `startup_coverage.json`, conversion reports)

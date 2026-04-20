@@ -8,8 +8,9 @@ Suspected gaps (long inactivity) are counted, optionally triggering a book reset
 """
 from __future__ import annotations
 
+import json
 import logging
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from nautilus_trader.model.data import BookOrder, OrderBookDepth10
 from nautilus_trader.model.enums import OrderSide
@@ -63,7 +64,10 @@ class BookReconstructor:
         self.asks: Dict[float, float] = {}
         self.gaps_suspected: int = 0
         self.book_resets: int = 0
+        self.crossed_book_events: int = 0
+        self.crossed_book_examples: List[Dict[str, Any]] = []
         self._last_ts_ns: Optional[int] = None
+        self._last_snapshot_context: Optional[Dict[str, Any]] = None
 
     def apply_delta(self, rec: dict, ts_ns: int) -> None:
         """Apply a single delta record, checking for inactivity gaps."""
@@ -95,6 +99,80 @@ class BookReconstructor:
                 self.asks.pop(price, None)
             else:
                 self.asks[price] = size
+
+    def _sorted_levels(self, side: str, limit: int = 10) -> List[Dict[str, float]]:
+        if side == "bids":
+            levels = sorted(self.bids.items(), key=lambda x: -x[0])[:limit]
+        else:
+            levels = sorted(self.asks.items(), key=lambda x: x[0])[:limit]
+        return [{"price": price, "size": size} for price, size in levels]
+
+    def _current_book_context(self, limit: int = 10) -> Dict[str, Any]:
+        bids = self._sorted_levels("bids", limit=limit)
+        asks = self._sorted_levels("asks", limit=limit)
+        best_bid = bids[0]["price"] if bids else None
+        best_ask = asks[0]["price"] if asks else None
+        return {
+            "best_bid": best_bid,
+            "best_ask": best_ask,
+            "bids": bids,
+            "asks": asks,
+        }
+
+    def _delta_context(self, rec: dict, limit: int = 10) -> Dict[str, Any]:
+        payload = rec.get("payload", {})
+        return {
+            "sequence_number": rec.get("sequence_number"),
+            "bids": payload.get("bids", [])[:limit],
+            "asks": payload.get("asks", [])[:limit],
+        }
+
+    def _reset_book(self) -> None:
+        self.bids.clear()
+        self.asks.clear()
+        self.book_resets += 1
+
+    def handle_crossed_book(
+        self,
+        rec: dict,
+        *,
+        ts_event: int,
+        ts_init: int,
+        input_index: int,
+        log_limit: int = 10,
+    ) -> bool:
+        """Log and reset when the reconstructed book becomes crossed."""
+        context = self._current_book_context(limit=log_limit)
+        best_bid = context["best_bid"]
+        best_ask = context["best_ask"]
+        if best_bid is None or best_ask is None or best_bid < best_ask:
+            return False
+
+        self.crossed_book_events += 1
+        event = {
+            "event": "crossed_book",
+            "instrument_id": str(self.instrument_id),
+            "ts_event": ts_event,
+            "ts_init": ts_init,
+            "input_index": input_index,
+            "best_bid": best_bid,
+            "best_ask": best_ask,
+            "previous_snapshot": self._last_snapshot_context,
+            "current_delta": self._delta_context(rec, limit=log_limit),
+            "current_book": context,
+        }
+        if len(self.crossed_book_examples) < 10:
+            self.crossed_book_examples.append(event)
+        if self.crossed_book_events <= log_limit:
+            logger.warning("crossed_book %s", json.dumps(event, sort_keys=True, default=str))
+        elif self.crossed_book_events == log_limit + 1:
+            logger.warning(
+                "crossed_book further events suppressed for %s after %s detailed logs",
+                self.instrument_id,
+                log_limit,
+            )
+        self._reset_book()
+        return True
 
     def snapshot(self, ts_event: int, ts_init: int) -> Optional[OrderBookDepth10]:
         """Build an OrderBookDepth10 from current state.
@@ -132,7 +210,7 @@ class BookReconstructor:
         while len(ask_orders) < 10:
             ask_orders.append(_ZERO_ASK())
 
-        return OrderBookDepth10(
+        snapshot = OrderBookDepth10(
             instrument_id=self.instrument_id,
             bids=bid_orders,
             asks=ask_orders,
@@ -143,11 +221,39 @@ class BookReconstructor:
             ts_event=ts_event,
             ts_init=ts_init,
         )
+        self._last_snapshot_context = {
+            "ts_event": ts_event,
+            "ts_init": ts_init,
+            **self._current_book_context(),
+        }
+        return snapshot
 
 
 # ── top-level conversion function ───────────────────────────────────
 
 DEPTH_SNAPSHOT_INTERVAL_SEC: float = 1.0
+
+
+def _record_ts_init_ns(rec: dict) -> int:
+    """Return the converter replay timestamp for a raw depth record."""
+    ts_init = rec.get("ts_recv_ns")
+    if ts_init:
+        return int(ts_init)
+    ts_event_ms = rec.get("ts_event_ms")
+    return int(ts_event_ms * 1_000_000) if ts_event_ms else 0
+
+
+def _sorted_depth_records(records: Iterable[dict]) -> List[Tuple[int, dict]]:
+    """Return records sorted stably by ts_init/ts_recv_ns.
+
+    The input order is preserved when multiple records share the same ts_init.
+    """
+    buffered: List[Tuple[int, int, dict]] = []
+    for input_index, rec in enumerate(records):
+        ts_init = _record_ts_init_ns(rec)
+        buffered.append((ts_init, input_index, rec))
+    buffered.sort(key=lambda item: (item[0], item[1]))
+    return [(input_index, rec) for _, input_index, rec in buffered]
 
 
 def convert_depth(
@@ -159,11 +265,20 @@ def convert_depth(
     size_prec: int,
     *,
     snapshot_interval_sec: float = DEPTH_SNAPSHOT_INTERVAL_SEC,
-) -> Tuple[List[OrderBookDepth10], int, int, int, Optional[int], Optional[int]]:
+) -> Tuple[
+    List[OrderBookDepth10],
+    int,
+    int,
+    int,
+    int,
+    List[Dict[str, Any]],
+    Optional[int],
+    Optional[int],
+]:
     """Stream-convert raw depth deltas → 1-second OrderBookDepth10 snapshots.
 
-    Returns ``(snapshot_list, bad_line_count, gaps_suspected,
-               book_resets, first_ts_ns, last_ts_ns)``.
+    Returns ``(snapshot_list, bad_line_count, gaps_suspected, book_resets,
+               crossed_book_events, crossed_book_examples, first_ts_ns, last_ts_ns)``.
     """
     book = BookReconstructor(instrument_id, price_prec, size_prec)
     snapshots: List[OrderBookDepth10] = []
@@ -173,23 +288,37 @@ def convert_depth(
     first_ts: Optional[int] = None
     last_ts: Optional[int] = None
 
-    for rec in stream_raw_records(venue, symbol, "depth", date_str):
+    ordered_records = _sorted_depth_records(
+        stream_raw_records(venue, symbol, "depth", date_str)
+    )
+
+    for input_index, rec in ordered_records:
         try:
             ts_event_ms = rec.get("ts_event_ms")
-            ts_recv_ns = rec.get("ts_recv_ns", 0)
+            ts_recv_ns = _record_ts_init_ns(rec)
             ts_event = ts_event_ms * 1_000_000 if ts_event_ms else ts_recv_ns
             ts_init = ts_recv_ns
 
             if ts_event == 0:
                 continue
 
-            book.apply_delta(rec, ts_event)
+            book.apply_delta(rec, ts_init)
+            if book.handle_crossed_book(
+                rec,
+                ts_event=ts_event,
+                ts_init=ts_init,
+                input_index=input_index,
+            ):
+                if first_ts is None:
+                    first_ts = ts_event
+                last_ts = ts_event
+                continue
 
-            if last_emit_ns is None or (ts_event - last_emit_ns) >= interval_ns:
+            if last_emit_ns is None or (ts_init - last_emit_ns) >= interval_ns:
                 snap = book.snapshot(ts_event, ts_init)
                 if snap is not None:
                     snapshots.append(snap)
-                    last_emit_ns = ts_event
+                    last_emit_ns = ts_init
 
             if first_ts is None:
                 first_ts = ts_event
@@ -197,4 +326,13 @@ def convert_depth(
         except Exception:
             bad += 1
 
-    return snapshots, bad, book.gaps_suspected, book.book_resets, first_ts, last_ts
+    return (
+        snapshots,
+        bad,
+        book.gaps_suspected,
+        book.book_resets,
+        book.crossed_book_events,
+        book.crossed_book_examples,
+        first_ts,
+        last_ts,
+    )

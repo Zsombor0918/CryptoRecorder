@@ -27,6 +27,9 @@ journalctl -u cryptofeed-recorder -f
 - `state/master_validation_report.json`
 - `recorder.log`
 
+Report timestamps in these JSON files use Hungary local time
+(`Europe/Budapest`). Day-scoped recorder/converter dates still remain UTC.
+
 ## Coverage terminology
 
 Startup and runtime reporting uses these terms:
@@ -46,16 +49,8 @@ Startup and runtime reporting uses these terms:
 
 ## Conversion operations
 
-Primary CLI:
-
 ```bash
 python convert_day.py --date YYYY-MM-DD [--staging]
-```
-
-Compatibility CLI (legacy name):
-
-```bash
-python convert_yesterday.py --date YYYY-MM-DD [--staging]
 ```
 
 ## Validation operations
@@ -70,4 +65,4 @@ python VALIDATE.py all
 ```
 
 Preferred validator module names are the short files under `validators/`.
-Legacy `validate_*.py` files remain for compatibility.
+`python VALIDATE.py converter` remains as an alias of `nautilus`.

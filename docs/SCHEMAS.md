@@ -7,7 +7,7 @@ They are interface notes, not a strict JSON Schema contract.
 
 Top-level fields:
 
-- `timestamp` (UTC ISO-8601)
+- `timestamp` (ISO-8601 with Hungary local offset, `Europe/Budapest`)
 - `uptime_seconds`
 - `total_symbols`
 - `spot_symbols_active`
@@ -33,6 +33,8 @@ Top-level fields:
 Notes:
 
 - `snapshot_mode` is expected to be `"disabled"` in Phase 1.
+- Human-facing report timestamps use Hungary local time with DST-aware offset
+  (`+01:00` or `+02:00` depending on the date).
 - `spot_symbols_dropped*` / `futures_symbols_dropped*` summarize startup
   `runtime_dropped` symbols, not the full universe `candidate_pool`.
 - `last_update_id` is reserved for future richer sequencing support and is
@@ -52,6 +54,9 @@ Notes:
 
 Startup audit summary with top-level `timestamp`, `warnings`, and nested
 per-venue `spot` / `futures` sections.
+
+`timestamp` uses Hungary local time (`Europe/Budapest`). The date-scoped file
+names and conversion target dates elsewhere in the pipeline still stay on UTC.
 
 Per-venue fields:
 
@@ -128,3 +133,6 @@ Core fields:
 
 `per_symbol_gaps` is a small diagnostic map of the worst gap offenders, not a
 complete per-symbol dump of every converted instrument.
+
+`timestamp` is the report creation time in Hungary local time
+(`Europe/Budapest`), not the UTC trading day boundary.

@@ -13,6 +13,7 @@ import json
 import shutil
 import sys
 import tempfile
+from datetime import datetime
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -83,7 +84,17 @@ def run_tests() -> int:
             f"(spot={hb.get('spot_coverage_ratio')}, futures={hb.get('futures_coverage_ratio')})"
         )
 
-        results = [ok1, ok2, ok3, ok4, ok5]
+        hb_ts = datetime.fromisoformat(hb["timestamp"])
+        sym_ts = datetime.fromisoformat(hb["by_venue"]["BINANCE_SPOT"][0]["last_heartbeat"])
+        allowed_offsets = {3600.0, 7200.0}
+        ok6 = hb_ts.utcoffset() is not None and hb_ts.utcoffset().total_seconds() in allowed_offsets
+        ok6 = ok6 and sym_ts.utcoffset() is not None and sym_ts.utcoffset().total_seconds() in allowed_offsets
+        print(
+            f"  [{'PASS' if ok6 else 'FAIL'}] timezone_offset "
+            f"(heartbeat={hb.get('timestamp')}, last_heartbeat={hb['by_venue']['BINANCE_SPOT'][0]['last_heartbeat']})"
+        )
+
+        results = [ok1, ok2, ok3, ok4, ok5, ok6]
         passed = sum(results)
         total = len(results)
         print(f"\n  {passed}/{total} passed")

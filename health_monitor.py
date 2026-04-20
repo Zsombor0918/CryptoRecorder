@@ -5,7 +5,6 @@ import asyncio
 import json
 import logging
 import time
-from datetime import datetime
 from pathlib import Path
 from typing import Any, DefaultDict, Dict, List
 from collections import defaultdict
@@ -14,6 +13,7 @@ from config import (
     STATE_ROOT,
     HEARTBEAT_INTERVAL_SEC,
 )
+from time_utils import local_now_iso, timestamp_to_local_iso
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +39,7 @@ class SymbolStats:
             'last_ts_event': self.last_ts_event,
             'last_update_id': self.last_update_id,
             'gap_count': self.gap_count,
-            'last_heartbeat': datetime.utcfromtimestamp(self.last_heartbeat).isoformat(),
+            'last_heartbeat': timestamp_to_local_iso(self.last_heartbeat),
         }
 
 
@@ -97,7 +97,7 @@ class HealthMonitor:
         """Record a reconnection event."""
         self.reconnect_count += 1
         
-        timestamp = datetime.utcnow().isoformat()
+        timestamp = local_now_iso()
         message = f"[{timestamp}] Reconnect #{self.reconnect_count} - {venue}"
         if reason:
             message += f": {reason}"
@@ -152,7 +152,7 @@ class HealthMonitor:
             )
             
             heartbeat = {
-                'timestamp': datetime.utcnow().isoformat(),
+                'timestamp': local_now_iso(),
                 'uptime_seconds': uptime_sec,
                 'total_symbols': len(self.symbol_stats),
                 'spot_symbols_active': spot_symbols_active,

@@ -26,6 +26,7 @@ from config import (
     KNOWN_UNSUPPORTED_FULL_SYMBOLS,
     KNOWN_UNSUPPORTED_BASE_ASSETS,
 )
+from time_utils import local_now_iso
 
 logger = logging.getLogger(__name__)
 
@@ -195,7 +196,7 @@ class UniverseSelector:
         universe = {
             "BINANCE_SPOT": spot_symbols,
             "BINANCE_USDTF": futures_symbols,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": local_now_iso(),
             "top_count": TOP_SYMBOLS,
             "candidate_pool_size": TOP_SYMBOL_CANDIDATES,
             "candidate_pool_sizes": {

@@ -20,6 +20,8 @@ from pathlib import Path
 from typing import Dict, Optional
 from collections import deque
 
+from time_utils import local_now_iso
+
 logger = logging.getLogger(__name__)
 
 
@@ -108,7 +110,7 @@ class DiskMonitor:
         total_gb = data_raw_gb + catalog_gb + meta_gb + state_gb
         
         usage = {
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": local_now_iso(),
             "data_raw_gb": round(data_raw_gb, 2),
             "catalog_gb": round(catalog_gb, 2),
             "meta_gb": round(meta_gb, 2),
