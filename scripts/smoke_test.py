@@ -47,7 +47,7 @@ class Colors:
     RESET = '\033[0m'
 
 
-def run_smoke_test(runtime_sec: int = DEFAULT_RUNTIME_SEC) -> Dict[str, Any]:
+def run_smoke_test(runtime_sec: int = DEFAULT_RUNTIME_SEC, depth_mode: str = "phase1") -> Dict[str, Any]:
     """Run the recorder and check basic functionality."""
     print(f"\n{Colors.BOLD}═══════════════════════════════════════════════════{Colors.RESET}")
     print(f"{Colors.BOLD}  Smoke Test ({runtime_sec}s with {TEST_SYMBOLS} symbols){Colors.RESET}")
@@ -70,7 +70,7 @@ def run_smoke_test(runtime_sec: int = DEFAULT_RUNTIME_SEC) -> Dict[str, Any]:
 
     print(f"Starting recorder (pid will be shown)...")
     proc = subprocess.Popen(
-        [py, str(PROJECT_ROOT / "recorder.py")],
+        [py, str(PROJECT_ROOT / "recorder.py"), "--depth-mode", depth_mode],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         env=env,
@@ -102,7 +102,7 @@ def run_smoke_test(runtime_sec: int = DEFAULT_RUNTIME_SEC) -> Dict[str, Any]:
     checks = [
         ("No rate limit errors", _check_no_rate_limit(log)),
         ("No callback errors", _check_no_callback_errors(log)),
-        ("Raw files created", _check_raw_files_created(t0)),
+        ("Raw files created", _check_raw_files_created(t0, depth_mode)),
         ("Heartbeat exists", _check_heartbeat()),
         ("Clean shutdown", _check_clean_shutdown(log, proc.returncode)),
     ]
@@ -151,7 +151,7 @@ def _check_no_callback_errors(log: str) -> tuple[bool, str]:
     return True, ""
 
 
-def _check_raw_files_created(t0: float) -> tuple[bool, str]:
+def _check_raw_files_created(t0: float, depth_mode: str) -> tuple[bool, str]:
     if not DATA_ROOT.exists():
         return False, "data_raw/ doesn't exist"
 
@@ -162,7 +162,9 @@ def _check_raw_files_created(t0: float) -> tuple[bool, str]:
 
     if not files:
         return False, "No files created"
-    return True, f"{len(files)} files"
+    depth_channel = "depth_v2" if depth_mode == "phase2" else "depth"
+    depth_files = [f for f in files if f"/{depth_channel}/" in str(f)]
+    return True, f"{len(files)} files ({len(depth_files)} {depth_channel})"
 
 
 def _check_heartbeat() -> tuple[bool, str]:
@@ -202,9 +204,15 @@ def main() -> int:
         default=DEFAULT_RUNTIME_SEC,
         help=f"Seconds to run (default: {DEFAULT_RUNTIME_SEC})",
     )
+    parser.add_argument(
+        "--depth-mode",
+        choices=("phase1", "phase2"),
+        default="phase1",
+        help="Depth pipeline mode to validate.",
+    )
     args = parser.parse_args()
 
-    result = run_smoke_test(args.runtime)
+    result = run_smoke_test(args.runtime, depth_mode=args.depth_mode)
     return 0 if result["passed"] else 1
 
 

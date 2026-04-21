@@ -76,6 +76,25 @@ QUOTE_ASSET_FUTURES: Final = "USDT"  # For USDT-M perpetuals
 # WebSocket depth update frequency (100ms or 1000ms)
 DEPTH_INTERVAL_MS: Final = 100
 
+# Depth pipeline mode.
+# Phase 1 remains default until Phase 2 is fully validated.
+DEPTH_PIPELINE_MODE_DEFAULT: Final = os.environ.get(
+    "CRYPTO_RECORDER_DEPTH_PIPELINE_MODE",
+    "phase1",
+).strip().lower()
+
+# Phase 2 raw depth channel name.
+DEPTH_V2_CHANNEL: Final = "depth_v2"
+
+# Optional Phase 2 depth10 derivation defaults (converter-side).
+PHASE2_EMIT_DEPTH10_DEFAULT: Final = (
+    os.environ.get("CRYPTO_RECORDER_PHASE2_EMIT_DEPTH10", "0").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
+PHASE2_DEPTH10_INTERVAL_SEC: Final = float(
+    os.environ.get("CRYPTO_RECORDER_PHASE2_DEPTH10_INTERVAL_SEC", "1.0")
+)
+
 # Legacy placeholder kept for config compatibility; REST snapshots stay disabled.
 SNAPSHOT_INTERVAL_SEC: Final = 600
 
@@ -152,6 +171,35 @@ WS_PING_INTERVAL_SEC: Final = 30
 RECONNECT_INITIAL_DELAY_SEC: Final = 1
 RECONNECT_MAX_DELAY_SEC: Final = 60
 RECONNECT_MAX_ATTEMPTS: Final = 0  # 0 = unlimited
+
+# ============================================================================
+# Phase 2 native depth snapshot / resync controls
+# ============================================================================
+
+PHASE2_SNAPSHOT_LIMIT: Final = int(
+    os.environ.get("CRYPTO_RECORDER_PHASE2_SNAPSHOT_LIMIT", "1000")
+)
+PHASE2_SNAPSHOT_MAX_CONCURRENCY_PER_VENUE: Final = int(
+    os.environ.get("CRYPTO_RECORDER_PHASE2_SNAPSHOT_MAX_CONCURRENCY_PER_VENUE", "2")
+)
+PHASE2_SNAPSHOT_MIN_DELAY_SEC: Final = float(
+    os.environ.get("CRYPTO_RECORDER_PHASE2_SNAPSHOT_MIN_DELAY_SEC", "0.35")
+)
+PHASE2_SNAPSHOT_RETRY_MAX_ATTEMPTS: Final = int(
+    os.environ.get("CRYPTO_RECORDER_PHASE2_SNAPSHOT_RETRY_MAX_ATTEMPTS", "5")
+)
+PHASE2_SNAPSHOT_RETRY_BASE_DELAY_SEC: Final = float(
+    os.environ.get("CRYPTO_RECORDER_PHASE2_SNAPSHOT_RETRY_BASE_DELAY_SEC", "1.5")
+)
+PHASE2_RESYNC_COOLDOWN_SEC: Final = float(
+    os.environ.get("CRYPTO_RECORDER_PHASE2_RESYNC_COOLDOWN_SEC", "5.0")
+)
+PHASE2_MAX_RESYNCS_PER_SYMBOL_WINDOW: Final = int(
+    os.environ.get("CRYPTO_RECORDER_PHASE2_MAX_RESYNCS_PER_SYMBOL_WINDOW", "6")
+)
+PHASE2_RESYNC_WINDOW_SEC: Final = float(
+    os.environ.get("CRYPTO_RECORDER_PHASE2_RESYNC_WINDOW_SEC", "300")
+)
 
 # ============================================================================
 # Converter / catalog output

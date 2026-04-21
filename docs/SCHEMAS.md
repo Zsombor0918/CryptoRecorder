@@ -28,6 +28,7 @@ Top-level fields:
 - `futures_enabled`
 - `futures_disabled_reason`
 - `snapshot_mode`
+- `phase`
 - `by_venue`
 
 Notes:
@@ -47,7 +48,13 @@ Notes:
 - `message_count`
 - `last_ts_event`
 - `last_update_id`
+- `prev_update_id`
 - `gap_count`
+- `phase`
+- `sync_state`
+- `snapshot_seed_count`
+- `resync_count`
+- `desync_events`
 - `last_heartbeat`
 
 ## `state/startup_coverage.json`
@@ -104,20 +111,28 @@ Core fields:
 - `instruments_written`
 - `total_trades_written`
 - `total_depth_snapshots_written`
+- `total_order_book_deltas_written`
+- `total_depth10_written`
 - `bad_lines`
 - `gaps_suspected`
 - `book_resets_total`
 - `crossed_book_events_total`
+- `snapshot_seed_count`
+- `resync_count`
+- `desync_events`
+- `fenced_ranges_total`
 - `gap_rate`
 - `crossed_rate`
 - `per_symbol_gaps`
 - `per_symbol_crossed_books`
+- `per_symbol_fenced_ranges`
 - `data_presence`
 - `futures_enabled`
 - `symbols_processed`
 - `venues`
 - `ts_ranges` (`trade` and `depth` start/end nanoseconds)
 - `catalog_root`
+- `phase`
 
 `status` meanings:
 
@@ -130,9 +145,15 @@ Core fields:
 - `symbols`
 - `trades_written`
 - `depth_snapshots_written`
+- `delta_events_written`
+- `depth10_written`
 - `gaps_suspected`
 - `book_resets`
 - `crossed_book_events`
+- `snapshot_seed_count`
+- `resync_count`
+- `desync_events`
+- `fenced_ranges`
 
 `data_presence` tracks which instruments have actual data:
 
@@ -147,6 +168,11 @@ Core fields:
 
 - `crossed_book_events`: Count of crossed events during reconstruction
 - `examples`: Up to 3 example crossed-book events with context
+
+`per_symbol_fenced_ranges` maps `"VENUE/SYMBOL"` to:
+
+- `fenced_ranges`: Count of intentionally excluded ranges
+- `examples`: Up to 3 sample fenced ranges with session/time/reason metadata
 
 `ts_ranges` is the authoritative indication of actual temporal coverage in converted raw inputs.
 

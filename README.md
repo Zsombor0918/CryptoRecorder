@@ -1,6 +1,7 @@
 # CryptoRecorder
 
-CryptoRecorder is a Phase 1 Binance market-data pipeline for backtesting.
+CryptoRecorder is a Binance market-data pipeline for backtesting with a
+preserved Phase 1 path and an opt-in Phase 2 deterministic L2 path.
 
 **Phase 1 Target:** 50 spot instruments with trades + approximate L2 depth,
 converted to a Nautilus-queryable `ParquetDataCatalog`.
@@ -23,6 +24,9 @@ pytest tests/
 
 # 4. Start the recorder
 python recorder.py
+
+# Optional: Phase 2 native depth mode
+python recorder.py --depth-mode phase2
 ```
 
 ## Project Structure
@@ -72,11 +76,16 @@ Convert recorded data to Nautilus catalog:
 
 ```bash
 python convert_day.py --date 2026-04-20
+
+# Optional: Phase 2 deterministic replay -> OrderBookDeltas
+python convert_day.py --date 2026-04-20 --depth-mode phase2
 ```
 
 This produces:
 - `TradeTick` objects from raw trades
-- `OrderBookDepth10` snapshots from L2 deltas
+- Phase 1: `OrderBookDepth10` snapshots from approximate L2 deltas
+- Phase 2: `OrderBookDeltas` as the primary L2 output
+- Phase 2 optional: derived `OrderBookDepth10`
 - `CurrencyPair` / `CryptoPerpetual` instruments
 
 ## Phase 1 Scope
@@ -93,6 +102,15 @@ This produces:
 - REST depth polling (causes rate limits)
 
 See [docs/GUARANTEES.md](docs/GUARANTEES.md) for full details.
+
+## Phase 2 Scope
+
+Phase 2 keeps the repo workflow familiar while changing the L2 truth model:
+
+- raw source of truth becomes Binance-native `depth_v2`
+- snapshot seeding and sync/resync state are explicit
+- deterministic replay writes Nautilus `OrderBookDeltas`
+- derived `OrderBookDepth10` stays optional and off by default
 
 ## Documentation
 

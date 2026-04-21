@@ -71,6 +71,7 @@ Full pipeline test (recorder → converter → catalog):
 python scripts/acceptance_test.py              # Full test (10 min)
 python scripts/acceptance_test.py --runtime 300 # 5 minutes
 python scripts/acceptance_test.py --skip-recorder # Test converter only
+python scripts/acceptance_test.py --depth-mode phase2 --skip-recorder
 ```
 
 Checks:
@@ -78,6 +79,7 @@ Checks:
 - Converter produces valid output
 - Catalog is queryable
 - No crossed-book snapshots
+- In Phase 2 mode, `OrderBookDeltas` are queryable and fenced ranges are reported
 
 ## Reports
 

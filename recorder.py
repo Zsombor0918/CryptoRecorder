@@ -5,6 +5,7 @@ Records L2 depth deltas, trades, and periodic exchangeInfo metadata.
 REST depth snapshots are DISABLED (causes 429/418 ban).
 Futures are attempted but gracefully disabled if they fail.
 """
+import argparse
 import asyncio
 import json
 import logging
@@ -35,11 +36,13 @@ from config import (
     DATA_ROOT,
     BINANCE_SPOT_REST,
     BINANCE_FUTURES_REST,
+    DEPTH_PIPELINE_MODE_DEFAULT,
     TOP_SYMBOLS,
 )
 from binance_universe import UniverseSelector, partition_known_unsupported_symbols
 from disk_monitor import DiskMonitor
 from health_monitor import HealthMonitor
+from phase2_depth import BinanceNativeDepthRecorder
 from storage import StorageManager
 from time_utils import local_now_iso
 
@@ -66,8 +69,10 @@ health_monitor: Optional[HealthMonitor] = None
 disk_monitor: Optional[DiskMonitor] = None
 shutdown_event: Optional[asyncio.Event] = None
 feed_handler: Optional[FeedHandler] = None
+native_depth_recorder: Optional[BinanceNativeDepthRecorder] = None
 futures_enabled: bool = True
 futures_disabled_reason: str = ""
+depth_pipeline_mode: str = DEPTH_PIPELINE_MODE_DEFAULT
 
 # Configurable watchdog timeout (seconds)
 SHUTDOWN_WATCHDOG_SEC: int = int(os.environ.get(
@@ -470,7 +475,11 @@ async def initialize() -> Dict[str, Any]:
     return universe
 
 
-def _setup_feeds(universe: Dict[str, Any]) -> Tuple[FeedHandler, Dict[str, Any]]:
+def _setup_feeds(
+    universe: Dict[str, Any],
+    *,
+    depth_mode: str = "phase1",
+) -> Tuple[FeedHandler, Dict[str, Any]]:
     """Build FeedHandler with Spot + (optional) Futures feeds."""
     global futures_enabled, futures_disabled_reason
 
@@ -479,6 +488,11 @@ def _setup_feeds(universe: Dict[str, Any]) -> Tuple[FeedHandler, Dict[str, Any]]
     futures_enabled = True
     futures_disabled_reason = ""
     fh = FeedHandler()
+    use_phase2_depth = depth_mode == "phase2"
+    spot_channels = [TRADES] if use_phase2_depth else [L2_BOOK, TRADES]
+    fut_channels = [TRADES] if use_phase2_depth else [L2_BOOK, TRADES]
+    spot_callbacks = {TRADES: on_trade} if use_phase2_depth else {L2_BOOK: on_l2_book, TRADES: on_trade}
+    fut_callbacks = {TRADES: on_trade} if use_phase2_depth else {L2_BOOK: on_l2_book, TRADES: on_trade}
     coverage: Dict[str, Any] = {
         "timestamp": local_now_iso(),
         "spot": _make_venue_coverage(
@@ -565,8 +579,8 @@ def _setup_feeds(universe: Dict[str, Any]) -> Tuple[FeedHandler, Dict[str, Any]]
             try:
                 fh.add_feed(Binance(
                     symbols=remaining,
-                    channels=[L2_BOOK, TRADES],
-                    callbacks={L2_BOOK: on_l2_book, TRADES: on_trade},
+                    channels=spot_channels,
+                    callbacks=spot_callbacks,
                     depth_interval=f"{DEPTH_INTERVAL_MS}ms",
                 ))
                 spot_cov["active_cf"] = list(remaining)
@@ -614,8 +628,8 @@ def _setup_feeds(universe: Dict[str, Any]) -> Tuple[FeedHandler, Dict[str, Any]]
             try:
                 fh.add_feed(BinanceFutures(
                     symbols=remaining,
-                    channels=[L2_BOOK, TRADES],
-                    callbacks={L2_BOOK: on_l2_book, TRADES: on_trade},
+                    channels=fut_channels,
+                    callbacks=fut_callbacks,
                 ))
                 fut_cov["active_cf"] = list(remaining)
                 fut_cov["active_raw"] = [_from_cf_symbol(sym) for sym in remaining]
@@ -669,6 +683,7 @@ def _setup_feeds(universe: Dict[str, Any]) -> Tuple[FeedHandler, Dict[str, Any]]
 async def shutdown(background_tasks: List[asyncio.Task]) -> None:
     """Stop feeds → cancel tasks → flush storage → write heartbeat."""
     import threading, os as _os
+    global native_depth_recorder
 
     # Watchdog: configurable hard timeout (default 120 s)
     def _force_exit():
@@ -695,6 +710,15 @@ async def shutdown(background_tasks: List[asyncio.Task]) -> None:
         except Exception as e:
             logger.warning(f"FeedHandler stop error (non-fatal): {e}")
 
+    if native_depth_recorder is not None:
+        try:
+            await asyncio.wait_for(native_depth_recorder.shutdown(), timeout=10)
+        except asyncio.TimeoutError:
+            logger.warning("Native depth recorder shutdown timed out (10s) – continuing")
+        except Exception as e:
+            logger.warning(f"Native depth recorder shutdown error (non-fatal): {e}")
+        native_depth_recorder = None
+
     # 3. Cancel background tasks (heartbeat, disk check, metadata)
     for t in background_tasks:
         if not t.done():
@@ -719,6 +743,7 @@ async def shutdown(background_tasks: List[asyncio.Task]) -> None:
             }
         health_monitor.futures_enabled = futures_enabled
         health_monitor.futures_disabled_reason = futures_disabled_reason
+        health_monitor.phase = depth_pipeline_mode
         await health_monitor.write_heartbeat()
         logger.info(f"Final stats: {health_monitor.get_summary()}")
 
@@ -763,7 +788,7 @@ async def _update_drop_stats_task() -> None:
 # Main  –  single event loop, no threads, clean SIGINT
 # ============================================================================
 
-async def main() -> None:
+async def main(depth_mode: str = DEPTH_PIPELINE_MODE_DEFAULT) -> None:
     """
     Single-loop architecture.
 
@@ -774,13 +799,15 @@ async def main() -> None:
     background_tasks: List[asyncio.Task] = []
 
     try:
-        global feed_handler
+        global feed_handler, native_depth_recorder, depth_pipeline_mode
+        depth_pipeline_mode = depth_mode
         universe = await initialize()
-        fh, startup_coverage = _setup_feeds(universe)
+        fh, startup_coverage = _setup_feeds(universe, depth_mode=depth_mode)
         feed_handler = fh
 
         health_monitor.futures_enabled = futures_enabled
         health_monitor.futures_disabled_reason = futures_disabled_reason
+        health_monitor.phase = depth_mode
         health_monitor.set_startup_coverage(startup_coverage)
         _persist_startup_coverage(startup_coverage)
 
@@ -803,6 +830,22 @@ async def main() -> None:
         logger.info(f"Metadata active venues: {active_venues}")
         background_tasks.append(
             asyncio.create_task(metadata_task(active_venues)))
+
+        if depth_mode == "phase2":
+            native_symbols = {
+                venue: list(symbols)
+                for venue, symbols in universe.items()
+                if venue in ("BINANCE_SPOT", "BINANCE_USDTF")
+            }
+            native_depth_recorder = BinanceNativeDepthRecorder(
+                storage_manager=storage_manager,
+                health_monitor=health_monitor,
+                shutdown_event=shutdown_event,
+            )
+            background_tasks.append(
+                asyncio.create_task(native_depth_recorder.run(native_symbols))
+            )
+            logger.info("Phase 2 native depth recorder enabled")
 
         logger.info("Background tasks started")
 
@@ -832,9 +875,21 @@ async def main() -> None:
 
 
 # ============================================================================
+def _build_arg_parser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(description="Run the Binance market data recorder.")
+    ap.add_argument(
+        "--depth-mode",
+        choices=("phase1", "phase2"),
+        default=DEPTH_PIPELINE_MODE_DEFAULT,
+        help="Depth pipeline mode. Phase 1 remains the default until Phase 2 is fully validated.",
+    )
+    return ap
+
+
 if __name__ == '__main__':
+    args = _build_arg_parser().parse_args()
     try:
-        asyncio.run(main())
+        asyncio.run(main(args.depth_mode))
     except KeyboardInterrupt:
         pass
     except Exception as e:
