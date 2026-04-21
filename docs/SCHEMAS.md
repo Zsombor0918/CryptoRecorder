@@ -107,8 +107,12 @@ Core fields:
 - `bad_lines`
 - `gaps_suspected`
 - `book_resets_total`
+- `crossed_book_events_total`
 - `gap_rate`
+- `crossed_rate`
 - `per_symbol_gaps`
+- `per_symbol_crossed_books`
+- `data_presence`
 - `futures_enabled`
 - `symbols_processed`
 - `venues`
@@ -128,6 +132,21 @@ Core fields:
 - `depth_snapshots_written`
 - `gaps_suspected`
 - `book_resets`
+- `crossed_book_events`
+
+`data_presence` tracks which instruments have actual data:
+
+- `instruments_defined`: Total instruments from exchangeInfo
+- `instruments_with_trades`: Instruments with ≥1 TradeTick
+- `instruments_with_depth`: Instruments with ≥1 OrderBookDepth10
+- `instruments_with_both`: Instruments with both trades and depth
+- `instruments_with_no_data`: Instruments with neither
+- `no_data_list`: List of instruments with no data (up to 20)
+
+`per_symbol_crossed_books` maps `"VENUE/SYMBOL"` to:
+
+- `crossed_book_events`: Count of crossed events during reconstruction
+- `examples`: Up to 3 example crossed-book events with context
 
 `ts_ranges` is the authoritative indication of actual temporal coverage in converted raw inputs.
 

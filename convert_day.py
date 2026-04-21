@@ -122,6 +122,11 @@ def convert_date(
     }
     symbols_processed: Dict[str, List[str]] = {}
 
+    # Track data presence per instrument
+    instruments_with_trades: List[str] = []
+    instruments_with_depth: List[str] = []
+    instruments_with_no_data: List[str] = []
+
     for venue, symbols in sorted(universe.items()):
         v_trades = 0
         v_depth = 0
@@ -143,6 +148,7 @@ def convert_date(
                 venue, symbol, date_str, iid, pp, sp,
             )
             total_bad += bad_t
+            sym_has_trades = len(ticks) > 0
             if ticks:
                 ticks.sort(key=lambda t: t.ts_init)
                 for i in range(0, len(ticks), WRITE_BATCH_SIZE):
@@ -158,6 +164,7 @@ def convert_date(
             v_gaps += gaps
             v_resets += resets
             v_crossed_books += crossed_books
+            sym_has_depth = len(snaps) > 0
             if gaps > 0 or resets > 0:
                 per_symbol_gaps[f"{venue}/{symbol}"] = {
                     "gaps_suspected": gaps,
@@ -174,6 +181,15 @@ def convert_date(
                     catalog.write_data(snaps[i : i + WRITE_BATCH_SIZE])
                 v_depth += len(snaps)
                 _update_ts_range(ts_ranges["depth"], d_first, d_last)
+
+            # ── track data presence ───────────────────────────────────
+            iid_str = str(iid)
+            if sym_has_trades:
+                instruments_with_trades.append(iid_str)
+            if sym_has_depth:
+                instruments_with_depth.append(iid_str)
+            if not sym_has_trades and not sym_has_depth:
+                instruments_with_no_data.append(iid_str)
 
         total_trades += v_trades
         total_depth += v_depth
@@ -205,6 +221,7 @@ def convert_date(
     # ── gap rate ─────────────────────────────────────────────────────
     total_symbols = sum(len(s) for s in symbols_processed.values())
     gap_rate = round(total_gaps / total_depth, 6) if total_depth > 0 else 0.0
+    crossed_rate = round(total_crossed_books / total_depth, 6) if total_depth > 0 else 0.0
 
     # ── top offenders (symbols with most gaps) ─────────────────────
     top_gap_offenders = sorted(
@@ -212,6 +229,18 @@ def convert_date(
         key=lambda kv: kv[1]["gaps_suspected"],
         reverse=True,
     )[:5]  # top 5
+
+    # ── data presence summary ─────────────────────────────────────────
+    instruments_with_both = set(instruments_with_trades) & set(instruments_with_depth)
+    data_presence = {
+        "instruments_defined": len(all_instruments),
+        "instruments_with_trades": len(instruments_with_trades),
+        "instruments_with_depth": len(instruments_with_depth),
+        "instruments_with_both": len(instruments_with_both),
+        "instruments_with_no_data": len(instruments_with_no_data),
+        "no_data_list": instruments_with_no_data[:20],
+    }
+
     # ── report ────────────────────────────────────────────────────────
     elapsed = time.time() - t0
     report = {
@@ -227,8 +256,10 @@ def convert_date(
         "book_resets_total": total_resets,
         "crossed_book_events_total": total_crossed_books,
         "gap_rate": gap_rate,
+        "crossed_rate": crossed_rate,
         "per_symbol_gaps": dict(top_gap_offenders),
         "per_symbol_crossed_books": per_symbol_crossed_books,
+        "data_presence": data_presence,
         "futures_enabled": "BINANCE_USDTF" in universe,
         "symbols_processed": symbols_processed,
         "venues": venue_reports,
