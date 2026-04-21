@@ -81,6 +81,20 @@ class DepthSymbolState:
     snapshot_seed_count: int = 0
     resync_count: int = 0
     desync_events: int = 0
+    # ── rich diagnostics ──────────────────────────────────────────────
+    accepted_update_count: int = 0
+    rejected_update_count: int = 0
+    last_snapshot_seed_ts: Optional[float] = None    # monotonic
+    last_live_synced_ts: Optional[float] = None      # monotonic
+    last_desync_ts: Optional[float] = None           # monotonic
+    last_desync_reason: Optional[str] = None
+    last_resync_reason: Optional[str] = None
+    last_seen_U: Optional[int] = None
+    last_seen_u: Optional[int] = None
+    last_seen_pu: Optional[int] = None
+    last_rejected_U: Optional[int] = None
+    last_rejected_u: Optional[int] = None
+    last_rejected_pu: Optional[int] = None
 
     def allocate_ws_arrival_seq(self) -> int:
         """Monotonic counter for all WS messages (internal ordering for buffering)."""
@@ -277,6 +291,11 @@ class BinanceNativeDepthRecorder:
         if state.sync_state == SYNC_FENCED:
             return
 
+        # Track last-seen continuity IDs for diagnostics
+        state.last_seen_U = data.get("U")
+        state.last_seen_u = data.get("u")
+        state.last_seen_pu = data.get("pu")
+
         state.pending_updates.append(buffered)
         if len(state.pending_updates) > 5000:
             state.pending_updates = state.pending_updates[-5000:]
@@ -292,25 +311,50 @@ class BinanceNativeDepthRecorder:
                 await self._commit_depth_update(state, buffered)
             else:
                 self._ensure_snapshot_task(state, reason="continuity_break")
+        elif state.sync_state in (SYNC_DESYNCED, SYNC_RESYNC_REQUIRED):
+            # Keep retrying snapshot acquisition after cooldown expires.
+            # Without this, a symbol stuck in DESYNCED would never resync
+            # because no code path re-triggers the snapshot task.
+            self._ensure_snapshot_task(state, reason="desynced_retry")
         else:
-            pass  # Still buffering (RESYNC_REQUIRED / UNSYNCED / DESYNCED)
+            pass  # Still buffering (UNSYNCED — waiting for first WS message)
 
-        self.health_monitor.record_phase2_symbol_state(
-            venue=venue,
-            symbol=symbol,
-            sync_state=state.sync_state,
-            last_update_id=state.last_update_id,
-            prev_update_id=state.prev_update_id,
-            snapshot_seed_count=state.snapshot_seed_count,
-            resync_count=state.resync_count,
-            desync_events=state.desync_events,
-        )
+        self._report_symbol_state(state)
 
     def _state_for(self, venue: str, symbol: str) -> DepthSymbolState:
         key = (venue, symbol)
         if key not in self._states:
             self._states[key] = DepthSymbolState(venue=venue, symbol=symbol)
         return self._states[key]
+
+    def _report_symbol_state(self, state: DepthSymbolState) -> None:
+        """Push full diagnostic snapshot to health monitor."""
+        self.health_monitor.record_phase2_symbol_state(
+            venue=state.venue,
+            symbol=state.symbol,
+            sync_state=state.sync_state,
+            last_update_id=state.last_update_id,
+            prev_update_id=state.prev_update_id,
+            snapshot_seed_count=state.snapshot_seed_count,
+            resync_count=state.resync_count,
+            desync_events=state.desync_events,
+            stream_session_id=state.stream_session_id,
+            accepted_update_count=state.accepted_update_count,
+            rejected_update_count=state.rejected_update_count,
+            buffered_update_count=len(state.pending_updates),
+            last_snapshot_seed_ts=state.last_snapshot_seed_ts,
+            last_live_synced_ts=state.last_live_synced_ts,
+            last_desync_ts=state.last_desync_ts,
+            last_desync_reason=state.last_desync_reason,
+            last_resync_reason=state.last_resync_reason,
+            fenced_reason=state.fenced_reason,
+            last_seen_U=state.last_seen_U,
+            last_seen_u=state.last_seen_u,
+            last_seen_pu=state.last_seen_pu,
+            last_rejected_U=state.last_rejected_U,
+            last_rejected_u=state.last_rejected_u,
+            last_rejected_pu=state.last_rejected_pu,
+        )
 
     def _ensure_snapshot_task(self, state: DepthSymbolState, *, reason: str) -> None:
         if state.sync_state == SYNC_FENCED:
@@ -375,6 +419,8 @@ class BinanceNativeDepthRecorder:
 
     async def _handle_snapshot_seed(self, state: DepthSymbolState, raw: dict, *, reason: str) -> None:
         state.snapshot_seed_count += 1
+        state.last_snapshot_seed_ts = time.monotonic()
+        state.last_resync_reason = reason
         # Set IDs from snapshot but do NOT transition to SNAPSHOT_SEEDED yet.
         # Keep state as RESYNC_REQUIRED during promote so the WS handler just
         # buffers incoming messages without checking continuity.  The promote
@@ -519,11 +565,13 @@ class BinanceNativeDepthRecorder:
             )
 
         # 5. Update state and transition sync
+        state.accepted_update_count += len(accepted_updates)
         if accepted_updates:
             last_accepted_u = accepted_updates[-1].get("u")
             if last_accepted_u is not None:
                 state.prev_update_id = last_accepted_u
                 state.last_update_id = last_accepted_u
+            state.last_live_synced_ts = time.monotonic()
             await self._transition_sync_state(state, SYNC_LIVE_SYNCED, "bootstrap_promote")
         else:
             # No buffered updates bridged the gap — transition to SNAPSHOT_SEEDED
@@ -574,10 +622,21 @@ class BinanceNativeDepthRecorder:
             state.prev_update_id = u
             state.last_update_id = u
             state.sync_state = SYNC_LIVE_SYNCED
+            state.accepted_update_count += 1
+            state.last_live_synced_ts = time.monotonic()
             return True
 
         state.desync_events += 1
+        state.rejected_update_count += 1
         state.sync_state = SYNC_DESYNCED
+        state.last_desync_ts = time.monotonic()
+        state.last_desync_reason = (
+            f"bootstrap_{'futures' if is_futures else 'spot'}" if is_bootstrap
+            else f"continuity_{'futures' if is_futures else 'spot'}"
+        )
+        state.last_rejected_U = U
+        state.last_rejected_u = u
+        state.last_rejected_pu = pu
         return False
 
     async def _transition_sync_state(
@@ -606,16 +665,7 @@ class BinanceNativeDepthRecorder:
             "prev_update_id": state.prev_update_id,
         }
         await self.storage_manager.write_record(state.venue, state.symbol, DEPTH_V2_CHANNEL, record)
-        self.health_monitor.record_phase2_symbol_state(
-            venue=state.venue,
-            symbol=state.symbol,
-            sync_state=state.sync_state,
-            last_update_id=state.last_update_id,
-            prev_update_id=state.prev_update_id,
-            snapshot_seed_count=state.snapshot_seed_count,
-            resync_count=state.resync_count,
-            desync_count=state.desync_events,
-        )
+        self._report_symbol_state(state)
 
     async def _emit_stream_lifecycle(
         self,

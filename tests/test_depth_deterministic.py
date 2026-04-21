@@ -201,16 +201,17 @@ def test_futures_U_u_pu_continuity_and_fencing() -> None:
                 ts_recv_ns=1_000, last_update_id=200,
                 bids=[["99.0", "1.0"]], asks=[["101.0", "2.0"]],
             )
+            # Bootstrap succeeds: U=198 <= 200, u=202 >= 200
             yield _depth_update(
                 session=1, session_seq=2,
-                ts_recv_ns=2_000, U=201, u=202, pu=200,
+                ts_recv_ns=2_000, U=198, u=202, pu=195,
                 bids=[["100.0", "2.0"]],
             )
             yield _sync_state(
                 session=1, session_seq=3,
                 ts_recv_ns=2_500, state="desynced", reason="continuity_break",
             )
-            # This depth_update has wrong pu → should be fenced
+            # This depth_update has wrong pu -> should be fenced
             yield _depth_update(
                 session=1, session_seq=4,
                 ts_recv_ns=3_000, U=203, u=204, pu=999,
@@ -222,9 +223,10 @@ def test_futures_U_u_pu_continuity_and_fencing() -> None:
                 ts_recv_ns=4_000, last_update_id=204,
                 bids=[["100.0", "2.0"]], asks=[["101.0", "1.0"]],
             )
+            # Bootstrap: U=202 <= 204, u=206 >= 204
             yield _depth_update(
                 session=1, session_seq=6,
-                ts_recv_ns=5_000, U=205, u=205, pu=204,
+                ts_recv_ns=5_000, U=202, u=206, pu=200,
                 asks=[["101.5", "1.5"]],
             )
 

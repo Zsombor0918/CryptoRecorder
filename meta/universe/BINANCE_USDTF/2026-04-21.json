@@ -16,10 +16,10 @@
     "PEPEUSDT",
     "PAXGUSDT",
     "GUNUSDT",
-    "ORDIUSDT",
-    "EDUUSDT",
-    "ADAUSDT",
     "FDUSDUSDT",
+    "ORDIUSDT",
+    "ADAUSDT",
+    "EDUUSDT",
     "SUIUSDT",
     "AVAXUSDT",
     "LINKUSDT",
@@ -29,27 +29,27 @@
     "GIGGLEUSDT",
     "XAUTUSDT",
     "TAOUSDT",
-    "NEARUSDT",
-    "BIOUSDT",
     "DASHUSDT",
+    "NEARUSDT",
+    "USDEUSDT",
+    "BIOUSDT",
     "LTCUSDT",
     "PENGUUSDT",
     "XLMUSDT",
-    "USDEUSDT",
-    "CHZUSDT",
     "ENAUSDT",
-    "ASTERUSDT",
+    "CHZUSDT",
     "RUNEUSDT",
+    "ASTERUSDT",
     "XUSDUSDT",
     "UTKUSDT",
     "NEWTUSDT",
     "TRUMPUSDT",
-    "PORTALUSDT",
     "ZENUSDT",
-    "ZROUSDT",
+    "PORTALUSDT",
     "UNIUSDT",
     "LDOUSDT",
-    "DENTUSDT"
+    "DENTUSDT",
+    "HBARUSDT"
   ],
   "BINANCE_USDTF": [
     "BTCUSDT",
@@ -60,8 +60,8 @@
     "CLUSDT",
     "XAGUSDT",
     "XRPUSDT",
-    "ZECUSDT",
     "CHIPUSDT",
+    "ZECUSDT",
     "HYPEUSDT",
     "BZUSDT",
     "DOGEUSDT",
@@ -83,27 +83,27 @@
     "LINKUSDT",
     "TSLAUSDT",
     "TAOUSDT",
-    "ENAUSDT",
     "CRCLUSDT",
+    "ENAUSDT",
     "NEARUSDT",
+    "BASUSDT",
     "FILUSDT",
     "GWEIUSDT",
     "MSTRUSDT",
     "PENGUUSDT",
     "BIOUSDT",
     "DOTUSDT",
-    "TRUMPUSDT",
     "GIGGLEUSDT",
+    "TRUMPUSDT",
+    "XMRUSDT",
     "ARIAUSDT",
     "XLMUSDT",
-    "XMRUSDT",
     "ASTERUSDT",
-    "BASUSDT",
-    "CHZUSDT",
     "TRXUSDT",
+    "CHZUSDT",
     "FARTCOINUSDT"
   ],
-  "timestamp": "2026-04-22T00:24:18.660871+02:00",
+  "timestamp": "2026-04-22T01:28:03.150155+02:00",
   "top_count": 50,
   "candidate_pool_size": 120,
   "candidate_pool_sizes": {
@@ -129,11 +129,11 @@
       "candidate_pool_size": 120,
       "candidate_pool_count": 120,
       "candidate_pool_raw_count": 120,
-      "candidate_pool_after_sanity_count": 118,
-      "candidate_pool_after_support_check_count": 118,
+      "candidate_pool_after_sanity_count": 117,
+      "candidate_pool_after_support_check_count": 117,
       "requested_count": 50,
-      "eligible_count": 118,
-      "survivor_count": 118,
+      "eligible_count": 117,
+      "survivor_count": 117,
       "selected_count": 50,
       "selected_sample": [
         "USDCUSDT",
@@ -147,30 +147,40 @@
         "BNBUSDT",
         "DOGEUSDT"
       ],
-      "pre_filter_rejected_count": 2,
+      "pre_filter_rejected_count": 3,
       "pre_filter_rejected_sample": [
         {
           "symbol": "\u5e01\u5b89\u4eba\u751fUSDT",
           "reason": "contains non-ASCII characters",
-          "quote_volume": 67507761.65368
+          "quote_volume": 66068730.53237
         },
         {
           "symbol": "UUSDT",
           "reason": "base asset shorter than 2 chars ('U')",
-          "quote_volume": 38424621.4122
+          "quote_volume": 38325172.2988
+        },
+        {
+          "symbol": "CUSDT",
+          "reason": "base asset shorter than 2 chars ('C')",
+          "quote_volume": 3731333.48021
         }
       ],
-      "rejected_pre_filter_count": 2,
+      "rejected_pre_filter_count": 3,
       "rejected_pre_filter_sample": [
         {
           "symbol": "\u5e01\u5b89\u4eba\u751fUSDT",
           "reason": "contains non-ASCII characters",
-          "quote_volume": 67507761.65368
+          "quote_volume": 66068730.53237
         },
         {
           "symbol": "UUSDT",
           "reason": "base asset shorter than 2 chars ('U')",
-          "quote_volume": 38424621.4122
+          "quote_volume": 38325172.2988
+        },
+        {
+          "symbol": "CUSDT",
+          "reason": "base asset shorter than 2 chars ('C')",
+          "quote_volume": 3731333.48021
         }
       ],
       "support_precheck_available": false,
@@ -202,40 +212,40 @@
         "CLUSDT",
         "XAGUSDT",
         "XRPUSDT",
-        "ZECUSDT",
-        "CHIPUSDT"
+        "CHIPUSDT",
+        "ZECUSDT"
       ],
       "pre_filter_rejected_count": 6,
       "pre_filter_rejected_sample": [
         {
           "symbol": "\u5e01\u5b89\u4eba\u751fUSDT",
           "reason": "contains non-ASCII characters",
-          "quote_volume": 231326882.07797
+          "quote_volume": 227918242.0201
         },
         {
           "symbol": "MUSDT",
           "reason": "base asset shorter than 2 chars ('M')",
-          "quote_volume": 97489669.4446
+          "quote_volume": 99647979.8838
         },
         {
           "symbol": "\u6211\u8e0f\u9a6c\u6765\u4e86USDT",
           "reason": "contains non-ASCII characters",
-          "quote_volume": 15645583.448293
-        },
-        {
-          "symbol": "HUSDT",
-          "reason": "base asset shorter than 2 chars ('H')",
-          "quote_volume": 11769541.30234
-        },
-        {
-          "symbol": "WUSDT",
-          "reason": "base asset shorter than 2 chars ('W')",
-          "quote_volume": 9343223.1266845
+          "quote_volume": 15374682.308969
         },
         {
           "symbol": "CUSDT",
           "reason": "base asset shorter than 2 chars ('C')",
-          "quote_volume": 8634000.11547
+          "quote_volume": 12819048.22488
+        },
+        {
+          "symbol": "HUSDT",
+          "reason": "base asset shorter than 2 chars ('H')",
+          "quote_volume": 12327315.34614
+        },
+        {
+          "symbol": "WUSDT",
+          "reason": "base asset shorter than 2 chars ('W')",
+          "quote_volume": 9290559.8638905
         }
       ],
       "rejected_pre_filter_count": 6,
@@ -243,32 +253,32 @@
         {
           "symbol": "\u5e01\u5b89\u4eba\u751fUSDT",
           "reason": "contains non-ASCII characters",
-          "quote_volume": 231326882.07797
+          "quote_volume": 227918242.0201
         },
         {
           "symbol": "MUSDT",
           "reason": "base asset shorter than 2 chars ('M')",
-          "quote_volume": 97489669.4446
+          "quote_volume": 99647979.8838
         },
         {
           "symbol": "\u6211\u8e0f\u9a6c\u6765\u4e86USDT",
           "reason": "contains non-ASCII characters",
-          "quote_volume": 15645583.448293
-        },
-        {
-          "symbol": "HUSDT",
-          "reason": "base asset shorter than 2 chars ('H')",
-          "quote_volume": 11769541.30234
-        },
-        {
-          "symbol": "WUSDT",
-          "reason": "base asset shorter than 2 chars ('W')",
-          "quote_volume": 9343223.1266845
+          "quote_volume": 15374682.308969
         },
         {
           "symbol": "CUSDT",
           "reason": "base asset shorter than 2 chars ('C')",
-          "quote_volume": 8634000.11547
+          "quote_volume": 12819048.22488
+        },
+        {
+          "symbol": "HUSDT",
+          "reason": "base asset shorter than 2 chars ('H')",
+          "quote_volume": 12327315.34614
+        },
+        {
+          "symbol": "WUSDT",
+          "reason": "base asset shorter than 2 chars ('W')",
+          "quote_volume": 9290559.8638905
         }
       ],
       "support_precheck_available": false,

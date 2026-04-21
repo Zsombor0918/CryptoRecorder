@@ -34,9 +34,27 @@ class SymbolStats:
         self.snapshot_seed_count = 0
         self.resync_count = 0
         self.desync_events = 0
+        # ── rich sync diagnostics ──
+        self.stream_session_id: int = 0
+        self.accepted_update_count: int = 0
+        self.rejected_update_count: int = 0
+        self.buffered_update_count: int = 0
+        self.last_snapshot_seed_ts: float | None = None
+        self.last_live_synced_ts: float | None = None
+        self.last_desync_ts: float | None = None
+        self.last_desync_reason: str | None = None
+        self.last_resync_reason: str | None = None
+        self.fenced_reason: str | None = None
+        self.last_seen_U: int | None = None
+        self.last_seen_u: int | None = None
+        self.last_seen_pu: int | None = None
+        self.last_rejected_U: int | None = None
+        self.last_rejected_u: int | None = None
+        self.last_rejected_pu: int | None = None
 
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization."""
+        now_mono = time.monotonic()
         return {
             'venue': self.venue,
             'symbol': self.symbol,
@@ -46,9 +64,36 @@ class SymbolStats:
             'prev_update_id': self.prev_update_id,
             'gap_count': self.gap_count,
             'sync_state': self.sync_state,
+            'stream_session_id': self.stream_session_id,
             'snapshot_seed_count': self.snapshot_seed_count,
             'resync_count': self.resync_count,
             'desync_events': self.desync_events,
+            'accepted_update_count': self.accepted_update_count,
+            'rejected_update_count': self.rejected_update_count,
+            'buffered_update_count': self.buffered_update_count,
+            'last_snapshot_seed_ago_sec': (
+                round(now_mono - self.last_snapshot_seed_ts, 1)
+                if self.last_snapshot_seed_ts is not None else None
+            ),
+            'last_live_synced_ago_sec': (
+                round(now_mono - self.last_live_synced_ts, 1)
+                if self.last_live_synced_ts is not None else None
+            ),
+            'last_desync_ago_sec': (
+                round(now_mono - self.last_desync_ts, 1)
+                if self.last_desync_ts is not None else None
+            ),
+            'last_desync_reason': self.last_desync_reason,
+            'last_resync_reason': self.last_resync_reason,
+            'fenced_reason': self.fenced_reason,
+            'last_seen_ids': (
+                {'U': self.last_seen_U, 'u': self.last_seen_u, 'pu': self.last_seen_pu}
+                if self.last_seen_u is not None else None
+            ),
+            'last_rejected_ids': (
+                {'U': self.last_rejected_U, 'u': self.last_rejected_u, 'pu': self.last_rejected_pu}
+                if self.last_rejected_u is not None else None
+            ),
             'last_heartbeat': timestamp_to_local_iso(self.last_heartbeat),
         }
 
@@ -106,6 +151,23 @@ class HealthMonitor:
         resync_count: int = 0,
         desync_count: int | None = None,
         desync_events: int | None = None,
+        # ── rich diagnostics (optional for backward compat) ──
+        stream_session_id: int = 0,
+        accepted_update_count: int = 0,
+        rejected_update_count: int = 0,
+        buffered_update_count: int = 0,
+        last_snapshot_seed_ts: float | None = None,
+        last_live_synced_ts: float | None = None,
+        last_desync_ts: float | None = None,
+        last_desync_reason: str | None = None,
+        last_resync_reason: str | None = None,
+        fenced_reason: str | None = None,
+        last_seen_U: int | None = None,
+        last_seen_u: int | None = None,
+        last_seen_pu: int | None = None,
+        last_rejected_U: int | None = None,
+        last_rejected_u: int | None = None,
+        last_rejected_pu: int | None = None,
     ) -> None:
         key = (venue, symbol)
         if key not in self.symbol_stats:
@@ -119,6 +181,30 @@ class HealthMonitor:
         stats.desync_events = (
             desync_events if desync_events is not None else desync_count or 0
         )
+        # Rich diagnostics
+        stats.stream_session_id = stream_session_id
+        stats.accepted_update_count = accepted_update_count
+        stats.rejected_update_count = rejected_update_count
+        stats.buffered_update_count = buffered_update_count
+        if last_snapshot_seed_ts is not None:
+            stats.last_snapshot_seed_ts = last_snapshot_seed_ts
+        if last_live_synced_ts is not None:
+            stats.last_live_synced_ts = last_live_synced_ts
+        if last_desync_ts is not None:
+            stats.last_desync_ts = last_desync_ts
+        if last_desync_reason is not None:
+            stats.last_desync_reason = last_desync_reason
+        if last_resync_reason is not None:
+            stats.last_resync_reason = last_resync_reason
+        stats.fenced_reason = fenced_reason
+        if last_seen_U is not None:
+            stats.last_seen_U = last_seen_U
+            stats.last_seen_u = last_seen_u
+            stats.last_seen_pu = last_seen_pu
+        if last_rejected_U is not None:
+            stats.last_rejected_U = last_rejected_U
+            stats.last_rejected_u = last_rejected_u
+            stats.last_rejected_pu = last_rejected_pu
     
     def record_gap(self, venue: str, symbol: str) -> None:
         """Record a detected gap in sequence."""
@@ -186,6 +272,32 @@ class HealthMonitor:
                 round(futures_symbols_active / self.futures_symbols_requested, 4)
                 if self.futures_symbols_requested else None
             )
+
+            # ── venue-level sync-health summaries ─────────────────────
+            sync_health: Dict[str, Dict[str, Any]] = {}
+            for venue_key, sym_dicts in by_venue.items():
+                live = sum(1 for s in sym_dicts if s.get("sync_state") == "live_synced")
+                desynced = sum(1 for s in sym_dicts if s.get("sync_state") == "desynced")
+                unsynced = sum(1 for s in sym_dicts if s.get("sync_state") == "unsynced")
+                fenced = sum(1 for s in sym_dicts if s.get("sync_state") == "fenced")
+                seeded = sum(1 for s in sym_dicts if s.get("sync_state") == "snapshot_seeded")
+                resync_req = sum(1 for s in sym_dicts if s.get("sync_state") == "resync_required")
+                with_desync = sum(1 for s in sym_dicts if (s.get("desync_events") or 0) > 0)
+                max_resyncs = max((s.get("resync_count") or 0 for s in sym_dicts), default=0)
+                total_accepted = sum(s.get("accepted_update_count", 0) for s in sym_dicts)
+                total_rejected = sum(s.get("rejected_update_count", 0) for s in sym_dicts)
+                sync_health[venue_key] = {
+                    "live_synced_count": live,
+                    "snapshot_seeded_count": seeded,
+                    "desynced_count": desynced,
+                    "resync_required_count": resync_req,
+                    "unsynced_count": unsynced,
+                    "fenced_count": fenced,
+                    "symbols_with_desync_events": with_desync,
+                    "max_resync_count": max_resyncs,
+                    "total_accepted_updates": total_accepted,
+                    "total_rejected_updates": total_rejected,
+                }
             
             heartbeat = {
                 'timestamp': local_now_iso(),
@@ -210,6 +322,7 @@ class HealthMonitor:
                 'futures_disabled_reason': self.futures_disabled_reason,
                 'snapshot_mode': self.snapshot_mode,
                 'architecture': 'deterministic_native',
+                'sync_health': sync_health,
                 'by_venue': dict(by_venue),
             }
             
