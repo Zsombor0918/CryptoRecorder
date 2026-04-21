@@ -8,6 +8,7 @@ Suspected gaps (long inactivity) are counted, optionally triggering a book reset
 """
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 import json
 import logging
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -234,6 +235,111 @@ class BookReconstructor:
 DEPTH_SNAPSHOT_INTERVAL_SEC: float = 1.0
 
 
+@dataclass
+class BookBuilderPolicy:
+    on_crossed_book: str = "soft_reset"
+    snapshot_emit_mode: str = "interval"
+    snapshot_interval_sec: float = DEPTH_SNAPSHOT_INTERVAL_SEC
+
+
+@dataclass
+class BookBuilderMetrics:
+    depth_events_in: int = 0
+    depth_snapshots_out: int = 0
+    crossed_book_drops: int = 0
+    book_resets: int = 0
+    out_of_order_events: int = 0
+    gaps_suspected: int = 0
+    crossed_book_examples: List[Dict[str, Any]] = field(default_factory=list)
+
+
+class BookBuilder(BookReconstructor):
+    """Compatibility wrapper used by tests and older callers."""
+
+    def __init__(
+        self,
+        instrument_id: InstrumentId,
+        price_prec: int,
+        size_prec: int,
+        *,
+        venue: str,
+        symbol: str,
+        policy: Optional[BookBuilderPolicy] = None,
+    ):
+        super().__init__(instrument_id, price_prec, size_prec)
+        self.venue = venue
+        self.symbol = symbol
+        self.policy = policy or BookBuilderPolicy()
+        self.metrics = BookBuilderMetrics()
+        self._last_emit_ns: Optional[int] = None
+        self._last_ts_event: Optional[int] = None
+
+    def process_event(
+        self,
+        rec: dict,
+        *,
+        ts_event: int,
+        ts_init: int,
+        input_index: int,
+    ) -> Optional[OrderBookDepth10]:
+        self.metrics.depth_events_in += 1
+        if self._last_ts_event is not None and ts_event < self._last_ts_event:
+            self.metrics.out_of_order_events += 1
+        self._last_ts_event = ts_event
+
+        gaps_before = self.gaps_suspected
+        resets_before = self.book_resets
+        self.apply_delta(rec, ts_init)
+        self.metrics.gaps_suspected += self.gaps_suspected - gaps_before
+        self.metrics.book_resets += self.book_resets - resets_before
+
+        context = self._current_book_context()
+        best_bid = context["best_bid"]
+        best_ask = context["best_ask"]
+        if best_bid is not None and best_ask is not None and best_bid >= best_ask:
+            event = {
+                "event": "crossed_book",
+                "instrument_id": str(self.instrument_id),
+                "venue": self.venue,
+                "symbol": self.symbol,
+                "ts_event": ts_event,
+                "ts_init": ts_init,
+                "input_index": input_index,
+                "best_bid": best_bid,
+                "best_ask": best_ask,
+                "action": self.policy.on_crossed_book,
+                "previous_snapshot": self._last_snapshot_context,
+                "current_delta": self._delta_context(rec),
+                "current_book": context,
+            }
+            self.crossed_book_events += 1
+            if len(self.crossed_book_examples) < 10:
+                self.crossed_book_examples.append(event)
+            if len(self.metrics.crossed_book_examples) < 10:
+                self.metrics.crossed_book_examples.append(event)
+            self.metrics.crossed_book_drops += 1
+
+            if self.policy.on_crossed_book == "soft_reset":
+                self._reset_book()
+                self.metrics.book_resets += 1
+            return None
+
+        should_emit = self.policy.snapshot_emit_mode == "every_delta"
+        if not should_emit:
+            interval_ns = int(self.policy.snapshot_interval_sec * 1e9)
+            if self._last_emit_ns is None or (ts_init - self._last_emit_ns) >= interval_ns:
+                should_emit = True
+
+        if not should_emit:
+            return None
+
+        snapshot = self.snapshot(ts_event, ts_init)
+        if snapshot is not None:
+            self._last_emit_ns = ts_init
+            self.metrics.depth_snapshots_out += 1
+        return snapshot
+
+
 def _record_ts_init_ns(rec: dict) -> int:
     """Return the converter replay timestamp for a raw depth record."""
     ts_init = rec.get("ts_recv_ns")
@@ -336,3 +442,66 @@ def convert_depth(
         first_ts,
         last_ts,
     )
+
+
+def convert_depth_records(
+    records: Iterable[dict],
+    instrument_id: InstrumentId,
+    price_prec: int,
+    size_prec: int,
+    *,
+    venue: str,
+    symbol: str,
+    policy: Optional[BookBuilderPolicy] = None,
+    include_metrics: bool = False,
+):
+    """Compatibility helper for converting in-memory depth records."""
+    builder = BookBuilder(
+        instrument_id,
+        price_prec,
+        size_prec,
+        venue=venue,
+        symbol=symbol,
+        policy=policy,
+    )
+    snapshots: List[OrderBookDepth10] = []
+    bad = 0
+    first_ts: Optional[int] = None
+    last_ts: Optional[int] = None
+
+    for input_index, rec in _sorted_depth_records(records):
+        try:
+            ts_init = _record_ts_init_ns(rec)
+            ts_event_ms = rec.get("ts_event_ms")
+            ts_event = int(ts_event_ms * 1_000_000) if ts_event_ms else ts_init
+            if ts_event == 0:
+                continue
+
+            snapshot = builder.process_event(
+                rec,
+                ts_event=ts_event,
+                ts_init=ts_init,
+                input_index=input_index,
+            )
+            if snapshot is not None:
+                snapshots.append(snapshot)
+
+            if first_ts is None:
+                first_ts = ts_event
+            last_ts = ts_event
+        except Exception:
+            bad += 1
+
+    result = (
+        snapshots,
+        bad,
+        builder.metrics.gaps_suspected,
+        builder.metrics.book_resets,
+        builder.metrics.crossed_book_drops,
+        builder.metrics.crossed_book_examples,
+        first_ts,
+        last_ts,
+    )
+    if include_metrics:
+        return result + (builder.metrics.__dict__.copy(),)
+    return result
