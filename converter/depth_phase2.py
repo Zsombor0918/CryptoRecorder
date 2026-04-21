@@ -268,14 +268,28 @@ def _close_fence(
 
 
 def _should_accept_update(state: ReplayState, rec: dict) -> bool:
+    """Check Binance depth continuity.
+
+    For the first event after a snapshot (sync_state == 'snapshot_seeded'),
+    use the bootstrap overlap rule.  For subsequent events ('live_synced'),
+    use the ongoing continuity rule.  Must match the recorder's
+    ``_check_continuity`` exactly.
+    """
     U = rec.get("U")
     u = rec.get("u")
     pu = rec.get("pu")
     prev = state.prev_update_id
     if U is None or u is None or prev is None:
         return False
-    if state.venue == "BINANCE_USDTF":
-        return pu == prev and u > prev
+    is_futures = state.venue == "BINANCE_USDTF"
+    is_bootstrap = state.sync_state == "snapshot_seeded"
+    if is_futures:
+        if is_bootstrap:
+            # Futures bootstrap: U <= lastUpdateId AND u >= lastUpdateId
+            return (U <= prev) and (u >= prev)
+        # Futures ongoing: pu == prev_u
+        return pu == prev
+    # Spot: same formula for bootstrap and ongoing
     return U <= (prev + 1) <= u
 
 
