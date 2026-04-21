@@ -92,7 +92,7 @@ class FileRotator:
     
     async def _compress_file(self, file_path: Path) -> None:
         """Compress file with zstd.  Only removes source on success."""
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         
         def compress():
             dst = Path(f"{file_path}.zst")
