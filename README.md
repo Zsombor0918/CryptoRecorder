@@ -5,101 +5,98 @@ CryptoRecorder is a Phase 1 Binance market-data pipeline for backtesting.
 **Phase 1 Target:** 50 spot instruments with trades + approximate L2 depth,
 converted to a Nautilus-queryable `ParquetDataCatalog`.
 
-It records Binance **spot** and **USDT-M futures** market data (trades + L2 deltas),
-stores raw append-only files, and converts daily data into a NautilusTrader
-`ParquetDataCatalog`.
-
-## What Phase 1 does
-
-- 24/7 recording via `cryptofeed`
-- Channels: `trade`, `depth`, `exchangeinfo`
-- Hourly raw file rotation with compression
-- Daily conversion to Nautilus-native catalog (`TradeTick`, `OrderBookDepth10`)
-- Crossed-book detection and exclusion from catalog
-- Data presence tracking per instrument
-- Startup coverage + heartbeat + validation workflows
-
-## What Phase 1 does **not** do
-
-- No periodic REST `/depth` polling (causes rate limiting)
-- No deterministic Binance `U/u/pu` replay
-- No bit-exact matching-engine reconstruction
-- No L3 / queue position tracking
-
-L2 reconstruction in Phase 1 is **approximate** by design. Deterministic replay
-is roadmap work, not a current guarantee.
-
-## Quick start
+## Quick Start
 
 ```bash
-cd ~/CryptoRecorder
+# 1. Clone and setup
+git clone <repo>
+cd CryptoRecorder
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 
+# 2. Validate setup
+python validate.py
+
+# 3. Run unit tests
+pytest tests/
+
+# 4. Start the recorder
 python recorder.py
 ```
 
-In another shell:
+## Project Structure
 
-```bash
-source .venv/bin/activate
-python VALIDATE.py all
+```
+CryptoRecorder/
+├── recorder.py          # Main recorder (starts here)
+├── convert_day.py       # Convert raw data to Nautilus catalog
+├── validate.py          # Setup validation (run on new machine)
+│
+├── converter/           # Conversion logic
+│   ├── book.py          # L2 book reconstruction
+│   ├── trades.py        # Trade conversion
+│   └── instruments.py   # Instrument building
+│
+├── tests/               # Unit tests (run with pytest)
+│   ├── test_bookbuilder.py
+│   ├── test_depth_reconstruction_phase1.py
+│   └── ...
+│
+├── scripts/             # Operational scripts
+│   ├── smoke_test.py    # Quick 3-min recorder test
+│   └── acceptance_test.py # Full pipeline test
+│
+├── docs/                # Documentation
+│   ├── ARCHITECTURE.md  # System design
+│   ├── VALIDATION.md    # Testing/validation details
+│   └── GUARANTEES.md    # What Phase 1 guarantees
+│
+├── data_raw/            # Raw recorded data (gitignored)
+├── state/               # Runtime state files
+└── meta/                # Metadata storage
 ```
 
-Setup details and service installation live in [INSTALL.md](INSTALL.md).
+## Testing & Validation
+
+| What | Command | When |
+|------|---------|------|
+| Setup validation | `python validate.py` | After cloning/setup |
+| Unit tests | `pytest tests/` | After code changes |
+| Smoke test | `python scripts/smoke_test.py` | Verify recorder works |
+| Full acceptance | `python scripts/acceptance_test.py` | Release readiness |
 
 ## Conversion
 
-```bash
-python convert_day.py --date YYYY-MM-DD
-```
-
-The converter produces:
-- `CurrencyPair` instruments (spot) / `CryptoPerpetual` (futures)
-- `TradeTick` objects from raw trade data
-- `OrderBookDepth10` snapshots from L2 delta reconstruction
-
-## Validation entrypoint
-
-`VALIDATE.py` remains the master CLI:
+Convert recorded data to Nautilus catalog:
 
 ```bash
-python VALIDATE.py system      # Infrastructure checks
-python VALIDATE.py runtime     # 3-min recorder smoke test
-python VALIDATE.py scale       # 10-min 50/50 acceptance test
-python VALIDATE.py nautilus    # Converter + catalog validation
-python VALIDATE.py purge       # Purge safety proof
-python VALIDATE.py all         # Quick suite
-python VALIDATE.py accept      # Full acceptance suite
+python convert_day.py --date 2026-04-20
 ```
 
-Preferred validator modules live under `validators/`.
+This produces:
+- `TradeTick` objects from raw trades
+- `OrderBookDepth10` snapshots from L2 deltas
+- `CurrencyPair` / `CryptoPerpetual` instruments
 
-## Repository map (high level)
+## Phase 1 Scope
 
-- `recorder.py` – recorder runtime entrypoint
-- `convert_day.py` – conversion CLI
-- `converter/` – conversion internals (book reconstruction, trades, instruments)
-- `validators/` – validator implementations
-- `inspect_catalog.py` – catalog quality inspection (crossed-book, data presence)
-- `state/` – runtime reports (`heartbeat.json`, `startup_coverage.json`, conversion reports)
-- `docs/` – detailed documentation
+**What it does:**
+- Records trades + L2 deltas via cryptofeed
+- Converts to Nautilus-native format
+- Ensures no crossed-book snapshots in catalog
+- Tracks data quality metrics
 
-## Detailed docs
+**What it doesn't do:**
+- Deterministic Binance U/u/pu replay
+- Bit-exact order book reconstruction
+- REST depth polling (causes rate limits)
 
-- [INSTALL.md](INSTALL.md)
-- [Architecture](docs/ARCHITECTURE.md) – pipeline and conversion model
-- [Validation](docs/VALIDATION.md) – validation layers and checks
-- [Guarantees](docs/GUARANTEES.md) – what Phase 1 guarantees and does not
-- [Operations](docs/OPERATIONS.md)
-- [State schemas](docs/SCHEMAS.md)
+See [docs/GUARANTEES.md](docs/GUARANTEES.md) for full details.
 
-## Phase 1 status statement
+## Documentation
 
-This repository is intentionally optimized for robust, production-safe recording
-with graceful degradation (skip bad symbols, continue with survivors), not for
-exchange-perfect deterministic replay.
-
-**The final catalog contains no crossed-book snapshots.** Crossed events during
-reconstruction trigger resets, not catalog writes.
+- [Architecture](docs/ARCHITECTURE.md) — System design and pipeline
+- [Validation](docs/VALIDATION.md) — Testing layers and checks
+- [Guarantees](docs/GUARANTEES.md) — Phase 1 scope boundaries
+- [Installation](INSTALL.md) — Detailed setup guide
