@@ -32,11 +32,12 @@ def test_non_ascii_symbol_is_rejected() -> None:
 
 
 def test_known_unsupported_symbols_are_partitioned() -> None:
+    """In the deterministic native architecture, partition keeps everything."""
     kept, removed = partition_known_unsupported_symbols(
         ["BTCUSDT", "FDUSDUSDT", "ETHUSDT"]
     )
-    assert kept == ["BTCUSDT", "ETHUSDT"]
-    assert removed == ["FDUSDUSDT"]
+    assert kept == ["BTCUSDT", "FDUSDUSDT", "ETHUSDT"]
+    assert removed == []
 
 
 def test_selection_pipeline_reports_rejections_consistently() -> None:
@@ -52,13 +53,14 @@ def test_selection_pipeline_reports_rejections_consistently() -> None:
     ]
     selected, metadata = selector._select_from_tickers(fake_tickers, "spot")
 
-    assert selected[:3] == ["BTCUSDT", "ETHUSDT", "1000PEPEUSDT"]
-    assert metadata["eligible_count"] == 3
-    assert metadata["survivor_count"] == 3
-    assert metadata["pre_filter_rejected_count"] == 3
-    assert metadata["rejected_pre_filter_count"] == 3
+    # FDUSDUSDT passes sanity filter in native architecture (no cryptofeed friction)
+    assert selected[:4] == ["BTCUSDT", "ETHUSDT", "1000PEPEUSDT", "FDUSDUSDT"]
+    assert metadata["eligible_count"] == 4
+    assert metadata["survivor_count"] == 4
+    assert metadata["pre_filter_rejected_count"] == 2
+    assert metadata["rejected_pre_filter_count"] == 2
 
     rejected_symbols = {
         item["symbol"] for item in metadata["pre_filter_rejected_sample"]
     }
-    assert {"币安人生USDT", "UUSDT", "FDUSDUSDT"}.issubset(rejected_symbols)
+    assert {"币安人生USDT", "UUSDT"}.issubset(rejected_symbols)

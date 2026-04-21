@@ -1,6 +1,6 @@
 # Guarantees
 
-This document clearly states what CryptoRecorder Phase 1 guarantees and what it does not.
+This document states what CryptoRecorder guarantees and what it does not.
 
 ## What This Repository Guarantees
 
@@ -8,62 +8,44 @@ This document clearly states what CryptoRecorder Phase 1 guarantees and what it 
 
 | Guarantee | Description |
 |-----------|-------------|
-| L2 deltas recorded | cryptofeed-normalized delta updates, not full snapshots |
-| Trades recorded | Individual trade ticks with price, quantity, side, trade_id |
-| size==0 semantics preserved | Delete semantics maintained in raw data |
-| Timestamps preserved | Both exchange time (ts_event_ms) and local receipt (ts_recv_ns) |
-| Queue drops tracked | Heartbeat reports queue_drop_total |
-| 50 spot instruments | Top symbols by 24h quote volume |
+| Native Binance WebSocket depth | `depth_v2` records with exchange-native update IDs and raw level payloads |
+| Native Binance WebSocket trades | `trade_v2` records: spot `@trade`, futures `@aggTrade` |
+| Deterministic session ordering | Committed-only `session_seq` / `trade_session_seq` counters |
+| Tagged union trade schema | `market_type` discriminator with venue-specific fields |
+| Explicit sync lifecycle | `unsynced`, `snapshot_seeded`, `live_synced`, `desynced`, `resync_required` states tracked |
+| Timestamps preserved | Both exchange time (`ts_event_ms` / `ts_trade_ms`) and local receipt (`ts_recv_ns`) |
+| 50 instruments target | Top symbols by 24h quote volume (spot + futures) |
 
 ### Conversion
 
 | Guarantee | Description |
 |-----------|-------------|
-| Nautilus-native output | Real `TradeTick` and `OrderBookDepth10` objects |
+| Deterministic replay | Same raw data always produces identical Nautilus output |
+| Exact Decimal book state | Book reconstruction uses `Decimal` throughout (no float) |
+| Delta-first L2 output | Primary depth output is `OrderBookDeltas` |
+| Optional derived Depth10 | `OrderBookDepth10` derived only from replayed deterministic book state |
 | Valid instruments | `CurrencyPair` for spot, `CryptoPerpetual` for futures |
-| Queryable catalog | Standard Nautilus `ParquetDataCatalog` API works |
-| No crossed snapshots | Crossed books trigger reset, not catalog write |
-| Idempotent re-conversion | Same date re-run produces identical counts |
+| Queryable catalog | Standard Nautilus `ParquetDataCatalog` API |
+| Fenced bad ranges | Excluded ranges visible in reports instead of silently reconstructed |
+| Idempotent re-conversion | Same date re-run produces identical output |
 
 ### Validation
 
 | Guarantee | Description |
 |-----------|-------------|
-| Crossed-book detection | crossed_rate reported, threshold enforced |
-| Gap tracking | gaps_suspected, book_resets_total reported |
-| Data presence | instruments_with_trades/depth/both/no_data tracked |
+| Sync lifecycle tracking | resync_count, desync_events, fenced_ranges reported |
+| Data presence tracking | instruments_with_trades / depth / no_data tracked |
+| Exchange-native continuity | Spot U/u, futures pu checked against update IDs |
 | Schema validation | Records have required fields |
 
-## Phase 2 Guarantees
-
-When Phase 2 is explicitly enabled:
-
-| Guarantee | Description |
-|-----------|-------------|
-| Binance-native raw depth | `depth_v2` stores exchange-native update ids and raw level payloads |
-| Explicit sync lifecycle | `unsynced`, `snapshot_seeded`, `live_synced`, `desynced`, `resync_required`, and fenced ranges are surfaced |
-| Deterministic replay ordering | Replay order is stable by stream session and recorded arrival/order fields |
-| Delta-first Nautilus output | Primary L2 catalog output is `OrderBookDeltas` |
-| Optional derived depth10 | `OrderBookDepth10` is derived only from replayed deterministic book state |
-| Fenced bad ranges reported | Excluded ranges are visible in conversion reports instead of silently reconstructed |
-
 ## What This Repository Does NOT Guarantee
-
-### Not Deterministic Replay
-
-| Non-guarantee | Reason |
-|---------------|--------|
-| Binance U/u/pu sequence numbers | Not recorded or used |
-| Bit-exact book reconstruction | Approximate by design |
-| Perfect gap detection | 30s timestamp heuristic only |
-| Sub-second depth resolution | 1-second snapshots |
 
 ### Not Perfect Historical Hygiene
 
 | Non-guarantee | Reason |
 |---------------|--------|
 | All instruments have data | Market may be inactive |
-| Zero gaps | Reconnects happen |
+| Zero desyncs | Reconnects happen |
 | Perfect timestamp ordering | Interleaved WS messages |
 
 ### Not Consumer-Side Concerns
@@ -73,50 +55,35 @@ When Phase 2 is explicitly enabled:
 | BacktestNode configuration | Consumer responsibility |
 | Strategy code | Not this repo's scope |
 | Data viewer tools | Separate project |
+| Full Tardis equivalence | Different design choices at the edge |
 
 ## Scope Boundaries
 
 ### This Repository Handles
 
-- Recording raw market data
-- Converting to Nautilus catalog format
+- Recording raw market data via native Binance WebSockets
+- Converting to Nautilus catalog format with deterministic replay
 - Validating recording and conversion quality
 - Documenting what was produced
 
-### Viewer/Consumer Handles
+### Consumer Handles
 
 - Historical catalog inspection across many days
 - Visualization of gaps and quality metrics
 - BacktestNode configuration and strategy execution
 - Cross-day data continuity analysis
 
-## Phase 1 vs Future Phases
-
-| Feature | Phase 1 | Future |
-|---------|---------|--------|
-| L2 reconstruction | Approximate | Deterministic (U/u/pu) |
-| Depth output | 1-second snapshots | Per-delta or configurable |
-| Gap detection | Timestamp heuristic | Sequence-based |
-| Futures | Secondary, graceful degradation | Full parity with spot |
-
 ## Quality Thresholds
-
-Phase 1 enforces these thresholds:
 
 | Metric | Threshold | Meaning |
 |--------|-----------|---------|
-| crossed_rate | < 0.1% | Crossed events very rare |
-| gap_rate | < 100% | Not all records are gaps |
+| fenced_ranges | reported | Excluded ranges visible in reports |
 | queue_drops | 0 (smoke test) | No drops in normal operation |
+| rate_limit_hits | 0 | No 429/418 errors |
 
 ## Summary
 
-**CryptoRecorder Phase 1 is a production-safe recording and conversion pipeline
-that produces approximate L2 data suitable for spread/mid/TOB analytics and
-basic execution simulation.**
-
-**CryptoRecorder Phase 2 is an opt-in deterministic replay path for Binance
-native depth which is materially closer to Tardis-style delta-first usage, but
-still does not claim full Tardis equivalence.**
-
-The viewer and consumer code handle their own concerns separately.
+**CryptoRecorder is a deterministic native Binance market-data pipeline that
+records depth and trades via native WebSockets, replays them through exact
+Decimal book state, and produces Nautilus `OrderBookDeltas` and `TradeTick`
+objects suitable for backtesting research.**

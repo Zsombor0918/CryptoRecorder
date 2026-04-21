@@ -17,20 +17,20 @@ Systemd units are in `systemd/`.
 
 ```bash
 # Control recorder service
-sudo systemctl start cryptofeed-recorder
-sudo systemctl stop cryptofeed-recorder
-sudo systemctl restart cryptofeed-recorder
-sudo systemctl status cryptofeed-recorder
+sudo systemctl start crypto-recorder
+sudo systemctl stop crypto-recorder
+sudo systemctl restart crypto-recorder
+sudo systemctl status crypto-recorder
 
 # View logs
-journalctl -u cryptofeed-recorder -f
+journalctl -u crypto-recorder -f
 ```
 
 ## Important Runtime Files
 
 | File | Description |
 |------|-------------|
-| `state/heartbeat.json` | Live recorder status |
+| `state/heartbeat.json` | Live recorder status (architecture=deterministic_native) |
 | `state/startup_coverage.json` | Startup symbol coverage |
 | `state/convert_reports/YYYY-MM-DD.json` | Conversion reports |
 | `recorder.log` | Recorder log file |
@@ -52,8 +52,8 @@ Startup and runtime reporting uses these terms:
 
 - Unsupported symbols are logged and skipped
 - Startup continues with surviving symbols
-- Futures may degrade gracefully if support is limited
-- Approximate L2 is expected in Phase 1 (not deterministic replay)
+- Futures support is validated via REST exchangeInfo
+- Depth sync lifecycle handles reconnects deterministically (desync → resync)
 
 ## Conversion
 
@@ -66,6 +66,9 @@ python convert_day.py --date 2026-04-20
 
 # Convert with staging (atomic rename on success)
 python convert_day.py --date 2026-04-20 --staging
+
+# Enable optional derived depth10
+python convert_day.py --date 2026-04-20 --emit-depth10
 ```
 
 ## Validation & Testing

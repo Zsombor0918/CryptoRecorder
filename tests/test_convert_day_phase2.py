@@ -1,3 +1,9 @@
+"""
+test_convert_day_phase2.py — Deterministic native convert_date tests.
+
+Validates that convert_date produces the correct report shape and catalog
+output for the deterministic native architecture (no Phase 1 / mode flag).
+"""
 from __future__ import annotations
 
 from datetime import datetime
@@ -66,7 +72,8 @@ def _live_deltas(instrument) -> OrderBookDeltas:
     return OrderBookDeltas(instrument.id, deltas)
 
 
-def test_convert_date_phase2_writes_order_book_deltas_without_depth10(monkeypatch, tmp_path: Path) -> None:
+def test_convert_date_writes_order_book_deltas_without_depth10(monkeypatch, tmp_path: Path) -> None:
+    """convert_date emits OrderBookDeltas and no Depth10 by default."""
     instrument = TestInstrumentProvider.btcusdt_binance()
 
     monkeypatch.setattr(
@@ -100,17 +107,16 @@ def test_convert_date_phase2_writes_order_book_deltas_without_depth10(monkeypatc
     report = convert_day_mod.convert_date(
         datetime(2026, 4, 21),
         catalog_root=catalog_root,
-        depth_mode="phase2",
-        emit_phase2_depth10=False,
+        emit_depth10=False,
     )
 
     catalog = ParquetDataCatalog(str(catalog_root))
     deltas = catalog.order_book_deltas(instrument_ids=[instrument.id], batched=True)
     depth10 = catalog.order_book_depth10(instrument_ids=[instrument.id])
 
-    assert report["phase"] == "phase2"
+    assert report["architecture"] == "deterministic_native"
     assert report["total_order_book_deltas_written"] == 2
     assert report["total_depth10_written"] == 0
-    assert report["total_depth_snapshots_written"] == 0
+    assert report["total_trades_written"] == 0
     assert len(deltas) == 2
     assert depth10 == []

@@ -9,7 +9,6 @@ from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 import aiohttp
-from cryptofeed.exchanges import BinanceFutures
 
 from config import (
     META_ROOT,
@@ -23,8 +22,6 @@ from config import (
     API_REQUEST_TIMEOUT_SEC,
     UNIVERSE_FILTER_VERSION,
     UNIVERSE_REJECT_SAMPLE_SIZE,
-    KNOWN_UNSUPPORTED_FULL_SYMBOLS,
-    KNOWN_UNSUPPORTED_BASE_ASSETS,
 )
 from time_utils import local_now_iso
 
@@ -63,28 +60,19 @@ def _raw_to_cf_futures_symbol(symbol: str, quote: str = "USDT") -> str:
 
 
 def partition_known_unsupported_symbols(symbols: List[str]) -> Tuple[List[str], List[str]]:
-    """Split symbols into kept vs known-unsupported subsets."""
-    kept: List[str] = []
-    removed: List[str] = []
-    for symbol in symbols:
-        reason = known_unsupported_reason(symbol)
-        if reason:
-            removed.append(symbol)
-        else:
-            kept.append(symbol)
-    return kept, removed
+    """Split symbols into kept vs known-unsupported subsets.
+
+    With the deterministic-native architecture there are no cryptofeed-specific
+    friction symbols, so this always keeps everything.
+    """
+    return list(symbols), []
 
 
 def known_unsupported_reason(symbol: str) -> str | None:
-    """Return reason if the symbol matches a known unsupported pattern."""
-    if symbol in KNOWN_UNSUPPORTED_FULL_SYMBOLS:
-        return f"known unsupported symbol {symbol}"
+    """Return reason if the symbol matches a known unsupported pattern.
 
-    if symbol.endswith("USDT") and len(symbol) > len("USDT"):
-        base = symbol[:-len("USDT")]
-        if base in KNOWN_UNSUPPORTED_BASE_ASSETS:
-            return f"known unsupported base asset {base}"
-
+    With native Binance WebSockets there are no known friction symbols.
+    """
     return None
 
 
@@ -118,7 +106,7 @@ class UniverseSelector:
     def __init__(self):
         self.universe_path = META_ROOT / "universe"
         self.universe_path.mkdir(parents=True, exist_ok=True)
-        self._futures_support_mapping_cache: Dict[str, str] | None = None
+        self._futures_support_mapping_cache: set[str] | None = None
 
     def _empty_selection_metadata(
         self,
@@ -344,42 +332,58 @@ class UniverseSelector:
 
         return kept, rejected
 
-    def _get_futures_support_mapping(self) -> Tuple[Dict[str, str] | None, str | None]:
-        """Load cryptofeed's Binance Futures symbol map for a support precheck."""
+    def _get_futures_exchange_info_symbols(self) -> Tuple[set[str] | None, str | None]:
+        """Load the set of TRADING futures symbols from cached exchangeInfo on disk,
+        or return None if unavailable.
+        """
         if self._futures_support_mapping_cache is not None:
             return self._futures_support_mapping_cache, None
 
-        last_error: str | None = None
-        try:
-            mapping = BinanceFutures.symbol_mapping(refresh=False)
-            if not isinstance(mapping, dict):
-                raise TypeError(f"unexpected symbol mapping type {type(mapping).__name__}")
-            self._futures_support_mapping_cache = mapping
-            return mapping, None
-        except Exception as e:
-            last_error = str(e)
+        from config import DATA_ROOT
+        import pathlib
 
-        # Best-effort second attempt: force a refresh if no cached mapping was available.
-        # Failure still degrades gracefully to sanity-only selection.
-        try:
-            mapping = BinanceFutures.symbol_mapping(refresh=True)
-            if not isinstance(mapping, dict):
-                raise TypeError(f"unexpected symbol mapping type {type(mapping).__name__}")
-            self._futures_support_mapping_cache = mapping
-            return mapping, None
-        except Exception as e:
-            err = str(e)
-            if last_error:
-                err = f"initial lookup failed ({last_error}); refresh failed ({err})"
-            return None, err
+        info_dir = DATA_ROOT / "BINANCE_USDTF" / "exchangeinfo" / "EXCHANGEINFO"
+        if not info_dir.is_dir():
+            return None, "no exchangeInfo data on disk for BINANCE_USDTF"
+
+        # Find the most recent exchangeInfo file
+        candidates = sorted(info_dir.glob("*/*.jsonl*"), reverse=True)
+        if not candidates:
+            return None, "no exchangeInfo JSONL files found"
+
+        trading_symbols: set[str] = set()
+        for path in candidates[:5]:  # try a few recent files
+            try:
+                import zstandard as zstd
+                opener = (
+                    zstd.open if path.suffix == ".zst"
+                    else open
+                )
+                with opener(str(path), "rt") as f:
+                    for line in f:
+                        try:
+                            rec = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        for sym_info in rec.get("symbols", []):
+                            if sym_info.get("status") == "TRADING":
+                                trading_symbols.add(sym_info.get("symbol", ""))
+                if trading_symbols:
+                    self._futures_support_mapping_cache = trading_symbols
+                    return trading_symbols, None
+            except Exception as exc:
+                logger.debug("Could not read exchangeInfo %s: %s", path, exc)
+                continue
+
+        return None, "failed to parse any exchangeInfo files"
 
     def _apply_futures_support_precheck(
         self,
         candidates: List[Dict[str, Any]],
     ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], bool, str | None]:
-        """Filter futures candidates by cryptofeed's actual symbol support map."""
-        mapping, error = self._get_futures_support_mapping()
-        if not mapping:
+        """Filter futures candidates by the exchange's own symbol list (REST-based)."""
+        trading_symbols, error = self._get_futures_exchange_info_symbols()
+        if not trading_symbols:
             return list(candidates), [], False, error
 
         kept: List[Dict[str, Any]] = []
@@ -387,18 +391,12 @@ class UniverseSelector:
 
         for item in candidates:
             symbol = item["symbol"]
-            cf_symbol = _raw_to_cf_futures_symbol(symbol, _quote_asset("futures"))
-            exchange_symbol = mapping.get(cf_symbol)
-            if exchange_symbol == symbol:
+            if symbol in trading_symbols:
                 kept.append(item)
             else:
-                reason = "missing from cryptofeed BinanceFutures symbol_mapping"
-                if exchange_symbol is not None:
-                    reason = f"cryptofeed maps {cf_symbol} to {exchange_symbol}, not {symbol}"
                 rejected.append({
                     "symbol": symbol,
-                    "cf_symbol": cf_symbol,
-                    "reason": reason,
+                    "reason": "not found in futures exchangeInfo TRADING symbols",
                     "quote_volume": item["quoteVolume"],
                 })
 
@@ -481,7 +479,7 @@ class UniverseSelector:
                     logger.info(
                         "Futures support-precheck rejected sample: "
                         + ", ".join(
-                            f"{item['symbol']} -> {item['cf_symbol']} ({item['reason']})"
+                            f"{item['symbol']} ({item['reason']})"
                             for item in support_rejected_sample
                         )
                     )

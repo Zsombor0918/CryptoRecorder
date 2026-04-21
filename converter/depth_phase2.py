@@ -1,13 +1,18 @@
 """
-Phase 2 deterministic Binance-native depth replay.
+Deterministic Binance-native depth replay.
 
 Reads ``depth_v2`` raw records, enforces snapshot/bootstrap and continuity
 rules, emits primary ``OrderBookDeltas`` data, and optionally derives
 ``OrderBookDepth10`` from the same replayed book state.
+
+All records are sorted by ``(stream_session_id, session_seq)`` — the
+committed canonical ordering from the recorder.  Book state uses exact
+``Decimal`` representation throughout.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from decimal import Decimal
 import logging
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -21,7 +26,7 @@ from nautilus_trader.model.enums import BookAction, OrderSide
 from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.objects import Price, Quantity
 
-from config import PHASE2_DEPTH10_INTERVAL_SEC
+from config import DEPTH10_INTERVAL_SEC
 from converter.readers import stream_raw_records
 
 logger = logging.getLogger(__name__)
@@ -50,8 +55,8 @@ class ReplayState:
     symbol: str
     price_prec: int
     size_prec: int
-    bids: Dict[float, float] = field(default_factory=dict)
-    asks: Dict[float, float] = field(default_factory=dict)
+    bids: Dict[Decimal, Decimal] = field(default_factory=dict)
+    asks: Dict[Decimal, Decimal] = field(default_factory=dict)
     current_stream_session_id: Optional[int] = None
     sync_state: str = "unsynced"
     last_snapshot_update_id: Optional[int] = None
@@ -70,19 +75,12 @@ def _ts_event_ns(rec: dict) -> int:
     return int(ts_event_ms) * 1_000_000 if ts_event_ms else ts_recv_ns
 
 
-def _sort_key(raw_index: int, rec: dict) -> Tuple[int, int, int, int, int]:
-    priority = {
-        "stream_lifecycle": 0,
-        "sync_state": 1,
-        "snapshot_seed": 2,
-        "depth_update": 3,
-    }.get(rec.get("record_type", "depth_update"), 9)
+def _sort_key(raw_index: int, rec: dict) -> Tuple[int, int, int]:
+    """Sort by committed canonical order: (session, session_seq, raw_index fallback)."""
     return (
         int(rec.get("stream_session_id", 0)),
-        int(rec.get("connection_seq", 0)),
-        priority,
-        int(rec.get("ts_recv_ns", 0)),
-        int(rec.get("file_position", raw_index)),
+        int(rec.get("session_seq", rec.get("connection_seq", 0))),
+        raw_index,
     )
 
 
@@ -100,10 +98,10 @@ def _make_order(
     )
 
 
-def _apply_levels(book: Dict[float, float], levels: Iterable[List[str]]) -> None:
+def _apply_levels(book: Dict[Decimal, Decimal], levels: Iterable[List[str]]) -> None:
     for price_s, size_s in levels:
-        price = float(price_s)
-        size = float(size_s)
+        price = Decimal(price_s)
+        size = Decimal(size_s)
         if size == 0:
             book.pop(price, None)
         else:
@@ -193,14 +191,14 @@ def _depth10_from_state(state: ReplayState, *, ts_event: int, ts_init: int) -> O
     bid_levels = sorted(state.bids.items(), key=lambda kv: -kv[0])[:10]
     ask_levels = sorted(state.asks.items(), key=lambda kv: kv[0])[:10]
 
-    def _orders(side: OrderSide, levels: List[Tuple[float, float]]) -> List[BookOrder]:
+    def _orders(side: OrderSide, levels: List[Tuple[Decimal, Decimal]]) -> List[BookOrder]:
         out: List[BookOrder] = []
         for price, size in levels:
             out.append(
                 BookOrder(
                     side=side,
-                    price=Price.from_str(f"{price:.{state.price_prec}f}"),
-                    size=Quantity.from_str(f"{size:.{state.size_prec}f}"),
+                    price=Price.from_str(str(price)),
+                    size=Quantity.from_str(str(size)),
                     order_id=0,
                 )
             )
@@ -290,7 +288,7 @@ def convert_depth_v2(
     size_prec: int,
     *,
     emit_depth10: bool = False,
-    depth10_interval_sec: float = PHASE2_DEPTH10_INTERVAL_SEC,
+    depth10_interval_sec: float = DEPTH10_INTERVAL_SEC,
 ) -> Tuple[List[OrderBookDeltas], List[OrderBookDepth10], Phase2ReplayMetrics]:
     records = list(stream_raw_records(venue, symbol, "depth_v2", date_str))
     metrics = Phase2ReplayMetrics()

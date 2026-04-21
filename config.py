@@ -14,8 +14,9 @@ DATA_ROOT: Final = PROJECT_ROOT / "data_raw"
 META_ROOT: Final = PROJECT_ROOT / "meta"
 STATE_ROOT: Final = PROJECT_ROOT / "state"
 
-# Data subdirectories (snapshot removed – REST snapshots cause 429/418)
-CHANNELS: Final = ["depth", "trade", "exchangeinfo"]
+# Canonical data channels.  depth_v2 and trade_v2 are the only raw
+# sources on the deterministic-native mainline.
+CHANNELS: Final = ["depth_v2", "trade_v2", "exchangeinfo"]
 
 # Create required directories on import
 for directory in [DATA_ROOT, META_ROOT, STATE_ROOT, STATE_ROOT / "convert_reports"]:
@@ -52,18 +53,8 @@ FUTURES_TOP_SYMBOL_CANDIDATES: Final = int(
 )
 
 # Selection policy metadata written into the cached universe files.
-UNIVERSE_FILTER_VERSION: Final = "v3_futures_support_precheck"
+UNIVERSE_FILTER_VERSION: Final = "v4_native_deterministic"
 UNIVERSE_REJECT_SAMPLE_SIZE: Final = 12
-
-# Symbols/base assets known to cause cryptofeed friction and worth dropping early.
-KNOWN_UNSUPPORTED_FULL_SYMBOLS: Final = (
-    "USDCUSDT",
-)
-KNOWN_UNSUPPORTED_BASE_ASSETS: Final = (
-    "EURC",
-    "EURI",
-    "FDUSD",
-)
 
 # Base quote asset for universe selection
 QUOTE_ASSET_SPOT: Final = "USDT"
@@ -76,27 +67,18 @@ QUOTE_ASSET_FUTURES: Final = "USDT"  # For USDT-M perpetuals
 # WebSocket depth update frequency (100ms or 1000ms)
 DEPTH_INTERVAL_MS: Final = 100
 
-# Depth pipeline mode.
-# Phase 1 remains default until Phase 2 is fully validated.
-DEPTH_PIPELINE_MODE_DEFAULT: Final = os.environ.get(
-    "CRYPTO_RECORDER_DEPTH_PIPELINE_MODE",
-    "phase1",
-).strip().lower()
-
-# Phase 2 raw depth channel name.
+# Canonical raw channel names.
 DEPTH_V2_CHANNEL: Final = "depth_v2"
+TRADE_V2_CHANNEL: Final = "trade_v2"
 
-# Optional Phase 2 depth10 derivation defaults (converter-side).
-PHASE2_EMIT_DEPTH10_DEFAULT: Final = (
-    os.environ.get("CRYPTO_RECORDER_PHASE2_EMIT_DEPTH10", "0").strip().lower()
+# Optional depth10 derivation defaults (converter-side).
+EMIT_DEPTH10_DEFAULT: Final = (
+    os.environ.get("CRYPTO_RECORDER_EMIT_DEPTH10", "0").strip().lower()
     in {"1", "true", "yes", "on"}
 )
-PHASE2_DEPTH10_INTERVAL_SEC: Final = float(
-    os.environ.get("CRYPTO_RECORDER_PHASE2_DEPTH10_INTERVAL_SEC", "1.0")
+DEPTH10_INTERVAL_SEC: Final = float(
+    os.environ.get("CRYPTO_RECORDER_DEPTH10_INTERVAL_SEC", "1.0")
 )
-
-# Legacy placeholder kept for config compatibility; REST snapshots stay disabled.
-SNAPSHOT_INTERVAL_SEC: Final = 600
 
 # Exchange info fetch interval (seconds)
 EXCHANGEINFO_INTERVAL_SEC: Final = 21600  # 6 hours

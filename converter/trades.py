@@ -1,5 +1,12 @@
 """
-converter.trades — Convert raw trade JSONL records → Nautilus TradeTick.
+converter.trades — Convert raw ``trade_v2`` JSONL records → Nautilus TradeTick.
+
+Records are sorted by ``(trade_stream_session_id, trade_session_seq)`` so
+replay determinism depends only on committed canonical order, never on file
+timestamp coincidence.
+
+Exchange trade IDs are preserved as diagnostic ``TradeId`` metadata but do
+not affect ordering.
 """
 from __future__ import annotations
 
@@ -16,6 +23,14 @@ from converter.readers import stream_raw_records
 logger = logging.getLogger(__name__)
 
 
+def _trade_sort_key(rec: dict) -> Tuple[int, int]:
+    """Sort by committed canonical trade order."""
+    return (
+        int(rec.get("trade_stream_session_id", 0)),
+        int(rec.get("trade_session_seq", 0)),
+    )
+
+
 def convert_trades(
     venue: str,
     symbol: str,
@@ -24,7 +39,7 @@ def convert_trades(
     price_prec: int,
     size_prec: int,
 ) -> Tuple[List[TradeTick], int, Optional[int], Optional[int]]:
-    """Stream-convert raw trade records to Nautilus TradeTick.
+    """Stream-convert raw trade_v2 records to Nautilus TradeTick.
 
     Returns ``(tick_list, bad_line_count, first_ts_ns, last_ts_ns)``.
     """
@@ -33,28 +48,46 @@ def convert_trades(
     first_ts: Optional[int] = None
     last_ts: Optional[int] = None
 
-    for rec in stream_raw_records(venue, symbol, "trade", date_str):
+    # Collect then sort by committed session ordering
+    raw_records = list(stream_raw_records(venue, symbol, "trade_v2", date_str))
+    raw_records.sort(key=_trade_sort_key)
+
+    for rec in raw_records:
         try:
-            payload = rec.get("payload", {})
-            price_str = payload.get("price", "0")
-            qty_str = payload.get("quantity", "0")
-            side_raw = payload.get("side", "buy")
-            trade_id_raw = payload.get("trade_id")
+            record_type = rec.get("record_type", "trade")
+            # Skip lifecycle markers — they are metadata, not trade ticks
+            if record_type != "trade":
+                continue
+
+            price_str = rec.get("price", "0")
+            qty_str = rec.get("quantity", "0")
+            is_buyer_maker = rec.get("is_buyer_maker", False)
+            exchange_trade_id = rec.get("exchange_trade_id")
 
             ts_event_ms = rec.get("ts_event_ms")
+            ts_trade_ms = rec.get("ts_trade_ms")
             ts_recv_ns = rec.get("ts_recv_ns", 0)
-            ts_event = ts_event_ms * 1_000_000 if ts_event_ms else ts_recv_ns
-            ts_init = ts_recv_ns
 
+            # Prefer trade time, then event time, then recv time
+            if ts_trade_ms:
+                ts_event = int(ts_trade_ms) * 1_000_000
+            elif ts_event_ms:
+                ts_event = int(ts_event_ms) * 1_000_000
+            else:
+                ts_event = int(ts_recv_ns)
+            ts_init = int(ts_recv_ns)
+
+            # is_buyer_maker=True means the buyer was the maker,
+            # so the taker (aggressor) is the seller
             aggressor = (
-                AggressorSide.BUYER if side_raw == "buy" else AggressorSide.SELLER
+                AggressorSide.SELLER if is_buyer_maker else AggressorSide.BUYER
             )
-            tid = TradeId(str(trade_id_raw)) if trade_id_raw else TradeId("0")
+            tid = TradeId(str(exchange_trade_id)) if exchange_trade_id else TradeId("0")
 
             tick = TradeTick(
                 instrument_id=instrument_id,
-                price=Price.from_str(price_str),
-                size=Quantity.from_str(qty_str),
+                price=Price.from_str(str(price_str)),
+                size=Quantity.from_str(str(qty_str)),
                 aggressor_side=aggressor,
                 trade_id=tid,
                 ts_event=ts_event,
