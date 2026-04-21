@@ -7,6 +7,5 @@ Modules:
   trades       Raw trade records → TradeTick
   book         L2 delta reconstruction → OrderBookDepth10 snapshots
   catalog      Idempotent catalog writing & purge helpers
-  report       Conversion report generation
   universe     Universe resolution from meta/ or disk fallback
 """
