@@ -3,7 +3,7 @@
 ## Requirements
 
 - Linux or WSL2 with systemd (for service mode)
-- Python 3.12+
+- Python 3.10+
 - Network access to Binance APIs
 - Sufficient disk for raw + catalog data
 
@@ -16,34 +16,37 @@ cd CryptoRecorder
 
 python3 -m venv .venv
 source .venv/bin/activate
-sudo apt-get install -y build-essential python3-dev g++
 pip install -r requirements.txt
 ```
 
-## Basic verification
+## Verify Setup
 
 ```bash
-python VALIDATE.py system
+python validate.py
 ```
 
-More detailed validation and operations notes:
-- [docs/VALIDATION.md](docs/VALIDATION.md)
-- [docs/OPERATIONS.md](docs/OPERATIONS.md)
+This checks dependencies, directories, and configuration.
 
-## Run locally
+## Run Unit Tests
+
+```bash
+pytest tests/
+```
+
+## Run Recorder
 
 ```bash
 source .venv/bin/activate
 python recorder.py
 ```
 
-## Convert a day
+## Convert a Day
 
 ```bash
 python convert_day.py --date YYYY-MM-DD
 ```
 
-## Service install (optional)
+## Service Install (Optional)
 
 ```bash
 sudo cp systemd/cryptofeed-recorder.service /etc/systemd/system/
@@ -54,13 +57,25 @@ sudo systemctl enable --now cryptofeed-recorder
 sudo systemctl enable --now nautilus-convert.timer
 ```
 
-The service units use `convert_day.py` as the converter CLI.
-
-## Useful checks
+## Useful Commands
 
 ```bash
+# Check service status
 systemctl status cryptofeed-recorder
 journalctl -u cryptofeed-recorder -f
+
+# Check heartbeat
 cat state/heartbeat.json | python3 -m json.tool
-python VALIDATE.py all
+
+# Quick smoke test
+python scripts/smoke_test.py
+
+# Full acceptance test
+python scripts/acceptance_test.py
 ```
+
+## More Documentation
+
+- [docs/VALIDATION.md](docs/VALIDATION.md) — Testing guide
+- [docs/OPERATIONS.md](docs/OPERATIONS.md) — Operations guide
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — System design

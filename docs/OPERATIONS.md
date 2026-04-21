@@ -1,36 +1,44 @@
 # Operations
 
-## Common commands
+## Quick Reference
 
-```bash
-source .venv/bin/activate
-python recorder.py
-python VALIDATE.py all
-python convert_day.py --date YYYY-MM-DD
-```
+| Task | Command |
+|------|---------|
+| Start recorder | `python recorder.py` |
+| Convert a day | `python convert_day.py --date YYYY-MM-DD` |
+| Setup validation | `python validate.py` |
+| Run tests | `pytest tests/` |
+| Smoke test | `python scripts/smoke_test.py` |
+| Full acceptance | `python scripts/acceptance_test.py` |
 
-## Service mode
+## Service Mode
 
 Systemd units are in `systemd/`.
 
 ```bash
+# Control recorder service
+sudo systemctl start cryptofeed-recorder
+sudo systemctl stop cryptofeed-recorder
 sudo systemctl restart cryptofeed-recorder
 sudo systemctl status cryptofeed-recorder
+
+# View logs
 journalctl -u cryptofeed-recorder -f
 ```
 
-## Important runtime files
+## Important Runtime Files
 
-- `state/heartbeat.json`
-- `state/startup_coverage.json`
-- `state/convert_reports/YYYY-MM-DD.json`
-- `state/master_validation_report.json`
-- `recorder.log`
+| File | Description |
+|------|-------------|
+| `state/heartbeat.json` | Live recorder status |
+| `state/startup_coverage.json` | Startup symbol coverage |
+| `state/convert_reports/YYYY-MM-DD.json` | Conversion reports |
+| `recorder.log` | Recorder log file |
 
-Report timestamps in these JSON files use Hungary local time
-(`Europe/Budapest`). Day-scoped recorder/converter dates still remain UTC.
+Report timestamps use Hungary local time (`Europe/Budapest`).
+Day-scoped dates in file names remain UTC.
 
-## Coverage terminology
+## Coverage Terminology
 
 Startup and runtime reporting uses these terms:
 
@@ -40,29 +48,40 @@ Startup and runtime reporting uses these terms:
 - `runtime_dropped`: selected symbols that fail during feed initialization
 - `active`: symbols successfully recording
 
-## Failure handling expectations
+## Failure Handling
 
-- Unsupported symbols should be logged and skipped.
-- Startup should continue with survivors.
-- Futures may be degraded if support is limited, but recorder should stay up.
-- Approximate L2 remains expected in Phase 1; deterministic replay is not promised.
+- Unsupported symbols are logged and skipped
+- Startup continues with surviving symbols
+- Futures may degrade gracefully if support is limited
+- Approximate L2 is expected in Phase 1 (not deterministic replay)
 
-## Conversion operations
-
-```bash
-python convert_day.py --date YYYY-MM-DD [--staging]
-```
-
-## Validation operations
-
-`VALIDATE.py` is the stable front door:
+## Conversion
 
 ```bash
-python VALIDATE.py system
-python VALIDATE.py runtime
-python VALIDATE.py nautilus
-python VALIDATE.py all
+# Convert yesterday (default)
+python convert_day.py
+
+# Convert specific date
+python convert_day.py --date 2026-04-20
+
+# Convert with staging (atomic rename on success)
+python convert_day.py --date 2026-04-20 --staging
 ```
 
-Preferred validator module names are the short files under `validators/`.
-`python VALIDATE.py converter` remains as an alias of `nautilus`.
+## Validation & Testing
+
+```bash
+# Check setup (run on new machine)
+python validate.py
+
+# Run unit tests
+pytest tests/
+
+# Quick recorder test (3 minutes)
+python scripts/smoke_test.py
+
+# Full pipeline test (10 minutes)
+python scripts/acceptance_test.py
+```
+
+See [VALIDATION.md](VALIDATION.md) for details.
