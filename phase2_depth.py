@@ -1,9 +1,8 @@
-"""
-Phase 2 Binance-native depth recorder.
+"""Binance-native depth recorder.
 
 Records raw exchange-native depth updates into ``depth_v2`` with explicit
 snapshot/sync/lifecycle markers so the converter can perform deterministic
-replay later.
+replay later.  session_seq is assigned only to committed canonical records.
 """
 from __future__ import annotations
 
@@ -68,8 +67,8 @@ class DepthSymbolState:
     venue: str
     symbol: str
     stream_session_id: int = 0
-    next_connection_seq: int = 0
-    next_file_position: int = 0
+    next_ws_arrival_seq: int = 0
+    next_session_seq: int = 0
     sync_state: str = SYNC_UNSYNCED
     previous_sync_state: Optional[str] = None
     last_update_id: Optional[int] = None
@@ -83,17 +82,20 @@ class DepthSymbolState:
     resync_count: int = 0
     desync_events: int = 0
 
-    def allocate_file_position(self) -> int:
-        self.next_file_position += 1
-        return self.next_file_position
+    def allocate_ws_arrival_seq(self) -> int:
+        """Monotonic counter for all WS messages (internal ordering for buffering)."""
+        self.next_ws_arrival_seq += 1
+        return self.next_ws_arrival_seq
 
-    def allocate_connection_seq(self) -> int:
-        self.next_connection_seq += 1
-        return self.next_connection_seq
+    def allocate_session_seq(self) -> int:
+        """Monotonic counter for committed canonical records only."""
+        self.next_session_seq += 1
+        return self.next_session_seq
 
     def new_stream_session(self) -> None:
         self.stream_session_id += 1
-        self.next_connection_seq = 0
+        self.next_ws_arrival_seq = 0
+        self.next_session_seq = 0
         self.pending_updates.clear()
         self.last_update_id = None
         self.prev_update_id = None
@@ -178,7 +180,11 @@ class BinanceNativeDepthRecorder:
                     reason="startup_or_reconnect",
                 )
                 await self._transition_sync_state(state, SYNC_UNSYNCED, "new_stream_session")
-                self._ensure_snapshot_task(state, reason="session_start")
+                # NOTE: Do NOT trigger snapshot here.  The Binance bootstrap
+                # protocol requires: connect WS → buffer messages → GET REST
+                # snapshot → use buffer to bridge the gap.  The first WS
+                # message handler triggers the snapshot via reason="bootstrap"
+                # when last_update_id is None.
 
             try:
                 ws_url = _ws_url(venue, symbols)
@@ -187,7 +193,7 @@ class BinanceNativeDepthRecorder:
                     ws_url,
                     heartbeat=WS_PING_INTERVAL_SEC,
                 ) as ws:
-                    logger.info("Phase 2 depth websocket connected: %s", ws_url)
+                    logger.info("Depth websocket connected: %s", ws_url)
                     backoff = 1.0
                     async for msg in ws:
                         if self.shutdown_event.is_set():
@@ -201,7 +207,7 @@ class BinanceNativeDepthRecorder:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                logger.warning("Phase 2 depth websocket error for %s: %s", venue, exc)
+                logger.warning("Depth websocket error for %s: %s", venue, exc)
             finally:
                 for symbol in symbols:
                     state = self._state_for(venue, symbol)
@@ -221,7 +227,7 @@ class BinanceNativeDepthRecorder:
         try:
             message = json.loads(payload_text)
         except json.JSONDecodeError:
-            logger.warning("Skipping malformed Phase 2 depth frame for %s", venue)
+            logger.warning("Skipping malformed depth frame for %s", venue)
             return
 
         data = message.get("data") if isinstance(message, dict) else None
@@ -234,19 +240,18 @@ class BinanceNativeDepthRecorder:
         state = self._state_for(venue, symbol)
 
         ts_recv_ns = time.time_ns()
-        connection_seq = state.allocate_connection_seq()
-        file_position = state.allocate_file_position()
-        update_id = data.get("u")
+        ws_arrival_seq = state.allocate_ws_arrival_seq()
 
-        record = {
+        # Build an internal buffered record (not yet committed).
+        # session_seq is assigned only when the record is accepted.
+        buffered = {
             "schema_version": 2,
             "record_type": "depth_update",
             "venue": venue,
             "symbol": symbol,
             "channel": DEPTH_V2_CHANNEL,
             "stream_session_id": state.stream_session_id,
-            "connection_seq": connection_seq,
-            "file_position": file_position,
+            "ws_arrival_seq": ws_arrival_seq,
             "ts_recv_ns": ts_recv_ns,
             "ts_event_ms": data.get("E"),
             "exchange_ts_ms": data.get("E"),
@@ -259,8 +264,8 @@ class BinanceNativeDepthRecorder:
                 "asks": data.get("a", []),
             },
         }
-        await self.storage_manager.write_record(venue, symbol, DEPTH_V2_CHANNEL, record)
 
+        update_id = data.get("u")
         self.health_monitor.record_message(
             venue=venue,
             symbol=symbol,
@@ -272,7 +277,7 @@ class BinanceNativeDepthRecorder:
         if state.sync_state == SYNC_FENCED:
             return
 
-        state.pending_updates.append(record)
+        state.pending_updates.append(buffered)
         if len(state.pending_updates) > 5000:
             state.pending_updates = state.pending_updates[-5000:]
 
@@ -280,7 +285,16 @@ class BinanceNativeDepthRecorder:
             self._ensure_snapshot_task(state, reason="bootstrap")
             return
 
-        accepted = self._update_continuity_state(state, record)
+        # If we have a snapshot and are synced or seeded, try to accept immediately.
+        if state.sync_state in (SYNC_LIVE_SYNCED, SYNC_SNAPSHOT_SEEDED):
+            accepted = self._check_continuity(state, buffered)
+            if accepted:
+                await self._commit_depth_update(state, buffered)
+            else:
+                self._ensure_snapshot_task(state, reason="continuity_break")
+        else:
+            pass  # Still buffering (RESYNC_REQUIRED / UNSYNCED / DESYNCED)
+
         self.health_monitor.record_phase2_symbol_state(
             venue=venue,
             symbol=symbol,
@@ -291,8 +305,6 @@ class BinanceNativeDepthRecorder:
             resync_count=state.resync_count,
             desync_events=state.desync_events,
         )
-        if not accepted:
-            self._ensure_snapshot_task(state, reason="continuity_break")
 
     def _state_for(self, venue: str, symbol: str) -> DepthSymbolState:
         key = (venue, symbol)
@@ -363,48 +375,180 @@ class BinanceNativeDepthRecorder:
 
     async def _handle_snapshot_seed(self, state: DepthSymbolState, raw: dict, *, reason: str) -> None:
         state.snapshot_seed_count += 1
+        # Set IDs from snapshot but do NOT transition to SNAPSHOT_SEEDED yet.
+        # Keep state as RESYNC_REQUIRED during promote so the WS handler just
+        # buffers incoming messages without checking continuity.  The promote
+        # method transitions the state after processing.
         state.last_update_id = raw.get("lastUpdateId")
         state.prev_update_id = raw.get("lastUpdateId")
-        file_position = state.allocate_file_position()
-        record = {
+        await self._promote_buffered_updates(state, raw, reason=reason)
+
+    async def _promote_buffered_updates(
+        self,
+        state: DepthSymbolState,
+        snapshot_raw: dict,
+        *,
+        reason: str,
+    ) -> None:
+        """Commit a deterministic bundle: snapshot_seed, accepted buffered updates, sync transition.
+
+        session_seq is allocated atomically to the whole bundle so replay is
+        guaranteed to see snapshot -> updates -> sync-transition in exact order.
+
+        Implements the Binance depth bootstrap protocol:
+          1. Drop buffered events where u <= lastUpdateId
+          2. First accepted event must have U <= lastUpdateId+1 <= u (spot)
+             or pu == lastUpdateId and u > lastUpdateId (futures)
+          3. Subsequent events follow normal continuity rules
+
+        The buffer is atomically swapped at entry so messages arriving during
+        the async commit loop are preserved for subsequent live processing.
+        """
+        last_update_id = snapshot_raw.get("lastUpdateId")
+        if last_update_id is None:
+            state.pending_updates.clear()
+            return
+
+        # ── Atomically take the current buffer; new WS arrivals go into fresh list ──
+        pending_snapshot = state.pending_updates
+        state.pending_updates = []
+
+        # 1. Sort buffered updates by ws_arrival_seq
+        pending = sorted(
+            pending_snapshot,
+            key=lambda rec: (
+                int(rec.get("stream_session_id", 0)),
+                int(rec.get("ws_arrival_seq", 0)),
+            ),
+        )
+
+        # 2. Apply Binance bootstrap: drop stale, find overlap, continue
+        #
+        # The stale-drop rule differs by venue:
+        #   Spot:    drop events where u <= lastUpdateId
+        #   Futures: drop events where u <  lastUpdateId
+        #
+        # The first accepted event (bootstrap overlap) rule differs too:
+        #   Spot:    U <= lastUpdateId+1 <= u
+        #   Futures: U <= lastUpdateId AND u >= lastUpdateId
+        #
+        # Subsequent events (ongoing continuity):
+        #   Spot:    U <= prev_u+1 <= u   (generalised; U == prev_u+1 in practice)
+        #   Futures: pu == prev_u
+        is_futures = state.venue == "BINANCE_USDTF"
+        accepted_updates: List[dict] = []
+        prev_u = last_update_id
+        stale_count = 0
+        skip_count = 0
+        found_first = False
+        for rec in pending:
+            u = rec.get("u")
+            U = rec.get("U")
+            pu = rec.get("pu")
+            if u is None or U is None:
+                continue
+            # Drop stale events (Binance step 4)
+            if is_futures:
+                if u < last_update_id:
+                    stale_count += 1
+                    continue
+            else:
+                if u <= last_update_id:
+                    stale_count += 1
+                    continue
+            # Bootstrap overlap check for the first non-stale event
+            if not found_first:
+                if is_futures:
+                    ok = (U <= last_update_id) and (u >= last_update_id)
+                else:
+                    ok = (U <= last_update_id + 1 <= u)
+                if ok:
+                    found_first = True
+                    accepted_updates.append(rec)
+                    prev_u = u
+                else:
+                    skip_count += 1
+            else:
+                # Ongoing continuity
+                if is_futures:
+                    ok = (pu == prev_u)
+                else:
+                    ok = (U <= prev_u + 1 <= u)
+                if ok:
+                    accepted_updates.append(rec)
+                    prev_u = u
+                else:
+                    skip_count += 1
+        logger.info(
+            "PROMOTE %s/%s: lastUpdateId=%s pending=%d stale=%d skip=%d accepted=%d",
+            state.venue, state.symbol, last_update_id, len(pending), stale_count, skip_count, len(accepted_updates),
+        )
+
+        # 3. Commit the snapshot_seed record
+        snapshot_session_seq = state.allocate_session_seq()
+        snapshot_record = {
             "schema_version": 2,
             "record_type": "snapshot_seed",
             "venue": state.venue,
             "symbol": state.symbol,
             "channel": DEPTH_V2_CHANNEL,
             "stream_session_id": state.stream_session_id,
-            "connection_seq": state.next_connection_seq,
-            "file_position": file_position,
+            "session_seq": snapshot_session_seq,
             "ts_recv_ns": time.time_ns(),
-            "ts_event_ms": raw.get("E") or raw.get("T"),
-            "exchange_ts_ms": raw.get("E") or raw.get("T"),
-            "lastUpdateId": raw.get("lastUpdateId"),
+            "ts_event_ms": snapshot_raw.get("E") or snapshot_raw.get("T"),
+            "exchange_ts_ms": snapshot_raw.get("E") or snapshot_raw.get("T"),
+            "lastUpdateId": snapshot_raw.get("lastUpdateId"),
             "sync_reason": reason,
             "payload": {
-                "bids": raw.get("bids", []),
-                "asks": raw.get("asks", []),
+                "bids": snapshot_raw.get("bids", []),
+                "asks": snapshot_raw.get("asks", []),
             },
         }
-        await self.storage_manager.write_record(state.venue, state.symbol, DEPTH_V2_CHANNEL, record)
-        await self._transition_sync_state(state, SYNC_SNAPSHOT_SEEDED, reason)
-        self._promote_buffered_updates(state)
-
-    def _promote_buffered_updates(self, state: DepthSymbolState) -> None:
-        pending = sorted(
-            state.pending_updates,
-            key=lambda rec: (
-                int(rec.get("stream_session_id", 0)),
-                int(rec.get("connection_seq", 0)),
-                int(rec.get("ts_recv_ns", 0)),
-                int(rec.get("file_position", 0)),
-            ),
+        await self.storage_manager.write_record(
+            state.venue, state.symbol, DEPTH_V2_CHANNEL, snapshot_record,
         )
-        for rec in pending:
-            if self._update_continuity_state(state, rec):
-                continue
-            break
 
-    def _update_continuity_state(self, state: DepthSymbolState, record: dict) -> bool:
+        # 4. Commit each accepted buffered depth_update
+        for rec in accepted_updates:
+            session_seq = state.allocate_session_seq()
+            committed = dict(rec)
+            committed["session_seq"] = session_seq
+            committed.pop("ws_arrival_seq", None)
+            await self.storage_manager.write_record(
+                state.venue, state.symbol, DEPTH_V2_CHANNEL, committed,
+            )
+
+        # 5. Update state and transition sync
+        if accepted_updates:
+            last_accepted_u = accepted_updates[-1].get("u")
+            if last_accepted_u is not None:
+                state.prev_update_id = last_accepted_u
+                state.last_update_id = last_accepted_u
+            await self._transition_sync_state(state, SYNC_LIVE_SYNCED, "bootstrap_promote")
+        else:
+            # No buffered updates bridged the gap — transition to SNAPSHOT_SEEDED
+            # so the live WS handler will attempt continuity from prev_update_id.
+            await self._transition_sync_state(state, SYNC_SNAPSHOT_SEEDED, reason)
+
+    async def _commit_depth_update(self, state: DepthSymbolState, buffered: dict) -> None:
+        """Commit a single live depth_update that passed continuity checks."""
+        session_seq = state.allocate_session_seq()
+        committed = dict(buffered)
+        committed["session_seq"] = session_seq
+        committed.pop("ws_arrival_seq", None)
+        await self.storage_manager.write_record(
+            state.venue, state.symbol, DEPTH_V2_CHANNEL, committed,
+        )
+
+    def _check_continuity(self, state: DepthSymbolState, record: dict) -> bool:
+        """Check Binance depth continuity rules. Returns True if accepted.
+
+        For the first event after a snapshot (SNAPSHOT_SEEDED), uses the
+        bootstrap overlap rule.  For subsequent events (LIVE_SYNCED), uses
+        the ongoing continuity rule.
+
+        Updates state.last_update_id / prev_update_id / sync_state on success.
+        """
         u = record.get("u")
         U = record.get("U")
         pu = record.get("pu")
@@ -412,9 +556,18 @@ class BinanceNativeDepthRecorder:
         if u is None or U is None or prev is None:
             return False
 
-        if state.venue == "BINANCE_USDTF":
-            accepted = pu == prev and u > prev
+        is_futures = state.venue == "BINANCE_USDTF"
+        is_bootstrap = state.sync_state == SYNC_SNAPSHOT_SEEDED
+
+        if is_futures:
+            if is_bootstrap:
+                # Futures bootstrap: U <= lastUpdateId AND u >= lastUpdateId
+                accepted = (U <= prev) and (u >= prev)
+            else:
+                # Futures ongoing: pu == prev_u
+                accepted = pu == prev
         else:
+            # Spot: same formula for bootstrap and ongoing
             accepted = U <= (prev + 1) <= u
 
         if accepted:
@@ -436,7 +589,7 @@ class BinanceNativeDepthRecorder:
         previous = state.sync_state
         state.previous_sync_state = previous
         state.sync_state = new_state
-        file_position = state.allocate_file_position()
+        session_seq = state.allocate_session_seq()
         record = {
             "schema_version": 2,
             "record_type": "sync_state",
@@ -444,8 +597,7 @@ class BinanceNativeDepthRecorder:
             "symbol": state.symbol,
             "channel": DEPTH_V2_CHANNEL,
             "stream_session_id": state.stream_session_id,
-            "connection_seq": state.next_connection_seq,
-            "file_position": file_position,
+            "session_seq": session_seq,
             "ts_recv_ns": time.time_ns(),
             "previous_state": previous,
             "state": new_state,
@@ -472,7 +624,7 @@ class BinanceNativeDepthRecorder:
         event: str,
         reason: str,
     ) -> None:
-        file_position = state.allocate_file_position()
+        session_seq = state.allocate_session_seq()
         record = {
             "schema_version": 2,
             "record_type": "stream_lifecycle",
@@ -480,8 +632,7 @@ class BinanceNativeDepthRecorder:
             "symbol": state.symbol,
             "channel": DEPTH_V2_CHANNEL,
             "stream_session_id": state.stream_session_id,
-            "connection_seq": state.next_connection_seq,
-            "file_position": file_position,
+            "session_seq": session_seq,
             "ts_recv_ns": time.time_ns(),
             "event": event,
             "reason": reason,

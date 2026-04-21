@@ -28,7 +28,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -47,7 +47,7 @@ class Colors:
     RESET = '\033[0m'
 
 
-def run_smoke_test(runtime_sec: int = DEFAULT_RUNTIME_SEC, depth_mode: str = "phase1") -> Dict[str, Any]:
+def run_smoke_test(runtime_sec: int = DEFAULT_RUNTIME_SEC) -> Dict[str, Any]:
     """Run the recorder and check basic functionality."""
     print(f"\n{Colors.BOLD}═══════════════════════════════════════════════════{Colors.RESET}")
     print(f"{Colors.BOLD}  Smoke Test ({runtime_sec}s with {TEST_SYMBOLS} symbols){Colors.RESET}")
@@ -70,7 +70,7 @@ def run_smoke_test(runtime_sec: int = DEFAULT_RUNTIME_SEC, depth_mode: str = "ph
 
     print(f"Starting recorder (pid will be shown)...")
     proc = subprocess.Popen(
-        [py, str(PROJECT_ROOT / "recorder.py"), "--depth-mode", depth_mode],
+        [py, str(PROJECT_ROOT / "recorder.py")],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         env=env,
@@ -101,8 +101,8 @@ def run_smoke_test(runtime_sec: int = DEFAULT_RUNTIME_SEC, depth_mode: str = "ph
     # Run checks
     checks = [
         ("No rate limit errors", _check_no_rate_limit(log)),
-        ("No callback errors", _check_no_callback_errors(log)),
-        ("Raw files created", _check_raw_files_created(t0, depth_mode)),
+        ("No WS errors", _check_no_ws_errors(log)),
+        ("Raw files created", _check_raw_files_created(t0)),
         ("Heartbeat exists", _check_heartbeat()),
         ("Clean shutdown", _check_clean_shutdown(log, proc.returncode)),
     ]
@@ -144,14 +144,15 @@ def _check_no_rate_limit(log: str) -> tuple[bool, str]:
     return True, ""
 
 
-def _check_no_callback_errors(log: str) -> tuple[bool, str]:
-    hits = len(re.findall(r"Error in on_l2_book|Error in on_trade", log, re.I))
+def _check_no_ws_errors(log: str) -> tuple[bool, str]:
+    """Check for WebSocket connection errors (not transient reconnects)."""
+    hits = len(re.findall(r"WebSocket.*fatal|unrecoverable.*error", log, re.I))
     if hits:
-        return False, f"{hits} callback errors"
+        return False, f"{hits} WS errors"
     return True, ""
 
 
-def _check_raw_files_created(t0: float, depth_mode: str) -> tuple[bool, str]:
+def _check_raw_files_created(t0: float) -> tuple[bool, str]:
     if not DATA_ROOT.exists():
         return False, "data_raw/ doesn't exist"
 
@@ -162,9 +163,9 @@ def _check_raw_files_created(t0: float, depth_mode: str) -> tuple[bool, str]:
 
     if not files:
         return False, "No files created"
-    depth_channel = "depth_v2" if depth_mode == "phase2" else "depth"
-    depth_files = [f for f in files if f"/{depth_channel}/" in str(f)]
-    return True, f"{len(files)} files ({len(depth_files)} {depth_channel})"
+    depth_files = [f for f in files if "/depth_v2/" in str(f)]
+    trade_files = [f for f in files if "/trade_v2/" in str(f)]
+    return True, f"{len(files)} files ({len(depth_files)} depth_v2, {len(trade_files)} trade_v2)"
 
 
 def _check_heartbeat() -> tuple[bool, str]:
@@ -175,13 +176,13 @@ def _check_heartbeat() -> tuple[bool, str]:
         d = json.loads(hb.read_text())
         msgs = d.get("total_messages", 0)
         syms = d.get("total_symbols", 0)
-        return True, f"{msgs} messages, {syms} symbols"
+        arch = d.get("architecture", "unknown")
+        return True, f"{msgs} messages, {syms} symbols, arch={arch}"
     except Exception as e:
         return False, str(e)
 
 
 def _check_clean_shutdown(log: str, returncode: int) -> tuple[bool, str]:
-    # Check for async issues
     issues = []
     if re.search(r"watchdog fired", log, re.I):
         issues.append("watchdog fired")
@@ -204,15 +205,9 @@ def main() -> int:
         default=DEFAULT_RUNTIME_SEC,
         help=f"Seconds to run (default: {DEFAULT_RUNTIME_SEC})",
     )
-    parser.add_argument(
-        "--depth-mode",
-        choices=("phase1", "phase2"),
-        default="phase1",
-        help="Depth pipeline mode to validate.",
-    )
     args = parser.parse_args()
 
-    result = run_smoke_test(args.runtime, depth_mode=args.depth_mode)
+    result = run_smoke_test(args.runtime)
     return 0 if result["passed"] else 1
 
 

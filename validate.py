@@ -10,7 +10,7 @@ Usage:
     python validate.py --quick   # Quick dependency check only
 
 What it checks:
-    1. Python dependencies (cryptofeed, nautilus_trader, etc.)
+    1. Python dependencies (nautilus_trader, aiohttp, etc.)
     2. Project structure (required directories exist)
     3. Configuration (config.py loads correctly)
     4. Core modules (can be imported)
@@ -75,11 +75,9 @@ def check_python_version() -> tuple[bool, str]:
 def check_dependencies() -> list[tuple[str, bool, str]]:
     """Check required Python packages."""
     packages = [
-        ("cryptofeed", "cryptofeed"),
         ("nautilus_trader", "nautilus_trader"),
         ("aiohttp", "aiohttp"),
         ("zstandard", "zstandard"),
-        ("yaml", "yaml (PyYAML)"),
         ("pandas", "pandas"),
         ("pyarrow", "pyarrow"),
     ]
@@ -137,8 +135,8 @@ def check_core_modules() -> list[tuple[str, bool, str]]:
         ("health_monitor", "Health monitor"),
         ("binance_universe", "Universe selector"),
         ("convert_day", "Converter CLI"),
-        ("converter.book", "Book reconstruction"),
         ("converter.trades", "Trade conversion"),
+        ("converter.depth_phase2", "Depth replay"),
         ("converter.instruments", "Instrument builder"),
     ]
 

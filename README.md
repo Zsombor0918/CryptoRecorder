@@ -1,10 +1,12 @@
 # CryptoRecorder
 
-CryptoRecorder is a Binance market-data pipeline for backtesting with a
-preserved Phase 1 path and an opt-in Phase 2 deterministic L2 path.
+CryptoRecorder is a deterministic Binance market-data pipeline for backtesting
+with [Nautilus Trader](https://nautilustrader.io/). It records native Binance
+WebSocket depth and trade streams and converts them to a queryable
+`ParquetDataCatalog`.
 
-**Phase 1 Target:** 50 spot instruments with trades + approximate L2 depth,
-converted to a Nautilus-queryable `ParquetDataCatalog`.
+**Target:** 50 instruments (spot + USDT-M futures) with deterministic L2 depth
+replay and native trades.
 
 ## Quick Start
 
@@ -24,9 +26,6 @@ pytest tests/
 
 # 4. Start the recorder
 python recorder.py
-
-# Optional: Phase 2 native depth mode
-python recorder.py --depth-mode phase2
 ```
 
 ## Project Structure
@@ -34,17 +33,20 @@ python recorder.py --depth-mode phase2
 ```
 CryptoRecorder/
 ├── recorder.py          # Main recorder (starts here)
+├── phase2_depth.py      # Native Binance depth recorder
+├── native_trades.py     # Native Binance trade recorder
 ├── convert_day.py       # Convert raw data to Nautilus catalog
 ├── validate.py          # Setup validation (run on new machine)
 │
 ├── converter/           # Conversion logic
-│   ├── book.py          # L2 book reconstruction
-│   ├── trades.py        # Trade conversion
-│   └── instruments.py   # Instrument building
+│   ├── trades.py        # trade_v2 → TradeTick
+│   ├── depth_phase2.py  # depth_v2 → OrderBookDeltas (Decimal book state)
+│   └── instruments.py   # Instrument building from exchangeInfo
 │
 ├── tests/               # Unit tests (run with pytest)
-│   ├── test_bookbuilder.py
-│   ├── test_depth_reconstruction_phase1.py
+│   ├── test_depth_deterministic.py
+│   ├── test_trade_deterministic.py
+│   ├── test_converter_integration.py
 │   └── ...
 │
 ├── scripts/             # Operational scripts
@@ -53,8 +55,9 @@ CryptoRecorder/
 │
 ├── docs/                # Documentation
 │   ├── ARCHITECTURE.md  # System design
-│   ├── VALIDATION.md    # Testing/validation details
-│   └── GUARANTEES.md    # What Phase 1 guarantees
+│   ├── SCHEMAS.md       # Raw and state file schemas
+│   ├── VALIDATION.md    # Testing layers & checks
+│   └── GUARANTEES.md    # Scope boundaries
 │
 ├── data_raw/            # Raw recorded data (gitignored)
 ├── state/               # Runtime state files
@@ -75,46 +78,36 @@ CryptoRecorder/
 Convert recorded data to Nautilus catalog:
 
 ```bash
+# Convert yesterday (default)
+python convert_day.py
+
+# Convert specific date
 python convert_day.py --date 2026-04-20
 
-# Optional: Phase 2 deterministic replay -> OrderBookDeltas
-python convert_day.py --date 2026-04-20 --depth-mode phase2
+# Enable optional derived OrderBookDepth10
+python convert_day.py --date 2026-04-20 --emit-depth10
 ```
 
 This produces:
-- `TradeTick` objects from raw trades
-- Phase 1: `OrderBookDepth10` snapshots from approximate L2 deltas
-- Phase 2: `OrderBookDeltas` as the primary L2 output
-- Phase 2 optional: derived `OrderBookDepth10`
-- `CurrencyPair` / `CryptoPerpetual` instruments
+- `TradeTick` objects from raw `trade_v2`
+- `OrderBookDeltas` from deterministic `depth_v2` replay (Decimal book state)
+- Optional: derived `OrderBookDepth10` (off by default)
+- `CurrencyPair` / `CryptoPerpetual` instruments from exchangeInfo
 
-## Phase 1 Scope
+## Key Design Decisions
 
-**What it does:**
-- Records trades + L2 deltas via cryptofeed
-- Converts to Nautilus-native format
-- Ensures no crossed-book snapshots in catalog
-- Tracks data quality metrics
-
-**What it doesn't do:**
-- Deterministic Binance U/u/pu replay
-- Bit-exact order book reconstruction
-- REST depth polling (causes rate limits)
-
-See [docs/GUARANTEES.md](docs/GUARANTEES.md) for full details.
-
-## Phase 2 Scope
-
-Phase 2 keeps the repo workflow familiar while changing the L2 truth model:
-
-- raw source of truth becomes Binance-native `depth_v2`
-- snapshot seeding and sync/resync state are explicit
-- deterministic replay writes Nautilus `OrderBookDeltas`
-- derived `OrderBookDepth10` stays optional and off by default
+- **No cryptofeed** — native Binance WebSocket connections via aiohttp
+- **Committed-only ordering** — `session_seq` / `trade_session_seq` counters
+  allocated only for committed records, giving deterministic replay from raw JSONL
+- **Exact Decimal book state** — no float rounding during depth replay
+- **Tagged union trades** — `market_type` discriminator for spot vs futures fields
+- **OrderBookDeltas as primary** — `OrderBookDepth10` is optional and derived
 
 ## Documentation
 
 - [Architecture](docs/ARCHITECTURE.md) — System design and pipeline
-- [Validation](docs/VALIDATION.md) — Testing layers and checks
-- [Guarantees](docs/GUARANTEES.md) — Phase 1 scope boundaries
+- [Schemas](docs/SCHEMAS.md) — Raw and state file schemas
+- [Validation](docs/VALIDATION.md) — Testing layers & checks
+- [Guarantees](docs/GUARANTEES.md) — Scope boundaries
+- [Operations](docs/OPERATIONS.md) — Operations guide
 - [Installation](INSTALL.md) — Detailed setup guide

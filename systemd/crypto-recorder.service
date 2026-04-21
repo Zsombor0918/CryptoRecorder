@@ -1,5 +1,5 @@
 [Unit]
-Description=Binance Market Data Recorder
+Description=Binance Market Data Recorder (Deterministic Native)
 Documentation=file:///home/zsom/services/CryptoRecorder/README.md
 After=network-online.target
 Wants=network-online.target

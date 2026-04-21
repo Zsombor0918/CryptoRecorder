@@ -30,7 +30,6 @@ class SymbolStats:
         self.prev_update_id = None
         self.gap_count = 0
         self.last_heartbeat = time.time()
-        self.phase = "phase1"
         self.sync_state = None
         self.snapshot_seed_count = 0
         self.resync_count = 0
@@ -46,7 +45,6 @@ class SymbolStats:
             'last_update_id': self.last_update_id,
             'prev_update_id': self.prev_update_id,
             'gap_count': self.gap_count,
-            'phase': self.phase,
             'sync_state': self.sync_state,
             'snapshot_seed_count': self.snapshot_seed_count,
             'resync_count': self.resync_count,
@@ -69,7 +67,6 @@ class HealthMonitor:
         self.futures_disabled_reason: str = ""
         # Snapshot mode
         self.snapshot_mode: str = "disabled"
-        self.phase: str = "phase1"
         # Queue drop stats – updated from StorageManager before heartbeat writes
         self.queue_drop_total: int = 0
         self.queue_drop_by_writer: Dict[str, int] = {}
@@ -96,8 +93,6 @@ class HealthMonitor:
         
         if update_id is not None:
             stats.last_update_id = update_id
-        if channel == "depth_v2":
-            stats.phase = "phase2"
 
     def record_phase2_symbol_state(
         self,
@@ -116,7 +111,6 @@ class HealthMonitor:
         if key not in self.symbol_stats:
             self.symbol_stats[key] = SymbolStats(venue, symbol)
         stats = self.symbol_stats[key]
-        stats.phase = "phase2"
         stats.sync_state = sync_state
         stats.last_update_id = last_update_id
         stats.prev_update_id = prev_update_id
@@ -215,7 +209,7 @@ class HealthMonitor:
                 'futures_enabled': self.futures_enabled,
                 'futures_disabled_reason': self.futures_disabled_reason,
                 'snapshot_mode': self.snapshot_mode,
-                'phase': self.phase,
+                'architecture': 'deterministic_native',
                 'by_venue': dict(by_venue),
             }
             
