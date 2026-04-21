@@ -6,7 +6,12 @@ Runs the converter for a given date then queries the resulting
 ParquetDataCatalog to prove that Nautilus-native objects are
 queryable and internally consistent.
 
-Checks (18):
+Validation Layers:
+  A. Converter Layer — did the converter run and produce output?
+  B. Catalog Layer — can Nautilus query the catalog correctly?
+  C. Quality Layer — are crossed-book/gap/data-presence metrics acceptable?
+
+Checks (20):
    1.  converter_exit_zero        – converter exits 0
    2.  catalog_exists             – catalog directory is non-empty
    3.  report_valid               – convert report exists with required fields
@@ -25,6 +30,8 @@ Checks (18):
   16.  gap_per_symbol              – per-symbol gap breakdown present & non-negative
   17.  crossed_book_spot           – spot snapshots have positive spread
   18.  crossed_book_futures        – futures snapshots have positive spread
+  19.  crossed_rate_threshold      – crossed_rate < 0.1% (crossed events don't reach catalog)
+  20.  data_presence               – data_presence fields valid and consistent
 
 Report → state/validation/nautilus_catalog_e2e_{date}.json
 """
@@ -178,6 +185,8 @@ class NautilusCatalogValidator:
             self._ck_gap_per_symbol(),
             self._ck_crossed_book_venue("spot"),
             self._ck_crossed_book_venue("futures"),
+            self._ck_crossed_rate_threshold(),
+            self._ck_data_presence(),
         ]
 
         self.report["checks"] = {c["name"]: c for c in checks}
@@ -657,6 +666,83 @@ class NautilusCatalogValidator:
                 "valid_snapshots": venue.get("valid_snapshots"),
                 "positive_spread_ratio": venue.get("positive_spread_ratio"),
                 "failed_instruments": failed_instruments,
+            },
+        }
+
+    def _ck_crossed_rate_threshold(self) -> dict:
+        """crossed_rate must be 0 or acceptably low (< 0.001 = 0.1%)."""
+        rpt = self._convert_report
+        if not rpt:
+            return {"name": "crossed_rate_threshold", "passed": False,
+                    "details": {"reason": "no report"}}
+
+        crossed_rate = rpt.get("crossed_rate", 0.0)
+        crossed_total = rpt.get("crossed_book_events_total", 0)
+        depth_total = rpt.get("total_depth_snapshots_written", 0)
+
+        # Phase 1 threshold: crossed events during reconstruction are counted
+        # but should not appear in final catalog (they trigger resets).
+        # Accept if crossed_rate is essentially 0 or very low.
+        threshold = 0.001  # 0.1%
+        ok = crossed_rate < threshold
+
+        return {
+            "name": "crossed_rate_threshold",
+            "passed": ok,
+            "details": {
+                "crossed_rate": crossed_rate,
+                "crossed_book_events_total": crossed_total,
+                "depth_snapshots_total": depth_total,
+                "threshold": threshold,
+            },
+        }
+
+    def _ck_data_presence(self) -> dict:
+        """Verify data_presence fields exist and are sane."""
+        rpt = self._convert_report
+        if not rpt:
+            return {"name": "data_presence", "passed": False,
+                    "details": {"reason": "no report"}}
+
+        dp = rpt.get("data_presence")
+        if not isinstance(dp, dict):
+            return {"name": "data_presence", "passed": False,
+                    "details": {"reason": "data_presence missing or invalid"}}
+
+        required = [
+            "instruments_defined",
+            "instruments_with_trades",
+            "instruments_with_depth",
+            "instruments_with_both",
+            "instruments_with_no_data",
+        ]
+        missing = [f for f in required if f not in dp]
+        if missing:
+            return {"name": "data_presence", "passed": False,
+                    "details": {"missing_fields": missing}}
+
+        # Sanity: with_both <= with_trades and with_both <= with_depth
+        issues: List[str] = []
+        defined = dp.get("instruments_defined", 0)
+        with_trades = dp.get("instruments_with_trades", 0)
+        with_depth = dp.get("instruments_with_depth", 0)
+        with_both = dp.get("instruments_with_both", 0)
+        no_data = dp.get("instruments_with_no_data", 0)
+
+        if with_both > with_trades:
+            issues.append(f"with_both ({with_both}) > with_trades ({with_trades})")
+        if with_both > with_depth:
+            issues.append(f"with_both ({with_both}) > with_depth ({with_depth})")
+        if no_data > defined:
+            issues.append(f"no_data ({no_data}) > defined ({defined})")
+
+        ok = len(issues) == 0 and defined > 0
+        return {
+            "name": "data_presence",
+            "passed": ok,
+            "details": {
+                **dp,
+                "issues": issues,
             },
         }
 
