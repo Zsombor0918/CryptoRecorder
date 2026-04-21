@@ -27,9 +27,15 @@ class SymbolStats:
         self.message_count = 0
         self.last_ts_event = None
         self.last_update_id = None
+        self.prev_update_id = None
         self.gap_count = 0
         self.last_heartbeat = time.time()
-    
+        self.phase = "phase1"
+        self.sync_state = None
+        self.snapshot_seed_count = 0
+        self.resync_count = 0
+        self.desync_events = 0
+
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization."""
         return {
@@ -38,7 +44,13 @@ class SymbolStats:
             'message_count': self.message_count,
             'last_ts_event': self.last_ts_event,
             'last_update_id': self.last_update_id,
+            'prev_update_id': self.prev_update_id,
             'gap_count': self.gap_count,
+            'phase': self.phase,
+            'sync_state': self.sync_state,
+            'snapshot_seed_count': self.snapshot_seed_count,
+            'resync_count': self.resync_count,
+            'desync_events': self.desync_events,
             'last_heartbeat': timestamp_to_local_iso(self.last_heartbeat),
         }
 
@@ -57,6 +69,7 @@ class HealthMonitor:
         self.futures_disabled_reason: str = ""
         # Snapshot mode
         self.snapshot_mode: str = "disabled"
+        self.phase: str = "phase1"
         # Queue drop stats – updated from StorageManager before heartbeat writes
         self.queue_drop_total: int = 0
         self.queue_drop_by_writer: Dict[str, int] = {}
@@ -81,8 +94,37 @@ class HealthMonitor:
         if ts_event:
             stats.last_ts_event = ts_event
         
-        if update_id:
+        if update_id is not None:
             stats.last_update_id = update_id
+        if channel == "depth_v2":
+            stats.phase = "phase2"
+
+    def record_phase2_symbol_state(
+        self,
+        *,
+        venue: str,
+        symbol: str,
+        sync_state: str,
+        last_update_id: int | None,
+        prev_update_id: int | None,
+        snapshot_seed_count: int = 0,
+        resync_count: int = 0,
+        desync_count: int | None = None,
+        desync_events: int | None = None,
+    ) -> None:
+        key = (venue, symbol)
+        if key not in self.symbol_stats:
+            self.symbol_stats[key] = SymbolStats(venue, symbol)
+        stats = self.symbol_stats[key]
+        stats.phase = "phase2"
+        stats.sync_state = sync_state
+        stats.last_update_id = last_update_id
+        stats.prev_update_id = prev_update_id
+        stats.snapshot_seed_count = snapshot_seed_count
+        stats.resync_count = resync_count
+        stats.desync_events = (
+            desync_events if desync_events is not None else desync_count or 0
+        )
     
     def record_gap(self, venue: str, symbol: str) -> None:
         """Record a detected gap in sequence."""
@@ -173,6 +215,7 @@ class HealthMonitor:
                 'futures_enabled': self.futures_enabled,
                 'futures_disabled_reason': self.futures_disabled_reason,
                 'snapshot_mode': self.snapshot_mode,
+                'phase': self.phase,
                 'by_venue': dict(by_venue),
             }
             

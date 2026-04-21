@@ -21,6 +21,7 @@ state/
 # IDE
 .vscode/
 .codex/
+.codex
 .idea/
 *.swp
 *.swo

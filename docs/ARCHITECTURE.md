@@ -37,6 +37,7 @@ tests and tooling rely on them.
 Channels:
 - `trade` — individual trade ticks
 - `depth` — L2 book delta updates (cryptofeed-normalized)
+- `depth_v2` — Binance-native depth updates, snapshot seeds, sync-state, and lifecycle markers
 - `exchangeinfo` — periodic exchangeInfo snapshots
 
 ## Conversion model
@@ -89,6 +90,35 @@ The converter tracks which instruments have actual data:
 | 1-second depth snapshots (not every delta) | Sufficient for approximate backtesting |
 | Some instruments with no data | Market was inactive |
 | Futures may degrade gracefully | Secondary priority |
+
+## Phase 2 deterministic path
+
+Phase 2 is opt-in and keeps Phase 1 as the default command behavior during
+rollout.
+
+The Phase 2 depth pipeline is:
+
+1. `recorder.py --depth-mode phase2` records Binance-native `depth_v2`
+2. raw `depth_v2` stores `depth_update`, `snapshot_seed`, `sync_state`, and `stream_lifecycle`
+3. snapshot seeding / resync are rate-limited and concurrency-limited in config
+4. `convert_day.py --depth-mode phase2` deterministically replays `depth_v2`
+5. primary catalog output is Nautilus `OrderBookDeltas`
+6. optional `OrderBookDepth10` is derived from the replayed book only
+
+Phase 2 replay ordering is explicitly stable by:
+
+- `stream_session_id`
+- `connection_seq`
+- `ts_recv_ns`
+- `file_position`
+
+Continuity acceptance is exchange-native:
+
+- spot: `U <= last_update_id + 1 <= u`
+- futures: `pu == last_update_id`
+
+Records outside a valid sync window are fenced and surfaced in reports instead
+of being silently reconstructed.
 
 ## Reliability model
 

@@ -54,12 +54,17 @@ class AcceptanceTest:
         self,
         runtime_sec: int = DEFAULT_RUNTIME_SEC,
         skip_recorder: bool = False,
+        depth_mode: str = "phase1",
+        emit_phase2_depth10: bool = False,
     ):
         self.runtime_sec = runtime_sec
         self.skip_recorder = skip_recorder
+        self.depth_mode = depth_mode
+        self.emit_phase2_depth10 = emit_phase2_depth10
         self.results: Dict[str, Any] = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "runtime_sec": runtime_sec,
+            "depth_mode": depth_mode,
             "tests": {},
             "passed": False,
         }
@@ -122,9 +127,10 @@ class AcceptanceTest:
         self._t0 = time.time()
         env = os.environ.copy()
         env["CRYPTO_RECORDER_TOP_SYMBOLS"] = str(TARGET_SYMBOLS)
+        channel = "depth_v2" if self.depth_mode == "phase2" else "depth"
 
         proc = subprocess.Popen(
-            [py, str(PROJECT_ROOT / "recorder.py")],
+            [py, str(PROJECT_ROOT / "recorder.py"), "--depth-mode", self.depth_mode],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             env=env,
@@ -152,10 +158,11 @@ class AcceptanceTest:
         details = {}
 
         # Count symbols with data
-        spot_syms = self._count_symbols_with_data("BINANCE_SPOT", "depth")
-        fut_syms = self._count_symbols_with_data("BINANCE_USDTF", "depth")
+        spot_syms = self._count_symbols_with_data("BINANCE_SPOT", channel)
+        fut_syms = self._count_symbols_with_data("BINANCE_USDTF", channel)
         details["spot_symbols_with_data"] = spot_syms
         details["futures_symbols_with_data"] = fut_syms
+        details["depth_channel"] = channel
 
         # Check heartbeat
         hb = STATE_ROOT / "heartbeat.json"
@@ -163,6 +170,7 @@ class AcceptanceTest:
             hb_data = json.loads(hb.read_text())
             details["total_messages"] = hb_data.get("total_messages", 0)
             details["futures_enabled"] = hb_data.get("futures_enabled", False)
+            details["phase"] = hb_data.get("phase")
 
         # Check for rate limits
         rate_limits = len(re.findall(r"429|418", log, re.I))
@@ -197,7 +205,19 @@ class AcceptanceTest:
         py = str(venv_py) if venv_py.exists() else sys.executable
 
         result = subprocess.run(
-            [py, str(PROJECT_ROOT / "convert_day.py"), "--date", date_str],
+            [
+                py,
+                str(PROJECT_ROOT / "convert_day.py"),
+                "--date",
+                date_str,
+                "--depth-mode",
+                self.depth_mode,
+                *(
+                    ["--emit-phase2-depth10"]
+                    if self.depth_mode == "phase2" and self.emit_phase2_depth10
+                    else []
+                ),
+            ],
             capture_output=True,
             text=True,
             cwd=str(PROJECT_ROOT),
@@ -213,10 +233,13 @@ class AcceptanceTest:
         report_path = STATE_ROOT / "convert_reports" / f"{date_str}.json"
         if report_path.exists():
             report = json.loads(report_path.read_text())
+            details["phase"] = report.get("phase", "phase1")
             details["instruments_written"] = report.get("instruments_written", 0)
             details["trades_written"] = report.get("total_trades_written", 0)
             details["depth_written"] = report.get("total_depth_snapshots_written", 0)
+            details["delta_written"] = report.get("total_order_book_deltas_written", 0)
             details["crossed_book_events"] = report.get("crossed_book_events_total", 0)
+            details["fenced_ranges_total"] = report.get("fenced_ranges_total", 0)
 
         for key, value in details.items():
             print(f"    {key}: {value}")
@@ -257,6 +280,14 @@ class AcceptanceTest:
                     details["sample_depth"] = len(depth)
                 except Exception:
                     details["sample_depth"] = 0
+                try:
+                    deltas = catalog.order_book_deltas(
+                        instrument_ids=[sample.id],
+                        batched=True,
+                    )
+                    details["sample_deltas"] = len(deltas)
+                except Exception:
+                    details["sample_deltas"] = 0
 
         except Exception as e:
             details["error"] = str(e)
@@ -320,9 +351,25 @@ def main() -> int:
         action="store_true",
         help="Skip recorder test (useful if you already have data)",
     )
+    parser.add_argument(
+        "--depth-mode",
+        choices=("phase1", "phase2"),
+        default="phase1",
+        help="Acceptance mode for depth pipeline validation.",
+    )
+    parser.add_argument(
+        "--emit-phase2-depth10",
+        action="store_true",
+        help="When depth mode is phase2, also require optional derived depth10 output.",
+    )
     args = parser.parse_args()
 
-    test = AcceptanceTest(runtime_sec=args.runtime, skip_recorder=args.skip_recorder)
+    test = AcceptanceTest(
+        runtime_sec=args.runtime,
+        skip_recorder=args.skip_recorder,
+        depth_mode=args.depth_mode,
+        emit_phase2_depth10=args.emit_phase2_depth10,
+    )
     result = test.run()
     return 0 if result["passed"] else 1
 

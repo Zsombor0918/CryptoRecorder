@@ -1,4 +1,4 @@
-# Phase 1 Guarantees
+# Guarantees
 
 This document clearly states what CryptoRecorder Phase 1 guarantees and what it does not.
 
@@ -33,6 +33,19 @@ This document clearly states what CryptoRecorder Phase 1 guarantees and what it 
 | Gap tracking | gaps_suspected, book_resets_total reported |
 | Data presence | instruments_with_trades/depth/both/no_data tracked |
 | Schema validation | Records have required fields |
+
+## Phase 2 Guarantees
+
+When Phase 2 is explicitly enabled:
+
+| Guarantee | Description |
+|-----------|-------------|
+| Binance-native raw depth | `depth_v2` stores exchange-native update ids and raw level payloads |
+| Explicit sync lifecycle | `unsynced`, `snapshot_seeded`, `live_synced`, `desynced`, `resync_required`, and fenced ranges are surfaced |
+| Deterministic replay ordering | Replay order is stable by stream session and recorded arrival/order fields |
+| Delta-first Nautilus output | Primary L2 catalog output is `OrderBookDeltas` |
+| Optional derived depth10 | `OrderBookDepth10` is derived only from replayed deterministic book state |
+| Fenced bad ranges reported | Excluded ranges are visible in conversion reports instead of silently reconstructed |
 
 ## What This Repository Does NOT Guarantee
 
@@ -102,5 +115,8 @@ Phase 1 enforces these thresholds:
 that produces approximate L2 data suitable for spread/mid/TOB analytics and
 basic execution simulation.**
 
-It is NOT a deterministic exchange replay system, and does not claim to be.
+**CryptoRecorder Phase 2 is an opt-in deterministic replay path for Binance
+native depth which is materially closer to Tardis-style delta-first usage, but
+still does not claim full Tardis equivalence.**
+
 The viewer and consumer code handle their own concerns separately.
