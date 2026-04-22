@@ -51,6 +51,8 @@ class SymbolStats:
         self.last_rejected_U: int | None = None
         self.last_rejected_u: int | None = None
         self.last_rejected_pu: int | None = None
+        self.bootstrap_stale_drop_count: int = 0
+        self.promote_zero_accepted_count: int = 0
 
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization."""
@@ -94,6 +96,8 @@ class SymbolStats:
                 {'U': self.last_rejected_U, 'u': self.last_rejected_u, 'pu': self.last_rejected_pu}
                 if self.last_rejected_u is not None else None
             ),
+            'bootstrap_stale_drop_count': self.bootstrap_stale_drop_count,
+            'promote_zero_accepted_count': self.promote_zero_accepted_count,
             'last_heartbeat': timestamp_to_local_iso(self.last_heartbeat),
         }
 
@@ -168,6 +172,8 @@ class HealthMonitor:
         last_rejected_U: int | None = None,
         last_rejected_u: int | None = None,
         last_rejected_pu: int | None = None,
+        bootstrap_stale_drop_count: int = 0,
+        promote_zero_accepted_count: int = 0,
     ) -> None:
         key = (venue, symbol)
         if key not in self.symbol_stats:
@@ -205,6 +211,8 @@ class HealthMonitor:
             stats.last_rejected_U = last_rejected_U
             stats.last_rejected_u = last_rejected_u
             stats.last_rejected_pu = last_rejected_pu
+        stats.bootstrap_stale_drop_count = bootstrap_stale_drop_count
+        stats.promote_zero_accepted_count = promote_zero_accepted_count
     
     def record_gap(self, venue: str, symbol: str) -> None:
         """Record a detected gap in sequence."""
@@ -286,6 +294,8 @@ class HealthMonitor:
                 max_resyncs = max((s.get("resync_count") or 0 for s in sym_dicts), default=0)
                 total_accepted = sum(s.get("accepted_update_count", 0) for s in sym_dicts)
                 total_rejected = sum(s.get("rejected_update_count", 0) for s in sym_dicts)
+                total_bootstrap_stale_drops = sum(s.get("bootstrap_stale_drop_count", 0) for s in sym_dicts)
+                total_promote_zero = sum(s.get("promote_zero_accepted_count", 0) for s in sym_dicts)
                 sync_health[venue_key] = {
                     "live_synced_count": live,
                     "snapshot_seeded_count": seeded,
@@ -297,6 +307,8 @@ class HealthMonitor:
                     "max_resync_count": max_resyncs,
                     "total_accepted_updates": total_accepted,
                     "total_rejected_updates": total_rejected,
+                    "total_bootstrap_stale_drops": total_bootstrap_stale_drops,
+                    "total_promote_zero_accepted": total_promote_zero,
                 }
             
             heartbeat = {

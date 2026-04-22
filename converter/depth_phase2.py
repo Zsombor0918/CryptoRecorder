@@ -274,6 +274,12 @@ def _should_accept_update(state: ReplayState, rec: dict) -> bool:
     use the bootstrap overlap rule.  For subsequent events ('live_synced'),
     use the ongoing continuity rule.  Must match the recorder's
     ``_check_continuity`` exactly.
+
+    During bootstrap, stale messages (u < lastUpdateId for futures,
+    u <= lastUpdateId for spot) are silently accepted as "skip" — the
+    caller should not treat them as a desync.  In practice the recorder
+    never commits stale-during-bootstrap messages, so the converter
+    won't encounter them; this guard exists for 1:1 parity.
     """
     U = rec.get("U")
     u = rec.get("u")
@@ -283,6 +289,16 @@ def _should_accept_update(state: ReplayState, rec: dict) -> bool:
         return False
     is_futures = state.venue == "BINANCE_USDTF"
     is_bootstrap = state.sync_state == "snapshot_seeded"
+
+    # Stale drop during bootstrap — silent skip, not a desync
+    if is_bootstrap:
+        if is_futures:
+            if u < prev:
+                return False  # stale
+        else:
+            if u <= prev:
+                return False  # stale
+
     if is_futures:
         if is_bootstrap:
             # Futures bootstrap: U <= lastUpdateId AND u >= lastUpdateId
