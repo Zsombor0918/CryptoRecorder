@@ -143,13 +143,69 @@ class TestRecorderCheckContinuity:
         assert state.sync_state == SYNC_DESYNCED
         assert state.desync_events == 1
 
-    def test_futures_bootstrap_u_below_last_rejected(self) -> None:
-        """Bootstrap must reject when u < lastUpdateId (stale)."""
+    def test_futures_bootstrap_u_below_last_stale_drop(self) -> None:
+        """Bootstrap stale: u < lastUpdateId → silently dropped, NO desync."""
         state = self._make_state(sync_state=SYNC_SNAPSHOT_SEEDED, prev_update_id=200)
         rec = self._make_rec(U=190, u=195, pu=185)
         recorder = _stub_recorder()
         assert recorder._check_continuity(state, rec) is False
+        # Key: sync_state must stay SNAPSHOT_SEEDED, not DESYNCED
+        assert state.sync_state == SYNC_SNAPSHOT_SEEDED
+        assert state.desync_events == 0
+        assert state.bootstrap_stale_drop_count == 1
+
+    def test_futures_bootstrap_stale_then_overlap_accepted(self) -> None:
+        """Stale drops don't prevent subsequent bootstrap overlap from succeeding."""
+        state = self._make_state(sync_state=SYNC_SNAPSHOT_SEEDED, prev_update_id=200)
+        recorder = _stub_recorder()
+
+        # Several stale messages arrive first
+        for u_val in [180, 190, 195, 199]:
+            rec = self._make_rec(U=u_val - 5, u=u_val, pu=u_val - 10)
+            assert recorder._check_continuity(state, rec) is False
+            assert state.sync_state == SYNC_SNAPSHOT_SEEDED
+
+        assert state.bootstrap_stale_drop_count == 4
+
+        # Then the overlapping message arrives
+        rec = self._make_rec(U=198, u=205, pu=195)
+        assert recorder._check_continuity(state, rec) is True
+        assert state.sync_state == SYNC_LIVE_SYNCED
+        assert state.prev_update_id == 205
+
+    def test_futures_bootstrap_u_equals_last_not_stale(self) -> None:
+        """Futures: u == lastUpdateId is NOT stale (stale is u < lastUpdateId).
+        This message should hit the bootstrap overlap check."""
+        state = self._make_state(sync_state=SYNC_SNAPSHOT_SEEDED, prev_update_id=200)
+        rec = self._make_rec(U=195, u=200, pu=190)
+        recorder = _stub_recorder()
+        # U <= 200 AND u >= 200  → accepted
+        assert recorder._check_continuity(state, rec) is True
+        assert state.sync_state == SYNC_LIVE_SYNCED
+
+    def test_spot_bootstrap_stale_drop(self) -> None:
+        """Spot stale: u <= lastUpdateId → silently dropped, NO desync."""
+        state = self._make_state(
+            venue="BINANCE_SPOT",
+            sync_state=SYNC_SNAPSHOT_SEEDED,
+            prev_update_id=100,
+        )
+        rec = self._make_rec(U=95, u=100)  # u == prev → stale for spot
+        recorder = _stub_recorder()
+        assert recorder._check_continuity(state, rec) is False
+        assert state.sync_state == SYNC_SNAPSHOT_SEEDED
+        assert state.desync_events == 0
+        assert state.bootstrap_stale_drop_count == 1
+
+    def test_futures_bootstrap_gap_still_desyncs(self) -> None:
+        """Genuine gap (U > lastUpdateId) must still trigger DESYNCED."""
+        state = self._make_state(sync_state=SYNC_SNAPSHOT_SEEDED, prev_update_id=200)
+        rec = self._make_rec(U=205, u=210, pu=200)
+        recorder = _stub_recorder()
+        assert recorder._check_continuity(state, rec) is False
         assert state.sync_state == SYNC_DESYNCED
+        assert state.desync_events == 1
+        assert state.bootstrap_stale_drop_count == 0
 
     def test_futures_ongoing_pu_matches(self) -> None:
         """Ongoing futures: pu must equal prev_update_id."""
@@ -261,6 +317,36 @@ class TestConverterFuturesConsistency:
         state.prev_update_id = 100
         rec = {"U": 101, "u": 103, "pu": None}
         assert depth_mod._should_accept_update(state, rec) is True
+
+    def test_converter_futures_bootstrap_stale_drop(self) -> None:
+        """Converter stale drop: u < lastUpdateId → False (not desync, just skip)."""
+        state = depth_mod.ReplayState(
+            instrument_id=InstrumentId.from_str("BTCUSDT-PERP.BINANCE"),
+            venue="BINANCE_USDTF",
+            symbol="BTCUSDT",
+            price_prec=1,
+            size_prec=1,
+        )
+        state.sync_state = "snapshot_seeded"
+        state.prev_update_id = 200
+        rec = {"U": 190, "u": 195, "pu": 185}
+        assert depth_mod._should_accept_update(state, rec) is False
+        # State should stay snapshot_seeded — caller decides whether to desync
+        assert state.sync_state == "snapshot_seeded"
+
+    def test_converter_spot_bootstrap_stale_drop(self) -> None:
+        """Converter spot stale: u <= lastUpdateId → False."""
+        state = depth_mod.ReplayState(
+            instrument_id=InstrumentId.from_str("BTCUSDT.BINANCE"),
+            venue="BINANCE_SPOT",
+            symbol="BTCUSDT",
+            price_prec=1,
+            size_prec=1,
+        )
+        state.sync_state = "snapshot_seeded"
+        state.prev_update_id = 100
+        rec = {"U": 95, "u": 100, "pu": None}
+        assert depth_mod._should_accept_update(state, rec) is False
 
 
 # ======================================================================

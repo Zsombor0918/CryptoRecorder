@@ -95,6 +95,8 @@ class DepthSymbolState:
     last_rejected_U: Optional[int] = None
     last_rejected_u: Optional[int] = None
     last_rejected_pu: Optional[int] = None
+    bootstrap_stale_drop_count: int = 0       # stale msgs silently dropped in SNAPSHOT_SEEDED
+    promote_zero_accepted_count: int = 0      # promote() calls where accepted=0
 
     def allocate_ws_arrival_seq(self) -> int:
         """Monotonic counter for all WS messages (internal ordering for buffering)."""
@@ -309,7 +311,9 @@ class BinanceNativeDepthRecorder:
             accepted = self._check_continuity(state, buffered)
             if accepted:
                 await self._commit_depth_update(state, buffered)
-            else:
+            elif state.sync_state == SYNC_DESYNCED:
+                # Genuine continuity break — trigger resync.
+                # (Stale drops leave sync_state as SNAPSHOT_SEEDED → no resync.)
                 self._ensure_snapshot_task(state, reason="continuity_break")
         elif state.sync_state in (SYNC_DESYNCED, SYNC_RESYNC_REQUIRED):
             # Keep retrying snapshot acquisition after cooldown expires.
@@ -354,6 +358,8 @@ class BinanceNativeDepthRecorder:
             last_rejected_U=state.last_rejected_U,
             last_rejected_u=state.last_rejected_u,
             last_rejected_pu=state.last_rejected_pu,
+            bootstrap_stale_drop_count=state.bootstrap_stale_drop_count,
+            promote_zero_accepted_count=state.promote_zero_accepted_count,
         )
 
     def _ensure_snapshot_task(self, state: DepthSymbolState, *, reason: str) -> None:
@@ -576,6 +582,7 @@ class BinanceNativeDepthRecorder:
         else:
             # No buffered updates bridged the gap — transition to SNAPSHOT_SEEDED
             # so the live WS handler will attempt continuity from prev_update_id.
+            state.promote_zero_accepted_count += 1
             await self._transition_sync_state(state, SYNC_SNAPSHOT_SEEDED, reason)
 
     async def _commit_depth_update(self, state: DepthSymbolState, buffered: dict) -> None:
@@ -595,6 +602,11 @@ class BinanceNativeDepthRecorder:
         bootstrap overlap rule.  For subsequent events (LIVE_SYNCED), uses
         the ongoing continuity rule.
 
+        During SNAPSHOT_SEEDED, stale messages (whose range ends before the
+        snapshot point) are silently dropped — they do NOT trigger DESYNCED
+        because the next non-stale message may still pass the bootstrap check.
+        Only a genuine gap (U > lastUpdateId) causes a desync.
+
         Updates state.last_update_id / prev_update_id / sync_state on success.
         """
         u = record.get("u")
@@ -606,6 +618,19 @@ class BinanceNativeDepthRecorder:
 
         is_futures = state.venue == "BINANCE_USDTF"
         is_bootstrap = state.sync_state == SYNC_SNAPSHOT_SEEDED
+
+        # ── Stale-drop for messages arriving after snapshot but whose
+        #    range ends before lastUpdateId.  These were in-flight from
+        #    before the snapshot; silently ignore without triggering desync.
+        if is_bootstrap:
+            if is_futures:
+                if u < prev:       # futures: stale when u < lastUpdateId
+                    state.bootstrap_stale_drop_count += 1
+                    return False   # sync_state unchanged → stays SNAPSHOT_SEEDED
+            else:
+                if u <= prev:      # spot: stale when u <= lastUpdateId
+                    state.bootstrap_stale_drop_count += 1
+                    return False
 
         if is_futures:
             if is_bootstrap:
