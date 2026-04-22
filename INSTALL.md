@@ -59,7 +59,7 @@ sudo cp systemd/crypto-recorder.service /etc/systemd/system/
 sudo cp systemd/nautilus-convert.service /etc/systemd/system/
 sudo cp systemd/nautilus-convert.timer /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now crypto-recorder
+sudo systemctl enable --now crypto-recorder 
 sudo systemctl enable --now nautilus-convert.timer
 ```
 
@@ -68,7 +68,7 @@ sudo systemctl enable --now nautilus-convert.timer
 ```bash
 # Check service status
 systemctl status crypto-recorder
-journalctl -u crypto-recorder -f
+journalctl -u crypto-recorder -f    
 
 # Check heartbeat
 cat state/heartbeat.json | python3 -m json.tool
