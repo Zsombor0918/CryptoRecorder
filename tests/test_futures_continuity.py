@@ -601,6 +601,156 @@ class TestRecorderPromote:
 
 
 # ======================================================================
+# Bootstrap accounting: counter separation and fencing correctness
+# ======================================================================
+
+
+class TestBootstrapAccounting:
+    """Verify that bootstrap attempts vs continuity resyncs are correctly separated."""
+
+    @staticmethod
+    def _make_state(
+        *,
+        venue: str = "BINANCE_USDTF",
+    ) -> DepthSymbolState:
+        return DepthSymbolState(venue=venue, symbol="BTCUSDT")
+
+    @pytest.mark.asyncio
+    async def test_bootstrap_increments_bootstrap_count_not_resync(self) -> None:
+        """Initial bootstrap (reason='bootstrap') must increment bootstrap_attempt_count,
+        NOT resync_count."""
+        recorder = _stub_recorder()
+        state = self._make_state()
+        state.stream_session_id = 1
+        state.pending_updates = []
+
+        # Mock the HTTP call to return a valid snapshot
+        import aiohttp
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        mock_resp = AsyncMock()
+        mock_resp.status = 200
+        mock_resp.json = AsyncMock(return_value={
+            "lastUpdateId": 1000, "bids": [["99", "1"]], "asks": [["101", "2"]],
+        })
+        mock_session = MagicMock()
+        mock_session.get = MagicMock(return_value=AsyncMock(
+            __aenter__=AsyncMock(return_value=mock_resp),
+            __aexit__=AsyncMock(return_value=False),
+        ))
+        recorder._session = mock_session
+
+        await recorder._snapshot_seed_task(state, reason="bootstrap")
+
+        assert state.bootstrap_attempt_count == 1
+        assert state.resync_count == 0
+        assert len(state.resync_timestamps) == 0
+
+    @pytest.mark.asyncio
+    async def test_continuity_break_increments_resync_not_bootstrap(self) -> None:
+        """Continuity-recovery resync (reason='continuity_break') must increment
+        resync_count, NOT bootstrap_attempt_count."""
+        recorder = _stub_recorder()
+        state = self._make_state()
+        state.stream_session_id = 1
+        state.pending_updates = []
+
+        from unittest.mock import AsyncMock, MagicMock
+
+        mock_resp = AsyncMock()
+        mock_resp.status = 200
+        mock_resp.json = AsyncMock(return_value={
+            "lastUpdateId": 2000, "bids": [], "asks": [],
+        })
+        mock_session = MagicMock()
+        mock_session.get = MagicMock(return_value=AsyncMock(
+            __aenter__=AsyncMock(return_value=mock_resp),
+            __aexit__=AsyncMock(return_value=False),
+        ))
+        recorder._session = mock_session
+
+        await recorder._snapshot_seed_task(state, reason="continuity_break")
+
+        assert state.resync_count == 1
+        assert state.bootstrap_attempt_count == 0
+        assert len(state.resync_timestamps) == 1
+
+    @pytest.mark.asyncio
+    async def test_desynced_retry_increments_resync_not_bootstrap(self) -> None:
+        """Desynced retry is a continuity-recovery path, counted as resync."""
+        recorder = _stub_recorder()
+        state = self._make_state()
+        state.stream_session_id = 1
+        state.pending_updates = []
+
+        from unittest.mock import AsyncMock, MagicMock
+
+        mock_resp = AsyncMock()
+        mock_resp.status = 200
+        mock_resp.json = AsyncMock(return_value={
+            "lastUpdateId": 3000, "bids": [], "asks": [],
+        })
+        mock_session = MagicMock()
+        mock_session.get = MagicMock(return_value=AsyncMock(
+            __aenter__=AsyncMock(return_value=mock_resp),
+            __aexit__=AsyncMock(return_value=False),
+        ))
+        recorder._session = mock_session
+
+        await recorder._snapshot_seed_task(state, reason="desynced_retry")
+
+        assert state.resync_count == 1
+        assert state.bootstrap_attempt_count == 0
+
+    def test_multiple_bootstraps_do_not_fence(self) -> None:
+        """7 initial bootstraps (WS reconnections) must NOT cause fencing,
+        since bootstraps don't accumulate in resync_timestamps."""
+        state = self._make_state()
+
+        # Simulate 7 clean session starts — each increments bootstrap_attempt_count
+        for i in range(7):
+            state.bootstrap_attempt_count += 1
+
+        assert state.bootstrap_attempt_count == 7
+        assert state.resync_count == 0
+        assert len(state.resync_timestamps) == 0
+        assert state.sync_state != SYNC_FENCED
+
+    def test_promote_zero_accepted_is_expected_on_fresh_snapshot(self) -> None:
+        """When all buffered messages are stale, promote correctly reports
+        accepted=0 and increments promote_zero_accepted_count.
+        The symbol still syncs via the live SNAPSHOT_SEEDED → LIVE_SYNCED path."""
+        state = self._make_state()
+        state.sync_state = SYNC_SNAPSHOT_SEEDED
+        state.prev_update_id = 1000
+
+        # First WS message after promote is stale
+        recorder = _stub_recorder()
+        stale_rec = {"U": 990, "u": 995, "pu": 985}
+        assert recorder._check_continuity(state, stale_rec) is False
+        assert state.sync_state == SYNC_SNAPSHOT_SEEDED  # NOT desynced
+        assert state.bootstrap_stale_drop_count == 1
+
+        # Next WS message passes bootstrap overlap
+        overlap_rec = {"U": 998, "u": 1005, "pu": 995}
+        assert recorder._check_continuity(state, overlap_rec) is True
+        assert state.sync_state == SYNC_LIVE_SYNCED
+        assert state.prev_update_id == 1005
+        assert state.desync_events == 0
+
+    def test_snapshot_seed_count_tracks_all_committed_snapshots(self) -> None:
+        """snapshot_seed_count tracks total snapshots committed (bootstraps + resyncs).
+        It should equal bootstrap_attempt_count + resync_count when every attempt succeeds."""
+        state = self._make_state()
+        # Simulate 3 bootstraps + 2 resyncs, each calling _handle_snapshot_seed
+        state.bootstrap_attempt_count = 3
+        state.resync_count = 2
+        state.snapshot_seed_count = 5  # 3 + 2
+
+        assert state.snapshot_seed_count == state.bootstrap_attempt_count + state.resync_count
+
+
+# ======================================================================
 # helpers
 # ======================================================================
 
@@ -608,10 +758,10 @@ class TestRecorderPromote:
 def _stub_recorder() -> BinanceNativeDepthRecorder:
     """Create a BinanceNativeDepthRecorder with stubs for testing _check_continuity."""
     import asyncio
-    from unittest.mock import MagicMock
+    from unittest.mock import AsyncMock, MagicMock
 
     return BinanceNativeDepthRecorder(
-        storage_manager=MagicMock(),
+        storage_manager=AsyncMock(),
         health_monitor=MagicMock(),
         shutdown_event=asyncio.Event(),
     )

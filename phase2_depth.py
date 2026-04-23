@@ -79,7 +79,8 @@ class DepthSymbolState:
     snapshot_task: Optional[asyncio.Task] = None
     fenced_reason: Optional[str] = None
     snapshot_seed_count: int = 0
-    resync_count: int = 0
+    resync_count: int = 0            # true continuity-recovery resyncs only
+    bootstrap_attempt_count: int = 0  # initial per-session bootstrap snapshot fetches
     desync_events: int = 0
     # ── rich diagnostics ──────────────────────────────────────────────
     accepted_update_count: int = 0
@@ -341,6 +342,7 @@ class BinanceNativeDepthRecorder:
             prev_update_id=state.prev_update_id,
             snapshot_seed_count=state.snapshot_seed_count,
             resync_count=state.resync_count,
+            bootstrap_attempt_count=state.bootstrap_attempt_count,
             desync_events=state.desync_events,
             stream_session_id=state.stream_session_id,
             accepted_update_count=state.accepted_update_count,
@@ -374,14 +376,19 @@ class BinanceNativeDepthRecorder:
         state.snapshot_task = asyncio.create_task(self._snapshot_seed_task(state, reason=reason))
 
     async def _snapshot_seed_task(self, state: DepthSymbolState, *, reason: str) -> None:
-        state.resync_count += 1
-        self._trim_resync_window(state)
-        state.resync_timestamps.append(time.monotonic())
-        if len(state.resync_timestamps) > PHASE2_MAX_RESYNCS_PER_SYMBOL_WINDOW:
-            state.sync_state = SYNC_FENCED
-            state.fenced_reason = f"resync_limit_exceeded:{reason}"
-            await self._transition_sync_state(state, SYNC_FENCED, state.fenced_reason)
-            return
+        is_initial_bootstrap = reason == "bootstrap"
+        if is_initial_bootstrap:
+            state.bootstrap_attempt_count += 1
+        else:
+            # Only true continuity-recovery resyncs count toward fencing
+            state.resync_count += 1
+            self._trim_resync_window(state)
+            state.resync_timestamps.append(time.monotonic())
+            if len(state.resync_timestamps) > PHASE2_MAX_RESYNCS_PER_SYMBOL_WINDOW:
+                state.sync_state = SYNC_FENCED
+                state.fenced_reason = f"resync_limit_exceeded:{reason}"
+                await self._transition_sync_state(state, SYNC_FENCED, state.fenced_reason)
+                return
 
         await self._transition_sync_state(state, SYNC_RESYNC_REQUIRED, reason)
         url = _snapshot_url(state.venue, state.symbol)
