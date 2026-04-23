@@ -335,8 +335,8 @@ def test_deterministic_replay_stability() -> None:
     assert results[0] == results[1] == results[2]
 
 
-def test_depth10_off_by_default() -> None:
-    """OrderBookDepth10 should be empty when emit_depth10 is False (default)."""
+def test_depth10_empty_when_explicitly_disabled() -> None:
+    """OrderBookDepth10 should be empty when emit_depth10 is explicitly False."""
     iid = InstrumentId.from_str("BTCUSDT.BINANCE")
     original = depth_mod.stream_raw_records
 

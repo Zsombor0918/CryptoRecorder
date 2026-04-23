@@ -7,8 +7,8 @@ builds Nautilus Instrument objects from exchangeInfo, converts trades to
 TradeTick, replays depth deterministically to OrderBookDeltas, and writes
 everything into a ParquetDataCatalog.
 
-OrderBookDepth10 is optional (off by default) and derived only from the
-replayed deterministic book state.
+OrderBookDepth10 is enabled by default and derived only from the replayed
+deterministic book state.
 
 Usage:
     python convert_day.py                          # yesterday UTC
@@ -359,7 +359,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--emit-depth10",
         action="store_true",
         default=EMIT_DEPTH10_DEFAULT,
-        help="Derive optional OrderBookDepth10 output from replayed book state.",
+        help="Derive OrderBookDepth10 output from replayed book state.",
     )
     ap.add_argument(
         "--depth10-interval-sec",

@@ -91,7 +91,7 @@ python convert_day.py --date 2026-04-20 --emit-depth10
 This produces:
 - `TradeTick` objects from raw `trade_v2`
 - `OrderBookDeltas` from deterministic `depth_v2` replay (Decimal book state)
-- Optional: derived `OrderBookDepth10` (off by default)
+- Derived `OrderBookDepth10` (enabled by default)
 - `CurrencyPair` / `CryptoPerpetual` instruments from exchangeInfo
 
 ## Key Design Decisions
