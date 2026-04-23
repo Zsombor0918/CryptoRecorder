@@ -73,7 +73,7 @@ def _live_deltas(instrument) -> OrderBookDeltas:
 
 
 def test_convert_date_writes_order_book_deltas_without_depth10(monkeypatch, tmp_path: Path) -> None:
-    """convert_date emits OrderBookDeltas and no Depth10 by default."""
+    """convert_date emits no Depth10 when emit_depth10 is explicitly False."""
     instrument = TestInstrumentProvider.btcusdt_binance()
 
     monkeypatch.setattr(

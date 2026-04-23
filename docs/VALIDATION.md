@@ -45,7 +45,7 @@ Tests cover:
 - Committed-only session_seq allocation (no gaps from lifecycle/rejects)
 - Futures U/u/pu continuity enforcement and fencing
 - Reconnect session boundary handling
-- Depth10 off by default
+- Depth10 enabled by default
 - Trade canonical ordering and aggressor mapping
 - Lifecycle marker exclusion from TradeTick output
 - Spot vs futures tagged union schema decoding

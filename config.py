@@ -73,7 +73,7 @@ TRADE_V2_CHANNEL: Final = "trade_v2"
 
 # Optional depth10 derivation defaults (converter-side).
 EMIT_DEPTH10_DEFAULT: Final = (
-    os.environ.get("CRYPTO_RECORDER_EMIT_DEPTH10", "0").strip().lower()
+    os.environ.get("CRYPTO_RECORDER_EMIT_DEPTH10", "1").strip().lower()
     in {"1", "true", "yes", "on"}
 )
 DEPTH10_INTERVAL_SEC: Final = float(

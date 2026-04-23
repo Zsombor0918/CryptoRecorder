@@ -1,0 +1,290 @@
+{
+  "BINANCE_SPOT": [
+    "USDCUSDT",
+    "BTCUSDT",
+    "ETHUSDT",
+    "CHIPUSDT",
+    "SOLUSDT",
+    "USD1USDT",
+    "SPKUSDT",
+    "XRPUSDT",
+    "RLUSDUSDT",
+    "DOGEUSDT",
+    "BNBUSDT",
+    "ZECUSDT",
+    "PEPEUSDT",
+    "TRXUSDT",
+    "KATUSDT",
+    "STRKUSDT",
+    "EURUSDT",
+    "BIOUSDT",
+    "ADAUSDT",
+    "SUIUSDT",
+    "FDUSDUSDT",
+    "PENGUUSDT",
+    "AVAXUSDT",
+    "MOVRUSDT",
+    "LINKUSDT",
+    "TAOUSDT",
+    "AAVEUSDT",
+    "DEXEUSDT",
+    "PAXGUSDT",
+    "ORDIUSDT",
+    "NEIROUSDT",
+    "BBUSDT",
+    "LTCUSDT",
+    "HUMAUSDT",
+    "ENAUSDT",
+    "UNIUSDT",
+    "TONUSDT",
+    "NEARUSDT",
+    "ARBUSDT",
+    "XAUTUSDT",
+    "UTKUSDT",
+    "SEIUSDT",
+    "TRUMPUSDT",
+    "XLMUSDT",
+    "HBARUSDT",
+    "BCHUSDT",
+    "ZAMAUSDT",
+    "DASHUSDT",
+    "CHZUSDT",
+    "BFUSDUSDT"
+  ],
+  "BINANCE_USDTF": [
+    "BTCUSDT",
+    "ETHUSDT",
+    "CHIPUSDT",
+    "SOLUSDT",
+    "XAUUSDT",
+    "CLUSDT",
+    "XAGUSDT",
+    "SPKUSDT",
+    "RAVEUSDT",
+    "DOGEUSDT",
+    "XRPUSDT",
+    "ZECUSDT",
+    "HYPEUSDT",
+    "BNBUSDT",
+    "UBUSDT",
+    "BZUSDT",
+    "1000PEPEUSDT",
+    "TSLAUSDT",
+    "MOVRUSDT",
+    "OPGUSDT",
+    "ADAUSDT",
+    "SUIUSDT",
+    "PENGUUSDT",
+    "KATUSDT",
+    "TAOUSDT",
+    "BIOUSDT",
+    "AVAXUSDT",
+    "LINKUSDT",
+    "SOONUSDT",
+    "RIVERUSDT",
+    "STRKUSDT",
+    "BSBUSDT",
+    "ENAUSDT",
+    "TRUMPUSDT",
+    "PIEVERSEUSDT",
+    "AAVEUSDT",
+    "BASEDUSDT",
+    "PAXGUSDT",
+    "FILUSDT",
+    "ORDIUSDT",
+    "NEARUSDT",
+    "MAGMAUSDT",
+    "MSTRUSDT",
+    "NEIROUSDT",
+    "DOTUSDT",
+    "BCHUSDT",
+    "GENIUSUSDT",
+    "CRCLUSDT",
+    "WLDUSDT",
+    "CRVUSDT"
+  ],
+  "timestamp": "2026-04-23T17:37:33.368585+02:00",
+  "top_count": 50,
+  "candidate_pool_size": 120,
+  "candidate_pool_sizes": {
+    "BINANCE_SPOT": 120,
+    "BINANCE_USDTF": 200
+  },
+  "filter_version": "v4_native_deterministic",
+  "requested_counts": {
+    "BINANCE_SPOT": 50,
+    "BINANCE_USDTF": 50
+  },
+  "selected_counts": {
+    "BINANCE_SPOT": 50,
+    "BINANCE_USDTF": 50
+  },
+  "selection_metadata": {
+    "BINANCE_SPOT": {
+      "venue": "BINANCE_SPOT",
+      "quote_asset": "USDT",
+      "raw_candidates_seen": 3570,
+      "quote_matched_count": 660,
+      "configured_candidate_pool_size": 120,
+      "candidate_pool_size": 120,
+      "candidate_pool_count": 120,
+      "candidate_pool_raw_count": 120,
+      "candidate_pool_after_sanity_count": 117,
+      "candidate_pool_after_support_check_count": 117,
+      "requested_count": 50,
+      "eligible_count": 117,
+      "survivor_count": 117,
+      "selected_count": 50,
+      "selected_sample": [
+        "USDCUSDT",
+        "BTCUSDT",
+        "ETHUSDT",
+        "CHIPUSDT",
+        "SOLUSDT",
+        "USD1USDT",
+        "SPKUSDT",
+        "XRPUSDT",
+        "RLUSDUSDT",
+        "DOGEUSDT"
+      ],
+      "pre_filter_rejected_count": 3,
+      "pre_filter_rejected_sample": [
+        {
+          "symbol": "\u5e01\u5b89\u4eba\u751fUSDT",
+          "reason": "contains non-ASCII characters",
+          "quote_volume": 56851465.4507
+        },
+        {
+          "symbol": "UUSDT",
+          "reason": "base asset shorter than 2 chars ('U')",
+          "quote_volume": 8046657.2659
+        },
+        {
+          "symbol": "CUSDT",
+          "reason": "base asset shorter than 2 chars ('C')",
+          "quote_volume": 2914436.69824
+        }
+      ],
+      "rejected_pre_filter_count": 3,
+      "rejected_pre_filter_sample": [
+        {
+          "symbol": "\u5e01\u5b89\u4eba\u751fUSDT",
+          "reason": "contains non-ASCII characters",
+          "quote_volume": 56851465.4507
+        },
+        {
+          "symbol": "UUSDT",
+          "reason": "base asset shorter than 2 chars ('U')",
+          "quote_volume": 8046657.2659
+        },
+        {
+          "symbol": "CUSDT",
+          "reason": "base asset shorter than 2 chars ('C')",
+          "quote_volume": 2914436.69824
+        }
+      ],
+      "support_precheck_available": false,
+      "support_precheck_error": null,
+      "support_precheck_rejected_count": 0,
+      "support_precheck_rejected_sample": []
+    },
+    "BINANCE_USDTF": {
+      "venue": "BINANCE_USDTF",
+      "quote_asset": "USDT",
+      "raw_candidates_seen": 609,
+      "quote_matched_count": 566,
+      "configured_candidate_pool_size": 200,
+      "candidate_pool_size": 200,
+      "candidate_pool_count": 200,
+      "candidate_pool_raw_count": 200,
+      "candidate_pool_after_sanity_count": 194,
+      "candidate_pool_after_support_check_count": 194,
+      "requested_count": 50,
+      "eligible_count": 194,
+      "survivor_count": 194,
+      "selected_count": 50,
+      "selected_sample": [
+        "BTCUSDT",
+        "ETHUSDT",
+        "CHIPUSDT",
+        "SOLUSDT",
+        "XAUUSDT",
+        "CLUSDT",
+        "XAGUSDT",
+        "SPKUSDT",
+        "RAVEUSDT",
+        "DOGEUSDT"
+      ],
+      "pre_filter_rejected_count": 6,
+      "pre_filter_rejected_sample": [
+        {
+          "symbol": "\u5e01\u5b89\u4eba\u751fUSDT",
+          "reason": "contains non-ASCII characters",
+          "quote_volume": 227265803.72271
+        },
+        {
+          "symbol": "QUSDT",
+          "reason": "base asset shorter than 2 chars ('Q')",
+          "quote_volume": 60499238.725792
+        },
+        {
+          "symbol": "MUSDT",
+          "reason": "base asset shorter than 2 chars ('M')",
+          "quote_volume": 51002638.4916
+        },
+        {
+          "symbol": "HUSDT",
+          "reason": "base asset shorter than 2 chars ('H')",
+          "quote_volume": 43221942.53378
+        },
+        {
+          "symbol": "CUSDT",
+          "reason": "base asset shorter than 2 chars ('C')",
+          "quote_volume": 11467944.74262
+        },
+        {
+          "symbol": "WUSDT",
+          "reason": "base asset shorter than 2 chars ('W')",
+          "quote_volume": 7579441.264333
+        }
+      ],
+      "rejected_pre_filter_count": 6,
+      "rejected_pre_filter_sample": [
+        {
+          "symbol": "\u5e01\u5b89\u4eba\u751fUSDT",
+          "reason": "contains non-ASCII characters",
+          "quote_volume": 227265803.72271
+        },
+        {
+          "symbol": "QUSDT",
+          "reason": "base asset shorter than 2 chars ('Q')",
+          "quote_volume": 60499238.725792
+        },
+        {
+          "symbol": "MUSDT",
+          "reason": "base asset shorter than 2 chars ('M')",
+          "quote_volume": 51002638.4916
+        },
+        {
+          "symbol": "HUSDT",
+          "reason": "base asset shorter than 2 chars ('H')",
+          "quote_volume": 43221942.53378
+        },
+        {
+          "symbol": "CUSDT",
+          "reason": "base asset shorter than 2 chars ('C')",
+          "quote_volume": 11467944.74262
+        },
+        {
+          "symbol": "WUSDT",
+          "reason": "base asset shorter than 2 chars ('W')",
+          "quote_volume": 7579441.264333
+        }
+      ],
+      "support_precheck_available": false,
+      "support_precheck_error": "no exchangeInfo data on disk for BINANCE_USDTF",
+      "support_precheck_rejected_count": 0,
+      "support_precheck_rejected_sample": []
+    }
+  }
+}

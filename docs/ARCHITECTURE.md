@@ -92,7 +92,7 @@ ordering — ordering comes solely from `trade_session_seq`.
   converted to Nautilus `TradeTick`.
 - Depth records are sorted by `(stream_session_id, session_seq, raw_index)` and
   replayed through an exact `Decimal` book state to produce `OrderBookDeltas`.
-- `OrderBookDepth10` is optional (off by default) and derived only from the
+- `OrderBookDepth10` is enabled by default and derived only from the
   replayed deterministic book state.
 - Instruments are built from exchangeInfo (`CurrencyPair` for spot,
   `CryptoPerpetual` for futures).
