@@ -33,6 +33,7 @@ class SymbolStats:
         self.sync_state = None
         self.snapshot_seed_count = 0
         self.resync_count = 0
+        self.bootstrap_attempt_count = 0
         self.desync_events = 0
         # ── rich sync diagnostics ──
         self.stream_session_id: int = 0
@@ -69,6 +70,7 @@ class SymbolStats:
             'stream_session_id': self.stream_session_id,
             'snapshot_seed_count': self.snapshot_seed_count,
             'resync_count': self.resync_count,
+            'bootstrap_attempt_count': self.bootstrap_attempt_count,
             'desync_events': self.desync_events,
             'accepted_update_count': self.accepted_update_count,
             'rejected_update_count': self.rejected_update_count,
@@ -153,6 +155,7 @@ class HealthMonitor:
         prev_update_id: int | None,
         snapshot_seed_count: int = 0,
         resync_count: int = 0,
+        bootstrap_attempt_count: int = 0,
         desync_count: int | None = None,
         desync_events: int | None = None,
         # ── rich diagnostics (optional for backward compat) ──
@@ -184,6 +187,7 @@ class HealthMonitor:
         stats.prev_update_id = prev_update_id
         stats.snapshot_seed_count = snapshot_seed_count
         stats.resync_count = resync_count
+        stats.bootstrap_attempt_count = bootstrap_attempt_count
         stats.desync_events = (
             desync_events if desync_events is not None else desync_count or 0
         )
@@ -296,6 +300,9 @@ class HealthMonitor:
                 total_rejected = sum(s.get("rejected_update_count", 0) for s in sym_dicts)
                 total_bootstrap_stale_drops = sum(s.get("bootstrap_stale_drop_count", 0) for s in sym_dicts)
                 total_promote_zero = sum(s.get("promote_zero_accepted_count", 0) for s in sym_dicts)
+                total_bootstrap_attempts = sum(s.get("bootstrap_attempt_count", 0) for s in sym_dicts)
+                total_continuity_resyncs = sum(s.get("resync_count", 0) for s in sym_dicts)
+                total_snapshots = sum(s.get("snapshot_seed_count", 0) for s in sym_dicts)
                 sync_health[venue_key] = {
                     "live_synced_count": live,
                     "snapshot_seeded_count": seeded,
@@ -309,6 +316,13 @@ class HealthMonitor:
                     "total_rejected_updates": total_rejected,
                     "total_bootstrap_stale_drops": total_bootstrap_stale_drops,
                     "total_promote_zero_accepted": total_promote_zero,
+                    "bootstrap_accounting": {
+                        "total_bootstrap_attempts": total_bootstrap_attempts,
+                        "total_continuity_resyncs": total_continuity_resyncs,
+                        "total_snapshots_committed": total_snapshots,
+                        "total_zero_accepted_promotes": total_promote_zero,
+                        "total_stale_drops_in_bootstrap": total_bootstrap_stale_drops,
+                    },
                 }
             
             heartbeat = {
