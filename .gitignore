@@ -12,6 +12,7 @@ venv/
 
 # Data & state
 data_raw/
+meta/
 state/
 *.log
 *.jsonl

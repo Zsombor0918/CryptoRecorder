@@ -12,12 +12,12 @@ venue-specific fields unambiguously.
 from __future__ import annotations
 
 import asyncio
-from collections import defaultdict, deque
-from dataclasses import dataclass, field
+from collections import defaultdict
+from dataclasses import dataclass
 import json
 import logging
 import time
-from typing import Any, Deque, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import aiohttp
 
@@ -58,6 +58,7 @@ class TradeSymbolState:
     market_type: str = ""  # "spot" or "futures"
     trade_stream_session_id: int = 0
     next_trade_session_seq: int = 0
+    session_trade_count: int = 0
     last_exchange_trade_id: Optional[int] = None
     trade_id_regressions: int = 0
 
@@ -69,6 +70,7 @@ class TradeSymbolState:
     def new_stream_session(self) -> None:
         self.trade_stream_session_id += 1
         self.next_trade_session_seq = 0
+        self.session_trade_count = 0
         self.last_exchange_trade_id = None
 
 
@@ -92,6 +94,86 @@ class BinanceNativeTradeRecorder:
         self._states: Dict[Tuple[str, str], TradeSymbolState] = {}
         self._tasks: List[asyncio.Task] = []
         self._session: Optional[aiohttp.ClientSession] = None
+        self._venue_diag: Dict[str, Dict[str, Any]] = defaultdict(self._new_venue_diag)
+
+    @staticmethod
+    def _new_venue_diag() -> Dict[str, Any]:
+        return {
+            "ws_message_count": 0,
+            "parsed_trade_count": 0,
+            "skipped_message_count": 0,
+            "skip_reasons": {},
+            "lifecycle_only_sessions": 0,
+            "reconnect_count": 0,
+            "last_close_reason": None,
+            "sample_payload_shape": None,
+        }
+
+    def _record_skip(self, venue: str, reason: str) -> None:
+        diag = self._venue_diag[venue]
+        diag["skipped_message_count"] += 1
+        skip_reasons = diag["skip_reasons"]
+        skip_reasons[reason] = int(skip_reasons.get(reason, 0)) + 1
+
+    def _record_sample_payload_shape(self, venue: str, message: dict, data: dict) -> None:
+        diag = self._venue_diag[venue]
+        if diag.get("sample_payload_shape") is not None:
+            return
+        diag["sample_payload_shape"] = {
+            "venue": venue,
+            "stream": message.get("stream") if isinstance(message, dict) else None,
+            "stream_event": data.get("e"),
+            "symbol": data.get("s"),
+            "field_names": sorted(data.keys()),
+            "event_type": data.get("e"),
+        }
+
+    def get_venue_diagnostics(self) -> Dict[str, Dict[str, Any]]:
+        return {
+            venue: {
+                "ws_message_count": int(diag.get("ws_message_count", 0)),
+                "parsed_trade_count": int(diag.get("parsed_trade_count", 0)),
+                "skipped_message_count": int(diag.get("skipped_message_count", 0)),
+                "skip_reasons": dict(diag.get("skip_reasons", {})),
+                "lifecycle_only_sessions": int(diag.get("lifecycle_only_sessions", 0)),
+                "reconnect_count": int(diag.get("reconnect_count", 0)),
+                "last_close_reason": diag.get("last_close_reason"),
+                "sample_payload_shape": diag.get("sample_payload_shape"),
+            }
+            for venue, diag in self._venue_diag.items()
+        }
+
+    async def _finalize_symbol_session(self, state: TradeSymbolState, *, reason: str) -> None:
+        if state.session_trade_count == 0:
+            self._venue_diag[state.venue]["lifecycle_only_sessions"] += 1
+            logger.warning(
+                "Lifecycle-only trade session %s/%s stream_session=%d reason=%s",
+                state.venue,
+                state.symbol,
+                state.trade_stream_session_id,
+                reason,
+            )
+        await self._emit_trade_lifecycle(
+            state,
+            event="session_end",
+            reason=reason,
+        )
+
+    def _log_venue_diag_summary(self, venue: str, *, close_reason: str) -> None:
+        diag = self._venue_diag[venue]
+        diag["last_close_reason"] = close_reason
+        logger.info(
+            "Trade ingest diag %s: ws_messages=%d parsed_trades=%d skipped=%d lifecycle_only_sessions=%d reconnects=%d close_reason=%s skip_reasons=%s sample_futures_payload=%s",
+            venue,
+            diag["ws_message_count"],
+            diag["parsed_trade_count"],
+            diag["skipped_message_count"],
+            diag["lifecycle_only_sessions"],
+            diag["reconnect_count"],
+            close_reason,
+            diag["skip_reasons"],
+            diag["sample_payload_shape"],
+        )
 
     async def run(self, symbols_by_venue: Dict[str, List[str]]) -> None:
         timeout = aiohttp.ClientTimeout(total=30)
@@ -121,6 +203,7 @@ class BinanceNativeTradeRecorder:
     async def _run_venue_loop(self, venue: str, symbols: List[str]) -> None:
         backoff = 1.0
         while not self.shutdown_event.is_set():
+            close_reason = "websocket_closed"
             for symbol in symbols:
                 state = self._state_for(venue, symbol)
                 state.new_stream_session()
@@ -156,15 +239,14 @@ class BinanceNativeTradeRecorder:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                close_reason = f"websocket_error:{type(exc).__name__}"
                 logger.warning("Trade websocket error for %s: %s", venue, exc)
             finally:
+                self._venue_diag[venue]["reconnect_count"] += 1
                 for symbol in symbols:
                     state = self._state_for(venue, symbol)
-                    await self._emit_trade_lifecycle(
-                        state,
-                        event="session_end",
-                        reason="websocket_closed",
-                    )
+                    await self._finalize_symbol_session(state, reason=close_reason)
+                self._log_venue_diag_summary(venue, close_reason=close_reason)
 
             if self.shutdown_event.is_set():
                 break
@@ -176,58 +258,78 @@ class BinanceNativeTradeRecorder:
     # ------------------------------------------------------------------
 
     async def _handle_ws_text(self, venue: str, payload_text: str) -> None:
+        diag = self._venue_diag[venue]
+        diag["ws_message_count"] += 1
         try:
             message = json.loads(payload_text)
         except json.JSONDecodeError:
-            logger.warning("Skipping malformed trade frame for %s", venue)
+            self._record_skip(venue, "malformed_json")
             return
 
         data = message.get("data") if isinstance(message, dict) else None
         if not isinstance(data, dict):
+            self._record_skip(venue, "missing_combined_data")
             return
+
+        self._record_sample_payload_shape(venue, message, data)
 
         symbol = data.get("s")
         if not symbol:
+            self._record_skip(venue, "missing_symbol")
             return
 
-        state = self._state_for(venue, symbol)
-        ts_recv_ns = time.time_ns()
+        try:
+            state = self._state_for(venue, symbol)
+            ts_recv_ns = time.time_ns()
 
-        if venue == "BINANCE_USDTF":
-            record = self._build_futures_trade(state, data, ts_recv_ns)
-        else:
-            record = self._build_spot_trade(state, data, ts_recv_ns)
+            if venue == "BINANCE_USDTF":
+                # Futures aggTrade payload must include aggregate trade id `a`.
+                if data.get("a") is None:
+                    self._record_skip(venue, "missing_futures_agg_trade_id")
+                    return
+                record = self._build_futures_trade(state, data, ts_recv_ns)
+            else:
+                # Spot trade payload must include trade id `t`.
+                if data.get("t") is None:
+                    self._record_skip(venue, "missing_spot_trade_id")
+                    return
+                record = self._build_spot_trade(state, data, ts_recv_ns)
 
-        # Diagnostic: validate exchange trade-id monotonicity
-        exchange_trade_id = record.get("exchange_trade_id")
-        if exchange_trade_id is not None and state.last_exchange_trade_id is not None:
-            if exchange_trade_id <= state.last_exchange_trade_id:
-                state.trade_id_regressions += 1
-                logger.warning(
-                    "Trade-id regression %s/%s: %d <= %d (regressions=%d)",
-                    venue,
-                    symbol,
-                    exchange_trade_id,
-                    state.last_exchange_trade_id,
-                    state.trade_id_regressions,
-                )
-        if exchange_trade_id is not None:
-            state.last_exchange_trade_id = exchange_trade_id
+            # Diagnostic: validate exchange trade-id monotonicity
+            exchange_trade_id = record.get("exchange_trade_id")
+            if exchange_trade_id is not None and state.last_exchange_trade_id is not None:
+                if exchange_trade_id <= state.last_exchange_trade_id:
+                    state.trade_id_regressions += 1
+                    logger.warning(
+                        "Trade-id regression %s/%s: %d <= %d (regressions=%d)",
+                        venue,
+                        symbol,
+                        exchange_trade_id,
+                        state.last_exchange_trade_id,
+                        state.trade_id_regressions,
+                    )
+            if exchange_trade_id is not None:
+                state.last_exchange_trade_id = exchange_trade_id
 
-        # Commit the canonical trade record
-        trade_session_seq = state.allocate_trade_session_seq()
-        record["trade_session_seq"] = trade_session_seq
+            # Commit the canonical trade record
+            trade_session_seq = state.allocate_trade_session_seq()
+            record["trade_session_seq"] = trade_session_seq
 
-        await self.storage_manager.write_record(
-            venue, symbol, TRADE_V2_CHANNEL, record,
-        )
+            await self.storage_manager.write_record(
+                venue, symbol, TRADE_V2_CHANNEL, record,
+            )
+            state.session_trade_count += 1
 
-        self.health_monitor.record_message(
-            venue=venue,
-            symbol=symbol,
-            ts_event=record.get("ts_event_ms"),
-            channel=TRADE_V2_CHANNEL,
-        )
+            self.health_monitor.record_message(
+                venue=venue,
+                symbol=symbol,
+                ts_event=record.get("ts_event_ms"),
+                channel=TRADE_V2_CHANNEL,
+            )
+            diag["parsed_trade_count"] += 1
+        except Exception:
+            self._record_skip(venue, "handler_exception")
+            logger.exception("Trade message handling error for %s/%s", venue, symbol)
 
     def _build_spot_trade(
         self,

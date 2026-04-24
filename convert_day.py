@@ -40,6 +40,7 @@ from converter.depth_phase2 import convert_depth_v2
 from converter.catalog import purge_catalog_date_range
 from converter.instruments import build_instruments, load_exchange_info
 from converter.trades import convert_trades
+from converter.readers import stream_raw_records
 from converter.universe import resolve_universe
 from time_utils import local_now_iso
 
@@ -128,6 +129,7 @@ def convert_date(
     total_fenced_ranges = 0
     venue_reports: Dict[str, dict] = {}
     per_symbol_fenced_ranges: Dict[str, Dict[str, object]] = {}
+    per_symbol_trade: Dict[str, Dict[str, int]] = {}
     ts_ranges: Dict[str, Dict[str, Optional[int]]] = {
         "trade": {"start_ns": None, "end_ns": None},
         "order_book_deltas": {"start_ns": None, "end_ns": None},
@@ -142,6 +144,9 @@ def convert_date(
 
     for venue, symbols in sorted(universe.items()):
         v_trades = 0
+        v_trade_raw_records = 0
+        v_symbols_with_trades: List[str] = []
+        v_symbols_without_trades: List[str] = []
         v_delta_events = 0
         v_depth10 = 0
         v_snapshot_seeds = 0
@@ -162,8 +167,22 @@ def convert_date(
             ticks, bad_t, t_first, t_last = convert_trades(
                 venue, symbol, date_str, iid, pp, sp,
             )
+            trade_diag = _trade_raw_counts(venue, symbol, date_str, len(ticks))
             total_bad += bad_t
+            v_trade_raw_records += int(trade_diag.get("raw_record_count", 0))
             sym_has_trades = len(ticks) > 0
+            if sym_has_trades:
+                v_symbols_with_trades.append(symbol)
+            else:
+                v_symbols_without_trades.append(symbol)
+
+            per_symbol_trade[f"{venue}/{symbol}"] = {
+                "trade_raw_record_count": int(trade_diag.get("raw_record_count", 0)),
+                "trade_raw_trade_record_count": int(trade_diag.get("raw_trade_record_count", 0)),
+                "trade_raw_lifecycle_record_count": int(trade_diag.get("raw_lifecycle_record_count", 0)),
+                "trade_ticks_written": int(trade_diag.get("trade_ticks_written", 0)),
+            }
+
             if ticks:
                 ticks.sort(key=lambda t: t.ts_init)
                 for i in range(0, len(ticks), WRITE_BATCH_SIZE):
@@ -234,6 +253,9 @@ def convert_date(
         venue_reports[venue] = {
             "symbols": v_symbols,
             "trades_written": v_trades,
+            "trade_raw_record_count": v_trade_raw_records,
+            "symbols_with_trades": v_symbols_with_trades,
+            "symbols_without_trades": v_symbols_without_trades,
             "delta_events_written": v_delta_events,
             "depth10_written": v_depth10,
             "snapshot_seed_count": v_snapshot_seeds,
@@ -284,6 +306,7 @@ def convert_date(
         "desync_events": total_desyncs,
         "fenced_ranges_total": total_fenced_ranges,
         "per_symbol_fenced_ranges": per_symbol_fenced_ranges,
+        "per_symbol_trade": per_symbol_trade,
         "data_presence": data_presence,
         "futures_enabled": "BINANCE_USDTF" in universe,
         "symbols_processed": symbols_processed,
@@ -321,6 +344,30 @@ def _update_ts_range(
     if last is not None:
         if r["end_ns"] is None or last > r["end_ns"]:
             r["end_ns"] = last
+
+
+def _trade_raw_counts(
+    venue: str,
+    symbol: str,
+    date_str: str,
+    ticks_written: int,
+) -> Dict[str, int]:
+    raw_record_count = 0
+    raw_trade_record_count = 0
+    raw_lifecycle_record_count = 0
+    for rec in stream_raw_records(venue, symbol, "trade_v2", date_str):
+        raw_record_count += 1
+        rtype = rec.get("record_type", "trade")
+        if rtype == "trade":
+            raw_trade_record_count += 1
+        elif rtype == "trade_stream_lifecycle":
+            raw_lifecycle_record_count += 1
+    return {
+        "raw_record_count": raw_record_count,
+        "raw_trade_record_count": raw_trade_record_count,
+        "raw_lifecycle_record_count": raw_lifecycle_record_count,
+        "trade_ticks_written": ticks_written,
+    }
 
 
 def _empty_report(date_str: str, t0: float, **kwargs) -> dict:
