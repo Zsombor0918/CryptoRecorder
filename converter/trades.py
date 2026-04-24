@@ -11,7 +11,7 @@ not affect ordering.
 from __future__ import annotations
 
 import logging
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from nautilus_trader.model.data import TradeTick
 from nautilus_trader.model.enums import AggressorSide
@@ -43,6 +43,34 @@ def convert_trades(
 
     Returns ``(tick_list, bad_line_count, first_ts_ns, last_ts_ns)``.
     """
+    ticks, bad, first_ts, last_ts, _ = convert_trades_with_diagnostics(
+        venue,
+        symbol,
+        date_str,
+        instrument_id,
+        price_prec,
+        size_prec,
+    )
+    return ticks, bad, first_ts, last_ts
+
+
+def convert_trades_with_diagnostics(
+    venue: str,
+    symbol: str,
+    date_str: str,
+    instrument_id: InstrumentId,
+    price_prec: int,
+    size_prec: int,
+) -> Tuple[List[TradeTick], int, Optional[int], Optional[int], Dict[str, int]]:
+    """Stream-convert raw trade_v2 records and return diagnostics.
+
+    Returns ``(tick_list, bad_line_count, first_ts_ns, last_ts_ns, diagnostics)``
+    where diagnostics includes:
+      - ``raw_record_count``: all parsed JSON records from trade_v2 files
+      - ``raw_trade_record_count``: parsed records with record_type == "trade"
+      - ``raw_lifecycle_record_count``: parsed lifecycle records
+      - ``trade_ticks_written``: number of TradeTick objects produced
+    """
     ticks: List[TradeTick] = []
     bad = 0
     first_ts: Optional[int] = None
@@ -52,12 +80,18 @@ def convert_trades(
     raw_records = list(stream_raw_records(venue, symbol, "trade_v2", date_str))
     raw_records.sort(key=_trade_sort_key)
 
+    raw_trade_record_count = 0
+    raw_lifecycle_record_count = 0
+
     for rec in raw_records:
         try:
             record_type = rec.get("record_type", "trade")
             # Skip lifecycle markers — they are metadata, not trade ticks
             if record_type != "trade":
+                if record_type == "trade_stream_lifecycle":
+                    raw_lifecycle_record_count += 1
                 continue
+            raw_trade_record_count += 1
 
             price_str = rec.get("price", "0")
             qty_str = rec.get("quantity", "0")
@@ -101,4 +135,10 @@ def convert_trades(
         except Exception:
             bad += 1
 
-    return ticks, bad, first_ts, last_ts
+    diagnostics = {
+        "raw_record_count": len(raw_records),
+        "raw_trade_record_count": raw_trade_record_count,
+        "raw_lifecycle_record_count": raw_lifecycle_record_count,
+        "trade_ticks_written": len(ticks),
+    }
+    return ticks, bad, first_ts, last_ts, diagnostics

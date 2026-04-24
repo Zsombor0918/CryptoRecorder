@@ -118,5 +118,13 @@ def test_convert_date_writes_order_book_deltas_without_depth10(monkeypatch, tmp_
     assert report["total_order_book_deltas_written"] == 2
     assert report["total_depth10_written"] == 0
     assert report["total_trades_written"] == 0
+    assert "per_symbol_trade" in report
+    assert report["per_symbol_trade"]["BINANCE_SPOT/BTCUSDT"]["trade_raw_record_count"] == 0
+    assert report["per_symbol_trade"]["BINANCE_SPOT/BTCUSDT"]["trade_ticks_written"] == 0
+    assert "venues" in report
+    assert report["venues"]["BINANCE_SPOT"]["trades_written"] == 0
+    assert report["venues"]["BINANCE_SPOT"]["trade_raw_record_count"] == 0
+    assert report["venues"]["BINANCE_SPOT"]["symbols_with_trades"] == []
+    assert report["venues"]["BINANCE_SPOT"]["symbols_without_trades"] == ["BTCUSDT"]
     assert len(deltas) == 2
     assert depth10 == []
