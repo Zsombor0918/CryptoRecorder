@@ -34,15 +34,17 @@ from config import (
     NAUTILUS_CATALOG_ROOT,
     DEPTH10_INTERVAL_SEC,
     EMIT_DEPTH10_DEFAULT,
+    MIN_TRADE_RECORDS_FOR_FULL_READY,
     STATE_ROOT,
 )
 from converter.depth_phase2 import convert_depth_v2
 from converter.catalog import purge_catalog_date_range
 from converter.instruments import build_instruments, load_exchange_info
-from converter.trades import convert_trades
 from converter.readers import stream_raw_records
+from converter.trades import convert_trades_with_diagnostics
 from converter.universe import resolve_universe
 from time_utils import local_now_iso
+from validators.trade_coverage import build_readiness_summary
 
 # ---------------------------------------------------------------------------
 logging.basicConfig(
@@ -52,6 +54,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 WRITE_BATCH_SIZE: int = 5000
+# Threshold for refusing a non-staging conversion when raw depth coverage is too low.
+# Refuse only when expected_symbols_total is large enough to be meaningful.
+OVERWRITE_DEPTH_REFUSE_MIN_RATIO: float = 0.80
+OVERWRITE_DEPTH_REFUSE_MIN_EXPECTED_SYMBOLS: int = 50
 
 
 # ===================================================================
@@ -65,6 +71,7 @@ def convert_date(
     *,
     emit_depth10: bool = EMIT_DEPTH10_DEFAULT,
     depth10_interval_sec: float = DEPTH10_INTERVAL_SEC,
+    allow_partial_overwrite: bool = False,
 ) -> Dict:
     """Convert one UTC day's raw data → Nautilus ParquetDataCatalog.
 
@@ -102,6 +109,86 @@ def convert_date(
         insts = build_instruments(venue, syms, einfo)
         all_instruments.extend(insts)
 
+    # ── instrument lookup (needed before raw scan and purge guard) ────
+    inst_map: Dict[Tuple[str, str], Tuple] = {}
+    for inst in all_instruments:
+        raw = str(inst.raw_symbol)
+        vtag = "BINANCE_USDTF" if isinstance(inst, CryptoPerpetual) else "BINANCE_SPOT"
+        inst_map[(vtag, raw)] = (inst.id, inst.price_precision, inst.size_precision)
+
+    expected_symbol_keys = {
+        f"{venue}/{symbol}"
+        for (venue, symbol) in inst_map.keys()
+    }
+
+    # ── raw coverage scan (before any purge) ──────────────────────────
+    raw_depth_symbols_set = (
+        _symbols_with_raw_record_type(universe, date_str, channel="depth_v2", record_type="depth_update")
+        & expected_symbol_keys
+    )
+    raw_trade_symbols_set = (
+        _symbols_with_raw_record_type(universe, date_str, channel="trade_v2", record_type="trade")
+        & expected_symbol_keys
+    )
+    raw_depth_symbols = sorted(raw_depth_symbols_set)
+    raw_trade_symbols = sorted(raw_trade_symbols_set)
+
+    # ── partial overwrite guard (before purge so catalog is never touched on refuse) ──
+    overwrite_enabled = not staging
+    integrity_warnings: List[str] = []
+    if (
+        overwrite_enabled
+        and not allow_partial_overwrite
+        and len(expected_symbol_keys) >= OVERWRITE_DEPTH_REFUSE_MIN_EXPECTED_SYMBOLS
+    ):
+        depth_ratio = (
+            len(raw_depth_symbols) / float(len(expected_symbol_keys))
+            if expected_symbol_keys
+            else 1.0
+        )
+        if depth_ratio < OVERWRITE_DEPTH_REFUSE_MIN_RATIO:
+            msg = (
+                "REFUSING conversion: partial raw depth coverage would overwrite catalog. "
+                f"raw_depth_symbols={len(raw_depth_symbols)}/{len(expected_symbol_keys)} "
+                f"({depth_ratio:.1%}). "
+                "Pass --allow-partial-overwrite to force."
+            )
+            logger.error(msg)
+            return _save_report({
+                "date": date_str,
+                "timestamp": local_now_iso(),
+                "runtime_sec": round(time.time() - t0, 2),
+                "status": "refused_partial_raw_depth",
+                "architecture": "deterministic_native",
+                "conversion_integrity": {
+                    "date_converted": date_str,
+                    "catalog_root_written": str(work_root),
+                    "staging": staging,
+                    "emit_depth10": emit_depth10,
+                    "expected_symbols_total": len(expected_symbol_keys),
+                    "raw_depth_symbols": raw_depth_symbols,
+                    "raw_trade_symbols": raw_trade_symbols,
+                    "warnings": [msg],
+                },
+            })
+    elif (
+        overwrite_enabled
+        and len(expected_symbol_keys) >= OVERWRITE_DEPTH_REFUSE_MIN_EXPECTED_SYMBOLS
+    ):
+        depth_ratio = (
+            len(raw_depth_symbols) / float(len(expected_symbol_keys))
+            if expected_symbol_keys
+            else 1.0
+        )
+        if depth_ratio < OVERWRITE_DEPTH_REFUSE_MIN_RATIO:
+            warning = (
+                "WARNING: partial raw depth overwrite allowed by --allow-partial-overwrite. "
+                f"raw_depth_symbols={len(raw_depth_symbols)}/{len(expected_symbol_keys)} "
+                f"({depth_ratio:.1%})"
+            )
+            integrity_warnings.append(warning)
+            logger.warning(warning)
+
     # ── purge existing catalog data (date-scoped idempotency) ─────────
     if not staging:
         iid_list = [inst.id for inst in all_instruments]
@@ -110,13 +197,6 @@ def convert_date(
     if all_instruments:
         catalog.write_data(all_instruments)
         logger.info(f"Wrote {len(all_instruments)} instruments")
-
-    # ── instrument lookup ─────────────────────────────────────────────
-    inst_map: Dict[Tuple[str, str], Tuple] = {}
-    for inst in all_instruments:
-        raw = str(inst.raw_symbol)
-        vtag = "BINANCE_USDTF" if isinstance(inst, CryptoPerpetual) else "BINANCE_SPOT"
-        inst_map[(vtag, raw)] = (inst.id, inst.price_precision, inst.size_precision)
 
     # ── per-venue / per-symbol conversion ─────────────────────────────
     total_trades = 0
@@ -130,6 +210,7 @@ def convert_date(
     venue_reports: Dict[str, dict] = {}
     per_symbol_fenced_ranges: Dict[str, Dict[str, object]] = {}
     per_symbol_trade: Dict[str, Dict[str, int]] = {}
+    per_symbol_depth: Dict[str, Dict[str, int]] = {}
     ts_ranges: Dict[str, Dict[str, Optional[int]]] = {
         "trade": {"start_ns": None, "end_ns": None},
         "order_book_deltas": {"start_ns": None, "end_ns": None},
@@ -141,12 +222,20 @@ def convert_date(
     instruments_with_trades: List[str] = []
     instruments_with_depth: List[str] = []
     instruments_with_no_data: List[str] = []
+    converted_trade_symbols: set[str] = set()
+    converted_order_book_delta_symbols: set[str] = set()
+    converted_order_book_depth_symbols: set[str] = set()
 
     for venue, symbols in sorted(universe.items()):
         v_trades = 0
         v_trade_raw_records = 0
+        v_trade_raw_trade_records = 0
+        v_trade_raw_lifecycle_records = 0
         v_symbols_with_trades: List[str] = []
         v_symbols_without_trades: List[str] = []
+        v_symbols_with_trade_ticks: List[str] = []
+        v_symbols_without_trade_ticks: List[str] = []
+        v_lifecycle_only_symbols: List[str] = []
         v_delta_events = 0
         v_depth10 = 0
         v_snapshot_seeds = 0
@@ -154,6 +243,7 @@ def convert_date(
         v_desyncs = 0
         v_fenced_ranges = 0
         v_symbols: List[str] = []
+        v_top_symbols_by_trade_count: List[Tuple[str, int]] = []
 
         for symbol in sorted(symbols):
             key = (venue, symbol)
@@ -164,23 +254,45 @@ def convert_date(
             v_symbols.append(symbol)
 
             # ── trades (trade_v2) ─────────────────────────────────────
-            ticks, bad_t, t_first, t_last = convert_trades(
-                venue, symbol, date_str, iid, pp, sp,
+            ticks, bad_t, t_first, t_last, trade_diag = convert_trades_with_diagnostics(
+                venue,
+                symbol,
+                date_str,
+                iid,
+                pp,
+                sp,
             )
-            trade_diag = _trade_raw_counts(venue, symbol, date_str, len(ticks))
             total_bad += bad_t
             v_trade_raw_records += int(trade_diag.get("raw_record_count", 0))
-            sym_has_trades = len(ticks) > 0
+            v_trade_raw_trade_records += int(trade_diag.get("raw_trade_record_count", 0))
+            v_trade_raw_lifecycle_records += int(trade_diag.get("raw_lifecycle_record_count", 0))
+            sym_has_trades = int(trade_diag.get("raw_trade_record_count", 0)) > 0
+            sym_has_trade_ticks = len(ticks) > 0
             if sym_has_trades:
                 v_symbols_with_trades.append(symbol)
             else:
                 v_symbols_without_trades.append(symbol)
+            if sym_has_trade_ticks:
+                v_symbols_with_trade_ticks.append(symbol)
+            else:
+                v_symbols_without_trade_ticks.append(symbol)
+            if (
+                int(trade_diag.get("raw_trade_record_count", 0)) == 0
+                and int(trade_diag.get("raw_lifecycle_record_count", 0)) > 0
+            ):
+                v_lifecycle_only_symbols.append(symbol)
+            v_top_symbols_by_trade_count.append(
+                (symbol, int(trade_diag.get("raw_trade_record_count", 0)))
+            )
 
             per_symbol_trade[f"{venue}/{symbol}"] = {
-                "trade_raw_record_count": int(trade_diag.get("raw_record_count", 0)),
-                "trade_raw_trade_record_count": int(trade_diag.get("raw_trade_record_count", 0)),
-                "trade_raw_lifecycle_record_count": int(trade_diag.get("raw_lifecycle_record_count", 0)),
-                "trade_ticks_written": int(trade_diag.get("trade_ticks_written", 0)),
+                "raw_record_count": int(trade_diag.get("raw_record_count", 0)),
+                "raw_trade_record_count": int(trade_diag.get("raw_trade_record_count", 0)),
+                "raw_lifecycle_record_count": int(trade_diag.get("raw_lifecycle_record_count", 0)),
+                "ticks_written": int(trade_diag.get("ticks_written", 0)),
+                "first_trade_ts_ns": t_first,
+                "last_trade_ts_ns": t_last,
+                "will_create_tradetick": sym_has_trade_ticks,
             }
 
             if ticks:
@@ -188,6 +300,7 @@ def convert_date(
                 for i in range(0, len(ticks), WRITE_BATCH_SIZE):
                     catalog.write_data(ticks[i : i + WRITE_BATCH_SIZE])
                 v_trades += len(ticks)
+                converted_trade_symbols.add(f"{venue}/{symbol}")
                 _update_ts_range(ts_ranges["trade"], t_first, t_last)
 
             # ── depth (depth_v2 → OrderBookDeltas) ────────────────────
@@ -209,6 +322,21 @@ def convert_date(
             v_desyncs += depth_metrics.desync_events
             v_fenced_ranges += len(depth_metrics.fenced_ranges)
             sym_has_depth = len(deltas) > 0 or len(depth10s) > 0
+            per_symbol_depth[f"{venue}/{symbol}"] = {
+                "raw_record_count": depth_metrics.raw_record_count,
+                "snapshot_seed_count": depth_metrics.snapshot_seed_count,
+                "depth_update_record_count": depth_metrics.depth_update_record_count,
+                "sync_state_record_count": depth_metrics.sync_state_record_count,
+                "stream_lifecycle_record_count": depth_metrics.stream_lifecycle_record_count,
+                "deltas_written": int(len(deltas)),
+                "depth10_written": int(len(depth10s)),
+                "fenced_ranges": len(depth_metrics.fenced_ranges),
+                "desync_events": depth_metrics.desync_events,
+                "resync_count": depth_metrics.resync_count,
+                "first_depth_ts_ns": depth_metrics.first_ts_ns,
+                "last_depth_ts_ns": depth_metrics.last_ts_ns,
+                "will_create_l2": len(deltas) > 0,
+            }
             if depth_metrics.fenced_ranges:
                 per_symbol_fenced_ranges[f"{venue}/{symbol}"] = {
                     "fenced_ranges": len(depth_metrics.fenced_ranges),
@@ -218,6 +346,7 @@ def convert_date(
                 deltas.sort(key=lambda d: d.ts_init)
                 for i in range(0, len(deltas), WRITE_BATCH_SIZE):
                     catalog.write_data(deltas[i : i + WRITE_BATCH_SIZE])
+                converted_order_book_delta_symbols.add(f"{venue}/{symbol}")
                 _update_ts_range(
                     ts_ranges["order_book_deltas"],
                     depth_metrics.first_ts_ns,
@@ -227,6 +356,7 @@ def convert_date(
                 depth10s.sort(key=lambda d: d.ts_init)
                 for i in range(0, len(depth10s), WRITE_BATCH_SIZE):
                     catalog.write_data(depth10s[i : i + WRITE_BATCH_SIZE])
+                converted_order_book_depth_symbols.add(f"{venue}/{symbol}")
                 _update_ts_range(
                     ts_ranges["order_book_depths"],
                     depth_metrics.first_ts_ns,
@@ -235,7 +365,7 @@ def convert_date(
 
             # ── track data presence ───────────────────────────────────
             iid_str = str(iid)
-            if sym_has_trades:
+            if sym_has_trade_ticks:
                 instruments_with_trades.append(iid_str)
             if sym_has_depth:
                 instruments_with_depth.append(iid_str)
@@ -254,8 +384,20 @@ def convert_date(
             "symbols": v_symbols,
             "trades_written": v_trades,
             "trade_raw_record_count": v_trade_raw_records,
+            "trade_raw_trade_record_count": v_trade_raw_trade_records,
+            "trade_raw_lifecycle_record_count": v_trade_raw_lifecycle_records,
             "symbols_with_trades": v_symbols_with_trades,
             "symbols_without_trades": v_symbols_without_trades,
+            "symbols_with_trade_ticks": v_symbols_with_trade_ticks,
+            "symbols_without_trade_ticks": v_symbols_without_trade_ticks,
+            "lifecycle_only_symbols": v_lifecycle_only_symbols,
+            "top_symbols_by_trade_count": [
+                {"symbol": sym, "trade_record_count": count}
+                for sym, count in sorted(
+                    v_top_symbols_by_trade_count,
+                    key=lambda item: (-item[1], item[0]),
+                )[:10]
+            ],
             "delta_events_written": v_delta_events,
             "depth10_written": v_depth10,
             "snapshot_seed_count": v_snapshot_seeds,
@@ -287,6 +429,98 @@ def convert_date(
         "instruments_with_no_data": len(instruments_with_no_data),
         "no_data_list": instruments_with_no_data[:20],
     }
+    readiness = build_readiness_summary(
+        per_symbol_trade,
+        per_symbol_depth,
+        min_trade_records_for_full_ready=MIN_TRADE_RECORDS_FOR_FULL_READY,
+    )
+
+    # ── readiness classification (from actual conversion output) ──────
+    readiness_classification: Dict[str, object] = {
+        "full_ready": [],
+        "l2_ready": [],
+        "trade_only": [],
+        "not_ready": [],
+        "full_ready_count": 0,
+        "l2_ready_count": 0,
+        "trade_only_count": 0,
+        "not_ready_count": 0,
+        "by_venue": {},
+    }
+    for key, info in sorted(readiness["per_symbol"].items()):
+        cls = info["readiness"]
+        readiness_classification[cls].append(key)  # type: ignore[union-attr]
+        readiness_classification[f"{cls}_count"] += 1  # type: ignore[operator]
+        sym_venue = key.split("/")[0]
+        bv = readiness_classification["by_venue"].setdefault(  # type: ignore[union-attr]
+            sym_venue,
+            {"full_ready_count": 0, "l2_ready_count": 0, "trade_only_count": 0, "not_ready_count": 0},
+        )
+        bv[f"{cls}_count"] += 1
+
+    # ── by-venue sets for conversion_integrity ────────────────────────
+    def _by_venue_names(key_set: set, venue_name: str) -> List[str]:
+        return sorted(
+            sym for key in key_set
+            if (parts := key.split("/", 1)) and parts[0] == venue_name
+            for sym in [parts[1]]
+        )
+
+    all_venues = sorted(universe.keys())
+    conv_int_expected_by_venue = {v: sorted(universe[v]) for v in all_venues}
+    conv_int_raw_trade_by_venue = {v: _by_venue_names(raw_trade_symbols_set, v) for v in all_venues}
+    conv_int_raw_depth_by_venue = {v: _by_venue_names(raw_depth_symbols_set, v) for v in all_venues}
+    conv_int_conv_trade_by_venue = {v: _by_venue_names(converted_trade_symbols, v) for v in all_venues}
+    conv_int_conv_depth_by_venue = {v: _by_venue_names(converted_order_book_delta_symbols, v) for v in all_venues}
+    conv_int_conv_depth10_by_venue = {v: _by_venue_names(converted_order_book_depth_symbols, v) for v in all_venues}
+    conv_int_miss_raw_trade_by_venue = {
+        v: sorted(set(universe[v]) - set(conv_int_raw_trade_by_venue[v])) for v in all_venues
+    }
+    conv_int_miss_raw_depth_by_venue = {
+        v: sorted(set(universe[v]) - set(conv_int_raw_depth_by_venue[v])) for v in all_venues
+    }
+    conv_int_miss_conv_trade_by_venue = {
+        v: sorted(set(universe[v]) - set(conv_int_conv_trade_by_venue[v])) for v in all_venues
+    }
+    conv_int_miss_conv_depth_by_venue = {
+        v: sorted(set(universe[v]) - set(conv_int_conv_depth_by_venue[v])) for v in all_venues
+    }
+    conv_int_miss_conv_depth10_by_venue = {
+        v: sorted(set(universe[v]) - set(conv_int_conv_depth10_by_venue[v])) for v in all_venues
+    }
+
+    converted_trade_symbols_sorted = sorted(converted_trade_symbols)
+    converted_order_book_delta_symbols_sorted = sorted(converted_order_book_delta_symbols)
+    converted_order_book_depth_symbols_sorted = sorted(converted_order_book_depth_symbols)
+    conversion_integrity = {
+        "date_converted": date_str,
+        "catalog_root_written": str(target_root),
+        "staging": staging,
+        "emit_depth10": emit_depth10,
+        "expected_symbols_total": len(expected_symbol_keys),
+        "expected_symbols_by_venue": conv_int_expected_by_venue,
+        "raw_trade_symbols_by_venue": conv_int_raw_trade_by_venue,
+        "raw_depth_symbols_by_venue": conv_int_raw_depth_by_venue,
+        "converted_trade_symbols_by_venue": conv_int_conv_trade_by_venue,
+        "converted_depth_symbols_by_venue": conv_int_conv_depth_by_venue,
+        "converted_depth10_symbols_by_venue": conv_int_conv_depth10_by_venue,
+        "missing_raw_trade_symbols_by_venue": conv_int_miss_raw_trade_by_venue,
+        "missing_raw_depth_symbols_by_venue": conv_int_miss_raw_depth_by_venue,
+        "missing_converted_trade_symbols_by_venue": conv_int_miss_conv_trade_by_venue,
+        "missing_converted_depth_symbols_by_venue": conv_int_miss_conv_depth_by_venue,
+        "missing_converted_depth10_symbols_by_venue": conv_int_miss_conv_depth10_by_venue,
+        # Flat lists kept for backward compatibility
+        "raw_depth_symbols": raw_depth_symbols,
+        "raw_trade_symbols": raw_trade_symbols,
+        "converted_trade_symbols": converted_trade_symbols_sorted,
+        "converted_order_book_delta_symbols": converted_order_book_delta_symbols_sorted,
+        "converted_order_book_depth_symbols": converted_order_book_depth_symbols_sorted,
+        "missing_depth_after_convert": sorted(expected_symbol_keys - set(converted_order_book_delta_symbols_sorted)),
+        "missing_trade_after_convert": sorted(expected_symbol_keys - set(converted_trade_symbols_sorted)),
+        "missing_depth10_after_convert": sorted(expected_symbol_keys - set(converted_order_book_depth_symbols_sorted)),
+        "overwrite_enabled": overwrite_enabled,
+        "warnings": integrity_warnings,
+    }
 
     # ── report ────────────────────────────────────────────────────────
     elapsed = time.time() - t0
@@ -307,7 +541,11 @@ def convert_date(
         "fenced_ranges_total": total_fenced_ranges,
         "per_symbol_fenced_ranges": per_symbol_fenced_ranges,
         "per_symbol_trade": per_symbol_trade,
+        "per_symbol_depth": per_symbol_depth,
         "data_presence": data_presence,
+        "readiness": readiness,
+        "readiness_classification": readiness_classification,
+        "conversion_integrity": conversion_integrity,
         "futures_enabled": "BINANCE_USDTF" in universe,
         "symbols_processed": symbols_processed,
         "venues": venue_reports,
@@ -346,36 +584,30 @@ def _update_ts_range(
             r["end_ns"] = last
 
 
-def _trade_raw_counts(
-    venue: str,
-    symbol: str,
-    date_str: str,
-    ticks_written: int,
-) -> Dict[str, int]:
-    raw_record_count = 0
-    raw_trade_record_count = 0
-    raw_lifecycle_record_count = 0
-    for rec in stream_raw_records(venue, symbol, "trade_v2", date_str):
-        raw_record_count += 1
-        rtype = rec.get("record_type", "trade")
-        if rtype == "trade":
-            raw_trade_record_count += 1
-        elif rtype == "trade_stream_lifecycle":
-            raw_lifecycle_record_count += 1
-    return {
-        "raw_record_count": raw_record_count,
-        "raw_trade_record_count": raw_trade_record_count,
-        "raw_lifecycle_record_count": raw_lifecycle_record_count,
-        "trade_ticks_written": ticks_written,
-    }
-
-
 def _empty_report(date_str: str, t0: float, **kwargs) -> dict:
     return {
         "date": date_str,
         "runtime_sec": round(time.time() - t0, 2),
         **kwargs,
     }
+
+
+def _symbols_with_raw_record_type(
+    universe: Dict[str, List[str]],
+    date_str: str,
+    *,
+    channel: str,
+    record_type: str,
+) -> set[str]:
+    symbols: set[str] = set()
+    for venue, venue_symbols in universe.items():
+        for symbol in venue_symbols:
+            for rec in stream_raw_records(venue, symbol, channel, date_str):
+                current_record_type = rec.get("record_type", "trade")
+                if current_record_type == record_type:
+                    symbols.add(f"{venue}/{symbol}")
+                    break
+    return symbols
 
 
 def _save_report(report: dict) -> dict:
@@ -414,6 +646,16 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=DEPTH10_INTERVAL_SEC,
         help="Minimum interval between derived depth10 snapshots.",
     )
+    ap.add_argument(
+        "--allow-partial-overwrite",
+        action="store_true",
+        default=False,
+        help=(
+            "Allow overwriting catalog even when raw depth coverage is below "
+            f"{OVERWRITE_DEPTH_REFUSE_MIN_RATIO:.0%} of expected symbols. "
+            "Without this flag the conversion refuses when coverage is too low."
+        ),
+    )
     return ap
 
 
@@ -433,6 +675,7 @@ def main(
         staging=args.staging,
         emit_depth10=args.emit_depth10,
         depth10_interval_sec=args.depth10_interval_sec,
+        allow_partial_overwrite=args.allow_partial_overwrite,
     )
     return 0 if report.get("status") in ("ok", "no_data") else 1
 

@@ -46,6 +46,11 @@ class Phase2ReplayMetrics:
     first_ts_ns: Optional[int] = None
     last_ts_ns: Optional[int] = None
     fenced_ranges: List[Dict[str, Any]] = field(default_factory=list)
+    # Raw record type counts (diagnostic only — do not affect conversion output)
+    raw_record_count: int = 0
+    depth_update_record_count: int = 0
+    sync_state_record_count: int = 0
+    stream_lifecycle_record_count: int = 0
 
 
 @dataclass
@@ -340,6 +345,13 @@ def convert_depth_v2(
     for raw_index, rec in ordered:
         try:
             record_type = rec.get("record_type", "depth_update")
+            metrics.raw_record_count += 1
+            if record_type == "depth_update":
+                metrics.depth_update_record_count += 1
+            elif record_type == "sync_state":
+                metrics.sync_state_record_count += 1
+            elif record_type == "stream_lifecycle":
+                metrics.stream_lifecycle_record_count += 1
             ts_event = _ts_event_ns(rec)
             ts_init = int(rec.get("ts_recv_ns", ts_event))
 

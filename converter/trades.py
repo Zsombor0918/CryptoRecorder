@@ -139,6 +139,6 @@ def convert_trades_with_diagnostics(
         "raw_record_count": len(raw_records),
         "raw_trade_record_count": raw_trade_record_count,
         "raw_lifecycle_record_count": raw_lifecycle_record_count,
-        "trade_ticks_written": len(ticks),
+        "ticks_written": len(ticks),
     }
     return ticks, bad, first_ts, last_ts, diagnostics
