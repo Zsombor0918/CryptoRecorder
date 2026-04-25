@@ -7,11 +7,14 @@ consistency.
 from __future__ import annotations
 
 from typing import Iterable
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from nautilus_trader.model.identifiers import InstrumentId
 
 import converter.depth_phase2 as depth_mod
+import phase2_depth as phase2_depth_mod
 from phase2_depth import (
     DepthSymbolState,
     BinanceNativeDepthRecorder,
@@ -765,3 +768,79 @@ def _stub_recorder() -> BinanceNativeDepthRecorder:
         health_monitor=MagicMock(),
         shutdown_event=asyncio.Event(),
     )
+
+
+class _DepthStubWebSocket:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    def __aiter__(self):
+        async def _gen():
+            if False:
+                yield None
+        return _gen()
+
+    def exception(self):
+        return None
+
+
+@pytest.mark.asyncio
+async def test_depth_sharding_creates_two_tasks_for_fifty_symbols(monkeypatch) -> None:
+    recorder = _stub_recorder()
+    symbols = [f"SYM{i:02d}USDT" for i in range(50)]
+    calls: list[tuple[str, list[str], int, int]] = []
+
+    async def _fake_run_venue_loop(venue, shard_symbols, *, shard_index=1, shard_count=1):
+        calls.append((venue, list(shard_symbols), shard_index, shard_count))
+
+    recorder._run_venue_loop = _fake_run_venue_loop  # type: ignore[method-assign]
+
+    class _FakeClientSession:
+        def __init__(self, *args, **kwargs):
+            self.closed = False
+
+        async def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(phase2_depth_mod.aiohttp, "ClientSession", _FakeClientSession)
+    monkeypatch.setattr(phase2_depth_mod, "DEPTH_WS_SHARD_ENABLED", True)
+    monkeypatch.setattr(phase2_depth_mod, "DEPTH_WS_MAX_SYMBOLS_PER_CONNECTION", 25)
+
+    await recorder.run({"BINANCE_SPOT": symbols})
+
+    assert len(calls) == 2
+    assert all(len(chunk) == 25 for _, chunk, _, _ in calls)
+    assert calls[0][2:] == (1, 2)
+    assert calls[1][2:] == (2, 2)
+
+
+@pytest.mark.asyncio
+async def test_depth_reconnect_only_affects_symbols_in_one_shard(monkeypatch) -> None:
+    recorder = _stub_recorder()
+    ws_urls: list[str] = []
+
+    class _FakeSession:
+        closed = False
+
+        def ws_connect(self, url, heartbeat):
+            ws_urls.append(url)
+            recorder.shutdown_event.set()
+            return _DepthStubWebSocket()
+
+    recorder._session = _FakeSession()
+    monkeypatch.setattr(phase2_depth_mod.asyncio, "sleep", AsyncMock())
+
+    await recorder._run_venue_loop(
+        "BINANCE_USDTF",
+        ["BTCUSDT", "ETHUSDT"],
+        shard_index=1,
+        shard_count=2,
+    )
+
+    written_symbols = [call.args[1] for call in recorder.storage_manager.write_record.await_args_list]
+    assert ws_urls and "btcusdt@depth@" in ws_urls[0] and "ethusdt@depth@" in ws_urls[0]
+    assert set(written_symbols) == {"BTCUSDT", "ETHUSDT"}
+    assert "SOLUSDT" not in written_symbols

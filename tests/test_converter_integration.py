@@ -306,8 +306,22 @@ class TestConvertDayIntegration:
                             lambda v, ds: {})
         monkeypatch.setattr(convert_day_mod, "build_instruments",
                             lambda v, s, e: [instrument])
-        monkeypatch.setattr(convert_day_mod, "convert_trades",
-                            lambda *a, **kw: ([], 0, None, None))
+        monkeypatch.setattr(
+            convert_day_mod,
+            "convert_trades_with_diagnostics",
+            lambda *a, **kw: (
+                [],
+                0,
+                None,
+                None,
+                {
+                    "raw_record_count": 0,
+                    "raw_trade_record_count": 0,
+                    "raw_lifecycle_record_count": 0,
+                    "ticks_written": 0,
+                },
+            ),
+        )
         monkeypatch.setattr(convert_day_mod, "convert_depth_v2",
                             lambda *a, **kw: (
                                 [_fake_snapshot_deltas()],
@@ -362,8 +376,22 @@ class TestConvertDayIntegration:
                             lambda v, ds: {})
         monkeypatch.setattr(convert_day_mod, "build_instruments",
                             lambda v, s, e: [instrument])
-        monkeypatch.setattr(convert_day_mod, "convert_trades",
-                            lambda *a, **kw: ([], 0, None, None))
+        monkeypatch.setattr(
+            convert_day_mod,
+            "convert_trades_with_diagnostics",
+            lambda *a, **kw: (
+                [],
+                0,
+                None,
+                None,
+                {
+                    "raw_record_count": 0,
+                    "raw_trade_record_count": 0,
+                    "raw_lifecycle_record_count": 0,
+                    "ticks_written": 0,
+                },
+            ),
+        )
         monkeypatch.setattr(convert_day_mod, "convert_depth_v2",
                             lambda *a, **kw: (
                                 [deltas_batch], [],

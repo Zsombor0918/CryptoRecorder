@@ -71,6 +71,22 @@ DEPTH_INTERVAL_MS: Final = 100
 DEPTH_V2_CHANNEL: Final = "depth_v2"
 TRADE_V2_CHANNEL: Final = "trade_v2"
 
+TRADE_WS_SHARD_ENABLED: Final = (
+    os.environ.get("CRYPTO_RECORDER_TRADE_WS_SHARD_ENABLED", "1").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
+TRADE_WS_MAX_SYMBOLS_PER_CONNECTION: Final = int(
+    os.environ.get("CRYPTO_RECORDER_TRADE_WS_MAX_SYMBOLS_PER_CONNECTION", "25")
+)
+
+DEPTH_WS_SHARD_ENABLED: Final = (
+    os.environ.get("CRYPTO_RECORDER_DEPTH_WS_SHARD_ENABLED", "1").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
+DEPTH_WS_MAX_SYMBOLS_PER_CONNECTION: Final = int(
+    os.environ.get("CRYPTO_RECORDER_DEPTH_WS_MAX_SYMBOLS_PER_CONNECTION", "25")
+)
+
 # Optional depth10 derivation defaults (converter-side).
 EMIT_DEPTH10_DEFAULT: Final = (
     os.environ.get("CRYPTO_RECORDER_EMIT_DEPTH10", "1").strip().lower()
@@ -189,6 +205,9 @@ PHASE2_RESYNC_WINDOW_SEC: Final = float(
 
 NAUTILUS_CATALOG_ROOT: Final = PROJECT_ROOT.parent / "nautilus_data" / "catalog"
 CONVERTER_BATCH_SIZE: Final = 1000
+MIN_TRADE_RECORDS_FOR_FULL_READY: Final = int(
+    os.environ.get("CRYPTO_RECORDER_MIN_TRADE_RECORDS_FOR_FULL_READY", "1")
+)
 
 # Raw data retention days for disk cleanup.
 RAW_RETENTION_DAYS: Final = 7

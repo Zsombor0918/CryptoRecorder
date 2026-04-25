@@ -20,6 +20,8 @@ from config import (
     BINANCE_FUTURES_REST,
     BINANCE_SPOT_REST,
     DEPTH_INTERVAL_MS,
+    DEPTH_WS_MAX_SYMBOLS_PER_CONNECTION,
+    DEPTH_WS_SHARD_ENABLED,
     DEPTH_V2_CHANNEL,
     PHASE2_MAX_RESYNCS_PER_SYMBOL_WINDOW,
     PHASE2_RESYNC_COOLDOWN_SEC,
@@ -54,6 +56,12 @@ def _ws_url(venue: str, symbols: Iterable[str]) -> str:
     base = FUTURES_WS_BASE if venue == "BINANCE_USDTF" else SPOT_WS_BASE
     streams = "/".join(_stream_name(symbol) for symbol in symbols)
     return f"{base}{streams}"
+
+
+def _chunk_symbols(symbols: List[str], max_size: int) -> List[List[str]]:
+    if max_size <= 0 or len(symbols) <= max_size:
+        return [list(symbols)]
+    return [list(symbols[i : i + max_size]) for i in range(0, len(symbols), max_size)]
 
 
 def _snapshot_url(venue: str, symbol: str) -> str:
@@ -166,9 +174,24 @@ class BinanceNativeDepthRecorder:
         try:
             for venue, symbols in symbols_by_venue.items():
                 if symbols:
-                    self._tasks.append(
-                        asyncio.create_task(self._run_venue_loop(venue, list(symbols)))
+                    sorted_symbols = sorted(symbols)
+                    shards = (
+                        _chunk_symbols(sorted_symbols, DEPTH_WS_MAX_SYMBOLS_PER_CONNECTION)
+                        if DEPTH_WS_SHARD_ENABLED
+                        else [sorted_symbols]
                     )
+                    shard_count = len(shards)
+                    for shard_index, shard_symbols in enumerate(shards, start=1):
+                        self._tasks.append(
+                            asyncio.create_task(
+                                self._run_venue_loop(
+                                    venue,
+                                    list(shard_symbols),
+                                    shard_index=shard_index,
+                                    shard_count=shard_count,
+                                )
+                            )
+                        )
             if self._tasks:
                 await asyncio.gather(*self._tasks)
         finally:
@@ -185,8 +208,16 @@ class BinanceNativeDepthRecorder:
             await self._session.close()
         self._session = None
 
-    async def _run_venue_loop(self, venue: str, symbols: List[str]) -> None:
+    async def _run_venue_loop(
+        self,
+        venue: str,
+        symbols: List[str],
+        *,
+        shard_index: int = 1,
+        shard_count: int = 1,
+    ) -> None:
         backoff = 1.0
+        shard_label = f"{venue}[{shard_index}/{shard_count}]"
         while not self.shutdown_event.is_set():
             for symbol in symbols:
                 state = self._state_for(venue, symbol)
@@ -210,7 +241,7 @@ class BinanceNativeDepthRecorder:
                     ws_url,
                     heartbeat=WS_PING_INTERVAL_SEC,
                 ) as ws:
-                    logger.info("Depth websocket connected: %s", ws_url)
+                    logger.info("Depth websocket connected %s: %s", shard_label, ws_url)
                     backoff = 1.0
                     async for msg in ws:
                         if self.shutdown_event.is_set():
@@ -224,7 +255,7 @@ class BinanceNativeDepthRecorder:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                logger.warning("Depth websocket error for %s: %s", venue, exc)
+                logger.warning("Depth websocket error for %s: %s", shard_label, exc)
             finally:
                 for symbol in symbols:
                     state = self._state_for(venue, symbol)
