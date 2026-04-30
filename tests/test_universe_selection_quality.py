@@ -164,7 +164,7 @@ def test_universe_health_excludes_only_after_repeated_zero_runs(monkeypatch, tmp
         {"symbol": "SOLUSDT", "quoteVolume": "700"},
     ]
 
-    selected, metadata = selector._select_from_tickers(fake_tickers, "spot")
+    selected, metadata = asyncio.run(selector._select_from_tickers(fake_tickers, "spot"))
 
     assert selected == ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
     assert metadata["health_excluded_count"] == 1

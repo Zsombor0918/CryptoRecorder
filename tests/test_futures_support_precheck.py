@@ -1,6 +1,8 @@
 """Tests for futures support precheck using REST-based exchange info validation."""
 from __future__ import annotations
 
+import asyncio
+
 from binance_universe import UniverseSelector
 
 
@@ -21,7 +23,7 @@ def test_support_precheck_filters_by_exchange_info() -> None:
     # Inject a pre-populated cache of trading symbols
     selector._futures_support_mapping_cache = {"BTCUSDT", "ETHUSDT", "SOLUSDT"}
 
-    selected, metadata = selector._select_from_tickers(_fake_tickers(), "futures")
+    selected, metadata = asyncio.run(selector._select_from_tickers(_fake_tickers(), "futures"))
 
     assert selected[:3] == ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
     assert metadata["candidate_pool_raw_count"] == 6
@@ -36,7 +38,7 @@ def test_support_precheck_rejected_sample_has_reason() -> None:
     selector = UniverseSelector()
     selector._futures_support_mapping_cache = {"BTCUSDT"}
 
-    _, metadata = selector._select_from_tickers(_fake_tickers(), "futures")
+    _, metadata = asyncio.run(selector._select_from_tickers(_fake_tickers(), "futures"))
 
     rejected_symbols = {
         item["symbol"] for item in metadata["support_precheck_rejected_sample"]
@@ -52,7 +54,7 @@ def test_fallback_without_exchange_info_keeps_sane_survivors() -> None:
     # Force the method to return None
     selector._get_futures_exchange_info_symbols = lambda: (None, "no data")
 
-    selected, metadata = selector._select_from_tickers(_fake_tickers(), "futures")
+    selected, metadata = asyncio.run(selector._select_from_tickers(_fake_tickers(), "futures"))
 
     assert selected[:5] == ["BTCUSDT", "ETHUSDT", "SOLUSDT", "AGIXUSDT", "FDUSDUSDT"]
     assert metadata["support_precheck_available"] is False
