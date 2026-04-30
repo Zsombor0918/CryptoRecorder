@@ -22,10 +22,15 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import aiohttp
 
 from config import (
+    FUTURES_TRADE_WS_FALLBACK_ENABLED,
+    FUTURES_TRADE_WS_PROBE_SYMBOL,
+    FUTURES_TRADE_WS_FALLBACK_PROBE_TIMEOUT_SEC,
     TRADE_WS_FIRST_MESSAGE_TIMEOUT_SEC,
     TRADE_WS_IDLE_TIMEOUT_SEC,
     TRADE_WS_MAX_SYMBOLS_PER_CONNECTION,
+    TRADE_WS_SHARD_ADAPTIVE_SPLIT_ENABLED,
     TRADE_WS_SHARD_ENABLED,
+    TRADE_WS_SHARD_SPLIT_SIZES,
     TRADE_V2_CHANNEL,
     WS_PING_INTERVAL_SEC,
 )
@@ -62,6 +67,13 @@ def _new_diag_bucket() -> Dict[str, Any]:
         "first_message_seen_at": None,
         "last_message_seen_at": None,
         "last_exception": None,
+        # ── extended diagnostics ──────────────────────────────────────
+        "first_message_timeout_count": 0,
+        "no_first_message_since_connect_count": 0,
+        "current_stream_mode": None,
+        "endpoint": None,
+        "last_url": None,
+        "suggested_action": None,
     }
 
 
@@ -69,14 +81,20 @@ def _stream_name_spot(symbol: str) -> str:
     return f"{symbol.lower()}@trade"
 
 
-def _stream_name_futures(symbol: str) -> str:
+def _stream_name_futures(symbol: str, mode: str = "aggTrade") -> str:
+    """Return the futures stream name for the given symbol and mode.
+
+    Binance USDT-M Futures supports @aggTrade (default) and @trade.
+    """
+    if mode == "trade":
+        return f"{symbol.lower()}@trade"
     return f"{symbol.lower()}@aggTrade"
 
 
-def _ws_url(venue: str, symbols: Iterable[str]) -> str:
+def _ws_url(venue: str, symbols: Iterable[str], *, stream_mode: str = "aggTrade") -> str:
     if venue == "BINANCE_USDTF":
         base = FUTURES_WS_BASE
-        streams = "/".join(_stream_name_futures(s) for s in symbols)
+        streams = "/".join(_stream_name_futures(s, stream_mode) for s in symbols)
     else:
         base = SPOT_WS_BASE
         streams = "/".join(_stream_name_spot(s) for s in symbols)
@@ -135,6 +153,9 @@ class BinanceNativeTradeRecorder:
         self._session: Optional[aiohttp.ClientSession] = None
         self._venue_diag: Dict[str, Dict[str, Any]] = defaultdict(self._new_venue_diag)
         self._symbol_to_shard_key: Dict[Tuple[str, str], str] = {}
+        # Per-venue active stream mode ("aggTrade" or "trade").
+        # Starts with aggTrade for futures; may fall back to trade.
+        self._futures_trade_mode: Dict[str, str] = {}
 
     @staticmethod
     def _new_venue_diag() -> Dict[str, Any]:
@@ -157,26 +178,30 @@ class BinanceNativeTradeRecorder:
         symbols: List[str],
         *,
         shard_key: Optional[str] = None,
+        stream_mode: str = "aggTrade",
     ) -> None:
         """Expose selected stream symbols in heartbeat diagnostics."""
         normalized = sorted({s for s in symbols if isinstance(s, str)})
         stream_names = [
-            _stream_name_futures(symbol) if venue == "BINANCE_USDTF"
+            _stream_name_futures(symbol, stream_mode) if venue == "BINANCE_USDTF"
             else _stream_name_spot(symbol)
             for symbol in normalized
         ]
+        endpoint = FUTURES_WS_BASE if venue == "BINANCE_USDTF" else SPOT_WS_BASE
         diag = self._diag_bucket(venue, shard_key)
         diag["subscribed_symbols"] = normalized
         diag["subscribed_symbol_count"] = len(normalized)
         diag["stream_count"] = len(stream_names)
         diag["first_5_streams"] = stream_names[:5]
+        diag["current_stream_mode"] = stream_mode
+        diag["endpoint"] = endpoint
 
         venue_diag = self._diag_bucket(venue)
         existing = set(venue_diag.get("subscribed_symbols", []))
         existing.update(normalized)
         venue_symbols = sorted(existing)
         venue_stream_names = [
-            _stream_name_futures(symbol) if venue == "BINANCE_USDTF"
+            _stream_name_futures(symbol, stream_mode) if venue == "BINANCE_USDTF"
             else _stream_name_spot(symbol)
             for symbol in venue_symbols
         ]
@@ -184,6 +209,8 @@ class BinanceNativeTradeRecorder:
         venue_diag["subscribed_symbol_count"] = len(venue_symbols)
         venue_diag["stream_count"] = len(venue_stream_names)
         venue_diag["first_5_streams"] = venue_stream_names[:5]
+        venue_diag["current_stream_mode"] = stream_mode
+        venue_diag["endpoint"] = endpoint
 
     def _mark_task_started(self, venue: str, shard_key: str, url: str) -> None:
         diag = self._diag_bucket(venue, shard_key)
@@ -191,6 +218,7 @@ class BinanceNativeTradeRecorder:
         diag["task_done"] = False
         diag["task_cancelled"] = False
         diag["url"] = url
+        diag["last_url"] = url
         diag["url_length"] = len(url)
 
     def _mark_task_done(self, venue: str, shard_key: str, *, cancelled: bool = False) -> None:
@@ -271,6 +299,15 @@ class BinanceNativeTradeRecorder:
                 "first_message_seen_at": diag.get("first_message_seen_at"),
                 "last_message_seen_at": diag.get("last_message_seen_at"),
                 "last_exception": diag.get("last_exception"),
+                # extended
+                "first_message_timeout_count": int(diag.get("first_message_timeout_count", 0)),
+                "no_first_message_since_connect_count": int(
+                    diag.get("no_first_message_since_connect_count", 0)
+                ),
+                "current_stream_mode": diag.get("current_stream_mode"),
+                "endpoint": diag.get("endpoint"),
+                "last_url": diag.get("last_url"),
+                "suggested_action": diag.get("suggested_action"),
             }
 
         return {
@@ -323,6 +360,39 @@ class BinanceNativeTradeRecorder:
             diag["sample_payload_shape"],
         )
 
+    async def _probe_futures_trade_stream(
+        self,
+        probe_symbol: str,
+        mode: str,
+        timeout: float,
+    ) -> bool:
+        """Try a single-symbol WS connection; return True if a TEXT frame arrives."""
+        url = _ws_url("BINANCE_USDTF", [probe_symbol], stream_mode=mode)
+        logger.info(
+            "Probing futures trade stream mode=%s symbol=%s url=%s timeout=%.1fs",
+            mode, probe_symbol, url, timeout,
+        )
+        try:
+            assert self._session is not None
+            async with self._session.ws_connect(url, heartbeat=WS_PING_INTERVAL_SEC) as ws:
+                try:
+                    msg = await ws.receive(timeout=timeout)
+                    got_text = msg.type == aiohttp.WSMsgType.TEXT
+                    logger.info(
+                        "Probe result mode=%s symbol=%s got_text=%s msg_type=%s",
+                        mode, probe_symbol, got_text, msg.type,
+                    )
+                    return got_text
+                except asyncio.TimeoutError:
+                    logger.info(
+                        "Probe timeout mode=%s symbol=%s timeout=%.1fs",
+                        mode, probe_symbol, timeout,
+                    )
+                    return False
+        except Exception as exc:
+            logger.warning("Probe failed mode=%s symbol=%s: %s", mode, probe_symbol, exc)
+            return False
+
     async def run(self, symbols_by_venue: Dict[str, List[str]]) -> None:
         timeout = aiohttp.ClientTimeout(total=30)
         self._session = aiohttp.ClientSession(timeout=timeout)
@@ -336,6 +406,12 @@ class BinanceNativeTradeRecorder:
                         else [sorted_symbols]
                     )
                     shard_count = len(shards)
+                    # Initialise stream mode: futures → aggTrade, spot → trade (only mode)
+                    if venue not in self._futures_trade_mode:
+                        self._futures_trade_mode[venue] = (
+                            "aggTrade" if venue == "BINANCE_USDTF" else "trade"
+                        )
+                    stream_mode = self._futures_trade_mode[venue]
                     for shard_index, shard_symbols in enumerate(shards, start=1):
                         shard_key = f"shard_{shard_index}_of_{shard_count}"
                         for symbol in shard_symbols:
@@ -344,6 +420,7 @@ class BinanceNativeTradeRecorder:
                             venue,
                             list(shard_symbols),
                             shard_key=shard_key,
+                            stream_mode=stream_mode,
                         )
                         self._tasks.append(
                             asyncio.create_task(
@@ -382,12 +459,21 @@ class BinanceNativeTradeRecorder:
         backoff = 1.0
         shard_key = f"shard_{shard_index}_of_{shard_count}"
         shard_label = f"{venue}[{shard_index}/{shard_count}]"
-        ws_url = _ws_url(venue, symbols)
+
+        # Per-shard adaptive state: shrinks on repeated first-message timeouts.
+        current_symbols: List[str] = list(symbols)
+        split_index: int = 0          # Index into TRADE_WS_SHARD_SPLIT_SIZES
+        first_msg_timeout_count: int = 0
+
+        def _current_mode() -> str:
+            return self._futures_trade_mode.get(venue, "aggTrade")
+
+        ws_url = _ws_url(venue, current_symbols, stream_mode=_current_mode())
         self._mark_task_started(venue, shard_key, ws_url)
         try:
             while not self.shutdown_event.is_set():
                 close_reason = "websocket_closed"
-                for symbol in symbols:
+                for symbol in current_symbols:
                     state = self._state_for(venue, symbol)
                     state.new_stream_session()
                     await self._emit_trade_lifecycle(
@@ -404,13 +490,16 @@ class BinanceNativeTradeRecorder:
                         heartbeat=WS_PING_INTERVAL_SEC,
                     ) as ws:
                         self._mark_connected(venue, shard_key)
+                        diag = self._diag_bucket(venue, shard_key)
+                        diag["last_url"] = ws_url
+                        diag["current_stream_mode"] = _current_mode()
                         logger.info(
-                            "Trade websocket connected %s: streams=%d url_len=%d first_streams=%s url=%s",
+                            "Trade websocket connected %s: streams=%d mode=%s url_len=%d first_streams=%s",
                             shard_label,
-                            len(symbols),
+                            len(current_symbols),
+                            _current_mode(),
                             len(ws_url),
-                            self._diag_bucket(venue, shard_key).get("first_5_streams", []),
-                            ws_url,
+                            diag.get("first_5_streams", []),
                         )
                         backoff = 1.0
                         first_seen = False
@@ -453,6 +542,119 @@ class BinanceNativeTradeRecorder:
                 except asyncio.CancelledError:
                     self._mark_task_done(venue, shard_key, cancelled=True)
                     raise
+                except TimeoutError as exc:
+                    close_reason = f"websocket_error:{type(exc).__name__}"
+                    self._mark_exception(venue, shard_key, exc)
+                    logger.warning("Trade websocket error for %s: %s", shard_label, exc)
+
+                    # ── first-message timeout: try mode fallback + adaptive split ──
+                    if "no first trade websocket message" in str(exc) and venue == "BINANCE_USDTF":
+                        first_msg_timeout_count += 1
+                        shard_diag = self._diag_bucket(venue, shard_key)
+                        shard_diag["first_message_timeout_count"] = first_msg_timeout_count
+                        shard_diag["no_first_message_since_connect_count"] = (
+                            int(shard_diag.get("no_first_message_since_connect_count", 0)) + 1
+                        )
+
+                        # 1. Try @trade fallback probe on first timeout
+                        if FUTURES_TRADE_WS_FALLBACK_ENABLED and first_msg_timeout_count == 1:
+                            current_mode = _current_mode()
+                            fallback_mode = "trade" if current_mode == "aggTrade" else "aggTrade"
+                            logger.warning(
+                                "Futures trade shard %s got no messages with mode=%s; "
+                                "probing mode=%s on %s",
+                                shard_label, current_mode, fallback_mode, FUTURES_TRADE_WS_PROBE_SYMBOL,
+                            )
+                            probe_ok = await self._probe_futures_trade_stream(
+                                FUTURES_TRADE_WS_PROBE_SYMBOL,
+                                fallback_mode,
+                                FUTURES_TRADE_WS_FALLBACK_PROBE_TIMEOUT_SEC,
+                            )
+                            if probe_ok:
+                                logger.warning(
+                                    "Probe SUCCEEDED: switching %s from mode=%s to mode=%s",
+                                    venue, current_mode, fallback_mode,
+                                )
+                                self._futures_trade_mode[venue] = fallback_mode
+                                shard_diag["current_stream_mode"] = fallback_mode
+                                shard_diag["suggested_action"] = f"switched_to_{fallback_mode}"
+                                # Rebuild URL with new mode and reset split
+                                current_symbols = list(symbols)
+                                split_index = 0
+                                ws_url = _ws_url(
+                                    venue, current_symbols, stream_mode=fallback_mode
+                                )
+                                self._set_subscription_diag(
+                                    venue, current_symbols,
+                                    shard_key=shard_key, stream_mode=fallback_mode,
+                                )
+                            else:
+                                logger.warning(
+                                    "Probe FAILED for mode=%s; both modes silent for %s",
+                                    fallback_mode, shard_label,
+                                )
+                                shard_diag["suggested_action"] = (
+                                    "check_futures_trade_ws_endpoint_or_ip_restrictions"
+                                )
+                                # 2. Adaptive shard split on probe failure
+                                if (
+                                    TRADE_WS_SHARD_ADAPTIVE_SPLIT_ENABLED
+                                    and len(current_symbols) > 1
+                                    and split_index < len(TRADE_WS_SHARD_SPLIT_SIZES)
+                                ):
+                                    new_size = TRADE_WS_SHARD_SPLIT_SIZES[split_index]
+                                    split_index += 1
+                                    if new_size < len(current_symbols):
+                                        old_count = len(current_symbols)
+                                        current_symbols = current_symbols[:new_size]
+                                        logger.warning(
+                                            "Adaptive split %s: reducing %d → %d symbols "
+                                            "(split_index=%d sizes=%s)",
+                                            shard_label,
+                                            old_count,
+                                            len(current_symbols),
+                                            split_index,
+                                            TRADE_WS_SHARD_SPLIT_SIZES,
+                                        )
+                                        shard_diag["suggested_action"] = (
+                                            f"adaptive_split_to_{len(current_symbols)}_symbols"
+                                        )
+                                        ws_url = _ws_url(
+                                            venue, current_symbols,
+                                            stream_mode=_current_mode(),
+                                        )
+                        elif TRADE_WS_SHARD_ADAPTIVE_SPLIT_ENABLED and first_msg_timeout_count > 1:
+                            # Subsequent timeouts: keep splitting if possible
+                            if (
+                                len(current_symbols) > 1
+                                and split_index < len(TRADE_WS_SHARD_SPLIT_SIZES)
+                            ):
+                                new_size = TRADE_WS_SHARD_SPLIT_SIZES[split_index]
+                                split_index += 1
+                                if new_size < len(current_symbols):
+                                    old_count = len(current_symbols)
+                                    current_symbols = current_symbols[:new_size]
+                                    logger.warning(
+                                        "Adaptive split %s (timeout #%d): reducing %d → %d symbols",
+                                        shard_label, first_msg_timeout_count,
+                                        old_count, len(current_symbols),
+                                    )
+                                    ws_url = _ws_url(
+                                        venue, current_symbols, stream_mode=_current_mode()
+                                    )
+                                    self._diag_bucket(venue, shard_key)["suggested_action"] = (
+                                        f"adaptive_split_to_{len(current_symbols)}_symbols"
+                                    )
+                            elif len(current_symbols) == 1:
+                                logger.error(
+                                    "SINGLE SYMBOL %s still silent in %s mode=%s — "
+                                    "likely IP blocking or endpoint issue",
+                                    current_symbols[0], shard_label, _current_mode(),
+                                )
+                                self._diag_bucket(venue, shard_key)["suggested_action"] = (
+                                    "single_symbol_silent_check_ip_or_endpoint"
+                                )
+
                 except Exception as exc:
                     close_reason = f"websocket_error:{type(exc).__name__}"
                     self._mark_exception(venue, shard_key, exc)
@@ -460,7 +662,7 @@ class BinanceNativeTradeRecorder:
                 finally:
                     self._venue_diag[venue]["reconnect_count"] += 1
                     self._diag_bucket(venue, shard_key)["reconnect_count"] += 1
-                    for symbol in symbols:
+                    for symbol in current_symbols:
                         state = self._state_for(venue, symbol)
                         await self._finalize_symbol_session(state, reason=close_reason)
                     self._log_venue_diag_summary(venue, close_reason=close_reason)
@@ -515,10 +717,17 @@ class BinanceNativeTradeRecorder:
             ts_recv_ns = time.time_ns()
 
             if venue == "BINANCE_USDTF":
-                # Futures aggTrade payload must include aggregate trade id `a`.
-                if data.get("a") is None:
-                    self._record_skip(venue, "missing_futures_agg_trade_id", shard_key=shard_key)
-                    return
+                current_mode = self._futures_trade_mode.get(venue, "aggTrade")
+                if current_mode == "aggTrade":
+                    # aggTrade payload must include aggregate trade id `a`.
+                    if data.get("a") is None:
+                        self._record_skip(venue, "missing_futures_agg_trade_id", shard_key=shard_key)
+                        return
+                else:
+                    # @trade payload must include trade id `t`.
+                    if data.get("t") is None:
+                        self._record_skip(venue, "missing_futures_trade_id", shard_key=shard_key)
+                        return
                 record = self._build_futures_trade(state, data, ts_recv_ns)
             else:
                 # Spot trade payload must include trade id `t`.

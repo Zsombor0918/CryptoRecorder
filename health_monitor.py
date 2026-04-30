@@ -328,7 +328,7 @@ class HealthMonitor:
                 continue
             if stats.depth_message_count > 0 and stats.trade_message_count == 0:
                 warnings.append({
-                    "severity": "warning",
+                    "severity": "error",
                     "venue": venue,
                     "symbol": symbol,
                     "reason": "high_liquidity_futures_zero_trades_with_active_depth",

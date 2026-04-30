@@ -161,9 +161,19 @@ def convert_date(
     raw_depth_symbols = sorted(raw_depth_symbols_set)
     raw_trade_symbols = sorted(raw_trade_symbols_set)
 
+    # ── USDTF depth-without-trades raw ingest warning ─────────────────
+    usdtf_depth = {k for k in raw_depth_symbols_set if k.startswith("BINANCE_USDTF/")}
+    usdtf_trades = {k for k in raw_trade_symbols_set if k.startswith("BINANCE_USDTF/")}
+    _usdtf_ingest_warnings: List[str] = []
+    if usdtf_depth and not usdtf_trades:
+        _usdtf_ingest_warnings.append(
+            "futures depth is healthy but trade websocket received no messages; "
+            "TradeTick missing is caused by raw ingest, not conversion"
+        )
+
     # ── partial overwrite guard (before purge so catalog is never touched on refuse) ──
     overwrite_enabled = not staging
-    integrity_warnings: List[str] = []
+    integrity_warnings: List[str] = list(_usdtf_ingest_warnings)
     if (
         overwrite_enabled
         and not allow_partial_overwrite
