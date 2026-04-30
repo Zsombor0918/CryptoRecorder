@@ -4,18 +4,21 @@ Unit tests for CryptoRecorder. Run with pytest.
 
 ## Running Tests
 
+Activate the project virtualenv first, then prefer `python -m pytest` so the
+tests run with the same interpreter that has the project dependencies installed.
+
 ```bash
 # All tests
-pytest tests/
+python -m pytest tests/
 
 # Specific test file
-pytest tests/test_depth_deterministic.py
+python -m pytest tests/test_depth_deterministic.py
 
 # With verbose output
-pytest tests/ -v
+python -m pytest tests/ -v
 
 # Stop on first failure
-pytest tests/ -x
+python -m pytest tests/ -x
 ```
 
 ## Test Files

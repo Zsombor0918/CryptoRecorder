@@ -6,6 +6,7 @@ output for the deterministic native architecture (no Phase 1 / mode flag).
 """
 from __future__ import annotations
 
+import json
 from datetime import datetime
 from pathlib import Path
 
@@ -70,6 +71,33 @@ def _live_deltas(instrument) -> OrderBookDeltas:
         ),
     ]
     return OrderBookDeltas(instrument.id, deltas)
+
+
+def test_convert_date_writes_state_and_catalog_sibling_reports(monkeypatch, tmp_path: Path) -> None:
+    """convert_date writes the existing report plus the Nautilus sibling copy."""
+    state_root = tmp_path / "state"
+    catalog_root = tmp_path / "nautilus_data" / "catalog"
+    expected_state_report = state_root / "convert_reports" / "2026-04-21.json"
+    expected_extra_report = tmp_path / "nautilus_data" / "convert_reports" / "2026-04-21.json"
+
+    monkeypatch.setattr(convert_day_mod, "STATE_ROOT", state_root)
+    monkeypatch.setattr(convert_day_mod, "resolve_universe", lambda date_str: {})
+
+    report = convert_day_mod.convert_date(
+        datetime(2026, 4, 21),
+        catalog_root=catalog_root,
+        emit_depth10=False,
+    )
+
+    assert expected_state_report.exists()
+    assert expected_extra_report.exists()
+    assert report["catalog_root"] == str(catalog_root)
+    assert report["convert_report_extra_path"] == str(expected_extra_report)
+    assert report["report_paths"] == [str(expected_state_report), str(expected_extra_report)]
+
+    state_payload = json.loads(expected_state_report.read_text())
+    extra_payload = json.loads(expected_extra_report.read_text())
+    assert state_payload == extra_payload == report
 
 
 def test_convert_date_writes_order_book_deltas_without_depth10(monkeypatch, tmp_path: Path) -> None:
@@ -147,8 +175,79 @@ def test_convert_date_writes_order_book_deltas_without_depth10(monkeypatch, tmp_
     assert report["conversion_integrity"]["missing_depth_after_convert"] == []
     assert report["conversion_integrity"]["overwrite_enabled"] is True
     assert report["conversion_integrity"]["date_converted"] == "2026-04-21"
+    assert report["full_depth_source"] == "OrderBookDeltas"
+    assert report["derived_depth_snapshot_type"] == "OrderBookDepth10"
     assert len(deltas) == 2
     assert depth10 == []
+
+
+def test_requested_derived_snapshot_levels_are_capped_and_explained(monkeypatch, tmp_path: Path) -> None:
+    instrument = TestInstrumentProvider.btcusdt_binance()
+    monkeypatch.setattr(
+        convert_day_mod,
+        "resolve_universe",
+        lambda date_str: {"BINANCE_SPOT": ["BTCUSDT"]},
+    )
+    monkeypatch.setattr(convert_day_mod, "load_exchange_info", lambda venue, date_str: {})
+    monkeypatch.setattr(convert_day_mod, "build_instruments", lambda venue, syms, einfo: [instrument])
+    monkeypatch.setattr(
+        convert_day_mod,
+        "convert_trades_with_diagnostics",
+        lambda *args, **kwargs: (
+            [],
+            0,
+            None,
+            None,
+            {
+                "raw_record_count": 0,
+                "raw_trade_record_count": 0,
+                "raw_lifecycle_record_count": 0,
+                "trade_ticks_written": 0,
+            },
+        ),
+    )
+
+    captured_kwargs = {}
+
+    def fake_convert_depth(*args, **kwargs):
+        captured_kwargs.update(kwargs)
+        metrics = Phase2ReplayMetrics(
+            snapshot_seed_count=1,
+            delta_events_written=2,
+            depth10_written=1,
+            derived_depth_snapshots_written=1,
+            first_ts_ns=1_000_000_000,
+            last_ts_ns=2_000_000_000,
+        )
+        metrics.requested_depth_snapshot_levels = kwargs["derived_depth_snapshot_levels"]
+        metrics.requested_depth_snapshot_levels_applied = 10
+        metrics.derived_depth_snapshot_levels = 10
+        return [_snapshot_deltas(instrument), _live_deltas(instrument)], [], metrics
+
+    monkeypatch.setattr(convert_day_mod, "convert_depth_v2", fake_convert_depth)
+    monkeypatch.setattr(
+        convert_day_mod,
+        "_symbols_with_raw_record_type",
+        lambda *a, **kw: {"BINANCE_SPOT/BTCUSDT"},
+    )
+
+    report = convert_day_mod.convert_date(
+        datetime(2026, 4, 21),
+        catalog_root=tmp_path / "catalog",
+        emit_depth10=True,
+        depth10_interval_sec=0.0,
+        derived_depth_snapshot_levels=1000,
+    )
+
+    assert captured_kwargs["derived_depth_snapshot_levels"] == 1000
+    assert report["full_depth_source"] == "OrderBookDeltas"
+    assert report["derived_depth_snapshot_type"] == "OrderBookDepth10"
+    assert report["requested_depth_snapshot_levels"] == 1000
+    assert report["requested_depth_snapshot_levels_applied"] == 10
+    assert report["derived_depth_snapshot_levels"] == 10
+    assert "OrderBookDepth10 only" in report["derived_depth_snapshot_warning"]
+    assert report["total_order_book_deltas_written"] == 2
+    assert report["total_depth10_written"] == 0
 
 
 def test_convert_date_warns_on_partial_raw_depth_overwrite(monkeypatch, tmp_path: Path) -> None:

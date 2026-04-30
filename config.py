@@ -53,7 +53,7 @@ FUTURES_TOP_SYMBOL_CANDIDATES: Final = int(
 )
 
 # Selection policy metadata written into the cached universe files.
-UNIVERSE_FILTER_VERSION: Final = "v4_native_deterministic"
+UNIVERSE_FILTER_VERSION: Final = "v6_spot_support_cache_trade_health"
 UNIVERSE_REJECT_SAMPLE_SIZE: Final = 12
 
 # Base quote asset for universe selection
@@ -78,6 +78,20 @@ TRADE_WS_SHARD_ENABLED: Final = (
 TRADE_WS_MAX_SYMBOLS_PER_CONNECTION: Final = int(
     os.environ.get("CRYPTO_RECORDER_TRADE_WS_MAX_SYMBOLS_PER_CONNECTION", "25")
 )
+TRADE_WS_FIRST_MESSAGE_TIMEOUT_SEC: Final = float(
+    os.environ.get("CRYPTO_RECORDER_TRADE_WS_FIRST_MESSAGE_TIMEOUT_SEC", "15")
+)
+TRADE_WS_IDLE_TIMEOUT_SEC: Final = float(
+    os.environ.get("CRYPTO_RECORDER_TRADE_WS_IDLE_TIMEOUT_SEC", "120")
+)
+TRADE_HEALTH_HIGH_LIQUIDITY_USDTF: Final = tuple(
+    symbol.strip().upper()
+    for symbol in os.environ.get(
+        "CRYPTO_RECORDER_TRADE_HEALTH_HIGH_LIQUIDITY_USDTF",
+        "BTCUSDT,ETHUSDT,BNBUSDT",
+    ).split(",")
+    if symbol.strip()
+)
 
 DEPTH_WS_SHARD_ENABLED: Final = (
     os.environ.get("CRYPTO_RECORDER_DEPTH_WS_SHARD_ENABLED", "1").strip().lower()
@@ -87,14 +101,30 @@ DEPTH_WS_MAX_SYMBOLS_PER_CONNECTION: Final = int(
     os.environ.get("CRYPTO_RECORDER_DEPTH_WS_MAX_SYMBOLS_PER_CONNECTION", "25")
 )
 
-# Optional depth10 derivation defaults (converter-side).
-EMIT_DEPTH10_DEFAULT: Final = (
-    os.environ.get("CRYPTO_RECORDER_EMIT_DEPTH10", "1").strip().lower()
+# Optional derived depth snapshot defaults (converter-side).
+#
+# Nautilus currently exposes OrderBookDepth10 as the catalog-native snapshot
+# type. OrderBookDeltas remains the full-depth replay source.
+EMIT_DERIVED_DEPTH_SNAPSHOTS_DEFAULT: Final = (
+    os.environ.get(
+        "CRYPTO_RECORDER_EMIT_DERIVED_DEPTH_SNAPSHOTS",
+        os.environ.get("CRYPTO_RECORDER_EMIT_DEPTH10", "1"),
+    ).strip().lower()
     in {"1", "true", "yes", "on"}
 )
-DEPTH10_INTERVAL_SEC: Final = float(
-    os.environ.get("CRYPTO_RECORDER_DEPTH10_INTERVAL_SEC", "1.0")
+DERIVED_DEPTH_SNAPSHOT_INTERVAL_SEC: Final = float(
+    os.environ.get(
+        "CRYPTO_RECORDER_DERIVED_DEPTH_SNAPSHOT_INTERVAL_SEC",
+        os.environ.get("CRYPTO_RECORDER_DEPTH10_INTERVAL_SEC", "1.0"),
+    )
 )
+DERIVED_DEPTH_SNAPSHOT_LEVELS: Final = int(
+    os.environ.get("CRYPTO_RECORDER_DERIVED_DEPTH_SNAPSHOT_LEVELS", "10")
+)
+
+# Backward-compatible aliases.
+EMIT_DEPTH10_DEFAULT: Final = EMIT_DERIVED_DEPTH_SNAPSHOTS_DEFAULT
+DEPTH10_INTERVAL_SEC: Final = DERIVED_DEPTH_SNAPSHOT_INTERVAL_SEC
 
 # Exchange info fetch interval (seconds)
 EXCHANGEINFO_INTERVAL_SEC: Final = 21600  # 6 hours
@@ -118,6 +148,26 @@ HEARTBEAT_INTERVAL_SEC: Final = 30
 
 # Health check interval (seconds)
 HEALTH_CHECK_INTERVAL_SEC: Final = 10
+
+UNIVERSE_HEALTH_ENABLED: Final = (
+    os.environ.get("CRYPTO_RECORDER_UNIVERSE_HEALTH_ENABLED", "1").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
+UNIVERSE_ZERO_MESSAGE_GRACE_SEC: Final = int(
+    os.environ.get("CRYPTO_RECORDER_UNIVERSE_ZERO_MESSAGE_GRACE_SEC", "300")
+)
+UNIVERSE_ZERO_MESSAGE_MAX_CONSECUTIVE_RUNS: Final = int(
+    os.environ.get("CRYPTO_RECORDER_UNIVERSE_ZERO_MESSAGE_MAX_CONSECUTIVE_RUNS", "2")
+)
+UNIVERSE_HEALTH_EXCLUDE_DAYS: Final = int(
+    os.environ.get("CRYPTO_RECORDER_UNIVERSE_HEALTH_EXCLUDE_DAYS", "1")
+)
+UNIVERSE_HEALTH_MIN_OBSERVATION_SEC: Final = int(
+    os.environ.get("CRYPTO_RECORDER_UNIVERSE_HEALTH_MIN_OBSERVATION_SEC", "300")
+)
+UNIVERSE_HEALTH_CHECKPOINT_INTERVAL_SEC: Final = int(
+    os.environ.get("CRYPTO_RECORDER_UNIVERSE_HEALTH_CHECKPOINT_INTERVAL_SEC", "120")
+)
 
 # Human-facing timestamps in reports/heartbeat use Hungary local time.
 REPORT_TIMEZONE_NAME: Final = "Europe/Budapest"

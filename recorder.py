@@ -314,6 +314,16 @@ def _build_startup_coverage(universe: Dict[str, Any]) -> Dict[str, Any]:
 # Shutdown
 # ============================================================================
 
+def _refresh_trade_health_from_recorder() -> None:
+    """Copy live native trade diagnostics into heartbeat state."""
+    if native_trade_recorder is None or health_monitor is None:
+        return
+    try:
+        health_monitor.set_trade_health(native_trade_recorder.get_venue_diagnostics())
+    except Exception as exc:
+        logger.debug("Could not refresh runtime trade health: %s", exc)
+
+
 async def shutdown(background_tasks: List[asyncio.Task]) -> None:
     """Stop recorders → cancel tasks → flush storage → write heartbeat."""
     import threading, os as _os
@@ -351,6 +361,10 @@ async def shutdown(background_tasks: List[asyncio.Task]) -> None:
             logger.warning("Native trade recorder shutdown timed out (10s) — continuing")
         except Exception as e:
             logger.warning(f"Native trade recorder shutdown error (non-fatal): {e}")
+
+        # Capture trade diagnostics before setting recorder to None
+        _refresh_trade_health_from_recorder()
+
         native_trade_recorder = None
 
     # 4. Cancel background tasks (heartbeat, disk check, metadata)
@@ -377,6 +391,7 @@ async def shutdown(background_tasks: List[asyncio.Task]) -> None:
         health_monitor.futures_enabled = futures_enabled
         health_monitor.futures_disabled_reason = futures_disabled_reason
         await health_monitor.write_heartbeat()
+        health_monitor.write_universe_health_checkpoint(force=True)
         logger.info(f"Final stats: {health_monitor.get_summary()}")
 
     # 7. Cancel any orphaned asyncio tasks
@@ -400,7 +415,7 @@ async def shutdown(background_tasks: List[asyncio.Task]) -> None:
 # ============================================================================
 
 async def _update_drop_stats_task() -> None:
-    """Periodically copy queue drop counts from StorageManager to HealthMonitor."""
+    """Periodically copy runtime diagnostics into HealthMonitor."""
     while not shutdown_event.is_set():
         try:
             if storage_manager and health_monitor:
@@ -409,6 +424,7 @@ async def _update_drop_stats_task() -> None:
                 health_monitor.queue_drop_by_writer = {
                     k: v for k, v in drops.items() if v > 0
                 }
+            _refresh_trade_health_from_recorder()
         except Exception:
             pass
         try:

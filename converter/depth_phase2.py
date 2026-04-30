@@ -26,7 +26,10 @@ from nautilus_trader.model.enums import BookAction, OrderSide
 from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.objects import Price, Quantity
 
-from config import DEPTH10_INTERVAL_SEC
+from config import (
+    DEPTH10_INTERVAL_SEC,
+    DERIVED_DEPTH_SNAPSHOT_LEVELS,
+)
 from converter.readers import stream_raw_records
 
 logger = logging.getLogger(__name__)
@@ -43,6 +46,11 @@ class Phase2ReplayMetrics:
     desync_events: int = 0
     delta_events_written: int = 0
     depth10_written: int = 0
+    derived_depth_snapshots_written: int = 0
+    derived_depth_snapshot_levels: int = 10
+    derived_depth_snapshot_type: str = "OrderBookDepth10"
+    requested_depth_snapshot_levels: int = 10
+    requested_depth_snapshot_levels_applied: int = 10
     first_ts_ns: Optional[int] = None
     last_ts_ns: Optional[int] = None
     fenced_ranges: List[Dict[str, Any]] = field(default_factory=list)
@@ -324,9 +332,18 @@ def convert_depth_v2(
     *,
     emit_depth10: bool = False,
     depth10_interval_sec: float = DEPTH10_INTERVAL_SEC,
+    derived_depth_snapshot_levels: int = DERIVED_DEPTH_SNAPSHOT_LEVELS,
 ) -> Tuple[List[OrderBookDeltas], List[OrderBookDepth10], Phase2ReplayMetrics]:
     records = list(stream_raw_records(venue, symbol, "depth_v2", date_str))
     metrics = Phase2ReplayMetrics()
+    requested_depth_snapshot_levels = max(0, int(derived_depth_snapshot_levels))
+    applied_depth_snapshot_levels = min(requested_depth_snapshot_levels, 10)
+    if applied_depth_snapshot_levels <= 0:
+        applied_depth_snapshot_levels = 10
+    metrics.requested_depth_snapshot_levels = requested_depth_snapshot_levels
+    metrics.requested_depth_snapshot_levels_applied = applied_depth_snapshot_levels
+    metrics.derived_depth_snapshot_levels = applied_depth_snapshot_levels
+    metrics.derived_depth_snapshot_type = "OrderBookDepth10"
     deltas_out: List[OrderBookDeltas] = []
     depth10_out: List[OrderBookDepth10] = []
     state = ReplayState(
@@ -411,6 +428,7 @@ def convert_depth_v2(
                         depth10_out.append(depth)
                         state.last_depth10_emit_ns = ts_event
                         metrics.depth10_written += 1
+                        metrics.derived_depth_snapshots_written += 1
                 continue
 
             if record_type != "depth_update":
@@ -456,6 +474,7 @@ def convert_depth_v2(
                         depth10_out.append(depth)
                         state.last_depth10_emit_ns = ts_event
                         metrics.depth10_written += 1
+                        metrics.derived_depth_snapshots_written += 1
         except Exception:
             logger.exception("Phase 2 replay error for %s/%s", venue, symbol)
             metrics.bad_lines += 1

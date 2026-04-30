@@ -2,9 +2,11 @@
 Health monitoring, statistics collection, and heartbeat.
 """
 import asyncio
+import copy
 import json
 import logging
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, DefaultDict, Dict, List
 from collections import defaultdict
@@ -12,10 +14,18 @@ from collections import defaultdict
 from config import (
     STATE_ROOT,
     HEARTBEAT_INTERVAL_SEC,
+    TRADE_HEALTH_HIGH_LIQUIDITY_USDTF,
+    UNIVERSE_HEALTH_CHECKPOINT_INTERVAL_SEC,
+    UNIVERSE_HEALTH_MIN_OBSERVATION_SEC,
+    UNIVERSE_ZERO_MESSAGE_GRACE_SEC,
 )
 from time_utils import local_now_iso, timestamp_to_local_iso
 
 logger = logging.getLogger(__name__)
+
+
+def datetime_date_str() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
 class SymbolStats:
@@ -25,6 +35,9 @@ class SymbolStats:
         self.venue = venue
         self.symbol = symbol
         self.message_count = 0
+        self.depth_message_count = 0
+        self.trade_message_count = 0
+        self.trade_committed_count = 0
         self.last_ts_event = None
         self.last_update_id = None
         self.prev_update_id = None
@@ -54,6 +67,7 @@ class SymbolStats:
         self.last_rejected_pu: int | None = None
         self.bootstrap_stale_drop_count: int = 0
         self.promote_zero_accepted_count: int = 0
+        self.depth_live_synced_ever: bool = False
 
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization."""
@@ -62,6 +76,9 @@ class SymbolStats:
             'venue': self.venue,
             'symbol': self.symbol,
             'message_count': self.message_count,
+            'depth_message_count': self.depth_message_count,
+            'trade_message_count': self.trade_message_count,
+            'trade_committed_count': self.trade_committed_count,
             'last_ts_event': self.last_ts_event,
             'last_update_id': self.last_update_id,
             'prev_update_id': self.prev_update_id,
@@ -100,6 +117,7 @@ class SymbolStats:
             ),
             'bootstrap_stale_drop_count': self.bootstrap_stale_drop_count,
             'promote_zero_accepted_count': self.promote_zero_accepted_count,
+            'depth_live_synced_ever': self.depth_live_synced_ever,
             'last_heartbeat': timestamp_to_local_iso(self.last_heartbeat),
         }
 
@@ -127,6 +145,9 @@ class HealthMonitor:
         self.spot_symbols_dropped_list: List[str] = []
         self.futures_symbols_dropped_list: List[str] = []
         self.startup_coverage: Dict[str, Any] = {}
+        # Trade health diagnostics – set by recorder before final heartbeat
+        self.trade_health: Dict[str, Any] = {}
+        self.last_universe_health_checkpoint: float = 0.0
     
     def record_message(self, venue: str, symbol: str, ts_event: int = None, 
                       update_id: int = None, channel: str = None) -> None:
@@ -138,6 +159,11 @@ class HealthMonitor:
         
         stats = self.symbol_stats[key]
         stats.message_count += 1
+        if channel == "depth_v2":
+            stats.depth_message_count += 1
+        elif channel == "trade_v2":
+            stats.trade_message_count += 1
+            stats.trade_committed_count += 1
         
         if ts_event:
             stats.last_ts_event = ts_event
@@ -183,6 +209,8 @@ class HealthMonitor:
             self.symbol_stats[key] = SymbolStats(venue, symbol)
         stats = self.symbol_stats[key]
         stats.sync_state = sync_state
+        if sync_state == "live_synced":
+            stats.depth_live_synced_ever = True
         stats.last_update_id = last_update_id
         stats.prev_update_id = prev_update_id
         stats.snapshot_seed_count = snapshot_seed_count
@@ -259,6 +287,151 @@ class HealthMonitor:
             futures.get("runtime_dropped_raw", futures.get("dropped_all_raw", []))
         )
     
+    def set_trade_health(self, trade_diagnostics: Dict[str, Any]) -> None:
+        """Store trade health diagnostics for heartbeat export."""
+        self.trade_health = trade_diagnostics
+
+    def _subscribed_symbols_from_trade_health(self, venue: str) -> set[str]:
+        venue_diag = self.trade_health.get(venue, {})
+        subscribed = set()
+        if isinstance(venue_diag, dict):
+            for symbol in venue_diag.get("subscribed_symbols", []) or []:
+                if isinstance(symbol, str):
+                    subscribed.add(symbol)
+            shards = venue_diag.get("shards", {})
+            if isinstance(shards, dict):
+                for shard_diag in shards.values():
+                    if not isinstance(shard_diag, dict):
+                        continue
+                    for symbol in shard_diag.get("subscribed_symbols", []) or []:
+                        if isinstance(symbol, str):
+                            subscribed.add(symbol)
+        return subscribed
+
+    def _build_trade_health_warnings(self, now: float) -> Dict[str, List[Dict[str, Any]]]:
+        """Warn on impossible-looking zero-trade futures while depth is live."""
+        selected = self._selected_symbols_by_venue()
+        venue = "BINANCE_USDTF"
+        selected_futures = set(selected.get(venue, []))
+        subscribed = self._subscribed_symbols_from_trade_health(venue)
+        warnings: List[Dict[str, Any]] = []
+        observation_sec = max(0.0, now - self.start_time)
+
+        if observation_sec < UNIVERSE_HEALTH_MIN_OBSERVATION_SEC:
+            return {}
+
+        for symbol in TRADE_HEALTH_HIGH_LIQUIDITY_USDTF:
+            if symbol not in selected_futures or symbol not in subscribed:
+                continue
+            stats = self.symbol_stats.get((venue, symbol))
+            if not stats:
+                continue
+            if stats.depth_message_count > 0 and stats.trade_message_count == 0:
+                warnings.append({
+                    "severity": "warning",
+                    "venue": venue,
+                    "symbol": symbol,
+                    "reason": "high_liquidity_futures_zero_trades_with_active_depth",
+                    "depth_message_count": stats.depth_message_count,
+                    "trade_message_count": stats.trade_message_count,
+                    "observation_sec": round(observation_sec, 3),
+                    "subscribed": True,
+                    "l2_failure": False,
+                })
+
+        return {venue: warnings} if warnings else {}
+
+    def _trade_health_with_warnings(self, now: float) -> Dict[str, Any]:
+        payload = copy.deepcopy(self.trade_health)
+        warnings_by_venue = self._build_trade_health_warnings(now)
+        for venue, warnings in warnings_by_venue.items():
+            venue_diag = payload.setdefault(venue, {})
+            if isinstance(venue_diag, dict):
+                venue_diag["warnings"] = warnings
+                venue_diag["warning_count"] = len(warnings)
+        return payload
+
+    def _selected_symbols_by_venue(self) -> Dict[str, List[str]]:
+        selected: Dict[str, List[str]] = {}
+        for cov_key in ("spot", "futures"):
+            coverage = self.startup_coverage.get(cov_key, {})
+            venue = coverage.get("venue")
+            symbols = coverage.get("requested_raw", coverage.get("active_raw", []))
+            if venue and isinstance(symbols, list):
+                selected[venue] = [s for s in symbols if isinstance(s, str)]
+        return selected
+
+    def build_universe_health_summary(self) -> Dict[str, Any]:
+        """Build a checkpoint consumed by the next universe selection."""
+        now = time.time()
+        date_str = datetime_date_str()
+        selected = self._selected_symbols_by_venue()
+        symbols_by_venue: Dict[str, Dict[str, Any]] = {}
+        for venue, symbols in selected.items():
+            venue_payload: Dict[str, Any] = {}
+            for symbol in symbols:
+                stats = self.symbol_stats.get((venue, symbol))
+                depth_count = stats.depth_message_count if stats else 0
+                trade_count = stats.trade_message_count if stats else 0
+                snapshot_count = stats.snapshot_seed_count if stats else 0
+                depth_live = stats.depth_live_synced_ever if stats else False
+                trade_committed = stats.trade_committed_count if stats else 0
+                observation_sec = max(0.0, now - self.start_time)
+                zero_messages = depth_count == 0 and trade_count == 0
+                no_data_reason = None
+                suggested_action = "keep"
+                if zero_messages:
+                    no_data_reason = "zero_depth_and_trade_messages"
+                    if observation_sec >= UNIVERSE_HEALTH_MIN_OBSERVATION_SEC:
+                        suggested_action = "temporary_exclude_candidate"
+                    elif observation_sec >= UNIVERSE_ZERO_MESSAGE_GRACE_SEC:
+                        suggested_action = "watch"
+                    else:
+                        suggested_action = "watch"
+                elif depth_count == 0:
+                    no_data_reason = "zero_depth_messages"
+                    suggested_action = "watch"
+                elif trade_count == 0:
+                    no_data_reason = "zero_trade_messages"
+                    suggested_action = "keep"
+
+                venue_payload[symbol] = {
+                    "date": date_str,
+                    "venue": venue,
+                    "symbol": symbol,
+                    "observation_sec": round(observation_sec, 3),
+                    "depth_message_count": depth_count,
+                    "trade_message_count": trade_count,
+                    "depth_live_synced_ever": depth_live,
+                    "trade_committed_count": trade_committed,
+                    "snapshot_seed_count": snapshot_count,
+                    "selected_in_universe": True,
+                    "no_data_reason": no_data_reason,
+                    "suggested_action": suggested_action,
+                }
+            symbols_by_venue[venue] = venue_payload
+
+        return {
+            "date": date_str,
+            "timestamp": local_now_iso(),
+            "uptime_seconds": round(now - self.start_time, 3),
+            "symbols": symbols_by_venue,
+        }
+
+    def write_universe_health_checkpoint(self, *, force: bool = False) -> None:
+        now = time.time()
+        if (
+            not force
+            and self.last_universe_health_checkpoint
+            and now - self.last_universe_health_checkpoint < UNIVERSE_HEALTH_CHECKPOINT_INTERVAL_SEC
+        ):
+            return
+        summary = self.build_universe_health_summary()
+        out = STATE_ROOT / "universe_health" / f"{summary['date']}.json"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(summary, indent=2))
+        self.last_universe_health_checkpoint = now
+
     async def write_heartbeat(self) -> None:
         """Write heartbeat with current stats."""
         try:
@@ -325,6 +498,8 @@ class HealthMonitor:
                     },
                 }
             
+            trade_health = self._trade_health_with_warnings(now)
+
             heartbeat = {
                 'timestamp': local_now_iso(),
                 'uptime_seconds': uptime_sec,
@@ -349,12 +524,14 @@ class HealthMonitor:
                 'snapshot_mode': self.snapshot_mode,
                 'architecture': 'deterministic_native',
                 'sync_health': sync_health,
+                'trade_health': trade_health,
                 'by_venue': dict(by_venue),
             }
             
             # Write to file
             with open(self.last_heartbeat_file, 'w') as f:
                 json.dump(heartbeat, f, indent=2)
+            self.write_universe_health_checkpoint()
             
         except Exception as e:
             logger.error(f"Error writing heartbeat: {e}", exc_info=True)
