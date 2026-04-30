@@ -15,6 +15,7 @@ from config import (
     META_ROOT,
     BINANCE_SPOT_REST,
     BINANCE_FUTURES_REST,
+    DATA_ROOT,
     TOP_SYMBOLS,
     TOP_SYMBOL_CANDIDATES,
     FUTURES_TOP_SYMBOL_CANDIDATES,
@@ -161,8 +162,7 @@ class UniverseSelector:
         Get today's universe or select if not already cached.
         Returns {venue: [list of symbols]}
         """
-        today_str = datetime.utcnow().strftime("%Y-%m-%d")
-        cache_file = self.universe_path / "BINANCE_SPOT" / f"{today_str}.json"
+        today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         
         # Check cache
         if cache_file.exists() and not force_refresh:
@@ -344,9 +344,6 @@ class UniverseSelector:
         if self._futures_support_mapping_cache is not None:
             return self._futures_support_mapping_cache, None
 
-        from config import DATA_ROOT
-        import pathlib
-
         info_dir = DATA_ROOT / "BINANCE_USDTF" / "exchangeinfo" / "EXCHANGEINFO"
         if not info_dir.is_dir():
             return None, "no exchangeInfo data on disk for BINANCE_USDTF"
@@ -384,7 +381,6 @@ class UniverseSelector:
 
     async def _fetch_spot_exchangeinfo_from_rest(self) -> Tuple[set[str] | None, str | None]:
         """Fetch exchangeInfo from Binance REST API and cache it."""
-        from config import DATA_ROOT
         import time
         
         try:
@@ -425,7 +421,7 @@ class UniverseSelector:
             
             # Cache the result to disk in JSONL format
             try:
-                today_str = datetime.utcnow().strftime("%Y-%m-%d")
+                today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
                 info_dir = DATA_ROOT / "BINANCE_SPOT" / "exchangeinfo" / "EXCHANGEINFO" / today_str
                 info_dir.mkdir(parents=True, exist_ok=True)
                 cache_file = info_dir / f"{int(time.time())}.jsonl"
@@ -460,8 +456,6 @@ class UniverseSelector:
         """Load TRADING, USDT-quoted spot symbols from cached exchangeInfo or fetch from REST."""
         if self._spot_support_mapping_cache is not None:
             return self._spot_support_mapping_cache, None
-
-        from config import DATA_ROOT
 
         info_dir = DATA_ROOT / "BINANCE_SPOT" / "exchangeinfo" / "EXCHANGEINFO"
         if info_dir.is_dir():
