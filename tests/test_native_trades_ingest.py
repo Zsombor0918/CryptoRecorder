@@ -444,6 +444,7 @@ async def test_trade_shard_reconnects_when_first_message_never_arrives(monkeypat
 
     recorder._session = _FakeSession()
     monkeypatch.setattr(native_trades_mod, "TRADE_WS_FIRST_MESSAGE_TIMEOUT_SEC", 0.01)
+    monkeypatch.setattr(native_trades_mod, "FUTURES_TRADE_WS_FALLBACK_ENABLED", False)
     monkeypatch.setattr(native_trades_mod.asyncio, "sleep", AsyncMock())
 
     await recorder._run_venue_loop(

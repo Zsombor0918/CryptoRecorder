@@ -84,6 +84,35 @@ TRADE_WS_FIRST_MESSAGE_TIMEOUT_SEC: Final = float(
 TRADE_WS_IDLE_TIMEOUT_SEC: Final = float(
     os.environ.get("CRYPTO_RECORDER_TRADE_WS_IDLE_TIMEOUT_SEC", "120")
 )
+
+# ── Futures trade-stream mode fallback ────────────────────────────────────────
+# BINANCE_USDTF normally uses @aggTrade.  If no messages arrive after the probe
+# timeout, the recorder optionally probes @trade on a single well-known symbol.
+# If @trade works the full shard is reconnected using @trade.
+FUTURES_TRADE_WS_FALLBACK_ENABLED: Final = (
+    os.environ.get("CRYPTO_RECORDER_FUTURES_TRADE_WS_FALLBACK_ENABLED", "1").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
+FUTURES_TRADE_WS_PROBE_SYMBOL: Final = os.environ.get(
+    "CRYPTO_RECORDER_FUTURES_TRADE_WS_PROBE_SYMBOL", "BTCUSDT"
+).strip().upper()
+FUTURES_TRADE_WS_FALLBACK_PROBE_TIMEOUT_SEC: Final = float(
+    os.environ.get("CRYPTO_RECORDER_FUTURES_TRADE_WS_FALLBACK_PROBE_TIMEOUT_SEC", "10")
+)
+
+# ── Adaptive shard split ──────────────────────────────────────────────────────
+# When a futures trade shard gets its first-message timeout, the shard is
+# progressively split into smaller chunks to identify poisoned symbols.
+TRADE_WS_SHARD_ADAPTIVE_SPLIT_ENABLED: Final = (
+    os.environ.get("CRYPTO_RECORDER_TRADE_WS_SHARD_ADAPTIVE_SPLIT_ENABLED", "1").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
+# Ordered sequence of chunk sizes to try on successive first-message timeouts.
+# Default: try 5, then 1 (single-symbol probe).
+_shard_split_env = os.environ.get("CRYPTO_RECORDER_TRADE_WS_SHARD_SPLIT_SIZES", "5,1")
+TRADE_WS_SHARD_SPLIT_SIZES: Final[list[int]] = [
+    int(x.strip()) for x in _shard_split_env.split(",") if x.strip().isdigit()
+] or [5, 1]
 TRADE_HEALTH_HIGH_LIQUIDITY_USDTF: Final = tuple(
     symbol.strip().upper()
     for symbol in os.environ.get(

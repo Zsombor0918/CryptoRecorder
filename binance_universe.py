@@ -163,6 +163,7 @@ class UniverseSelector:
         Returns {venue: [list of symbols]}
         """
         today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        cache_file = self.universe_path / "BINANCE_SPOT" / f"{today_str}.json"
         
         # Check cache
         if cache_file.exists() and not force_refresh:
