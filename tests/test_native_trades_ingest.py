@@ -129,6 +129,8 @@ async def test_futures_combined_stream_aggtrade_message_writes_trade_record() ->
     assert record["market_type"] == "futures"
     assert record["exchange_trade_id"] == 987654
     assert record["trade_session_seq"] == 1
+    diag = recorder.get_venue_diagnostics()["BINANCE_USDTF"]
+    assert diag["per_symbol_parsed_trade_count"]["BTCUSDT"] == 1
 
 
 @pytest.mark.asyncio
@@ -320,6 +322,43 @@ async def test_trade_sharding_creates_two_tasks_for_fifty_symbols(monkeypatch) -
     assert all(len(chunk) == 25 for _, chunk, _, _ in calls)
     assert calls[0][2:] == (1, 2)
     assert calls[1][2:] == (2, 2)
+    diag = recorder.get_venue_diagnostics()["BINANCE_USDTF"]
+    assert diag["subscribed_symbol_count"] == 50
+    assert set(diag["subscribed_symbols"]) == set(symbols)
+    assert diag["shards"]["shard_1_of_2"]["subscribed_symbol_count"] == 25
+    assert diag["shards"]["shard_2_of_2"]["subscribed_symbol_count"] == 25
+
+
+@pytest.mark.asyncio
+async def test_futures_trade_diagnostics_include_btc_eth_subscription(monkeypatch) -> None:
+    recorder = _make_recorder()
+    symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+
+    async def _fake_run_venue_loop(venue, shard_symbols, *, shard_index=1, shard_count=1):
+        return None
+
+    class _FakeClientSession:
+        def __init__(self, *args, **kwargs):
+            self.closed = False
+
+        closed = False
+
+        async def close(self):
+            self.closed = True
+
+    recorder._run_venue_loop = _fake_run_venue_loop  # type: ignore[method-assign]
+    monkeypatch.setattr(native_trades_mod.aiohttp, "ClientSession", _FakeClientSession)
+    monkeypatch.setattr(native_trades_mod, "TRADE_WS_SHARD_ENABLED", True)
+    monkeypatch.setattr(native_trades_mod, "TRADE_WS_MAX_SYMBOLS_PER_CONNECTION", 25)
+
+    await recorder.run({"BINANCE_USDTF": symbols})
+
+    diag = recorder.get_venue_diagnostics()["BINANCE_USDTF"]
+    assert {"BTCUSDT", "ETHUSDT"}.issubset(set(diag["subscribed_symbols"]))
+    shard_symbols = set()
+    for shard_diag in diag["shards"].values():
+        shard_symbols.update(shard_diag["subscribed_symbols"])
+    assert {"BTCUSDT", "ETHUSDT"}.issubset(shard_symbols)
 
 
 @pytest.mark.asyncio
@@ -359,6 +398,69 @@ async def test_trade_reconnect_only_finalizes_symbols_in_one_shard(monkeypatch) 
     assert ws_urls and "btcusdt@aggTrade" in ws_urls[0] and "ethusdt@aggTrade" in ws_urls[0]
     assert set(written_symbols) == {"BTCUSDT", "ETHUSDT"}
     assert "SOLUSDT" not in written_symbols
+
+
+@pytest.mark.asyncio
+async def test_trade_shard_reconnects_when_first_message_never_arrives(monkeypatch) -> None:
+    recorder = _make_recorder()
+    attempts = 0
+
+    class _SilentWebSocket:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def receive(self, timeout=None):
+            raise asyncio.TimeoutError
+
+        def exception(self):
+            return None
+
+    class _ShutdownWebSocket:
+        async def __aenter__(self):
+            recorder.shutdown_event.set()
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def receive(self, timeout=None):
+            raise asyncio.TimeoutError
+
+        def exception(self):
+            return None
+
+    class _FakeSession:
+        closed = False
+
+        def ws_connect(self, url, heartbeat):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                return _SilentWebSocket()
+            return _ShutdownWebSocket()
+
+    recorder._session = _FakeSession()
+    monkeypatch.setattr(native_trades_mod, "TRADE_WS_FIRST_MESSAGE_TIMEOUT_SEC", 0.01)
+    monkeypatch.setattr(native_trades_mod.asyncio, "sleep", AsyncMock())
+
+    await recorder._run_venue_loop(
+        "BINANCE_USDTF",
+        ["BTCUSDT", "ETHUSDT"],
+        shard_index=1,
+        shard_count=1,
+    )
+
+    diag = recorder.get_venue_diagnostics()["BINANCE_USDTF"]["shards"]["shard_1_of_1"]
+    assert attempts == 2
+    assert diag["connect_attempt_count"] == 2
+    assert diag["connected_once"] is True
+    assert diag["last_exception"].startswith("TimeoutError: no first trade websocket message")
+    assert diag["first_message_seen_at"] is None
+    assert diag["task_started"] is True
+    assert diag["task_done"] is True
 
 
 @pytest.mark.asyncio

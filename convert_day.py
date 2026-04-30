@@ -33,8 +33,10 @@ from nautilus_trader.persistence.catalog import ParquetDataCatalog
 from config import (
     NAUTILUS_CATALOG_ROOT,
     DEPTH10_INTERVAL_SEC,
+    DERIVED_DEPTH_SNAPSHOT_LEVELS,
     EMIT_DEPTH10_DEFAULT,
     MIN_TRADE_RECORDS_FOR_FULL_READY,
+    PHASE2_SNAPSHOT_LIMIT,
     STATE_ROOT,
 )
 from converter.depth_phase2 import convert_depth_v2
@@ -58,6 +60,12 @@ WRITE_BATCH_SIZE: int = 5000
 # Refuse only when expected_symbols_total is large enough to be meaningful.
 OVERWRITE_DEPTH_REFUSE_MIN_RATIO: float = 0.80
 OVERWRITE_DEPTH_REFUSE_MIN_EXPECTED_SYMBOLS: int = 50
+DERIVED_DEPTH_SNAPSHOT_TYPE: str = "OrderBookDepth10"
+FULL_DEPTH_SOURCE: str = "OrderBookDeltas"
+DERIVED_DEPTH_CAP_WARNING: str = (
+    "Nautilus catalog supports OrderBookDepth10 only; full depth is available "
+    "via OrderBookDeltas."
+)
 
 
 # ===================================================================
@@ -71,6 +79,7 @@ def convert_date(
     *,
     emit_depth10: bool = EMIT_DEPTH10_DEFAULT,
     depth10_interval_sec: float = DEPTH10_INTERVAL_SEC,
+    derived_depth_snapshot_levels: int = DERIVED_DEPTH_SNAPSHOT_LEVELS,
     allow_partial_overwrite: bool = False,
 ) -> Dict:
     """Convert one UTC day's raw data → Nautilus ParquetDataCatalog.
@@ -83,6 +92,15 @@ def convert_date(
     logger.info(f"Converting data for {date_str} (deterministic native) …")
 
     target_root = catalog_root or NAUTILUS_CATALOG_ROOT
+    requested_depth_snapshot_levels = max(0, int(derived_depth_snapshot_levels))
+    applied_depth_snapshot_levels = min(requested_depth_snapshot_levels, 10)
+    if applied_depth_snapshot_levels <= 0:
+        applied_depth_snapshot_levels = 10
+    derived_snapshot_warning = (
+        DERIVED_DEPTH_CAP_WARNING
+        if requested_depth_snapshot_levels != applied_depth_snapshot_levels
+        else None
+    )
     if staging:
         staging_dir = Path(str(target_root) + f".staging.{os.getpid()}")
         work_root = staging_dir
@@ -96,7 +114,17 @@ def convert_date(
     universe = resolve_universe(date_str)
     if not universe:
         logger.warning(f"No raw data found for {date_str}")
-        return _save_report(_empty_report(date_str, t0, status="no_data"))
+        return _save_report(_empty_report(
+            date_str,
+            t0,
+            status="no_data",
+            catalog_root=str(target_root),
+            **_derived_snapshot_report_fields(
+                requested_depth_snapshot_levels,
+                applied_depth_snapshot_levels,
+                derived_snapshot_warning,
+            ),
+        ))
 
     # ── exchangeInfo ──────────────────────────────────────────────────
     einfo_spot = load_exchange_info("BINANCE_SPOT", date_str)
@@ -160,6 +188,12 @@ def convert_date(
                 "runtime_sec": round(time.time() - t0, 2),
                 "status": "refused_partial_raw_depth",
                 "architecture": "deterministic_native",
+                "catalog_root": str(target_root),
+                **_derived_snapshot_report_fields(
+                    requested_depth_snapshot_levels,
+                    applied_depth_snapshot_levels,
+                    derived_snapshot_warning,
+                ),
                 "conversion_integrity": {
                     "date_converted": date_str,
                     "catalog_root_written": str(work_root),
@@ -202,15 +236,22 @@ def convert_date(
     total_trades = 0
     total_delta_events = 0
     total_depth10 = 0
+    total_derived_depth_snapshots = 0
     total_bad = 0
     total_snapshot_seeds = 0
     total_resyncs = 0
     total_desyncs = 0
     total_fenced_ranges = 0
+    total_fenced_ranges_low = 0
+    total_fenced_ranges_medium = 0
+    total_fenced_ranges_high = 0
+    total_unrecovered_fences = 0
+    total_depth_gap_warnings_over_60s = 0
     venue_reports: Dict[str, dict] = {}
     per_symbol_fenced_ranges: Dict[str, Dict[str, object]] = {}
     per_symbol_trade: Dict[str, Dict[str, int]] = {}
     per_symbol_depth: Dict[str, Dict[str, int]] = {}
+    per_symbol_gap_diagnostics: Dict[str, Dict[str, object]] = {}
     ts_ranges: Dict[str, Dict[str, Optional[int]]] = {
         "trade": {"start_ns": None, "end_ns": None},
         "order_book_deltas": {"start_ns": None, "end_ns": None},
@@ -238,10 +279,16 @@ def convert_date(
         v_lifecycle_only_symbols: List[str] = []
         v_delta_events = 0
         v_depth10 = 0
+        v_derived_depth_snapshots = 0
         v_snapshot_seeds = 0
         v_resyncs = 0
         v_desyncs = 0
         v_fenced_ranges = 0
+        v_fenced_ranges_low = 0
+        v_fenced_ranges_medium = 0
+        v_fenced_ranges_high = 0
+        v_unrecovered_fences = 0
+        v_depth_gap_warnings_over_60s = 0
         v_symbols: List[str] = []
         v_top_symbols_by_trade_count: List[Tuple[str, int]] = []
 
@@ -313,14 +360,24 @@ def convert_date(
                 sp,
                 emit_depth10=emit_depth10,
                 depth10_interval_sec=depth10_interval_sec,
+                derived_depth_snapshot_levels=requested_depth_snapshot_levels,
             )
             total_bad += depth_metrics.bad_lines
             v_delta_events += len(deltas)
             v_depth10 += len(depth10s)
+            v_derived_depth_snapshots += depth_metrics.derived_depth_snapshots_written
             v_snapshot_seeds += depth_metrics.snapshot_seed_count
             v_resyncs += depth_metrics.resync_count
             v_desyncs += depth_metrics.desync_events
             v_fenced_ranges += len(depth_metrics.fenced_ranges)
+            fence_summary = _summarize_fences(depth_metrics.fenced_ranges)
+            v_fenced_ranges_low += fence_summary["fenced_ranges_low"]
+            v_fenced_ranges_medium += fence_summary["fenced_ranges_medium"]
+            v_fenced_ranges_high += fence_summary["fenced_ranges_high"]
+            v_unrecovered_fences += fence_summary["unrecovered_fences"]
+            gap_diag = _build_gap_diagnostics(venue, symbol, date_str, depth10s)
+            v_depth_gap_warnings_over_60s += int(gap_diag["depth_gap_count_over_60s"])
+            per_symbol_gap_diagnostics[f"{venue}/{symbol}"] = gap_diag
             sym_has_depth = len(deltas) > 0 or len(depth10s) > 0
             per_symbol_depth[f"{venue}/{symbol}"] = {
                 "raw_record_count": depth_metrics.raw_record_count,
@@ -330,7 +387,14 @@ def convert_date(
                 "stream_lifecycle_record_count": depth_metrics.stream_lifecycle_record_count,
                 "deltas_written": int(len(deltas)),
                 "depth10_written": int(len(depth10s)),
+                "derived_depth_snapshots_written": depth_metrics.derived_depth_snapshots_written,
+                "derived_depth_snapshot_type": depth_metrics.derived_depth_snapshot_type,
+                "derived_depth_snapshot_levels": depth_metrics.derived_depth_snapshot_levels,
+                "requested_depth_snapshot_levels": depth_metrics.requested_depth_snapshot_levels,
+                "requested_depth_snapshot_levels_applied": depth_metrics.requested_depth_snapshot_levels_applied,
                 "fenced_ranges": len(depth_metrics.fenced_ranges),
+                **fence_summary,
+                **gap_diag,
                 "desync_events": depth_metrics.desync_events,
                 "resync_count": depth_metrics.resync_count,
                 "first_depth_ts_ns": depth_metrics.first_ts_ns,
@@ -340,6 +404,7 @@ def convert_date(
             if depth_metrics.fenced_ranges:
                 per_symbol_fenced_ranges[f"{venue}/{symbol}"] = {
                     "fenced_ranges": len(depth_metrics.fenced_ranges),
+                    **fence_summary,
                     "examples": depth_metrics.fenced_ranges[:3],
                 }
             if deltas:
@@ -375,10 +440,16 @@ def convert_date(
         total_trades += v_trades
         total_delta_events += v_delta_events
         total_depth10 += v_depth10
+        total_derived_depth_snapshots += v_derived_depth_snapshots
         total_snapshot_seeds += v_snapshot_seeds
         total_resyncs += v_resyncs
         total_desyncs += v_desyncs
         total_fenced_ranges += v_fenced_ranges
+        total_fenced_ranges_low += v_fenced_ranges_low
+        total_fenced_ranges_medium += v_fenced_ranges_medium
+        total_fenced_ranges_high += v_fenced_ranges_high
+        total_unrecovered_fences += v_unrecovered_fences
+        total_depth_gap_warnings_over_60s += v_depth_gap_warnings_over_60s
         symbols_processed[venue] = v_symbols
         venue_reports[venue] = {
             "symbols": v_symbols,
@@ -400,10 +471,16 @@ def convert_date(
             ],
             "delta_events_written": v_delta_events,
             "depth10_written": v_depth10,
+            "derived_depth_snapshots_written": v_derived_depth_snapshots,
             "snapshot_seed_count": v_snapshot_seeds,
             "resync_count": v_resyncs,
             "desync_events": v_desyncs,
             "fenced_ranges": v_fenced_ranges,
+            "fenced_ranges_low": v_fenced_ranges_low,
+            "fenced_ranges_medium": v_fenced_ranges_medium,
+            "fenced_ranges_high": v_fenced_ranges_high,
+            "unrecovered_fences": v_unrecovered_fences,
+            "depth_gap_warnings_over_60s": v_depth_gap_warnings_over_60s,
         }
 
     # ── staging → atomic rename ───────────────────────────────────────
@@ -521,9 +598,20 @@ def convert_date(
         "overwrite_enabled": overwrite_enabled,
         "warnings": integrity_warnings,
     }
+    if derived_snapshot_warning and derived_snapshot_warning not in integrity_warnings:
+        integrity_warnings.append(derived_snapshot_warning)
 
     # ── report ────────────────────────────────────────────────────────
     elapsed = time.time() - t0
+    gap_warning_counts = {
+        "depth_gap_count_over_60s": total_depth_gap_warnings_over_60s,
+    }
+    fence_severity_counts = {
+        "fenced_ranges_low": total_fenced_ranges_low,
+        "fenced_ranges_medium": total_fenced_ranges_medium,
+        "fenced_ranges_high": total_fenced_ranges_high,
+        "unrecovered_fences": total_unrecovered_fences,
+    }
     report = {
         "date": date_str,
         "timestamp": local_now_iso(),
@@ -534,12 +622,21 @@ def convert_date(
         "total_trades_written": total_trades,
         "total_order_book_deltas_written": total_delta_events,
         "total_depth10_written": total_depth10,
+        "total_derived_depth_snapshots_written": total_derived_depth_snapshots,
+        **_derived_snapshot_report_fields(
+            requested_depth_snapshot_levels,
+            applied_depth_snapshot_levels,
+            derived_snapshot_warning,
+        ),
         "bad_lines": total_bad,
         "snapshot_seed_count": total_snapshot_seeds,
         "resync_count": total_resyncs,
         "desync_events": total_desyncs,
         "fenced_ranges_total": total_fenced_ranges,
+        **fence_severity_counts,
+        "gap_warning_counts": gap_warning_counts,
         "per_symbol_fenced_ranges": per_symbol_fenced_ranges,
+        "per_symbol_gap_diagnostics": per_symbol_gap_diagnostics,
         "per_symbol_trade": per_symbol_trade,
         "per_symbol_depth": per_symbol_depth,
         "data_presence": data_presence,
@@ -553,6 +650,12 @@ def convert_date(
         "depth_settings": {
             "emit_depth10": emit_depth10,
             "depth10_interval_sec": depth10_interval_sec,
+            "emit_derived_depth_snapshots": emit_depth10,
+            "derived_depth_snapshot_interval_sec": depth10_interval_sec,
+            "derived_depth_snapshot_levels": applied_depth_snapshot_levels,
+            "requested_depth_snapshot_levels": requested_depth_snapshot_levels,
+            "requested_depth_snapshot_levels_applied": applied_depth_snapshot_levels,
+            "snapshot_seed_limit": PHASE2_SNAPSHOT_LIMIT,
         },
         "catalog_root": str(target_root),
     }
@@ -592,6 +695,160 @@ def _empty_report(date_str: str, t0: float, **kwargs) -> dict:
     }
 
 
+def _derived_snapshot_report_fields(
+    requested_levels: int,
+    applied_levels: int,
+    warning: Optional[str],
+) -> Dict[str, object]:
+    fields: Dict[str, object] = {
+        "full_depth_source": FULL_DEPTH_SOURCE,
+        "derived_depth_snapshot_type": DERIVED_DEPTH_SNAPSHOT_TYPE,
+        "derived_depth_snapshot_levels": applied_levels,
+        "requested_depth_snapshot_levels": requested_levels,
+        "requested_depth_snapshot_levels_applied": applied_levels,
+        "snapshot_seed_limit": PHASE2_SNAPSHOT_LIMIT,
+    }
+    if warning:
+        fields["derived_depth_snapshot_warning"] = warning
+    return fields
+
+
+def _record_ts_ns(rec: dict, *, trade: bool = False) -> Optional[int]:
+    ts_ms = rec.get("ts_trade_ms") if trade else None
+    ts_ms = ts_ms or rec.get("ts_event_ms") or rec.get("exchange_ts_ms")
+    if ts_ms is not None:
+        return int(ts_ms) * 1_000_000
+    ts_recv_ns = rec.get("ts_recv_ns")
+    return int(ts_recv_ns) if ts_recv_ns is not None else None
+
+
+def _gap_counts(timestamps_ns: List[int]) -> Dict[str, object]:
+    if len(timestamps_ns) < 2:
+        return {
+            "max_gap_sec": 0.0,
+            "gap_count_over_1s": 0,
+            "gap_count_over_5s": 0,
+            "gap_count_over_60s": 0,
+        }
+    ordered = sorted(timestamps_ns)
+    gaps = [
+        (ordered[i] - ordered[i - 1]) / 1_000_000_000.0
+        for i in range(1, len(ordered))
+        if ordered[i] >= ordered[i - 1]
+    ]
+    if not gaps:
+        return {
+            "max_gap_sec": 0.0,
+            "gap_count_over_1s": 0,
+            "gap_count_over_5s": 0,
+            "gap_count_over_60s": 0,
+        }
+    return {
+        "max_gap_sec": round(max(gaps), 6),
+        "gap_count_over_1s": sum(1 for gap in gaps if gap > 1.0),
+        "gap_count_over_5s": sum(1 for gap in gaps if gap > 5.0),
+        "gap_count_over_60s": sum(1 for gap in gaps if gap > 60.0),
+    }
+
+
+def _build_gap_diagnostics(
+    venue: str,
+    symbol: str,
+    date_str: str,
+    depth10s: Sequence,
+) -> Dict[str, object]:
+    depth_timestamps: List[int] = []
+    trade_timestamps: List[int] = []
+    session_boundary_gap_count = 0
+    shutdown_boundary_gap_count = 0
+    reconnect_boundary_gap_count = 0
+
+    for rec in stream_raw_records(venue, symbol, "depth_v2", date_str):
+        record_type = rec.get("record_type", "depth_update")
+        if record_type == "depth_update":
+            ts_ns = _record_ts_ns(rec)
+            if ts_ns is not None:
+                depth_timestamps.append(ts_ns)
+        elif record_type == "stream_lifecycle":
+            session_boundary_gap_count += 1
+            reason = str(rec.get("reason", ""))
+            event = rec.get("event")
+            if event == "session_end" and reason == "websocket_closed":
+                shutdown_boundary_gap_count += 1
+            elif "reconnect" in reason or reason == "websocket_closed":
+                reconnect_boundary_gap_count += 1
+
+    for rec in stream_raw_records(venue, symbol, "trade_v2", date_str):
+        if rec.get("record_type", "trade") == "trade":
+            ts_ns = _record_ts_ns(rec, trade=True)
+            if ts_ns is not None:
+                trade_timestamps.append(ts_ns)
+
+    depth_gaps = _gap_counts(depth_timestamps)
+    trade_gaps = _gap_counts(trade_timestamps)
+    depth10_gaps = _gap_counts([int(d.ts_event) for d in depth10s])
+    return {
+        "max_depth_update_gap_sec": depth_gaps["max_gap_sec"],
+        "depth_gap_count_over_1s": depth_gaps["gap_count_over_1s"],
+        "depth_gap_count_over_5s": depth_gaps["gap_count_over_5s"],
+        "depth_gap_count_over_60s": depth_gaps["gap_count_over_60s"],
+        "max_trade_gap_sec": trade_gaps["max_gap_sec"],
+        "trade_gap_informational": True,
+        "max_depth10_gap_sec": depth10_gaps["max_gap_sec"],
+        "session_boundary_gap_count": session_boundary_gap_count,
+        "shutdown_boundary_gap_count": shutdown_boundary_gap_count,
+        "reconnect_boundary_gap_count": reconnect_boundary_gap_count,
+    }
+
+
+def _normalize_fence_reason(reason: object) -> str:
+    value = str(reason or "unknown").lower()
+    if "bootstrap" in value:
+        return "bootstrap"
+    if "websocket_closed" in value:
+        return "websocket_closed"
+    if "shutdown" in value:
+        return "shutdown"
+    if "continuity" in value:
+        return "continuity_break"
+    if "desync" in value:
+        return "desynced"
+    if "snapshot" in value:
+        return "no_snapshot_seed"
+    if "rate" in value or "resync_limit" in value:
+        return "rate_limit_resync"
+    return "unknown"
+
+
+def _fence_severity(fence: Dict[str, object]) -> str:
+    reason = _normalize_fence_reason(fence.get("reason"))
+    recovered = bool(fence.get("recovered"))
+    if reason in {"bootstrap", "shutdown"}:
+        return "low"
+    if reason == "websocket_closed":
+        return "medium" if recovered else "low"
+    if recovered and reason in {"continuity_break", "desynced", "rate_limit_resync"}:
+        return "medium"
+    if reason in {"continuity_break", "desynced", "no_snapshot_seed", "rate_limit_resync"}:
+        return "high"
+    return "medium" if recovered else "high"
+
+
+def _summarize_fences(fences: List[Dict[str, object]]) -> Dict[str, int]:
+    summary = {
+        "fenced_ranges_low": 0,
+        "fenced_ranges_medium": 0,
+        "fenced_ranges_high": 0,
+        "unrecovered_fences": 0,
+    }
+    for fence in fences:
+        severity = _fence_severity(fence)
+        summary[f"fenced_ranges_{severity}"] += 1
+        if not bool(fence.get("recovered")):
+            summary["unrecovered_fences"] += 1
+    return summary
+
+
 def _symbols_with_raw_record_type(
     universe: Dict[str, List[str]],
     date_str: str,
@@ -612,9 +869,25 @@ def _symbols_with_raw_record_type(
 
 def _save_report(report: dict) -> dict:
     rp = STATE_ROOT / "convert_reports" / f"{report['date']}.json"
+    catalog_root = Path(report.get("catalog_root", NAUTILUS_CATALOG_ROOT))
+    extra_rp = catalog_root.parent / "convert_reports" / f"{report['date']}.json"
+    report["catalog_root"] = str(catalog_root)
+    report["convert_report_extra_path"] = str(extra_rp)
+    report["report_paths"] = [str(rp), str(extra_rp)]
+    if "full_depth_source" not in report:
+        requested = int(report.get("requested_depth_snapshot_levels", DERIVED_DEPTH_SNAPSHOT_LEVELS))
+        applied = min(max(requested, 1), 10)
+        warning = DERIVED_DEPTH_CAP_WARNING if requested != applied else None
+        report.update(_derived_snapshot_report_fields(requested, applied, warning))
+
+    payload = json.dumps(report, indent=2, default=str)
     rp.parent.mkdir(parents=True, exist_ok=True)
-    rp.write_text(json.dumps(report, indent=2, default=str))
+    rp.write_text(payload)
     logger.info(f"Report → {rp}")
+    if extra_rp != rp:
+        extra_rp.parent.mkdir(parents=True, exist_ok=True)
+        extra_rp.write_text(payload)
+        logger.info(f"Report → {extra_rp}")
     return report
 
 
@@ -647,6 +920,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Minimum interval between derived depth10 snapshots.",
     )
     ap.add_argument(
+        "--derived-depth-snapshot-levels",
+        type=int,
+        default=DERIVED_DEPTH_SNAPSHOT_LEVELS,
+        help=(
+            "Requested derived snapshot levels. Nautilus catalog output is "
+            "currently capped to OrderBookDepth10."
+        ),
+    )
+    ap.add_argument(
         "--allow-partial-overwrite",
         action="store_true",
         default=False,
@@ -675,6 +957,7 @@ def main(
         staging=args.staging,
         emit_depth10=args.emit_depth10,
         depth10_interval_sec=args.depth10_interval_sec,
+        derived_depth_snapshot_levels=args.derived_depth_snapshot_levels,
         allow_partial_overwrite=args.allow_partial_overwrite,
     )
     return 0 if report.get("status") in ("ok", "no_data") else 1

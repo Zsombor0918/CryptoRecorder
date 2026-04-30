@@ -22,6 +22,8 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import aiohttp
 
 from config import (
+    TRADE_WS_FIRST_MESSAGE_TIMEOUT_SEC,
+    TRADE_WS_IDLE_TIMEOUT_SEC,
     TRADE_WS_MAX_SYMBOLS_PER_CONNECTION,
     TRADE_WS_SHARD_ENABLED,
     TRADE_V2_CHANNEL,
@@ -45,6 +47,21 @@ def _new_diag_bucket() -> Dict[str, Any]:
         "reconnect_count": 0,
         "last_close_reason": None,
         "sample_payload_shape": None,
+        "subscribed_symbols": [],
+        "subscribed_symbol_count": 0,
+        "per_symbol_parsed_trade_count": {},
+        "stream_count": 0,
+        "first_5_streams": [],
+        "url": None,
+        "url_length": 0,
+        "task_started": False,
+        "task_done": False,
+        "task_cancelled": False,
+        "connect_attempt_count": 0,
+        "connected_once": False,
+        "first_message_seen_at": None,
+        "last_message_seen_at": None,
+        "last_exception": None,
     }
 
 
@@ -80,6 +97,7 @@ class TradeSymbolState:
     trade_stream_session_id: int = 0
     next_trade_session_seq: int = 0
     session_trade_count: int = 0
+    total_trade_count: int = 0
     last_exchange_trade_id: Optional[int] = None
     trade_id_regressions: int = 0
 
@@ -133,6 +151,72 @@ class BinanceNativeTradeRecorder:
             shards[shard_key] = _new_diag_bucket()
         return shards[shard_key]
 
+    def _set_subscription_diag(
+        self,
+        venue: str,
+        symbols: List[str],
+        *,
+        shard_key: Optional[str] = None,
+    ) -> None:
+        """Expose selected stream symbols in heartbeat diagnostics."""
+        normalized = sorted({s for s in symbols if isinstance(s, str)})
+        stream_names = [
+            _stream_name_futures(symbol) if venue == "BINANCE_USDTF"
+            else _stream_name_spot(symbol)
+            for symbol in normalized
+        ]
+        diag = self._diag_bucket(venue, shard_key)
+        diag["subscribed_symbols"] = normalized
+        diag["subscribed_symbol_count"] = len(normalized)
+        diag["stream_count"] = len(stream_names)
+        diag["first_5_streams"] = stream_names[:5]
+
+        venue_diag = self._diag_bucket(venue)
+        existing = set(venue_diag.get("subscribed_symbols", []))
+        existing.update(normalized)
+        venue_symbols = sorted(existing)
+        venue_stream_names = [
+            _stream_name_futures(symbol) if venue == "BINANCE_USDTF"
+            else _stream_name_spot(symbol)
+            for symbol in venue_symbols
+        ]
+        venue_diag["subscribed_symbols"] = venue_symbols
+        venue_diag["subscribed_symbol_count"] = len(venue_symbols)
+        venue_diag["stream_count"] = len(venue_stream_names)
+        venue_diag["first_5_streams"] = venue_stream_names[:5]
+
+    def _mark_task_started(self, venue: str, shard_key: str, url: str) -> None:
+        diag = self._diag_bucket(venue, shard_key)
+        diag["task_started"] = True
+        diag["task_done"] = False
+        diag["task_cancelled"] = False
+        diag["url"] = url
+        diag["url_length"] = len(url)
+
+    def _mark_task_done(self, venue: str, shard_key: str, *, cancelled: bool = False) -> None:
+        diag = self._diag_bucket(venue, shard_key)
+        diag["task_done"] = True
+        diag["task_cancelled"] = cancelled
+
+    def _mark_connect_attempt(self, venue: str, shard_key: str) -> None:
+        diag = self._diag_bucket(venue, shard_key)
+        diag["connect_attempt_count"] = int(diag.get("connect_attempt_count", 0)) + 1
+
+    def _mark_connected(self, venue: str, shard_key: str) -> None:
+        self._diag_bucket(venue, shard_key)["connected_once"] = True
+
+    def _mark_message_seen(self, venue: str, shard_key: str) -> None:
+        now = time.time()
+        diag = self._diag_bucket(venue, shard_key)
+        if diag.get("first_message_seen_at") is None:
+            diag["first_message_seen_at"] = now
+        diag["last_message_seen_at"] = now
+
+    def _mark_exception(self, venue: str, shard_key: str, exc: BaseException) -> None:
+        self._diag_bucket(venue, shard_key)["last_exception"] = (
+            f"{type(exc).__name__}: {exc}"
+        )
+
     def _record_skip(self, venue: str, reason: str, *, shard_key: Optional[str] = None) -> None:
         for diag in {id(self._diag_bucket(venue)): self._diag_bucket(venue), **({id(self._diag_bucket(venue, shard_key)): self._diag_bucket(venue, shard_key)} if shard_key else {})}.values():
             diag["skipped_message_count"] += 1
@@ -170,6 +254,23 @@ class BinanceNativeTradeRecorder:
                 "reconnect_count": int(diag.get("reconnect_count", 0)),
                 "last_close_reason": diag.get("last_close_reason"),
                 "sample_payload_shape": diag.get("sample_payload_shape"),
+                "subscribed_symbols": list(diag.get("subscribed_symbols", [])),
+                "subscribed_symbol_count": int(diag.get("subscribed_symbol_count", 0)),
+                "per_symbol_parsed_trade_count": dict(
+                    diag.get("per_symbol_parsed_trade_count", {})
+                ),
+                "stream_count": int(diag.get("stream_count", 0)),
+                "first_5_streams": list(diag.get("first_5_streams", [])),
+                "url": diag.get("url"),
+                "url_length": int(diag.get("url_length", 0)),
+                "task_started": bool(diag.get("task_started", False)),
+                "task_done": bool(diag.get("task_done", False)),
+                "task_cancelled": bool(diag.get("task_cancelled", False)),
+                "connect_attempt_count": int(diag.get("connect_attempt_count", 0)),
+                "connected_once": bool(diag.get("connected_once", False)),
+                "first_message_seen_at": diag.get("first_message_seen_at"),
+                "last_message_seen_at": diag.get("last_message_seen_at"),
+                "last_exception": diag.get("last_exception"),
             }
 
         return {
@@ -239,6 +340,11 @@ class BinanceNativeTradeRecorder:
                         shard_key = f"shard_{shard_index}_of_{shard_count}"
                         for symbol in shard_symbols:
                             self._symbol_to_shard_key[(venue, symbol)] = shard_key
+                        self._set_subscription_diag(
+                            venue,
+                            list(shard_symbols),
+                            shard_key=shard_key,
+                        )
                         self._tasks.append(
                             asyncio.create_task(
                                 self._run_venue_loop(
@@ -276,58 +382,100 @@ class BinanceNativeTradeRecorder:
         backoff = 1.0
         shard_key = f"shard_{shard_index}_of_{shard_count}"
         shard_label = f"{venue}[{shard_index}/{shard_count}]"
-        while not self.shutdown_event.is_set():
-            close_reason = "websocket_closed"
-            for symbol in symbols:
-                state = self._state_for(venue, symbol)
-                state.new_stream_session()
-                await self._emit_trade_lifecycle(
-                    state,
-                    event="session_start",
-                    reason="startup_or_reconnect",
-                )
-
-            try:
-                ws_url = _ws_url(venue, symbols)
-                assert self._session is not None
-                async with self._session.ws_connect(
-                    ws_url,
-                    heartbeat=WS_PING_INTERVAL_SEC,
-                ) as ws:
-                    logger.info("Trade websocket connected %s: %s", shard_label, ws_url)
-                    backoff = 1.0
-                    async for msg in ws:
-                        if self.shutdown_event.is_set():
-                            break
-                        if msg.type == aiohttp.WSMsgType.TEXT:
-                            await self._handle_ws_text(venue, msg.data, shard_key=shard_key)
-                        elif msg.type == aiohttp.WSMsgType.ERROR:
-                            raise RuntimeError(
-                                f"trade websocket error for {shard_label}: {ws.exception()}"
-                            )
-                        elif msg.type in (
-                            aiohttp.WSMsgType.CLOSED,
-                            aiohttp.WSMsgType.CLOSE,
-                        ):
-                            break
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                close_reason = f"websocket_error:{type(exc).__name__}"
-                logger.warning("Trade websocket error for %s: %s", shard_label, exc)
-            finally:
-                self._venue_diag[venue]["reconnect_count"] += 1
-                self._diag_bucket(venue, shard_key)["reconnect_count"] += 1
+        ws_url = _ws_url(venue, symbols)
+        self._mark_task_started(venue, shard_key, ws_url)
+        try:
+            while not self.shutdown_event.is_set():
+                close_reason = "websocket_closed"
                 for symbol in symbols:
                     state = self._state_for(venue, symbol)
-                    await self._finalize_symbol_session(state, reason=close_reason)
-                self._log_venue_diag_summary(venue, close_reason=close_reason)
-                self._log_venue_diag_summary(venue, close_reason=close_reason, shard_key=shard_key)
+                    state.new_stream_session()
+                    await self._emit_trade_lifecycle(
+                        state,
+                        event="session_start",
+                        reason="startup_or_reconnect",
+                    )
 
-            if self.shutdown_event.is_set():
-                break
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2.0, 30.0)
+                try:
+                    self._mark_connect_attempt(venue, shard_key)
+                    assert self._session is not None
+                    async with self._session.ws_connect(
+                        ws_url,
+                        heartbeat=WS_PING_INTERVAL_SEC,
+                    ) as ws:
+                        self._mark_connected(venue, shard_key)
+                        logger.info(
+                            "Trade websocket connected %s: streams=%d url_len=%d first_streams=%s url=%s",
+                            shard_label,
+                            len(symbols),
+                            len(ws_url),
+                            self._diag_bucket(venue, shard_key).get("first_5_streams", []),
+                            ws_url,
+                        )
+                        backoff = 1.0
+                        first_seen = False
+                        last_seen = time.monotonic()
+                        while not self.shutdown_event.is_set():
+                            try:
+                                msg = await ws.receive(timeout=1.0)
+                            except asyncio.TimeoutError:
+                                idle_for = time.monotonic() - last_seen
+                                if (
+                                    not first_seen
+                                    and idle_for >= TRADE_WS_FIRST_MESSAGE_TIMEOUT_SEC
+                                ):
+                                    raise TimeoutError(
+                                        f"no first trade websocket message for {shard_label} "
+                                        f"after {TRADE_WS_FIRST_MESSAGE_TIMEOUT_SEC:.1f}s"
+                                    )
+                                if first_seen and idle_for >= TRADE_WS_IDLE_TIMEOUT_SEC:
+                                    raise TimeoutError(
+                                        f"trade websocket idle for {shard_label} "
+                                        f"after {TRADE_WS_IDLE_TIMEOUT_SEC:.1f}s"
+                                    )
+                                continue
+
+                            if msg.type == aiohttp.WSMsgType.TEXT:
+                                first_seen = True
+                                last_seen = time.monotonic()
+                                self._mark_message_seen(venue, shard_key)
+                                await self._handle_ws_text(venue, msg.data, shard_key=shard_key)
+                            elif msg.type == aiohttp.WSMsgType.ERROR:
+                                raise RuntimeError(
+                                    f"trade websocket error for {shard_label}: {ws.exception()}"
+                                )
+                            elif msg.type in (
+                                aiohttp.WSMsgType.CLOSED,
+                                aiohttp.WSMsgType.CLOSE,
+                                aiohttp.WSMsgType.CLOSING,
+                            ):
+                                break
+                except asyncio.CancelledError:
+                    self._mark_task_done(venue, shard_key, cancelled=True)
+                    raise
+                except Exception as exc:
+                    close_reason = f"websocket_error:{type(exc).__name__}"
+                    self._mark_exception(venue, shard_key, exc)
+                    logger.warning("Trade websocket error for %s: %s", shard_label, exc)
+                finally:
+                    self._venue_diag[venue]["reconnect_count"] += 1
+                    self._diag_bucket(venue, shard_key)["reconnect_count"] += 1
+                    for symbol in symbols:
+                        state = self._state_for(venue, symbol)
+                        await self._finalize_symbol_session(state, reason=close_reason)
+                    self._log_venue_diag_summary(venue, close_reason=close_reason)
+                    self._log_venue_diag_summary(venue, close_reason=close_reason, shard_key=shard_key)
+
+                if self.shutdown_event.is_set():
+                    break
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2.0, 30.0)
+        finally:
+            self._mark_task_done(
+                venue,
+                shard_key,
+                cancelled=asyncio.current_task().cancelled() if asyncio.current_task() else False,
+            )
 
     # ------------------------------------------------------------------
     # WS message handling
@@ -403,6 +551,7 @@ class BinanceNativeTradeRecorder:
                 venue, symbol, TRADE_V2_CHANNEL, record,
             )
             state.session_trade_count += 1
+            state.total_trade_count += 1
 
             self.health_monitor.record_message(
                 venue=venue,
@@ -411,8 +560,14 @@ class BinanceNativeTradeRecorder:
                 channel=TRADE_V2_CHANNEL,
             )
             self._diag_bucket(venue)["parsed_trade_count"] += 1
+            venue_symbol_counts = self._diag_bucket(venue)["per_symbol_parsed_trade_count"]
+            venue_symbol_counts[symbol] = int(venue_symbol_counts.get(symbol, 0)) + 1
             if shard_key is not None:
                 self._diag_bucket(venue, shard_key)["parsed_trade_count"] += 1
+                shard_symbol_counts = self._diag_bucket(venue, shard_key)[
+                    "per_symbol_parsed_trade_count"
+                ]
+                shard_symbol_counts[symbol] = int(shard_symbol_counts.get(symbol, 0)) + 1
         except Exception:
             self._record_skip(venue, "handler_exception", shard_key=shard_key)
             logger.exception("Trade message handling error for %s/%s", venue, symbol)

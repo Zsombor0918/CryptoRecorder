@@ -28,6 +28,7 @@ Top-level fields:
 - `futures_enabled`
 - `futures_disabled_reason`
 - `architecture` — always `"deterministic_native"`
+- `trade_health` — trade_v2 ingest diagnostics by venue
 - `by_venue`
 
 Notes:
@@ -36,6 +37,26 @@ Notes:
   (`+01:00` or `+02:00` depending on the date).
 - `spot_symbols_dropped*` / `futures_symbols_dropped*` summarize startup
   `runtime_dropped` symbols, not the full universe `candidate_pool`.
+
+`trade_health` is a map keyed by venue (e.g. `BINANCE_SPOT`, `BINANCE_USDTF`) containing venue-level ingest diagnostics:
+
+- `ws_message_count` — total WebSocket messages received
+- `parsed_trade_count` — trade records successfully parsed and committed
+- `skipped_message_count` — messages skipped (validation or processing errors)
+- `skip_reasons` — map of skip reason → count
+- `lifecycle_only_sessions` — stream sessions with zero trade records
+- `reconnect_count` — number of stream reconnections
+- `last_close_reason` — most recent WebSocket close reason
+- `sample_payload_shape` — example of first parsed message structure (diagnostic)
+- `subscribed_symbols` / `subscribed_symbol_count` — native trade stream subscription coverage
+- `per_symbol_parsed_trade_count` — parsed trade counts keyed by raw Binance symbol
+- `stream_count`, `first_5_streams`, `url`, `url_length` — shard subscription/connect details
+- `task_started`, `task_done`, `task_cancelled`, `connect_attempt_count`, `connected_once` — shard lifecycle details
+- `first_message_seen_at`, `last_message_seen_at`, `last_exception` — liveness diagnostics for silent or failing trade shards
+- `warnings` / `warning_count` — trade-ingest warnings, such as high-liquidity futures with active depth but zero parsed trades
+- `shards` — if connection sharding is enabled, per-shard diagnostics with same structure
+
+Empty if no trade recorder is running.
 
 `by_venue` is a map keyed by venue (e.g. `BINANCE_SPOT`, `BINANCE_USDTF`) containing per-symbol objects with:
 
@@ -97,12 +118,25 @@ Core fields:
 - `total_trades_written`
 - `total_order_book_deltas_written`
 - `total_depth10_written`
+- `total_derived_depth_snapshots_written`
+- `full_depth_source` — currently `"OrderBookDeltas"`
+- `derived_depth_snapshot_type` — currently `"OrderBookDepth10"`
+- `derived_depth_snapshot_levels`
+- `requested_depth_snapshot_levels`
+- `requested_depth_snapshot_levels_applied`
+- `snapshot_seed_limit` — Binance REST snapshot seed depth, not catalog snapshot depth
 - `bad_lines`
 - `snapshot_seed_count`
 - `resync_count`
 - `desync_events`
 - `fenced_ranges_total`
+- `fenced_ranges_low`
+- `fenced_ranges_medium`
+- `fenced_ranges_high`
+- `unrecovered_fences`
+- `gap_warning_counts`
 - `per_symbol_fenced_ranges`
+- `per_symbol_gap_diagnostics`
 - `data_presence`
 - `futures_enabled`
 - `symbols_processed`
@@ -138,7 +172,23 @@ Core fields:
 `per_symbol_fenced_ranges` maps `"VENUE/SYMBOL"` to:
 
 - `fenced_ranges`: Count of intentionally excluded ranges
+- `fenced_ranges_low`
+- `fenced_ranges_medium`
+- `fenced_ranges_high`
+- `unrecovered_fences`
 - `examples`: Up to 3 sample fenced ranges with session/time/reason metadata
+
+`per_symbol_gap_diagnostics` maps `"VENUE/SYMBOL"` to:
+
+- `max_depth_update_gap_sec`
+- `depth_gap_count_over_1s`
+- `depth_gap_count_over_5s`
+- `depth_gap_count_over_60s`
+- `max_trade_gap_sec` (informational; trade inactivity is not an L2 failure)
+- `max_depth10_gap_sec`
+- `session_boundary_gap_count`
+- `shutdown_boundary_gap_count`
+- `reconnect_boundary_gap_count`
 
 `ts_ranges` is the authoritative indication of actual temporal coverage.
 
