@@ -130,7 +130,7 @@ def test_universe_health_excludes_only_after_repeated_zero_runs(monkeypatch, tmp
 
     health_dir = tmp_path / "state" / "universe_health"
     health_dir.mkdir(parents=True)
-    for date_str in ("2026-04-24", "2026-04-25"):
+    for date_str in ("2026-05-01", "2026-05-02"):
         (health_dir / f"{date_str}.json").write_text(
             """
 {
