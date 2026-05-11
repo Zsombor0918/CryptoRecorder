@@ -63,6 +63,7 @@ def _futures_trade(
     exchange_trade_id: int | None = None,
     first_trade_id: int | None = None,
     last_trade_id: int | None = None,
+    native_payload: dict | None = None,
 ) -> dict:
     return {
         "schema_version": 2,
@@ -82,7 +83,7 @@ def _futures_trade(
         "exchange_trade_id": exchange_trade_id,
         "first_trade_id": first_trade_id,
         "last_trade_id": last_trade_id,
-        "native_payload": {},
+        "native_payload": native_payload or {},
     }
 
 
@@ -212,6 +213,109 @@ def test_spot_vs_futures_schema_decoding() -> None:
 
     assert len(fut_ticks) == 1
     assert str(fut_ticks[0].trade_id) == "99999"
+
+
+def test_usdtf_positive_quantity_trade_converts_successfully() -> None:
+    iid = InstrumentId.from_str("BTCUSDT-PERP.BINANCE")
+    original = trade_mod.stream_raw_records
+
+    try:
+        def _fake(*a, **kw):
+            yield _futures_trade(
+                session=1,
+                seq=1,
+                ts_recv_ns=1_000_000_000,
+                price="50000.0",
+                quantity="0.001",
+                native_payload={"e": "trade", "t": 9001, "p": "50000.0", "q": "0.001"},
+            )
+
+        trade_mod.stream_raw_records = _fake
+        ticks, bad, first, last, diag = trade_mod.convert_trades_with_diagnostics(
+            "BINANCE_USDTF", "BTCUSDT", "2026-04-21", iid, 1, 3,
+        )
+    finally:
+        trade_mod.stream_raw_records = original
+
+    assert bad == 0
+    assert len(ticks) == 1
+    assert str(ticks[0].price) == "50000.0"
+    assert str(ticks[0].size) == "0.001"
+    assert str(ticks[0].trade_id) == "9001"
+    assert first == last == 1_000_000_000
+    assert diag["zero_size_trade_skipped"] == 0
+
+
+def test_usdtf_zero_size_trade_is_intentionally_skipped() -> None:
+    iid = InstrumentId.from_str("BTCUSDT-PERP.BINANCE")
+    original = trade_mod.stream_raw_records
+
+    try:
+        def _fake(*a, **kw):
+            yield _futures_trade(
+                session=1,
+                seq=1,
+                ts_recv_ns=1_000_000_000,
+                ts_event_ms=1_700_000_000_000,
+                price="0",
+                quantity="0",
+                native_payload={"e": "trade", "t": 9002, "p": "0", "q": "0"},
+            )
+
+        trade_mod.stream_raw_records = _fake
+        ticks, bad, first, last, diag = trade_mod.convert_trades_with_diagnostics(
+            "BINANCE_USDTF", "BTCUSDT", "2026-04-21", iid, 1, 3,
+        )
+    finally:
+        trade_mod.stream_raw_records = original
+
+    assert ticks == []
+    assert bad == 0
+    assert first is None
+    assert last is None
+    assert diag["zero_size_trade_skipped"] == 1
+    assert diag["bad_lines_by_exception_type"] == {}
+    assert diag["zero_size_trade_examples"] == [
+        {
+            "venue": "BINANCE_USDTF",
+            "symbol": "BTCUSDT",
+            "ts_event_ms": 1_700_000_000_000,
+            "price": "0",
+            "quantity": "0",
+            "exchange_trade_id": 9002,
+            "first_trade_id": None,
+            "last_trade_id": None,
+        }
+    ]
+
+
+def test_bad_lines_remain_for_unexpected_trade_exceptions_only() -> None:
+    iid = InstrumentId.from_str("BTCUSDT-PERP.BINANCE")
+    original = trade_mod.stream_raw_records
+
+    try:
+        def _fake(*a, **kw):
+            yield _futures_trade(
+                session=1,
+                seq=1,
+                ts_recv_ns=1_000_000_000,
+                price="not-a-price",
+                quantity="0.001",
+                exchange_trade_id=9003,
+            )
+
+        trade_mod.stream_raw_records = _fake
+        ticks, bad, _, _, diag = trade_mod.convert_trades_with_diagnostics(
+            "BINANCE_USDTF", "BTCUSDT", "2026-04-21", iid, 1, 3,
+        )
+    finally:
+        trade_mod.stream_raw_records = original
+
+    assert ticks == []
+    assert bad == 1
+    assert diag["zero_size_trade_skipped"] == 0
+    assert diag["bad_lines_by_record_type"] == {"trade": 1}
+    assert diag["bad_line_examples"][0]["quantity"] == "0.001"
 
 
 def test_exchange_trade_id_does_not_affect_ordering() -> None:

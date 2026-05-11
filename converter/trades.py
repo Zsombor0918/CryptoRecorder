@@ -10,8 +10,9 @@ not affect ordering.
 """
 from __future__ import annotations
 
+from decimal import Decimal
 import logging
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from nautilus_trader.model.data import TradeTick
 from nautilus_trader.model.enums import AggressorSide
@@ -29,6 +30,53 @@ def _trade_sort_key(rec: dict) -> Tuple[int, int]:
         int(rec.get("trade_stream_session_id", 0)),
         int(rec.get("trade_session_seq", 0)),
     )
+
+
+def _native_payload(rec: dict) -> dict:
+    payload = rec.get("native_payload")
+    return payload if isinstance(payload, dict) else {}
+
+
+def _as_decimal(value: object, *, field: str) -> Decimal:
+    if value is None:
+        raise ValueError(f"missing trade {field}")
+    return Decimal(str(value))
+
+
+def _trade_id_for_report(rec: dict) -> object:
+    native = _native_payload(rec)
+    trade_id = rec.get("exchange_trade_id")
+    return trade_id if trade_id is not None else native.get("t")
+
+
+def _first_trade_id_for_report(rec: dict) -> object:
+    native = _native_payload(rec)
+    trade_id = rec.get("first_trade_id")
+    return trade_id if trade_id is not None else native.get("f")
+
+
+def _last_trade_id_for_report(rec: dict) -> object:
+    native = _native_payload(rec)
+    trade_id = rec.get("last_trade_id")
+    return trade_id if trade_id is not None else native.get("l")
+
+
+def _trade_report_example(
+    *,
+    venue: str,
+    symbol: str,
+    rec: dict,
+) -> Dict[str, object]:
+    return {
+        "venue": venue,
+        "symbol": rec.get("symbol", symbol),
+        "ts_event_ms": rec.get("ts_event_ms"),
+        "price": rec.get("price"),
+        "quantity": rec.get("quantity"),
+        "exchange_trade_id": _trade_id_for_report(rec),
+        "first_trade_id": _first_trade_id_for_report(rec),
+        "last_trade_id": _last_trade_id_for_report(rec),
+    }
 
 
 def convert_trades(
@@ -61,7 +109,7 @@ def convert_trades_with_diagnostics(
     instrument_id: InstrumentId,
     price_prec: int,
     size_prec: int,
-) -> Tuple[List[TradeTick], int, Optional[int], Optional[int], Dict[str, int]]:
+) -> Tuple[List[TradeTick], int, Optional[int], Optional[int], Dict[str, Any]]:
     """Stream-convert raw trade_v2 records and return diagnostics.
 
     Returns ``(tick_list, bad_line_count, first_ts_ns, last_ts_ns, diagnostics)``
@@ -69,12 +117,22 @@ def convert_trades_with_diagnostics(
       - ``raw_record_count``: all parsed JSON records from trade_v2 files
       - ``raw_trade_record_count``: parsed records with record_type == "trade"
       - ``raw_lifecycle_record_count``: parsed lifecycle records
-      - ``trade_ticks_written``: number of TradeTick objects produced
+      - ``ticks_written``: number of TradeTick objects produced
+      - ``zero_size_trade_skipped``: trade records intentionally skipped
+        before Nautilus object construction because raw quantity is zero
+      - ``bad_lines_by_exception_type``: breakdown of exceptions by type
+      - ``bad_lines_by_record_type``: breakdown of bad lines by record type
+      - ``bad_line_examples``: first 20 examples with details
     """
     ticks: List[TradeTick] = []
     bad = 0
     first_ts: Optional[int] = None
     last_ts: Optional[int] = None
+    bad_lines_by_exception_type: Dict[str, int] = {}
+    bad_lines_by_record_type: Dict[str, int] = {}
+    bad_line_examples: List[Dict[str, Any]] = []
+    zero_size_trade_skipped = 0
+    zero_size_trade_examples: List[Dict[str, Any]] = []
 
     # Collect then sort by committed session ordering
     raw_records = list(stream_raw_records(venue, symbol, "trade_v2", date_str))
@@ -93,10 +151,19 @@ def convert_trades_with_diagnostics(
                 continue
             raw_trade_record_count += 1
 
-            price_str = rec.get("price", "0")
-            qty_str = rec.get("quantity", "0")
+            price_str = rec.get("price")
+            qty_str = rec.get("quantity")
             is_buyer_maker = rec.get("is_buyer_maker", False)
-            exchange_trade_id = rec.get("exchange_trade_id")
+            exchange_trade_id = _trade_id_for_report(rec)
+
+            qty = _as_decimal(qty_str, field="quantity")
+            if qty == 0:
+                zero_size_trade_skipped += 1
+                if len(zero_size_trade_examples) < 20:
+                    zero_size_trade_examples.append(
+                        _trade_report_example(venue=venue, symbol=symbol, rec=rec)
+                    )
+                continue
 
             ts_event_ms = rec.get("ts_event_ms")
             ts_trade_ms = rec.get("ts_trade_ms")
@@ -132,13 +199,45 @@ def convert_trades_with_diagnostics(
             if first_ts is None:
                 first_ts = ts_event
             last_ts = ts_event
-        except Exception:
+        except Exception as exc:
             bad += 1
+            exc_type = type(exc).__name__
+            record_type = (
+                rec.get("record_type", "unknown") if "rec" in locals() else "unknown"
+            )
 
-    diagnostics = {
+            # Track counts by exception type and record type
+            bad_lines_by_exception_type[exc_type] = (
+                bad_lines_by_exception_type.get(exc_type, 0) + 1
+            )
+            bad_lines_by_record_type[record_type] = (
+                bad_lines_by_record_type.get(record_type, 0) + 1
+            )
+
+            # Keep first 20 examples (compact format)
+            if len(bad_line_examples) < 20 and "rec" in locals():
+                example = _trade_report_example(venue=venue, symbol=symbol, rec=rec)
+                example.update(
+                    {
+                        "record_type": record_type,
+                        "ts_trade_ms": rec.get("ts_trade_ms"),
+                        "ts_recv_ns": rec.get("ts_recv_ns"),
+                        "exception_type": exc_type,
+                        "exception_message": str(exc)[:100],
+                        "record_keys": list(rec.keys()) if isinstance(rec, dict) else [],
+                    }
+                )
+                bad_line_examples.append(example)
+
+    diagnostics: Dict[str, Any] = {
         "raw_record_count": len(raw_records),
         "raw_trade_record_count": raw_trade_record_count,
         "raw_lifecycle_record_count": raw_lifecycle_record_count,
         "ticks_written": len(ticks),
+        "zero_size_trade_skipped": zero_size_trade_skipped,
+        "zero_size_trade_examples": zero_size_trade_examples,
+        "bad_lines_by_exception_type": bad_lines_by_exception_type,
+        "bad_lines_by_record_type": bad_lines_by_record_type,
+        "bad_line_examples": bad_line_examples,
     }
     return ticks, bad, first_ts, last_ts, diagnostics

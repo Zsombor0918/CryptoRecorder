@@ -42,6 +42,7 @@ def _make_dep_metrics(
     depth10: int = 0,
     first_ts_ns: int | None = None,
     last_ts_ns: int | None = None,
+    fenced_ranges: list[dict] | None = None,
 ) -> Phase2ReplayMetrics:
     m = Phase2ReplayMetrics(
         snapshot_seed_count=snapshot_seed_count,
@@ -56,6 +57,8 @@ def _make_dep_metrics(
     m.depth_update_record_count = depth_update_record_count
     m.sync_state_record_count = sync_state_record_count
     m.stream_lifecycle_record_count = stream_lifecycle_record_count
+    if fenced_ranges is not None:
+        m.fenced_ranges = fenced_ranges
     return m
 
 
@@ -193,6 +196,43 @@ class TestPerSymbolTradeDiagnostics:
         assert entry["first_trade_ts_ns"] == 1_000_000_000
         assert entry["last_trade_ts_ns"] == 1_000_000_000
 
+    def test_zero_size_trade_skips_are_reported_by_venue_symbol(
+        self, monkeypatch, tmp_path: Path
+    ):
+        instrument = TestInstrumentProvider.btcusdt_binance()
+        diag = {
+            "raw_record_count": 2,
+            "raw_trade_record_count": 2,
+            "raw_lifecycle_record_count": 0,
+            "ticks_written": 0,
+            "zero_size_trade_skipped": 2,
+            "zero_size_trade_examples": [
+                {
+                    "venue": "BINANCE_SPOT",
+                    "symbol": "BTCUSDT",
+                    "ts_event_ms": 1_700_000_000_000,
+                    "price": "0",
+                    "quantity": "0",
+                    "exchange_trade_id": 1,
+                    "first_trade_id": None,
+                    "last_trade_id": None,
+                }
+            ],
+        }
+        self._setup_minimal(monkeypatch, tmp_path, instrument, diag)
+
+        report = convert_day_mod.convert_date(
+            datetime(2026, 4, 21), catalog_root=tmp_path / "cat", emit_depth10=False,
+        )
+
+        assert report["bad_lines"] == 0
+        assert report["zero_size_trade_skipped_total"] == 2
+        assert report["zero_size_trade_skipped_by_venue_symbol"] == {
+            "BINANCE_SPOT/BTCUSDT": 2
+        }
+        entry = report["per_symbol_trade"]["BINANCE_SPOT/BTCUSDT"]
+        assert entry["zero_size_trade_skipped"] == 2
+
 
 # ---------------------------------------------------------------------------
 # per_symbol_depth diagnostics
@@ -290,6 +330,80 @@ class TestPerSymbolDepthDiagnostics:
         assert entry["will_create_l2"] is False
         assert entry["deltas_written"] == 0
         assert entry["stream_lifecycle_record_count"] == 3
+
+    def test_lifecycle_fences_do_not_create_readiness_warnings(
+        self, monkeypatch, tmp_path: Path
+    ):
+        instrument = TestInstrumentProvider.btcusdt_binance()
+        batch = _snapshot_deltas_batch(instrument)
+        metrics = _make_dep_metrics(
+            raw_record_count=10,
+            depth_update_record_count=7,
+            sync_state_record_count=2,
+            stream_lifecycle_record_count=2,
+            snapshot_seed_count=1,
+            deltas=2,
+            fenced_ranges=[
+                {"reason": "bootstrap", "recovered": True},
+                {"reason": "websocket_closed", "recovered": False},
+            ],
+        )
+
+        monkeypatch.setattr(convert_day_mod, "resolve_universe",
+                            lambda ds: {"BINANCE_SPOT": ["BTCUSDT"]})
+        monkeypatch.setattr(convert_day_mod, "load_exchange_info", lambda v, ds: {})
+        monkeypatch.setattr(convert_day_mod, "build_instruments",
+                            lambda v, s, e: [instrument])
+        monkeypatch.setattr(
+            convert_day_mod,
+            "convert_trades_with_diagnostics",
+            lambda *a, **kw: ([], 0, None, None, _no_ticks_diag()),
+        )
+        monkeypatch.setattr(
+            convert_day_mod,
+            "convert_depth_v2",
+            lambda *a, **kw: ([batch, batch], [], metrics),
+        )
+        monkeypatch.setattr(
+            convert_day_mod,
+            "_build_gap_diagnostics",
+            lambda *a, **kw: {
+                "max_depth_update_gap_sec": 0.2,
+                "depth_gap_count_over_1s": 0,
+                "depth_gap_count_over_5s": 0,
+                "depth_gap_count_over_60s": 0,
+                "max_trade_gap_sec": 120.0,
+                "trade_gap_informational": True,
+                "max_depth10_gap_sec": 0.0,
+                "session_boundary_gap_count": 2,
+                "shutdown_boundary_gap_count": 1,
+                "reconnect_boundary_gap_count": 0,
+            },
+        )
+        monkeypatch.setattr(
+            convert_day_mod,
+            "_symbols_with_raw_record_type",
+            lambda *a, **kw: {"BINANCE_SPOT/BTCUSDT"},
+        )
+
+        report = convert_day_mod.convert_date(
+            datetime(2026, 4, 21), catalog_root=tmp_path / "cat", emit_depth10=False,
+        )
+
+        assert report["fenced_ranges_total"] == 2
+        assert report["bootstrap_fences"] == 1
+        assert report["shutdown_fences"] == 1
+        assert report["real_desync_fences"] == 0
+        assert report["unrecovered_fences"] == 0
+        assert report["unrecovered_real_fences"] == 0
+        assert report["top_real_gap_offenders"] == []
+        depth_entry = report["per_symbol_depth"]["BINANCE_SPOT/BTCUSDT"]
+        assert depth_entry["bootstrap_fences"] == 1
+        assert depth_entry["shutdown_fences"] == 1
+        assert report["readiness"]["per_symbol"]["BINANCE_SPOT/BTCUSDT"]["readiness_warnings"] == []
+        fence_entry = report["per_symbol_fenced_ranges"]["BINANCE_SPOT/BTCUSDT"]
+        assert fence_entry["lifecycle_examples"][0]["classification"] == "bootstrap"
+        assert fence_entry["real_examples"] == []
 
 
 # ---------------------------------------------------------------------------

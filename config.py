@@ -76,7 +76,7 @@ TRADE_WS_SHARD_ENABLED: Final = (
     in {"1", "true", "yes", "on"}
 )
 TRADE_WS_MAX_SYMBOLS_PER_CONNECTION: Final = int(
-    os.environ.get("CRYPTO_RECORDER_TRADE_WS_MAX_SYMBOLS_PER_CONNECTION", "25")
+    os.environ.get("CRYPTO_RECORDER_TRADE_WS_MAX_SYMBOLS_PER_CONNECTION", "10")
 )
 TRADE_WS_FIRST_MESSAGE_TIMEOUT_SEC: Final = float(
     os.environ.get("CRYPTO_RECORDER_TRADE_WS_FIRST_MESSAGE_TIMEOUT_SEC", "15")
@@ -127,7 +127,7 @@ DEPTH_WS_SHARD_ENABLED: Final = (
     in {"1", "true", "yes", "on"}
 )
 DEPTH_WS_MAX_SYMBOLS_PER_CONNECTION: Final = int(
-    os.environ.get("CRYPTO_RECORDER_DEPTH_WS_MAX_SYMBOLS_PER_CONNECTION", "25")
+    os.environ.get("CRYPTO_RECORDER_DEPTH_WS_MAX_SYMBOLS_PER_CONNECTION", "10")
 )
 
 # Optional derived depth snapshot defaults (converter-side).

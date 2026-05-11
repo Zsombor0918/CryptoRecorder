@@ -59,6 +59,10 @@ class Phase2ReplayMetrics:
     depth_update_record_count: int = 0
     sync_state_record_count: int = 0
     stream_lifecycle_record_count: int = 0
+    # Bad lines tracking (compact diagnostic)
+    bad_lines_by_exception_type: Dict[str, int] = field(default_factory=dict)
+    bad_lines_by_record_type: Dict[str, int] = field(default_factory=dict)
+    bad_line_examples: List[Dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -280,6 +284,17 @@ def _close_fence(
     state.fence_open = None
 
 
+def _is_lifecycle_resync_reason(reason: object) -> bool:
+    value = str(reason or "").lower()
+    return (
+        "bootstrap" in value
+        or "websocket_closed" in value
+        or "shutdown" in value
+        or "startup_or_reconnect" in value
+        or "new_stream_session" in value
+    )
+
+
 def _should_accept_update(state: ReplayState, rec: dict) -> bool:
     """Check Binance depth continuity.
 
@@ -379,6 +394,7 @@ def convert_depth_v2(
             session_id = rec.get("stream_session_id")
             if state.current_stream_session_id != session_id:
                 if state.fence_open is not None:
+                    state.fence_open["closed_by_session_change"] = True
                     _close_fence(state, metrics, rec=rec, recovered=False)
                 state.current_stream_session_id = session_id
                 state.sync_state = "unsynced"
@@ -394,8 +410,10 @@ def convert_depth_v2(
                 if state.sync_state == "snapshot_seeded":
                     _close_fence(state, metrics, rec=rec, recovered=True)
                 elif state.sync_state == "resync_required":
-                    metrics.resync_count += 1
-                    _open_fence(state, metrics, reason=rec.get("reason", "resync_required"), rec=rec)
+                    reason = rec.get("reason", "resync_required")
+                    if not _is_lifecycle_resync_reason(reason):
+                        metrics.resync_count += 1
+                    _open_fence(state, metrics, reason=reason, rec=rec)
                 elif state.sync_state == "desynced":
                     metrics.desync_events += 1
                     _open_fence(state, metrics, reason=rec.get("reason", "desynced"), rec=rec)
@@ -475,12 +493,35 @@ def convert_depth_v2(
                         state.last_depth10_emit_ns = ts_event
                         metrics.depth10_written += 1
                         metrics.derived_depth_snapshots_written += 1
-        except Exception:
+        except Exception as exc:
             logger.exception("Phase 2 replay error for %s/%s", venue, symbol)
             metrics.bad_lines += 1
+            
+            # Capture compact diagnostic info for first 20 bad_lines
+            exc_type = type(exc).__name__
+            rec_type = rec.get("record_type", "unknown") if 'rec' in locals() else "unknown"
+            
+            # Track counts by exception type and record type
+            metrics.bad_lines_by_exception_type[exc_type] = metrics.bad_lines_by_exception_type.get(exc_type, 0) + 1
+            metrics.bad_lines_by_record_type[rec_type] = metrics.bad_lines_by_record_type.get(rec_type, 0) + 1
+            
+            # Keep first 20 examples (compact format)
+            if len(metrics.bad_line_examples) < 20 and 'rec' in locals():
+                metrics.bad_line_examples.append({
+                    "venue": venue,
+                    "symbol": symbol,
+                    "record_type": rec_type,
+                    "stream_session_id": rec.get("stream_session_id"),
+                    "session_seq": rec.get("session_seq"),
+                    "ts_event_ms": rec.get("ts_event_ms"),
+                    "exception_type": exc_type,
+                    "exception_message": str(exc)[:100],
+                    "record_keys": list(rec.keys()) if isinstance(rec, dict) else [],
+                })
 
     if state.fence_open is not None:
         state.fence_open["end_ts_ns"] = metrics.last_ts_ns
+        state.fence_open["closed_at_eof"] = True
         state.fence_open["recovered"] = False
         metrics.fenced_ranges.append(state.fence_open)
         state.fence_open = None

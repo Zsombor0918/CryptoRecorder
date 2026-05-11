@@ -95,3 +95,46 @@ def test_readiness_summary_classifies_honestly() -> None:
     assert readiness["per_symbol"]["BINANCE_USDTF/ETHUSDT"]["readiness"] == "full_ready"
     assert readiness["per_symbol"]["BINANCE_USDTF/SOLUSDT"]["readiness"] == "not_ready"
     assert readiness["suggested_full_ready_universe"]["BINANCE_USDTF"] == ["ETHUSDT"]
+
+
+def test_readiness_warnings_ignore_lifecycle_fences_and_warn_on_real_issues() -> None:
+    readiness = build_readiness_summary(
+        {
+            "BINANCE_USDTF/BTCUSDT": {
+                "raw_trade_record_count": 3,
+                "raw_lifecycle_record_count": 1,
+                "ticks_written": 3,
+            },
+            "BINANCE_USDTF/ETHUSDT": {
+                "raw_trade_record_count": 3,
+                "raw_lifecycle_record_count": 1,
+                "ticks_written": 3,
+            },
+        },
+        {
+            "BINANCE_USDTF/BTCUSDT": {
+                "deltas_written": 10,
+                "depth10_written": 2,
+                "bootstrap_fences": 1,
+                "shutdown_fences": 1,
+                "unrecovered_real_fences": 0,
+                "depth_gap_count_over_60s": 0,
+            },
+            "BINANCE_USDTF/ETHUSDT": {
+                "deltas_written": 10,
+                "depth10_written": 2,
+                "real_desync_fences": 1,
+                "unrecovered_real_fences": 1,
+                "depth_gap_count_over_60s": 1,
+            },
+        },
+        min_trade_records_for_full_ready=1,
+    )
+
+    assert readiness["per_symbol"]["BINANCE_USDTF/BTCUSDT"]["readiness_warnings"] == []
+    assert readiness["per_symbol"]["BINANCE_USDTF/ETHUSDT"]["readiness_warnings"] == [
+        "unrecovered_real_fence",
+        "real_desync_fence",
+        "depth_gap_over_60s",
+    ]
+    assert readiness["symbols_with_readiness_warnings"] == ["BINANCE_USDTF/ETHUSDT"]

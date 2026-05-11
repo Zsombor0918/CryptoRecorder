@@ -125,7 +125,16 @@ Core fields:
 - `requested_depth_snapshot_levels`
 - `requested_depth_snapshot_levels_applied`
 - `snapshot_seed_limit` — Binance REST snapshot seed depth, not catalog snapshot depth
-- `bad_lines`
+- `bad_lines` — unexpected converter exceptions only; intentional venue skips are counted separately
+- `bad_lines_by_exception_type`
+- `bad_lines_by_record_type`
+- `bad_lines_by_venue_symbol`
+- `bad_line_examples`
+- `zero_size_trade_skipped_total` — raw venue trade records skipped before
+  `TradeTick` construction because `quantity == 0`
+- `zero_size_trade_skipped_by_venue_symbol`
+- `zero_size_trade_examples` — up to 20 examples with symbol,
+  `ts_event_ms`, price, quantity, and trade IDs
 - `snapshot_seed_count`
 - `resync_count`
 - `desync_events`
@@ -133,8 +142,14 @@ Core fields:
 - `fenced_ranges_low`
 - `fenced_ranges_medium`
 - `fenced_ranges_high`
-- `unrecovered_fences`
+- `unrecovered_fences` — compatibility alias for unrecovered real data-quality fences
+- `bootstrap_fences` — normal startup/bootstrap fences
+- `shutdown_fences` — graceful end-of-run websocket close fences
+- `reconnect_fences` — live stream boundary fences requiring a new session/bootstrap
+- `real_desync_fences` — continuity/desync/snapshot-quality fences
+- `unrecovered_real_fences` — unrecovered `real_desync_fences`
 - `gap_warning_counts`
+- `top_real_gap_offenders` — top symbols by depth-update gap, never by informational trade gap
 - `per_symbol_fenced_ranges`
 - `per_symbol_gap_diagnostics`
 - `data_presence`
@@ -176,7 +191,14 @@ Core fields:
 - `fenced_ranges_medium`
 - `fenced_ranges_high`
 - `unrecovered_fences`
-- `examples`: Up to 3 sample fenced ranges with session/time/reason metadata
+- `bootstrap_fences`
+- `shutdown_fences`
+- `reconnect_fences`
+- `real_desync_fences`
+- `unrecovered_real_fences`
+- `examples`: Up to 3 sample fenced ranges with session/time/reason/classification metadata
+- `lifecycle_examples`: Bootstrap and graceful shutdown examples
+- `real_examples`: Reconnect and real desync examples
 
 `per_symbol_gap_diagnostics` maps `"VENUE/SYMBOL"` to:
 
@@ -189,6 +211,17 @@ Core fields:
 - `session_boundary_gap_count`
 - `shutdown_boundary_gap_count`
 - `reconnect_boundary_gap_count`
+
+`per_symbol_trade` maps `"VENUE/SYMBOL"` to trade conversion counts:
+
+- `raw_record_count`
+- `raw_trade_record_count`
+- `raw_lifecycle_record_count`
+- `ticks_written`
+- `zero_size_trade_skipped`
+- `first_trade_ts_ns`
+- `last_trade_ts_ns`
+- `will_create_tradetick`
 
 `ts_ranges` is the authoritative indication of actual temporal coverage.
 

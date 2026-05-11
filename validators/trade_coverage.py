@@ -118,6 +118,19 @@ def classify_symbol_readiness(*, has_trade_ticks: bool, has_depth: bool) -> str:
     return "not_ready"
 
 
+def _readiness_warnings(depth_info: Dict[str, int]) -> List[str]:
+    warnings: List[str] = []
+    if int(depth_info.get("unrecovered_real_fences", 0)) > 0:
+        warnings.append("unrecovered_real_fence")
+    if int(depth_info.get("real_desync_fences", 0)) > 0:
+        warnings.append("real_desync_fence")
+    if int(depth_info.get("reconnect_fences", 0)) > 0:
+        warnings.append("reconnect_fence")
+    if int(depth_info.get("depth_gap_count_over_60s", 0)) > 0:
+        warnings.append("depth_gap_over_60s")
+    return warnings
+
+
 def build_readiness_summary(
     per_symbol_trade: Dict[str, Dict[str, int]],
     per_symbol_depth: Dict[str, Dict[str, int]],
@@ -142,6 +155,7 @@ def build_readiness_summary(
             },
             "suggested_full_ready_symbols": [],
             "lifecycle_only_symbols": [],
+            "symbols_with_readiness_warnings": [],
         }
     )
 
@@ -163,6 +177,7 @@ def build_readiness_summary(
         lifecycle_only = (
             trade_raw_trade_record_count == 0 and trade_raw_lifecycle_record_count > 0
         )
+        readiness_warnings = _readiness_warnings(depth_info)
         eligible_full_ready = (
             readiness == "full_ready"
             and trade_raw_trade_record_count >= min_trade_records_for_full_ready
@@ -172,6 +187,8 @@ def build_readiness_summary(
         by_venue[venue]["counts"][readiness] += 1
         if lifecycle_only:
             by_venue[venue]["lifecycle_only_symbols"].append(symbol)
+        if readiness_warnings:
+            by_venue[venue]["symbols_with_readiness_warnings"].append(symbol)
         if eligible_full_ready:
             suggested_full_ready_by_venue[venue].append(symbol)
 
@@ -181,6 +198,15 @@ def build_readiness_summary(
             "has_depth": has_depth,
             "lifecycle_only": lifecycle_only,
             "eligible_for_full_ready_universe": eligible_full_ready,
+            "readiness_warnings": readiness_warnings,
+            "has_readiness_warning": bool(readiness_warnings),
+            "bootstrap_fences": int(depth_info.get("bootstrap_fences", 0)),
+            "shutdown_fences": int(depth_info.get("shutdown_fences", 0)),
+            "reconnect_fences": int(depth_info.get("reconnect_fences", 0)),
+            "real_desync_fences": int(depth_info.get("real_desync_fences", 0)),
+            "unrecovered_real_fences": int(depth_info.get("unrecovered_real_fences", 0)),
+            "depth_gap_count_over_60s": int(depth_info.get("depth_gap_count_over_60s", 0)),
+            "max_depth_update_gap_sec": depth_info.get("max_depth_update_gap_sec", 0.0),
         }
 
     for venue in by_venue:
@@ -188,12 +214,20 @@ def build_readiness_summary(
             suggested_full_ready_by_venue.get(venue, [])
         )
         by_venue[venue]["lifecycle_only_symbols"] = sorted(by_venue[venue]["lifecycle_only_symbols"])
+        by_venue[venue]["symbols_with_readiness_warnings"] = sorted(
+            by_venue[venue]["symbols_with_readiness_warnings"]
+        )
 
     return {
         "min_trade_records_for_full_ready": min_trade_records_for_full_ready,
         "counts": readiness_counts,
         "per_symbol": per_symbol,
         "by_venue": dict(by_venue),
+        "symbols_with_readiness_warnings": sorted(
+            key
+            for key, info in per_symbol.items()
+            if info["has_readiness_warning"]
+        ),
         "suggested_full_ready_universe": {
             venue: sorted(symbols)
             for venue, symbols in suggested_full_ready_by_venue.items()

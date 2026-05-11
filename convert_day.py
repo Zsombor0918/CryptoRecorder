@@ -25,7 +25,7 @@ import shutil
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from nautilus_trader.model.instruments import CryptoPerpetual
 from nautilus_trader.persistence.catalog import ParquetDataCatalog
@@ -66,7 +66,6 @@ DERIVED_DEPTH_CAP_WARNING: str = (
     "Nautilus catalog supports OrderBookDepth10 only; full depth is available "
     "via OrderBookDeltas."
 )
-
 
 # ===================================================================
 # Main conversion logic
@@ -248,6 +247,12 @@ def convert_date(
     total_depth10 = 0
     total_derived_depth_snapshots = 0
     total_bad = 0
+    bad_lines_by_exception_type: Dict[str, int] = {}
+    bad_lines_by_record_type: Dict[str, int] = {}
+    bad_lines_by_venue_symbol: Dict[str, int] = {}
+    bad_line_examples: List[Dict[str, Any]] = []
+    zero_size_trade_skipped_by_venue_symbol: Dict[str, int] = {}
+    zero_size_trade_examples: List[Dict[str, Any]] = []
     total_snapshot_seeds = 0
     total_resyncs = 0
     total_desyncs = 0
@@ -256,12 +261,18 @@ def convert_date(
     total_fenced_ranges_medium = 0
     total_fenced_ranges_high = 0
     total_unrecovered_fences = 0
+    total_bootstrap_fences = 0
+    total_shutdown_fences = 0
+    total_reconnect_fences = 0
+    total_real_desync_fences = 0
+    total_unrecovered_real_fences = 0
     total_depth_gap_warnings_over_60s = 0
     venue_reports: Dict[str, dict] = {}
     per_symbol_fenced_ranges: Dict[str, Dict[str, object]] = {}
     per_symbol_trade: Dict[str, Dict[str, int]] = {}
     per_symbol_depth: Dict[str, Dict[str, int]] = {}
     per_symbol_gap_diagnostics: Dict[str, Dict[str, object]] = {}
+    top_real_gap_candidates: List[Dict[str, object]] = []
     ts_ranges: Dict[str, Dict[str, Optional[int]]] = {
         "trade": {"start_ns": None, "end_ns": None},
         "order_book_deltas": {"start_ns": None, "end_ns": None},
@@ -298,9 +309,15 @@ def convert_date(
         v_fenced_ranges_medium = 0
         v_fenced_ranges_high = 0
         v_unrecovered_fences = 0
+        v_bootstrap_fences = 0
+        v_shutdown_fences = 0
+        v_reconnect_fences = 0
+        v_real_desync_fences = 0
+        v_unrecovered_real_fences = 0
         v_depth_gap_warnings_over_60s = 0
         v_symbols: List[str] = []
         v_top_symbols_by_trade_count: List[Tuple[str, int]] = []
+        v_top_real_gap_candidates: List[Dict[str, object]] = []
 
         for symbol in sorted(symbols):
             key = (venue, symbol)
@@ -320,6 +337,32 @@ def convert_date(
                 sp,
             )
             total_bad += bad_t
+
+            # Aggregate bad_lines tracking data from trades
+            sym_key = f"{venue}/{symbol}"
+            if bad_t > 0:
+                bad_lines_by_venue_symbol[sym_key] = (
+                    bad_lines_by_venue_symbol.get(sym_key, 0) + bad_t
+                )
+            for exc_type, count in trade_diag.get(
+                "bad_lines_by_exception_type", {}
+            ).items():
+                bad_lines_by_exception_type[exc_type] = (
+                    bad_lines_by_exception_type.get(exc_type, 0) + count
+                )
+            for rec_type, count in trade_diag.get("bad_lines_by_record_type", {}).items():
+                bad_lines_by_record_type[rec_type] = (
+                    bad_lines_by_record_type.get(rec_type, 0) + count
+                )
+            bad_line_examples.extend(trade_diag.get("bad_line_examples", []))
+            zero_size_skipped = int(trade_diag.get("zero_size_trade_skipped", 0))
+            if zero_size_skipped > 0:
+                zero_size_trade_skipped_by_venue_symbol[sym_key] = (
+                    zero_size_trade_skipped_by_venue_symbol.get(sym_key, 0)
+                    + zero_size_skipped
+                )
+            zero_size_trade_examples.extend(trade_diag.get("zero_size_trade_examples", []))
+
             v_trade_raw_records += int(trade_diag.get("raw_record_count", 0))
             v_trade_raw_trade_records += int(trade_diag.get("raw_trade_record_count", 0))
             v_trade_raw_lifecycle_records += int(trade_diag.get("raw_lifecycle_record_count", 0))
@@ -347,6 +390,7 @@ def convert_date(
                 "raw_trade_record_count": int(trade_diag.get("raw_trade_record_count", 0)),
                 "raw_lifecycle_record_count": int(trade_diag.get("raw_lifecycle_record_count", 0)),
                 "ticks_written": int(trade_diag.get("ticks_written", 0)),
+                "zero_size_trade_skipped": zero_size_skipped,
                 "first_trade_ts_ns": t_first,
                 "last_trade_ts_ns": t_last,
                 "will_create_tradetick": sym_has_trade_ticks,
@@ -373,6 +417,24 @@ def convert_date(
                 derived_depth_snapshot_levels=requested_depth_snapshot_levels,
             )
             total_bad += depth_metrics.bad_lines
+
+            # Aggregate bad_lines tracking data from depth
+            if depth_metrics.bad_lines > 0:
+                sym_key = f"{venue}/{symbol}"
+                bad_lines_by_venue_symbol[sym_key] = (
+                    bad_lines_by_venue_symbol.get(sym_key, 0)
+                    + depth_metrics.bad_lines
+                )
+            for exc_type, count in depth_metrics.bad_lines_by_exception_type.items():
+                bad_lines_by_exception_type[exc_type] = (
+                    bad_lines_by_exception_type.get(exc_type, 0) + count
+                )
+            for rec_type, count in depth_metrics.bad_lines_by_record_type.items():
+                bad_lines_by_record_type[rec_type] = (
+                    bad_lines_by_record_type.get(rec_type, 0) + count
+                )
+            bad_line_examples.extend(depth_metrics.bad_line_examples)
+
             v_delta_events += len(deltas)
             v_depth10 += len(depth10s)
             v_derived_depth_snapshots += depth_metrics.derived_depth_snapshots_written
@@ -385,9 +447,18 @@ def convert_date(
             v_fenced_ranges_medium += fence_summary["fenced_ranges_medium"]
             v_fenced_ranges_high += fence_summary["fenced_ranges_high"]
             v_unrecovered_fences += fence_summary["unrecovered_fences"]
+            v_bootstrap_fences += fence_summary["bootstrap_fences"]
+            v_shutdown_fences += fence_summary["shutdown_fences"]
+            v_reconnect_fences += fence_summary["reconnect_fences"]
+            v_real_desync_fences += fence_summary["real_desync_fences"]
+            v_unrecovered_real_fences += fence_summary["unrecovered_real_fences"]
             gap_diag = _build_gap_diagnostics(venue, symbol, date_str, depth10s)
             v_depth_gap_warnings_over_60s += int(gap_diag["depth_gap_count_over_60s"])
             per_symbol_gap_diagnostics[f"{venue}/{symbol}"] = gap_diag
+            gap_offender = _real_gap_offender_entry(f"{venue}/{symbol}", gap_diag)
+            if gap_offender is not None:
+                top_real_gap_candidates.append(gap_offender)
+                v_top_real_gap_candidates.append(gap_offender)
             sym_has_depth = len(deltas) > 0 or len(depth10s) > 0
             per_symbol_depth[f"{venue}/{symbol}"] = {
                 "raw_record_count": depth_metrics.raw_record_count,
@@ -410,12 +481,24 @@ def convert_date(
                 "first_depth_ts_ns": depth_metrics.first_ts_ns,
                 "last_depth_ts_ns": depth_metrics.last_ts_ns,
                 "will_create_l2": len(deltas) > 0,
+                "bad_lines": depth_metrics.bad_lines,
             }
             if depth_metrics.fenced_ranges:
+                annotated_fences = _annotated_fence_examples(depth_metrics.fenced_ranges)
                 per_symbol_fenced_ranges[f"{venue}/{symbol}"] = {
                     "fenced_ranges": len(depth_metrics.fenced_ranges),
                     **fence_summary,
-                    "examples": depth_metrics.fenced_ranges[:3],
+                    "examples": annotated_fences[:3],
+                    "lifecycle_examples": [
+                        fence
+                        for fence in annotated_fences
+                        if fence["classification"] in {"bootstrap", "shutdown"}
+                    ][:3],
+                    "real_examples": [
+                        fence
+                        for fence in annotated_fences
+                        if fence["classification"] in {"reconnect", "real_desync"}
+                    ][:3],
                 }
             if deltas:
                 deltas.sort(key=lambda d: d.ts_init)
@@ -459,6 +542,11 @@ def convert_date(
         total_fenced_ranges_medium += v_fenced_ranges_medium
         total_fenced_ranges_high += v_fenced_ranges_high
         total_unrecovered_fences += v_unrecovered_fences
+        total_bootstrap_fences += v_bootstrap_fences
+        total_shutdown_fences += v_shutdown_fences
+        total_reconnect_fences += v_reconnect_fences
+        total_real_desync_fences += v_real_desync_fences
+        total_unrecovered_real_fences += v_unrecovered_real_fences
         total_depth_gap_warnings_over_60s += v_depth_gap_warnings_over_60s
         symbols_processed[venue] = v_symbols
         venue_reports[venue] = {
@@ -490,7 +578,13 @@ def convert_date(
             "fenced_ranges_medium": v_fenced_ranges_medium,
             "fenced_ranges_high": v_fenced_ranges_high,
             "unrecovered_fences": v_unrecovered_fences,
+            "bootstrap_fences": v_bootstrap_fences,
+            "shutdown_fences": v_shutdown_fences,
+            "reconnect_fences": v_reconnect_fences,
+            "real_desync_fences": v_real_desync_fences,
+            "unrecovered_real_fences": v_unrecovered_real_fences,
             "depth_gap_warnings_over_60s": v_depth_gap_warnings_over_60s,
+            "top_real_gap_offenders": _top_real_gap_offenders(v_top_real_gap_candidates),
         }
 
     # ── staging → atomic rename ───────────────────────────────────────
@@ -616,11 +710,18 @@ def convert_date(
     gap_warning_counts = {
         "depth_gap_count_over_60s": total_depth_gap_warnings_over_60s,
     }
+    top_real_gap_offenders = _top_real_gap_offenders(top_real_gap_candidates)
+    gap_warning_counts["top_real_gap_offenders"] = top_real_gap_offenders
     fence_severity_counts = {
         "fenced_ranges_low": total_fenced_ranges_low,
         "fenced_ranges_medium": total_fenced_ranges_medium,
         "fenced_ranges_high": total_fenced_ranges_high,
         "unrecovered_fences": total_unrecovered_fences,
+        "bootstrap_fences": total_bootstrap_fences,
+        "shutdown_fences": total_shutdown_fences,
+        "reconnect_fences": total_reconnect_fences,
+        "real_desync_fences": total_real_desync_fences,
+        "unrecovered_real_fences": total_unrecovered_real_fences,
     }
     report = {
         "date": date_str,
@@ -639,12 +740,22 @@ def convert_date(
             derived_snapshot_warning,
         ),
         "bad_lines": total_bad,
+        "bad_lines_by_exception_type": bad_lines_by_exception_type,
+        "bad_lines_by_record_type": bad_lines_by_record_type,
+        "bad_lines_by_venue_symbol": bad_lines_by_venue_symbol,
+        "bad_line_examples": bad_line_examples[:20],  # Keep first 20 examples
+        "zero_size_trade_skipped_total": sum(
+            zero_size_trade_skipped_by_venue_symbol.values()
+        ),
+        "zero_size_trade_skipped_by_venue_symbol": zero_size_trade_skipped_by_venue_symbol,
+        "zero_size_trade_examples": zero_size_trade_examples[:20],
         "snapshot_seed_count": total_snapshot_seeds,
         "resync_count": total_resyncs,
         "desync_events": total_desyncs,
         "fenced_ranges_total": total_fenced_ranges,
         **fence_severity_counts,
         "gap_warning_counts": gap_warning_counts,
+        "top_real_gap_offenders": top_real_gap_offenders,
         "per_symbol_fenced_ranges": per_symbol_fenced_ranges,
         "per_symbol_gap_diagnostics": per_symbol_gap_diagnostics,
         "per_symbol_trade": per_symbol_trade,
@@ -769,9 +880,7 @@ def _build_gap_diagnostics(
 ) -> Dict[str, object]:
     depth_timestamps: List[int] = []
     trade_timestamps: List[int] = []
-    session_boundary_gap_count = 0
-    shutdown_boundary_gap_count = 0
-    reconnect_boundary_gap_count = 0
+    lifecycle_boundaries: List[Dict[str, object]] = []
 
     for rec in stream_raw_records(venue, symbol, "depth_v2", date_str):
         record_type = rec.get("record_type", "depth_update")
@@ -780,13 +889,7 @@ def _build_gap_diagnostics(
             if ts_ns is not None:
                 depth_timestamps.append(ts_ns)
         elif record_type == "stream_lifecycle":
-            session_boundary_gap_count += 1
-            reason = str(rec.get("reason", ""))
-            event = rec.get("event")
-            if event == "session_end" and reason == "websocket_closed":
-                shutdown_boundary_gap_count += 1
-            elif "reconnect" in reason or reason == "websocket_closed":
-                reconnect_boundary_gap_count += 1
+            lifecycle_boundaries.append(rec)
 
     for rec in stream_raw_records(venue, symbol, "trade_v2", date_str):
         if rec.get("record_type", "trade") == "trade":
@@ -797,6 +900,7 @@ def _build_gap_diagnostics(
     depth_gaps = _gap_counts(depth_timestamps)
     trade_gaps = _gap_counts(trade_timestamps)
     depth10_gaps = _gap_counts([int(d.ts_event) for d in depth10s])
+    boundary_counts = _classify_lifecycle_boundaries(lifecycle_boundaries)
     return {
         "max_depth_update_gap_sec": depth_gaps["max_gap_sec"],
         "depth_gap_count_over_1s": depth_gaps["gap_count_over_1s"],
@@ -805,7 +909,43 @@ def _build_gap_diagnostics(
         "max_trade_gap_sec": trade_gaps["max_gap_sec"],
         "trade_gap_informational": True,
         "max_depth10_gap_sec": depth10_gaps["max_gap_sec"],
-        "session_boundary_gap_count": session_boundary_gap_count,
+        **boundary_counts,
+    }
+
+
+def _classify_lifecycle_boundaries(boundaries: List[Dict[str, object]]) -> Dict[str, int]:
+    shutdown_boundary_gap_count = 0
+    reconnect_boundary_gap_count = 0
+    seen_session_start = False
+
+    for index, rec in enumerate(boundaries):
+        reason = str(rec.get("reason", "")).lower()
+        event = rec.get("event")
+        if event == "session_start":
+            session_id = rec.get("stream_session_id")
+            try:
+                session_number = int(session_id) if session_id is not None else None
+            except (TypeError, ValueError):
+                session_number = None
+            if seen_session_start or (session_number is not None and session_number > 1):
+                reconnect_boundary_gap_count += 1
+            seen_session_start = True
+            continue
+
+        if event != "session_end":
+            continue
+
+        later_restart = any(
+            later.get("event") == "session_start"
+            for later in boundaries[index + 1 :]
+        )
+        if "websocket_closed" in reason and not later_restart:
+            shutdown_boundary_gap_count += 1
+        elif "reconnect" in reason and not later_restart:
+            reconnect_boundary_gap_count += 1
+
+    return {
+        "session_boundary_gap_count": len(boundaries),
         "shutdown_boundary_gap_count": shutdown_boundary_gap_count,
         "reconnect_boundary_gap_count": reconnect_boundary_gap_count,
     }
@@ -830,12 +970,41 @@ def _normalize_fence_reason(reason: object) -> str:
     return "unknown"
 
 
+def _fence_time_increased(fence: Dict[str, object]) -> bool:
+    try:
+        start = int(fence.get("start_ts_ns") or 0)
+        end = int(fence.get("end_ts_ns") or 0)
+    except (TypeError, ValueError):
+        return False
+    return end > start
+
+
+def _fence_category(fence: Dict[str, object]) -> str:
+    reason = _normalize_fence_reason(fence.get("reason"))
+    if reason == "bootstrap":
+        return "bootstrap"
+    if reason == "shutdown":
+        return "shutdown"
+    if reason == "websocket_closed":
+        if (
+            fence.get("closed_by_session_change")
+            or bool(fence.get("recovered"))
+            or _fence_time_increased(fence)
+        ):
+            return "reconnect"
+        return "shutdown"
+    if "reconnect" in str(fence.get("reason", "")).lower():
+        return "reconnect"
+    return "real_desync"
+
+
 def _fence_severity(fence: Dict[str, object]) -> str:
+    category = _fence_category(fence)
     reason = _normalize_fence_reason(fence.get("reason"))
     recovered = bool(fence.get("recovered"))
-    if reason in {"bootstrap", "shutdown"}:
+    if category in {"bootstrap", "shutdown"}:
         return "low"
-    if reason == "websocket_closed":
+    if category == "reconnect":
         return "medium" if recovered else "low"
     if recovered and reason in {"continuity_break", "desynced", "rate_limit_resync"}:
         return "medium"
@@ -850,13 +1019,70 @@ def _summarize_fences(fences: List[Dict[str, object]]) -> Dict[str, int]:
         "fenced_ranges_medium": 0,
         "fenced_ranges_high": 0,
         "unrecovered_fences": 0,
+        "bootstrap_fences": 0,
+        "shutdown_fences": 0,
+        "reconnect_fences": 0,
+        "real_desync_fences": 0,
+        "unrecovered_real_fences": 0,
     }
     for fence in fences:
         severity = _fence_severity(fence)
+        category = _fence_category(fence)
         summary[f"fenced_ranges_{severity}"] += 1
-        if not bool(fence.get("recovered")):
-            summary["unrecovered_fences"] += 1
+        summary[f"{category}_fences"] += 1
+        if category == "real_desync" and not bool(fence.get("recovered")):
+            summary["unrecovered_real_fences"] += 1
+
+    # Compatibility: readiness/audit consumers should treat this as a real
+    # data-quality count, not as normal end-of-run lifecycle accounting.
+    summary["unrecovered_fences"] = summary["unrecovered_real_fences"]
     return summary
+
+
+def _annotated_fence_examples(
+    fences: List[Dict[str, object]],
+) -> List[Dict[str, object]]:
+    annotated: List[Dict[str, object]] = []
+    for fence in fences:
+        item = dict(fence)
+        item["classification"] = _fence_category(fence)
+        annotated.append(item)
+    return annotated
+
+
+def _real_gap_offender_entry(
+    key: str,
+    gap_diag: Dict[str, object],
+) -> Optional[Dict[str, object]]:
+    max_depth_gap = float(gap_diag.get("max_depth_update_gap_sec") or 0.0)
+    depth_gaps_over_1s = int(gap_diag.get("depth_gap_count_over_1s") or 0)
+    if max_depth_gap <= 1.0 and depth_gaps_over_1s <= 0:
+        return None
+    return {
+        "symbol": key,
+        "max_depth_update_gap_sec": max_depth_gap,
+        "depth_gap_count_over_1s": depth_gaps_over_1s,
+        "depth_gap_count_over_5s": int(gap_diag.get("depth_gap_count_over_5s") or 0),
+        "depth_gap_count_over_60s": int(gap_diag.get("depth_gap_count_over_60s") or 0),
+        "max_depth10_gap_sec": float(gap_diag.get("max_depth10_gap_sec") or 0.0),
+    }
+
+
+def _top_real_gap_offenders(
+    candidates: List[Dict[str, object]],
+    *,
+    limit: int = 10,
+) -> List[Dict[str, object]]:
+    return sorted(
+        candidates,
+        key=lambda item: (
+            -int(item.get("depth_gap_count_over_60s") or 0),
+            -float(item.get("max_depth_update_gap_sec") or 0.0),
+            -int(item.get("depth_gap_count_over_5s") or 0),
+            -int(item.get("depth_gap_count_over_1s") or 0),
+            str(item.get("symbol") or ""),
+        ),
+    )[:limit]
 
 
 def _symbols_with_raw_record_type(
