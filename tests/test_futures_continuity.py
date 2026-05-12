@@ -24,6 +24,7 @@ from phase2_depth import (
     SYNC_DESYNCED,
     SYNC_RESYNC_REQUIRED,
     SYNC_FENCED,
+    UTC_DAY_ROLLOVER_REASON,
 )
 
 
@@ -751,6 +752,90 @@ class TestBootstrapAccounting:
         state.snapshot_seed_count = 5  # 3 + 2
 
         assert state.snapshot_seed_count == state.bootstrap_attempt_count + state.resync_count
+
+    @pytest.mark.asyncio
+    async def test_utc_rollover_snapshot_does_not_count_as_real_resync(
+        self, monkeypatch
+    ) -> None:
+        recorder = _stub_recorder()
+        state = self._make_state()
+        state.stream_session_id = 1
+        state.sync_state = SYNC_LIVE_SYNCED
+        state.prev_update_id = 100
+        state.last_update_id = 100
+        state.pending_updates = [
+            {
+                "stream_session_id": 1,
+                "ws_arrival_seq": 1,
+                "record_type": "depth_update",
+                "U": 101,
+                "u": 101,
+                "pu": 100,
+                "payload": {"bids": [["100.0", "2.0"]], "asks": []},
+            }
+        ]
+        monkeypatch.setattr(phase2_depth_mod, "_utc_date_from_ns", lambda ns: "2026-05-12")
+
+        from unittest.mock import AsyncMock, MagicMock
+
+        mock_resp = AsyncMock()
+        mock_resp.status = 200
+        mock_resp.json = AsyncMock(
+            return_value={
+                "lastUpdateId": 100,
+                "bids": [["99.0", "1.0"]],
+                "asks": [["101.0", "1.0"]],
+            }
+        )
+        mock_session = MagicMock()
+        mock_session.get = MagicMock(
+            return_value=AsyncMock(
+                __aenter__=AsyncMock(return_value=mock_resp),
+                __aexit__=AsyncMock(return_value=False),
+            )
+        )
+        recorder._session = mock_session
+
+        await recorder._snapshot_seed_task(state, reason=UTC_DAY_ROLLOVER_REASON)
+
+        assert state.resync_count == 0
+        assert state.desync_events == 0
+        assert state.daily_rollover_snapshot_seed_count == 1
+        assert state.last_rollover_seed_date == "2026-05-12"
+        written = [call.args[3] for call in recorder.storage_manager.write_record.await_args_list]
+        assert any(
+            rec.get("record_type") == "sync_state"
+            and rec.get("reason") == UTC_DAY_ROLLOVER_REASON
+            for rec in written
+        )
+        assert any(
+            rec.get("record_type") == "snapshot_seed"
+            and rec.get("sync_reason") == UTC_DAY_ROLLOVER_REASON
+            for rec in written
+        )
+
+    def test_utc_rollover_seed_trigger_is_idempotent_for_date(self) -> None:
+        recorder = _stub_recorder()
+        state = self._make_state()
+        state.sync_state = SYNC_LIVE_SYNCED
+        state.prev_update_id = 100
+        state.last_update_id = 100
+        state.last_snapshot_seed_date = "2026-05-11"
+        state.last_rollover_seed_date = "2026-05-12"
+
+        calls = []
+
+        def fake_ensure(*args, **kwargs):
+            calls.append(kwargs.get("reason"))
+
+        recorder._ensure_snapshot_task = fake_ensure  # type: ignore[method-assign]
+
+        started = recorder._maybe_start_utc_rollover_seed(
+            state, 1778544000000000000
+        )
+
+        assert started is False
+        assert calls == []
 
 
 # ======================================================================

@@ -5,11 +5,17 @@ sort key instead of connection_seq / file_position.
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Iterable
 
 from nautilus_trader.model.identifiers import InstrumentId
 
 import converter.depth_phase2 as depth_mod
+
+
+def _epoch_ns(date_str: str, offset_ns: int = 0) -> int:
+    base = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    return int(base.timestamp() * 1_000_000_000) + offset_ns
 
 
 # ── record builders ───────────────────────────────────────────────────
@@ -144,6 +150,139 @@ def test_spot_replay_bootstrap_and_committed_ordering() -> None:
     assert metrics.snapshot_seed_count == 1
     assert metrics.delta_events_written == 3
     assert [obj.sequence for obj in deltas] == [100, 102, 103]
+
+
+def test_previous_day_carry_and_timestamp_repartition_emit_standalone_depth() -> None:
+    iid = InstrumentId.from_str("BTCUSDT.BINANCE")
+    original = depth_mod.stream_raw_records
+    target = "2026-05-12"
+    prev = "2026-05-11"
+    start_ns = _epoch_ns(target)
+    records_by_date = {
+        prev: [
+            _snapshot_seed(
+                session=1,
+                session_seq=1,
+                ts_recv_ns=start_ns - 2_000_000_000,
+                last_update_id=100,
+                bids=[["99.0", "1.0"]],
+                asks=[["101.0", "1.0"]],
+            ),
+            _depth_update(
+                session=1,
+                session_seq=2,
+                ts_recv_ns=start_ns - 1_000_000_000,
+                U=101,
+                u=101,
+                bids=[["99.0", "1.5"]],
+            ),
+            _depth_update(
+                session=1,
+                session_seq=3,
+                ts_recv_ns=start_ns + 100_000_000,
+                U=102,
+                u=102,
+                asks=[["101.0", "0.8"]],
+            ),
+        ],
+        target: [
+            _depth_update(
+                session=1,
+                session_seq=0,
+                ts_recv_ns=start_ns - 500_000_000,
+                U=99,
+                u=99,
+                bids=[["98.0", "1.0"]],
+            ),
+            _depth_update(
+                session=1,
+                session_seq=3,
+                ts_recv_ns=start_ns + 100_000_000,
+                U=102,
+                u=102,
+                asks=[["101.0", "0.8"]],
+            ),
+            _depth_update(
+                session=1,
+                session_seq=4,
+                ts_recv_ns=start_ns + 1_100_000_000,
+                U=103,
+                u=103,
+                bids=[["100.0", "2.0"]],
+            ),
+        ],
+    }
+
+    try:
+        def _fake(venue, symbol, channel, date_str) -> Iterable[dict]:
+            return iter(records_by_date.get(date_str, []))
+
+        depth_mod.stream_raw_records = _fake
+        deltas, depth10s, metrics = depth_mod.convert_depth_v2(
+            "BINANCE_SPOT",
+            "BTCUSDT",
+            target,
+            iid,
+            1,
+            1,
+            emit_depth10=True,
+            depth10_interval_sec=0.0,
+        )
+    finally:
+        depth_mod.stream_raw_records = original
+
+    assert metrics.snapshot_seed_count == 0
+    assert metrics.carried_seed_from_previous_day is True
+    assert metrics.carried_seed_date == prev
+    assert metrics.synthetic_opening_snapshot_written is True
+    assert metrics.records_imported_from_previous_folder == 1
+    assert metrics.records_dropped_outside_target_utc >= 1
+    assert metrics.duplicate_records_suppressed == 1
+    assert [obj.sequence for obj in deltas] == [101, 102, 103]
+    assert len(depth10s) == 3
+    assert metrics.desync_events == 0
+
+
+def test_updates_only_without_previous_seed_refuses_safely() -> None:
+    iid = InstrumentId.from_str("BTCUSDT.BINANCE")
+    original = depth_mod.stream_raw_records
+    target = "2026-05-12"
+    start_ns = _epoch_ns(target)
+
+    try:
+        def _fake(venue, symbol, channel, date_str) -> Iterable[dict]:
+            if date_str != target:
+                return iter(())
+            return iter([
+                _depth_update(
+                    session=1,
+                    session_seq=1,
+                    ts_recv_ns=start_ns + 1_000_000,
+                    U=101,
+                    u=101,
+                    bids=[["100.0", "1.0"]],
+                )
+            ])
+
+        depth_mod.stream_raw_records = _fake
+        deltas, depth10s, metrics = depth_mod.convert_depth_v2(
+            "BINANCE_SPOT",
+            "BTCUSDT",
+            target,
+            iid,
+            1,
+            1,
+            emit_depth10=True,
+            depth10_interval_sec=0.0,
+        )
+    finally:
+        depth_mod.stream_raw_records = original
+
+    assert deltas == []
+    assert depth10s == []
+    assert metrics.carried_seed_from_previous_day is False
+    assert metrics.carry_recovery_failed_reason == "no_previous_snapshot_seed"
+    assert metrics.fenced_ranges[0]["reason"] == "no_snapshot_seed"
 
 
 def test_session_seq_only_committed_records_no_gaps() -> None:

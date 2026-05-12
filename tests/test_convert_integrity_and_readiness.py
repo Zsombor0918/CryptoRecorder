@@ -293,6 +293,54 @@ class TestPerSymbolDepthDiagnostics:
         assert entry["first_depth_ts_ns"] == 1_000_000_000
         assert entry["last_depth_ts_ns"] == 2_000_000_000
 
+    def test_carried_depth_day_is_reported_standalone(
+        self, monkeypatch, tmp_path: Path
+    ):
+        instrument = TestInstrumentProvider.btcusdt_binance()
+        batch = _snapshot_deltas_batch(instrument)
+        metrics = _make_dep_metrics(
+            raw_record_count=2,
+            depth_update_record_count=2,
+            snapshot_seed_count=0,
+            deltas=2,
+            first_ts_ns=1_000_000_000,
+            last_ts_ns=2_000_000_000,
+        )
+        metrics.carried_seed_from_previous_day = True
+        metrics.carried_seed_date = "2026-04-20"
+        metrics.carried_seed_session_id = 1
+        metrics.carried_seed_last_update_id = 100
+        metrics.synthetic_opening_snapshot_written = True
+
+        monkeypatch.setattr(convert_day_mod, "resolve_universe",
+                            lambda ds: {"BINANCE_SPOT": ["BTCUSDT"]})
+        monkeypatch.setattr(convert_day_mod, "load_exchange_info", lambda v, ds: {})
+        monkeypatch.setattr(convert_day_mod, "build_instruments",
+                            lambda v, s, e: [instrument])
+        monkeypatch.setattr(
+            convert_day_mod,
+            "convert_trades_with_diagnostics",
+            lambda *a, **kw: ([], 0, None, None, _no_ticks_diag()),
+        )
+        monkeypatch.setattr(
+            convert_day_mod,
+            "convert_depth_v2",
+            lambda *a, **kw: ([batch, batch], [], metrics),
+        )
+        monkeypatch.setattr(
+            convert_day_mod,
+            "_symbols_with_raw_record_type",
+            lambda *a, **kw: {"BINANCE_SPOT/BTCUSDT"},
+        )
+
+        report = convert_day_mod.convert_date(
+            datetime(2026, 4, 21), catalog_root=tmp_path / "cat", emit_depth10=False,
+        )
+        entry = report["per_symbol_depth"]["BINANCE_SPOT/BTCUSDT"]
+        assert report["standalone_depth_day"] is True
+        assert entry["carried_seed_from_previous_day"] is True
+        assert entry["synthetic_opening_snapshot_written"] is True
+
     def test_depth_symbol_without_deltas_will_create_l2_false(
         self, monkeypatch, tmp_path: Path
     ):

@@ -68,6 +68,9 @@ class SymbolStats:
         self.bootstrap_stale_drop_count: int = 0
         self.promote_zero_accepted_count: int = 0
         self.depth_live_synced_ever: bool = False
+        self.daily_rollover_snapshot_seed_count: int = 0
+        self.utc_day_rollover_fences: int = 0
+        self.last_rollover_seed_date: str | None = None
 
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization."""
@@ -118,6 +121,9 @@ class SymbolStats:
             'bootstrap_stale_drop_count': self.bootstrap_stale_drop_count,
             'promote_zero_accepted_count': self.promote_zero_accepted_count,
             'depth_live_synced_ever': self.depth_live_synced_ever,
+            'daily_rollover_snapshot_seed_count': self.daily_rollover_snapshot_seed_count,
+            'utc_day_rollover_fences': self.utc_day_rollover_fences,
+            'last_rollover_seed_date': self.last_rollover_seed_date,
             'last_heartbeat': timestamp_to_local_iso(self.last_heartbeat),
         }
 
@@ -203,6 +209,9 @@ class HealthMonitor:
         last_rejected_pu: int | None = None,
         bootstrap_stale_drop_count: int = 0,
         promote_zero_accepted_count: int = 0,
+        daily_rollover_snapshot_seed_count: int = 0,
+        utc_day_rollover_fences: int = 0,
+        last_rollover_seed_date: str | None = None,
     ) -> None:
         key = (venue, symbol)
         if key not in self.symbol_stats:
@@ -245,6 +254,9 @@ class HealthMonitor:
             stats.last_rejected_pu = last_rejected_pu
         stats.bootstrap_stale_drop_count = bootstrap_stale_drop_count
         stats.promote_zero_accepted_count = promote_zero_accepted_count
+        stats.daily_rollover_snapshot_seed_count = daily_rollover_snapshot_seed_count
+        stats.utc_day_rollover_fences = utc_day_rollover_fences
+        stats.last_rollover_seed_date = last_rollover_seed_date
     
     def record_gap(self, venue: str, symbol: str) -> None:
         """Record a detected gap in sequence."""
@@ -476,6 +488,10 @@ class HealthMonitor:
                 total_bootstrap_attempts = sum(s.get("bootstrap_attempt_count", 0) for s in sym_dicts)
                 total_continuity_resyncs = sum(s.get("resync_count", 0) for s in sym_dicts)
                 total_snapshots = sum(s.get("snapshot_seed_count", 0) for s in sym_dicts)
+                total_rollover_snapshots = sum(
+                    s.get("daily_rollover_snapshot_seed_count", 0) for s in sym_dicts
+                )
+                total_rollover_fences = sum(s.get("utc_day_rollover_fences", 0) for s in sym_dicts)
                 sync_health[venue_key] = {
                     "live_synced_count": live,
                     "snapshot_seeded_count": seeded,
@@ -489,6 +505,8 @@ class HealthMonitor:
                     "total_rejected_updates": total_rejected,
                     "total_bootstrap_stale_drops": total_bootstrap_stale_drops,
                     "total_promote_zero_accepted": total_promote_zero,
+                    "daily_rollover_snapshot_seed_count": total_rollover_snapshots,
+                    "utc_day_rollover_fences": total_rollover_fences,
                     "bootstrap_accounting": {
                         "total_bootstrap_attempts": total_bootstrap_attempts,
                         "total_continuity_resyncs": total_continuity_resyncs,

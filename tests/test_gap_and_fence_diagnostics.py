@@ -62,6 +62,17 @@ def test_lifecycle_boundaries_are_not_real_unrecovered_fences() -> None:
     assert summary["fenced_ranges_high"] == 0
 
 
+def test_utc_day_rollover_fence_is_lifecycle_not_real_desync() -> None:
+    summary = convert_day_mod._summarize_fences([
+        {"reason": "utc_day_rollover", "recovered": True},
+    ])
+
+    assert summary["utc_day_rollover_fences"] == 1
+    assert summary["real_desync_fences"] == 0
+    assert summary["unrecovered_real_fences"] == 0
+    assert summary["fenced_ranges_low"] == 1
+
+
 def test_reconnect_boundary_is_separate_from_shutdown() -> None:
     summary = convert_day_mod._summarize_fences([
         {

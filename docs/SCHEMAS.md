@@ -146,8 +146,19 @@ Core fields:
 - `bootstrap_fences` — normal startup/bootstrap fences
 - `shutdown_fences` — graceful end-of-run websocket close fences
 - `reconnect_fences` — live stream boundary fences requiring a new session/bootstrap
+- `utc_day_rollover_fences` — UTC rollover reseed fences, counted as lifecycle
 - `real_desync_fences` — continuity/desync/snapshot-quality fences
 - `unrecovered_real_fences` — unrecovered `real_desync_fences`
+- `standalone_depth_day` — every symbol with target-day depth updates has an in-day
+  raw seed or carry-derived synthetic opening snapshot
+- `timestamp_repartition_enabled`
+- `extra_raw_partitions_scanned` — bounded adjacent raw folders scanned (`D-1`, `D+1`)
+- `records_imported_from_previous_folder`
+- `records_imported_from_next_folder`
+- `records_dropped_outside_target_utc`
+- `duplicate_records_suppressed`
+- `carried_seed_symbol_count`
+- `synthetic_opening_snapshot_count`
 - `gap_warning_counts`
 - `top_real_gap_offenders` — top symbols by depth-update gap, never by informational trade gap
 - `per_symbol_fenced_ranges`
@@ -175,6 +186,9 @@ Core fields:
 - `resync_count`
 - `desync_events`
 - `fenced_ranges`
+- `carried_seed_symbol_count`
+- `synthetic_opening_snapshot_count`
+- `duplicate_records_suppressed`
 
 `data_presence` tracks which instruments have actual data:
 
@@ -194,11 +208,35 @@ Core fields:
 - `bootstrap_fences`
 - `shutdown_fences`
 - `reconnect_fences`
+- `utc_day_rollover_fences`
 - `real_desync_fences`
 - `unrecovered_real_fences`
 - `examples`: Up to 3 sample fenced ranges with session/time/reason/classification metadata
-- `lifecycle_examples`: Bootstrap and graceful shutdown examples
+- `lifecycle_examples`: Bootstrap, UTC rollover, and graceful shutdown examples
 - `real_examples`: Reconnect and real desync examples
+
+`per_symbol_depth` maps `"VENUE/SYMBOL"` to depth conversion counts and recovery
+diagnostics:
+
+- `raw_record_count`
+- `snapshot_seed_count` — raw exchange `snapshot_seed` records in the target UTC day
+- `depth_update_record_count`
+- `deltas_written`
+- `depth10_written`
+- `carried_seed_from_previous_day`
+- `carried_seed_date`
+- `carried_seed_session_id`
+- `carried_seed_last_update_id`
+- `carry_replay_record_count`
+- `carry_recovery_failed_reason`
+- `synthetic_opening_snapshot_written` — catalog opening snapshot derived from carry;
+  not counted in `snapshot_seed_count`
+- `timestamp_repartition_enabled`
+- `extra_raw_partitions_scanned`
+- `records_imported_from_previous_folder`
+- `records_imported_from_next_folder`
+- `records_dropped_outside_target_utc`
+- `duplicate_records_suppressed`
 
 `per_symbol_gap_diagnostics` maps `"VENUE/SYMBOL"` to:
 

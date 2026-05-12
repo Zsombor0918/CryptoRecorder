@@ -264,9 +264,18 @@ def convert_date(
     total_bootstrap_fences = 0
     total_shutdown_fences = 0
     total_reconnect_fences = 0
+    total_utc_day_rollover_fences = 0
     total_real_desync_fences = 0
     total_unrecovered_real_fences = 0
     total_depth_gap_warnings_over_60s = 0
+    standalone_depth_day = True
+    extra_raw_partitions_scanned: set[str] = set()
+    records_imported_from_previous_folder = 0
+    records_imported_from_next_folder = 0
+    records_dropped_outside_target_utc = 0
+    duplicate_records_suppressed = 0
+    carried_seed_symbol_count = 0
+    synthetic_opening_snapshot_count = 0
     venue_reports: Dict[str, dict] = {}
     per_symbol_fenced_ranges: Dict[str, Dict[str, object]] = {}
     per_symbol_trade: Dict[str, Dict[str, int]] = {}
@@ -312,9 +321,16 @@ def convert_date(
         v_bootstrap_fences = 0
         v_shutdown_fences = 0
         v_reconnect_fences = 0
+        v_utc_day_rollover_fences = 0
         v_real_desync_fences = 0
         v_unrecovered_real_fences = 0
         v_depth_gap_warnings_over_60s = 0
+        v_records_imported_from_previous_folder = 0
+        v_records_imported_from_next_folder = 0
+        v_records_dropped_outside_target_utc = 0
+        v_duplicate_records_suppressed = 0
+        v_carried_seed_symbol_count = 0
+        v_synthetic_opening_snapshot_count = 0
         v_symbols: List[str] = []
         v_top_symbols_by_trade_count: List[Tuple[str, int]] = []
         v_top_real_gap_candidates: List[Dict[str, object]] = []
@@ -442,6 +458,27 @@ def convert_date(
             v_resyncs += depth_metrics.resync_count
             v_desyncs += depth_metrics.desync_events
             v_fenced_ranges += len(depth_metrics.fenced_ranges)
+            extra_raw_partitions_scanned.update(depth_metrics.extra_raw_partitions_scanned)
+            records_imported_from_previous_folder += depth_metrics.records_imported_from_previous_folder
+            records_imported_from_next_folder += depth_metrics.records_imported_from_next_folder
+            records_dropped_outside_target_utc += depth_metrics.records_dropped_outside_target_utc
+            duplicate_records_suppressed += depth_metrics.duplicate_records_suppressed
+            v_records_imported_from_previous_folder += depth_metrics.records_imported_from_previous_folder
+            v_records_imported_from_next_folder += depth_metrics.records_imported_from_next_folder
+            v_records_dropped_outside_target_utc += depth_metrics.records_dropped_outside_target_utc
+            v_duplicate_records_suppressed += depth_metrics.duplicate_records_suppressed
+            if depth_metrics.carried_seed_from_previous_day:
+                carried_seed_symbol_count += 1
+                v_carried_seed_symbol_count += 1
+            if depth_metrics.synthetic_opening_snapshot_written:
+                synthetic_opening_snapshot_count += 1
+                v_synthetic_opening_snapshot_count += 1
+            if (
+                depth_metrics.depth_update_record_count > 0
+                and depth_metrics.snapshot_seed_count == 0
+                and not depth_metrics.carried_seed_from_previous_day
+            ):
+                standalone_depth_day = False
             fence_summary = _summarize_fences(depth_metrics.fenced_ranges)
             v_fenced_ranges_low += fence_summary["fenced_ranges_low"]
             v_fenced_ranges_medium += fence_summary["fenced_ranges_medium"]
@@ -450,6 +487,7 @@ def convert_date(
             v_bootstrap_fences += fence_summary["bootstrap_fences"]
             v_shutdown_fences += fence_summary["shutdown_fences"]
             v_reconnect_fences += fence_summary["reconnect_fences"]
+            v_utc_day_rollover_fences += fence_summary["utc_day_rollover_fences"]
             v_real_desync_fences += fence_summary["real_desync_fences"]
             v_unrecovered_real_fences += fence_summary["unrecovered_real_fences"]
             gap_diag = _build_gap_diagnostics(venue, symbol, date_str, depth10s)
@@ -482,6 +520,19 @@ def convert_date(
                 "last_depth_ts_ns": depth_metrics.last_ts_ns,
                 "will_create_l2": len(deltas) > 0,
                 "bad_lines": depth_metrics.bad_lines,
+                "carried_seed_from_previous_day": depth_metrics.carried_seed_from_previous_day,
+                "carried_seed_date": depth_metrics.carried_seed_date,
+                "carried_seed_session_id": depth_metrics.carried_seed_session_id,
+                "carried_seed_last_update_id": depth_metrics.carried_seed_last_update_id,
+                "carry_replay_record_count": depth_metrics.carry_replay_record_count,
+                "carry_recovery_failed_reason": depth_metrics.carry_recovery_failed_reason,
+                "synthetic_opening_snapshot_written": depth_metrics.synthetic_opening_snapshot_written,
+                "timestamp_repartition_enabled": depth_metrics.timestamp_repartition_enabled,
+                "extra_raw_partitions_scanned": depth_metrics.extra_raw_partitions_scanned,
+                "records_imported_from_previous_folder": depth_metrics.records_imported_from_previous_folder,
+                "records_imported_from_next_folder": depth_metrics.records_imported_from_next_folder,
+                "records_dropped_outside_target_utc": depth_metrics.records_dropped_outside_target_utc,
+                "duplicate_records_suppressed": depth_metrics.duplicate_records_suppressed,
             }
             if depth_metrics.fenced_ranges:
                 annotated_fences = _annotated_fence_examples(depth_metrics.fenced_ranges)
@@ -492,7 +543,7 @@ def convert_date(
                     "lifecycle_examples": [
                         fence
                         for fence in annotated_fences
-                        if fence["classification"] in {"bootstrap", "shutdown"}
+                        if fence["classification"] in {"bootstrap", "shutdown", "utc_day_rollover"}
                     ][:3],
                     "real_examples": [
                         fence
@@ -545,6 +596,7 @@ def convert_date(
         total_bootstrap_fences += v_bootstrap_fences
         total_shutdown_fences += v_shutdown_fences
         total_reconnect_fences += v_reconnect_fences
+        total_utc_day_rollover_fences += v_utc_day_rollover_fences
         total_real_desync_fences += v_real_desync_fences
         total_unrecovered_real_fences += v_unrecovered_real_fences
         total_depth_gap_warnings_over_60s += v_depth_gap_warnings_over_60s
@@ -581,9 +633,16 @@ def convert_date(
             "bootstrap_fences": v_bootstrap_fences,
             "shutdown_fences": v_shutdown_fences,
             "reconnect_fences": v_reconnect_fences,
+            "utc_day_rollover_fences": v_utc_day_rollover_fences,
             "real_desync_fences": v_real_desync_fences,
             "unrecovered_real_fences": v_unrecovered_real_fences,
             "depth_gap_warnings_over_60s": v_depth_gap_warnings_over_60s,
+            "records_imported_from_previous_folder": v_records_imported_from_previous_folder,
+            "records_imported_from_next_folder": v_records_imported_from_next_folder,
+            "records_dropped_outside_target_utc": v_records_dropped_outside_target_utc,
+            "duplicate_records_suppressed": v_duplicate_records_suppressed,
+            "carried_seed_symbol_count": v_carried_seed_symbol_count,
+            "synthetic_opening_snapshot_count": v_synthetic_opening_snapshot_count,
             "top_real_gap_offenders": _top_real_gap_offenders(v_top_real_gap_candidates),
         }
 
@@ -720,6 +779,7 @@ def convert_date(
         "bootstrap_fences": total_bootstrap_fences,
         "shutdown_fences": total_shutdown_fences,
         "reconnect_fences": total_reconnect_fences,
+        "utc_day_rollover_fences": total_utc_day_rollover_fences,
         "real_desync_fences": total_real_desync_fences,
         "unrecovered_real_fences": total_unrecovered_real_fences,
     }
@@ -754,6 +814,15 @@ def convert_date(
         "desync_events": total_desyncs,
         "fenced_ranges_total": total_fenced_ranges,
         **fence_severity_counts,
+        "standalone_depth_day": standalone_depth_day,
+        "timestamp_repartition_enabled": True,
+        "extra_raw_partitions_scanned": sorted(extra_raw_partitions_scanned),
+        "records_imported_from_previous_folder": records_imported_from_previous_folder,
+        "records_imported_from_next_folder": records_imported_from_next_folder,
+        "records_dropped_outside_target_utc": records_dropped_outside_target_utc,
+        "duplicate_records_suppressed": duplicate_records_suppressed,
+        "carried_seed_symbol_count": carried_seed_symbol_count,
+        "synthetic_opening_snapshot_count": synthetic_opening_snapshot_count,
         "gap_warning_counts": gap_warning_counts,
         "top_real_gap_offenders": top_real_gap_offenders,
         "per_symbol_fenced_ranges": per_symbol_fenced_ranges,
@@ -953,6 +1022,8 @@ def _classify_lifecycle_boundaries(boundaries: List[Dict[str, object]]) -> Dict[
 
 def _normalize_fence_reason(reason: object) -> str:
     value = str(reason or "unknown").lower()
+    if "utc_day_rollover" in value:
+        return "utc_day_rollover"
     if "bootstrap" in value:
         return "bootstrap"
     if "websocket_closed" in value:
@@ -981,6 +1052,8 @@ def _fence_time_increased(fence: Dict[str, object]) -> bool:
 
 def _fence_category(fence: Dict[str, object]) -> str:
     reason = _normalize_fence_reason(fence.get("reason"))
+    if reason == "utc_day_rollover":
+        return "utc_day_rollover"
     if reason == "bootstrap":
         return "bootstrap"
     if reason == "shutdown":
@@ -1002,7 +1075,7 @@ def _fence_severity(fence: Dict[str, object]) -> str:
     category = _fence_category(fence)
     reason = _normalize_fence_reason(fence.get("reason"))
     recovered = bool(fence.get("recovered"))
-    if category in {"bootstrap", "shutdown"}:
+    if category in {"bootstrap", "shutdown", "utc_day_rollover"}:
         return "low"
     if category == "reconnect":
         return "medium" if recovered else "low"
@@ -1022,6 +1095,7 @@ def _summarize_fences(fences: List[Dict[str, object]]) -> Dict[str, int]:
         "bootstrap_fences": 0,
         "shutdown_fences": 0,
         "reconnect_fences": 0,
+        "utc_day_rollover_fences": 0,
         "real_desync_fences": 0,
         "unrecovered_real_fences": 0,
     }

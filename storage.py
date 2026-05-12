@@ -36,6 +36,12 @@ class FileRotator:
     def get_file_key(self, venue: str, symbol: str, channel: str) -> str:
         """Generate unique key for a file."""
         return f"{venue}:{symbol}:{channel}"
+
+    def _parts_from_key(self, key: str) -> Optional[Tuple[str, str, str]]:
+        parts = key.split(":", 2)
+        if len(parts) != 3:
+            return None
+        return parts[0], parts[1], parts[2]
     
     def get_file_path(self, venue: str, symbol: str, channel: str) -> Path:
         """Generate file path for venue/channel/symbol."""
@@ -48,12 +54,18 @@ class FileRotator:
         return path
     
     async def should_rotate(self, key: str) -> bool:
-        """Check if file should be rotated based on time."""
+        """Check if file should rotate based on time or UTC path boundary."""
         async with self.lock:
             if key not in self.current_files:
                 return True
-            
-            _, creation_time = self.current_files[key]
+
+            file_path, creation_time = self.current_files[key]
+            key_parts = self._parts_from_key(key)
+            if key_parts is not None:
+                venue, symbol, channel = key_parts
+                if file_path != self.get_file_path(venue, symbol, channel):
+                    return True
+
             elapsed_min = (time.time() - creation_time) / 60
             return elapsed_min >= ROTATION_INTERVAL_MIN
     

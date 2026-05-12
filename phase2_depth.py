@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 import json
 import logging
 import time
@@ -46,6 +47,7 @@ SYNC_LIVE_SYNCED = "live_synced"
 SYNC_DESYNCED = "desynced"
 SYNC_RESYNC_REQUIRED = "resync_required"
 SYNC_FENCED = "fenced"
+UTC_DAY_ROLLOVER_REASON = "utc_day_rollover"
 
 
 def _stream_name(symbol: str) -> str:
@@ -68,6 +70,10 @@ def _snapshot_url(venue: str, symbol: str) -> str:
     if venue == "BINANCE_USDTF":
         return f"{BINANCE_FUTURES_REST}/fapi/v1/depth?symbol={symbol}&limit={PHASE2_SNAPSHOT_LIMIT}"
     return f"{BINANCE_SPOT_REST}/api/v3/depth?symbol={symbol}&limit={PHASE2_SNAPSHOT_LIMIT}"
+
+
+def _utc_date_from_ns(ts_ns: int) -> str:
+    return datetime.fromtimestamp(ts_ns / 1_000_000_000, tz=timezone.utc).strftime("%Y-%m-%d")
 
 
 @dataclass
@@ -106,6 +112,10 @@ class DepthSymbolState:
     last_rejected_pu: Optional[int] = None
     bootstrap_stale_drop_count: int = 0       # stale msgs silently dropped in SNAPSHOT_SEEDED
     promote_zero_accepted_count: int = 0      # promote() calls where accepted=0
+    last_snapshot_seed_date: Optional[str] = None
+    last_rollover_seed_date: Optional[str] = None
+    daily_rollover_snapshot_seed_count: int = 0
+    utc_day_rollover_fences: int = 0
 
     def allocate_ws_arrival_seq(self) -> int:
         """Monotonic counter for all WS messages (internal ordering for buffering)."""
@@ -334,6 +344,10 @@ class BinanceNativeDepthRecorder:
         if len(state.pending_updates) > 5000:
             state.pending_updates = state.pending_updates[-5000:]
 
+        if self._maybe_start_utc_rollover_seed(state, ts_recv_ns):
+            self._report_symbol_state(state)
+            return
+
         if state.last_update_id is None:
             self._ensure_snapshot_task(state, reason="bootstrap")
             return
@@ -393,24 +407,60 @@ class BinanceNativeDepthRecorder:
             last_rejected_pu=state.last_rejected_pu,
             bootstrap_stale_drop_count=state.bootstrap_stale_drop_count,
             promote_zero_accepted_count=state.promote_zero_accepted_count,
+            daily_rollover_snapshot_seed_count=state.daily_rollover_snapshot_seed_count,
+            utc_day_rollover_fences=state.utc_day_rollover_fences,
+            last_rollover_seed_date=state.last_rollover_seed_date,
         )
 
-    def _ensure_snapshot_task(self, state: DepthSymbolState, *, reason: str) -> None:
+    def _maybe_start_utc_rollover_seed(self, state: DepthSymbolState, ts_recv_ns: int) -> bool:
+        """Start one lifecycle-safe seed when a live stream crosses UTC date."""
+        if state.last_update_id is None:
+            return False
+        if state.sync_state not in (SYNC_LIVE_SYNCED, SYNC_SNAPSHOT_SEEDED):
+            return False
+
+        current_date = _utc_date_from_ns(ts_recv_ns)
+        if state.last_snapshot_seed_date == current_date:
+            return False
+        if state.last_rollover_seed_date == current_date:
+            return False
+        if state.snapshot_task and not state.snapshot_task.done():
+            return False
+
+        state.utc_day_rollover_fences += 1
+        self._ensure_snapshot_task(
+            state,
+            reason=UTC_DAY_ROLLOVER_REASON,
+            bypass_cooldown=True,
+        )
+        return state.snapshot_task is not None and not state.snapshot_task.done()
+
+    def _ensure_snapshot_task(
+        self,
+        state: DepthSymbolState,
+        *,
+        reason: str,
+        bypass_cooldown: bool = False,
+    ) -> None:
         if state.sync_state == SYNC_FENCED:
             return
         if state.snapshot_task and not state.snapshot_task.done():
             return
         now = time.monotonic()
-        if now - state.last_resync_request_monotonic < PHASE2_RESYNC_COOLDOWN_SEC:
+        if (
+            not bypass_cooldown
+            and now - state.last_resync_request_monotonic < PHASE2_RESYNC_COOLDOWN_SEC
+        ):
             return
         state.last_resync_request_monotonic = now
         state.snapshot_task = asyncio.create_task(self._snapshot_seed_task(state, reason=reason))
 
     async def _snapshot_seed_task(self, state: DepthSymbolState, *, reason: str) -> None:
         is_initial_bootstrap = reason == "bootstrap"
+        is_lifecycle_seed = is_initial_bootstrap or reason == UTC_DAY_ROLLOVER_REASON
         if is_initial_bootstrap:
             state.bootstrap_attempt_count += 1
-        else:
+        elif not is_lifecycle_seed:
             # Only true continuity-recovery resyncs count toward fencing
             state.resync_count += 1
             self._trim_resync_window(state)
@@ -463,6 +513,11 @@ class BinanceNativeDepthRecorder:
 
     async def _handle_snapshot_seed(self, state: DepthSymbolState, raw: dict, *, reason: str) -> None:
         state.snapshot_seed_count += 1
+        seed_date = _utc_date_from_ns(time.time_ns())
+        state.last_snapshot_seed_date = seed_date
+        if reason == UTC_DAY_ROLLOVER_REASON:
+            state.last_rollover_seed_date = seed_date
+            state.daily_rollover_snapshot_seed_count += 1
         state.last_snapshot_seed_ts = time.monotonic()
         state.last_resync_reason = reason
         # Set IDs from snapshot but do NOT transition to SNAPSHOT_SEEDED yet.

@@ -12,6 +12,7 @@ committed canonical ordering from the recorder.  Book state uses exact
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import logging
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -36,6 +37,7 @@ logger = logging.getLogger(__name__)
 
 F_LAST = 1 << 7
 F_SNAPSHOT = 1 << 5
+EPOCH_LIKE_NS_MIN = 946684800000000000  # 2000-01-01T00:00:00Z
 
 
 @dataclass
@@ -63,6 +65,19 @@ class Phase2ReplayMetrics:
     bad_lines_by_exception_type: Dict[str, int] = field(default_factory=dict)
     bad_lines_by_record_type: Dict[str, int] = field(default_factory=dict)
     bad_line_examples: List[Dict[str, Any]] = field(default_factory=list)
+    carried_seed_from_previous_day: bool = False
+    carried_seed_date: Optional[str] = None
+    carried_seed_session_id: Optional[int] = None
+    carried_seed_last_update_id: Optional[int] = None
+    carry_replay_record_count: int = 0
+    carry_recovery_failed_reason: Optional[str] = None
+    synthetic_opening_snapshot_written: bool = False
+    timestamp_repartition_enabled: bool = True
+    extra_raw_partitions_scanned: List[str] = field(default_factory=list)
+    records_imported_from_previous_folder: int = 0
+    records_imported_from_next_folder: int = 0
+    records_dropped_outside_target_utc: int = 0
+    duplicate_records_suppressed: int = 0
 
 
 @dataclass
@@ -92,6 +107,21 @@ def _ts_event_ns(rec: dict) -> int:
     return int(ts_event_ms) * 1_000_000 if ts_event_ms else ts_recv_ns
 
 
+def _date_shift(date_str: str, days: int) -> str:
+    base = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    return (base + timedelta(days=days)).strftime("%Y-%m-%d")
+
+
+def _target_bounds_ns(date_str: str) -> Tuple[int, int]:
+    start = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    end = start + timedelta(days=1)
+    return int(start.timestamp() * 1_000_000_000), int(end.timestamp() * 1_000_000_000)
+
+
+def _is_epoch_like_ns(ts_ns: int) -> bool:
+    return ts_ns >= EPOCH_LIKE_NS_MIN
+
+
 def _sort_key(raw_index: int, rec: dict) -> Tuple[int, int, int]:
     """Sort by committed canonical order: (session, session_seq, raw_index fallback)."""
     return (
@@ -99,6 +129,26 @@ def _sort_key(raw_index: int, rec: dict) -> Tuple[int, int, int]:
         int(rec.get("session_seq", rec.get("connection_seq", 0))),
         raw_index,
     )
+
+
+def _dedupe_key(rec: dict) -> Tuple[object, ...]:
+    return (
+        rec.get("record_type", "depth_update"),
+        rec.get("stream_session_id"),
+        rec.get("session_seq", rec.get("connection_seq")),
+        rec.get("U"),
+        rec.get("u"),
+        rec.get("pu"),
+        rec.get("lastUpdateId"),
+        _ts_event_ns(rec),
+    )
+
+
+def _state_payload(state: ReplayState) -> Dict[str, List[List[str]]]:
+    return {
+        "bids": [[str(price), str(size)] for price, size in sorted(state.bids.items(), reverse=True)],
+        "asks": [[str(price), str(size)] for price, size in sorted(state.asks.items())],
+    }
 
 
 def _make_order(
@@ -292,6 +342,7 @@ def _is_lifecycle_resync_reason(reason: object) -> bool:
         or "shutdown" in value
         or "startup_or_reconnect" in value
         or "new_stream_session" in value
+        or "utc_day_rollover" in value
     )
 
 
@@ -337,6 +388,187 @@ def _should_accept_update(state: ReplayState, rec: dict) -> bool:
     return U <= (prev + 1) <= u
 
 
+def _load_repartitioned_records(
+    venue: str,
+    symbol: str,
+    date_str: str,
+    metrics: Phase2ReplayMetrics,
+) -> Tuple[List[dict], List[dict]]:
+    target_start_ns, target_end_ns = _target_bounds_ns(date_str)
+    partition_dates = [_date_shift(date_str, -1), date_str, _date_shift(date_str, 1)]
+    metrics.extra_raw_partitions_scanned = [partition_dates[0], partition_dates[2]]
+
+    target_records: List[dict] = []
+    carry_records: List[dict] = []
+    seen_target: set[Tuple[object, ...]] = set()
+
+    for source_date in partition_dates:
+        for rec in stream_raw_records(venue, symbol, "depth_v2", source_date):
+            item = dict(rec)
+            item["_source_date"] = source_date
+            ts_ns = _ts_event_ns(item)
+
+            # Existing unit fixtures often use tiny relative timestamps. Keep
+            # them path-scoped so historical tests do not masquerade as 1970.
+            if not _is_epoch_like_ns(ts_ns):
+                if source_date == date_str:
+                    key = _dedupe_key(item)
+                    if key in seen_target:
+                        metrics.duplicate_records_suppressed += 1
+                        continue
+                    seen_target.add(key)
+                    target_records.append(item)
+                continue
+
+            if target_start_ns <= ts_ns < target_end_ns:
+                key = _dedupe_key(item)
+                if key in seen_target:
+                    metrics.duplicate_records_suppressed += 1
+                    continue
+                seen_target.add(key)
+                target_records.append(item)
+                if source_date == partition_dates[0]:
+                    metrics.records_imported_from_previous_folder += 1
+                elif source_date == partition_dates[2]:
+                    metrics.records_imported_from_next_folder += 1
+            else:
+                metrics.records_dropped_outside_target_utc += 1
+                if ts_ns < target_start_ns:
+                    carry_records.append(item)
+
+    target_records.sort(key=lambda rec: _sort_key(0, rec))
+    carry_records.sort(key=lambda rec: _sort_key(0, rec))
+    return target_records, carry_records
+
+
+def _find_first_depth_update(records: List[dict]) -> Optional[dict]:
+    for rec in records:
+        if rec.get("record_type", "depth_update") == "depth_update":
+            return rec
+    return None
+
+
+def _has_snapshot_before_first_update(records: List[dict], first_update: dict) -> bool:
+    first_key = _sort_key(0, first_update)
+    for rec in records:
+        if rec.get("record_type") != "snapshot_seed":
+            continue
+        if _sort_key(0, rec) < first_key:
+            return True
+    return False
+
+
+def _fail_carry(state: ReplayState, metrics: Phase2ReplayMetrics, reason: str) -> bool:
+    state.current_stream_session_id = None
+    state.sync_state = "unsynced"
+    state.last_snapshot_update_id = None
+    state.prev_update_id = None
+    state.reset_book()
+    metrics.carry_recovery_failed_reason = reason
+    return False
+
+
+def _recover_carry_state(
+    state: ReplayState,
+    carry_records: List[dict],
+    first_update: dict,
+    metrics: Phase2ReplayMetrics,
+) -> bool:
+    session_id = first_update.get("stream_session_id")
+    snapshots = [
+        rec
+        for rec in carry_records
+        if rec.get("record_type") == "snapshot_seed"
+        and rec.get("stream_session_id") == session_id
+    ]
+    if not snapshots:
+        return _fail_carry(state, metrics, "no_previous_snapshot_seed")
+
+    seed = max(snapshots, key=lambda rec: _sort_key(0, rec))
+    seed_key = _sort_key(0, seed)
+    replay_records = [
+        rec
+        for rec in carry_records
+        if rec.get("stream_session_id") == session_id
+        and _sort_key(0, rec) >= seed_key
+    ]
+    if not replay_records:
+        return _fail_carry(state, metrics, "empty_carry_replay")
+
+    state.current_stream_session_id = session_id
+    state.sync_state = "unsynced"
+    state.last_snapshot_update_id = None
+    state.prev_update_id = None
+    state.reset_book()
+
+    for rec in replay_records:
+        metrics.carry_replay_record_count += 1
+        record_type = rec.get("record_type", "depth_update")
+        if record_type == "stream_lifecycle":
+            continue
+        if record_type == "sync_state":
+            state.sync_state = rec.get("state", state.sync_state)
+            continue
+        if record_type == "snapshot_seed":
+            _snapshot_to_book(state, rec.get("payload", {}))
+            state.last_snapshot_update_id = rec.get("lastUpdateId")
+            state.prev_update_id = rec.get("lastUpdateId")
+            state.sync_state = "snapshot_seeded"
+            continue
+        if record_type != "depth_update":
+            continue
+        if state.prev_update_id is None:
+            return _fail_carry(state, metrics, "carry_update_before_snapshot")
+        if not _should_accept_update(state, rec):
+            return _fail_carry(state, metrics, "carry_continuity_break")
+        _apply_levels(state.bids, rec.get("payload", {}).get("bids", []))
+        _apply_levels(state.asks, rec.get("payload", {}).get("asks", []))
+        state.prev_update_id = rec.get("u")
+        state.sync_state = "live_synced"
+
+    if state.prev_update_id is None or not state.bids or not state.asks:
+        return _fail_carry(state, metrics, "carry_incomplete_book_state")
+
+    metrics.carried_seed_from_previous_day = True
+    metrics.carried_seed_date = seed.get("_source_date")
+    metrics.carried_seed_session_id = int(session_id) if session_id is not None else None
+    metrics.carried_seed_last_update_id = int(seed.get("lastUpdateId") or 0)
+    metrics.carry_recovery_failed_reason = None
+    return True
+
+
+def _emit_synthetic_opening_snapshot(
+    state: ReplayState,
+    first_update: dict,
+    metrics: Phase2ReplayMetrics,
+    deltas_out: List[OrderBookDeltas],
+    depth10_out: List[OrderBookDepth10],
+    *,
+    emit_depth10: bool,
+) -> None:
+    payload = _state_payload(state)
+    ts_event = _ts_event_ns(first_update)
+    ts_init = int(first_update.get("ts_recv_ns", ts_event))
+    snapshot = _snapshot_deltas(
+        state,
+        payload,
+        sequence=int(state.prev_update_id or 0),
+        ts_event=ts_event,
+        ts_init=ts_init,
+    )
+    if snapshot is not None:
+        deltas_out.append(snapshot)
+        metrics.delta_events_written += 1
+        metrics.synthetic_opening_snapshot_written = True
+    if emit_depth10:
+        depth = _depth10_from_state(state, ts_event=ts_event, ts_init=ts_init)
+        if depth is not None:
+            depth10_out.append(depth)
+            state.last_depth10_emit_ns = ts_event
+            metrics.depth10_written += 1
+            metrics.derived_depth_snapshots_written += 1
+
+
 def convert_depth_v2(
     venue: str,
     symbol: str,
@@ -349,8 +581,8 @@ def convert_depth_v2(
     depth10_interval_sec: float = DEPTH10_INTERVAL_SEC,
     derived_depth_snapshot_levels: int = DERIVED_DEPTH_SNAPSHOT_LEVELS,
 ) -> Tuple[List[OrderBookDeltas], List[OrderBookDepth10], Phase2ReplayMetrics]:
-    records = list(stream_raw_records(venue, symbol, "depth_v2", date_str))
     metrics = Phase2ReplayMetrics()
+    records, carry_records = _load_repartitioned_records(venue, symbol, date_str, metrics)
     requested_depth_snapshot_levels = max(0, int(derived_depth_snapshot_levels))
     applied_depth_snapshot_levels = min(requested_depth_snapshot_levels, 10)
     if applied_depth_snapshot_levels <= 0:
@@ -369,6 +601,18 @@ def convert_depth_v2(
         size_prec=size_prec,
     )
     interval_ns = int(depth10_interval_sec * 1e9)
+
+    first_update = _find_first_depth_update(records)
+    if first_update is not None and not _has_snapshot_before_first_update(records, first_update):
+        if _recover_carry_state(state, carry_records, first_update, metrics):
+            _emit_synthetic_opening_snapshot(
+                state,
+                first_update,
+                metrics,
+                deltas_out,
+                depth10_out,
+                emit_depth10=emit_depth10,
+            )
 
     ordered = sorted(
         enumerate(records),
