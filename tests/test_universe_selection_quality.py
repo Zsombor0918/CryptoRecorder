@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 from binance_universe import (
     UniverseSelector,
     is_reasonable_symbol,
@@ -130,7 +132,12 @@ def test_universe_health_excludes_only_after_repeated_zero_runs(monkeypatch, tmp
 
     health_dir = tmp_path / "state" / "universe_health"
     health_dir.mkdir(parents=True)
-    for date_str in ("2026-05-01", "2026-05-02"):
+    latest_health_date = datetime.now(timezone.utc).date()
+    health_dates = [
+        (latest_health_date - timedelta(days=1)).isoformat(),
+        latest_health_date.isoformat(),
+    ]
+    for date_str in health_dates:
         (health_dir / f"{date_str}.json").write_text(
             """
 {
