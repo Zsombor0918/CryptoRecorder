@@ -1,89 +1,521 @@
-# Installation
+# Linux Server Installation
 
-## Requirements
+This guide prepares CryptoRecorder for a later Ubuntu/Linux server deployment.
+It does not require starting the live recorder during installation.
 
-- Linux or WSL2 with systemd (for service mode)
-- Python 3.10+
-- Network access to Binance APIs
-- Sufficient disk for raw + catalog data
+CryptoRecorder currently:
 
-## Setup
+- records live Binance REST/WebSocket market data with `recorder.py`
+- converts one UTC day at a time with `convert_day.py`
+- stores operational health/readiness as JSON files, not web pages
+- exposes an in-repo CLI catalog inspector, not a browser catalog viewer
+- uses `requirements.txt` plus a virtual environment; there is no `pyproject.toml`,
+  `uv.lock`, or Node/npm dependency in this repository
+
+## Assumptions Used Below
+
+These commands assume:
+
+- Ubuntu or another Linux host with `systemd`
+- the deploy user is the current shell user, exported as `APP_USER="$USER"`
+- project code lives at `~/services/CryptoRecorder`
+- optional large data storage lives at `/data/cryptorecorder`
+- Python `3.10+`
+- outbound network access to Binance REST and WebSocket endpoints
+
+Adjust the exported variables once if your server differs.
 
 ```bash
-cd ~
-git clone <repo-url> CryptoRecorder
-cd CryptoRecorder
+export APP_USER="$USER"
+export APP_HOME="$HOME/services"
+export APP_DIR="$APP_HOME/CryptoRecorder"
+export DATA_BASE="/data/cryptorecorder"
+```
 
+## 1. Install OS Packages
+
+Ubuntu/Debian example:
+
+```bash
+sudo apt update
+sudo apt install -y \
+  git \
+  curl \
+  ca-certificates \
+  build-essential \
+  python3 \
+  python3-venv \
+  python3-pip
+
+python3 --version
+```
+
+`python3 --version` must show Python `3.10` or newer.
+
+## 2. Clone the Repository
+
+```bash
+mkdir -p "$APP_HOME"
+cd "$APP_HOME"
+git clone <repo-url> CryptoRecorder
+cd "$APP_DIR"
+```
+
+Verification:
+
+```bash
+pwd
+git status --short
+```
+
+## 3. Choose Python Environment Setup
+
+### Option A: repo-native `venv` + `pip`
+
+```bash
+cd "$APP_DIR"
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
 ```
 
-## Verify Setup
+### Option B: optional `uv`
+
+`uv` is optional. The repository does not require it, but it can manage the same
+virtual environment and dependency installation workflow.
 
 ```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+export PATH="$HOME/.local/bin:$PATH"
+
+cd "$APP_DIR"
+uv venv .venv --python python3
+source .venv/bin/activate
+uv pip install -r requirements.txt
+```
+
+Verification for either option:
+
+```bash
+cd "$APP_DIR"
+source .venv/bin/activate
+python --version
+python -m pip --version || true
+```
+
+## 4. Understand Current Paths Before First Import
+
+`config.py` currently defines these paths directly:
+
+| Purpose | Current code path |
+|---|---|
+| raw JSONL/Zstandard data | `CryptoRecorder/data_raw/` |
+| metadata/universe cache | `CryptoRecorder/meta/` |
+| heartbeat, reports, state | `CryptoRecorder/state/` |
+| recorder file log | `CryptoRecorder/recorder.log` |
+| Nautilus catalog | sibling path `../nautilus_data/catalog/` |
+
+Important:
+
+- importing `config.py` creates `data_raw/`, `meta/`, `state/`, and
+  `state/convert_reports/`
+- if you want large data on `/data`, create symlinks before running
+  `validate.py`, tests that import config, or live commands
+- `recorder.log` still stays inside the project checkout unless code/config is
+  changed later
+
+## 5. Recommended Large-Disk Layout
+
+Recommended server layout:
+
+```text
+~/services/CryptoRecorder/              project code
+/data/cryptorecorder/data_raw/          raw exchange data
+/data/cryptorecorder/meta/              daily universe cache and metadata
+/data/cryptorecorder/state/             heartbeat, reports, runtime state
+/data/cryptorecorder/nautilus_data/     Nautilus catalog and sibling reports
+```
+
+Create the external directories:
+
+```bash
+sudo mkdir -p \
+  "$DATA_BASE/data_raw" \
+  "$DATA_BASE/meta" \
+  "$DATA_BASE/state" \
+  "$DATA_BASE/nautilus_data/catalog"
+
+sudo chown -R "$APP_USER:$APP_USER" "$DATA_BASE"
+```
+
+Create symlinks before the first app import. These commands intentionally stop
+if the repo-local paths already exist, so existing data is never overwritten
+silently.
+
+```bash
+cd "$APP_DIR"
+
+for path in data_raw meta state; do
+  if [ -e "$path" ] || [ -L "$path" ]; then
+    echo "Refusing to replace existing $path. Inspect it manually first."
+    exit 1
+  fi
+done
+
+if [ -e "$APP_HOME/nautilus_data" ] || [ -L "$APP_HOME/nautilus_data" ]; then
+  echo "Refusing to replace existing $APP_HOME/nautilus_data. Inspect it manually first."
+  exit 1
+fi
+
+ln -s "$DATA_BASE/data_raw" data_raw
+ln -s "$DATA_BASE/meta" meta
+ln -s "$DATA_BASE/state" state
+ln -s "$DATA_BASE/nautilus_data" "$APP_HOME/nautilus_data"
+```
+
+Verification:
+
+```bash
+cd "$APP_DIR"
+ls -ld data_raw meta state "$APP_HOME/nautilus_data"
+```
+
+If you prefer all data inside the project tree, skip the symlinks and create the
+default directory shape explicitly before validation:
+
+```bash
+cd "$APP_DIR"
+mkdir -p \
+  data_raw \
+  meta \
+  state/convert_reports \
+  "$APP_HOME/nautilus_data/catalog"
+```
+
+## 6. Validate the Python Setup Without Live Recording
+
+These are safe local checks. They do not start the live recorder.
+
+```bash
+cd "$APP_DIR"
+source .venv/bin/activate
+
 python validate.py
+python -m pytest tests/
+python convert_day.py --help
 ```
 
-This checks dependencies, directories, and configuration.
+Expected:
 
-## Run Unit Tests
+- `validate.py` reports dependency/import/path checks
+- the unit test suite passes
+- `convert_day.py --help` exits successfully and documents `--staging`
 
-```bash
-pytest tests/
+## 7. Configuration and Environment Variables
+
+There is no secret config file in this repo. Operational tuning is read from
+environment variables in `config.py` and `recorder.py`.
+
+Common examples:
+
+| Variable | Default | Purpose |
+|---|---:|---|
+| `CRYPTO_RECORDER_TOP_SYMBOLS` | `50` | symbols selected per venue |
+| `CRYPTO_RECORDER_TOP_SYMBOL_CANDIDATES` | `120` | spot candidate pool |
+| `CRYPTO_RECORDER_FUTURES_TOP_SYMBOL_CANDIDATES` | `200` | futures candidate pool |
+| `CRYPTO_RECORDER_EMIT_DERIVED_DEPTH_SNAPSHOTS` | `1` | derived depth snapshots |
+| `CRYPTO_RECORDER_DERIVED_DEPTH_SNAPSHOT_INTERVAL_SEC` | `1.0` | derived snapshot cadence |
+| `CRYPTO_RECORDER_DEPTH_WS_MAX_SYMBOLS_PER_CONNECTION` | `10` | depth WebSocket sharding |
+| `CRYPTO_RECORDER_TRADE_WS_MAX_SYMBOLS_PER_CONNECTION` | `10` | trade WebSocket sharding |
+
+The systemd units load this optional non-secret file:
+
+```text
+/etc/cryptorecorder/cryptorecorder.env
 ```
 
-## Run Recorder
+Install the example:
 
 ```bash
+sudo install -d -m 0755 /etc/cryptorecorder
+sudo install -m 0644 \
+  "$APP_DIR/systemd/cryptorecorder.env.example" \
+  /etc/cryptorecorder/cryptorecorder.env
+```
+
+Review before live operation:
+
+```bash
+sudo sed -n '1,200p' /etc/cryptorecorder/cryptorecorder.env
+```
+
+Path caveat:
+
+- data/catalog roots are not environment-configurable today
+- use the symlink layout above if the server should store large data under
+  `/data/cryptorecorder`
+
+## 8. Install systemd Units Safely
+
+Do not copy the repository unit files unchanged. They still contain the
+development checkout path `/home/zsom/services/CryptoRecorder` and
+`User=zsom`.
+
+Generate host-specific units with path/user substitution:
+
+```bash
+cd "$APP_DIR"
+
+for unit in \
+  crypto-recorder.service \
+  nautilus-convert.service \
+  nautilus-convert.timer
+do
+  sed \
+    -e "s|User=zsom|User=$APP_USER|g" \
+    -e "s|/home/zsom/services/CryptoRecorder|$APP_DIR|g" \
+    "systemd/$unit" | sudo tee "/etc/systemd/system/$unit" >/dev/null
+done
+
+sudo systemctl daemon-reload
+sudo systemd-analyze verify \
+  /etc/systemd/system/crypto-recorder.service \
+  /etc/systemd/system/nautilus-convert.service \
+  /etc/systemd/system/nautilus-convert.timer
+```
+
+Current unit behavior:
+
+- `crypto-recorder.service` runs `recorder.py`
+- `nautilus-convert.service` runs `convert_day.py --staging`
+- `nautilus-convert.timer` schedules conversion once daily at `00:10 UTC`
+- both services write stdout/stderr to `journald`
+- both services load `/etc/cryptorecorder/cryptorecorder.env` if present
+
+Inspect the installed units:
+
+```bash
+systemctl cat crypto-recorder.service
+systemctl cat nautilus-convert.service
+systemctl cat nautilus-convert.timer
+systemctl list-timers --all nautilus-convert.timer
+```
+
+## 9. Start Services Only When Live Recording Is Intended
+
+These commands begin real server operation.
+
+Enable automatic startup:
+
+```bash
+sudo systemctl enable crypto-recorder.service
+sudo systemctl enable nautilus-convert.timer
+```
+
+Start live operation:
+
+```bash
+sudo systemctl start crypto-recorder.service
+sudo systemctl start nautilus-convert.timer
+```
+
+Stop/restart later:
+
+```bash
+sudo systemctl stop crypto-recorder.service
+sudo systemctl restart crypto-recorder.service
+sudo systemctl stop nautilus-convert.timer
+sudo systemctl start nautilus-convert.timer
+```
+
+Status and logs:
+
+```bash
+systemctl status crypto-recorder.service
+systemctl status nautilus-convert.timer
+systemctl status nautilus-convert.service
+
+journalctl -u crypto-recorder.service -f
+journalctl -u nautilus-convert.service -f
+```
+
+## 10. Manual Commands
+
+### Live recorder
+
+This starts real Binance recording and writes raw data:
+
+```bash
+cd "$APP_DIR"
 source .venv/bin/activate
 python recorder.py
 ```
 
-The recorder launches native Binance WebSocket connections for `depth_v2` and
-`trade_v2` channels. No additional flags are needed.
+### Safe staged conversion
 
-## Convert a Day
-
-```bash
-python convert_day.py --date YYYY-MM-DD
-
-# Enable optional derived depth10
-python convert_day.py --date YYYY-MM-DD --emit-depth10
-```
-
-## Service Install (Optional)
+Preferred manual converter command for an existing UTC raw-data date:
 
 ```bash
-sudo cp systemd/crypto-recorder.service /etc/systemd/system/
-sudo cp systemd/nautilus-convert.service /etc/systemd/system/
-sudo cp systemd/nautilus-convert.timer /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now crypto-recorder 
-sudo systemctl enable --now nautilus-convert.timer
+cd "$APP_DIR"
+source .venv/bin/activate
+python convert_day.py --date YYYY-MM-DD --staging
 ```
 
-## Useful Commands
+`--staging` now:
+
+- converts into an isolated temporary catalog
+- validates staged output
+- publishes only parquet files overlapping the requested UTC date
+- preserves all unrelated catalog files
+- backs up only files being replaced for that date
+- rolls back on publish failure
+
+Do not use `--allow-partial-overwrite` casually. It bypasses the converter’s
+low-depth-coverage refusal guard for direct overwrite mode.
+
+## 11. Validation, Readiness, and Catalog Inspection
+
+Health/readiness output is file-based:
+
+| Path | Meaning |
+|---|---|
+| `state/heartbeat.json` | live recorder heartbeat |
+| `state/startup_coverage.json` | startup universe/coverage audit |
+| `state/universe_health/YYYY-MM-DD.json` | daily universe-health checkpoints |
+| `state/universe_health/symbol_health.json` | aggregated universe-health state |
+| `state/convert_reports/YYYY-MM-DD.json` | converter report |
+| `../nautilus_data/convert_reports/YYYY-MM-DD.json` | sibling converter report copy |
+| `state/disk_usage.json` | disk usage snapshot |
+| `state/reconnects.log` | reconnect events |
+
+Useful checks after real data exists:
 
 ```bash
-# Check service status
-systemctl status crypto-recorder
-journalctl -u crypto-recorder -f    
+cd "$APP_DIR"
+source .venv/bin/activate
 
-# Check heartbeat
-cat state/heartbeat.json | python3 -m json.tool
-
-# Quick smoke test
-python scripts/smoke_test.py
-
-# Full acceptance test
-python scripts/acceptance_test.py
+python -m json.tool state/heartbeat.json | sed -n '1,120p'
+python -m json.tool state/startup_coverage.json | sed -n '1,160p'
+python validators/phase2_report.py state/convert_reports/YYYY-MM-DD.json
 ```
+
+The repository does not ship a browser catalog viewer. Use the CLI inspector:
+
+```bash
+python validators/catalog_inspect.py \
+  "$APP_HOME/nautilus_data/catalog" \
+  BTCUSDT.BINANCE
+```
+
+## 12. Live Smoke and Acceptance Tests
+
+These scripts start the recorder unless you use the documented skip mode.
+Run them only when live Binance test recording is acceptable.
+
+```bash
+# Starts a short live recorder session
+python scripts/smoke_test.py --runtime 60
+
+# Starts live recorder unless --skip-recorder is used
+python scripts/acceptance_test.py --runtime 300
+
+# Converter/catalog-only path if raw data already exists
+python scripts/acceptance_test.py --skip-recorder
+```
+
+## 13. Disk Cleanup Warning
+
+While the live recorder is running, `disk_monitor.py` can delete the oldest raw
+date directories after total tracked storage crosses:
+
+- soft limit: `400 GB`
+- cleanup target: `350 GB`
+- hard alert threshold: `480 GB`
+
+Review those constants in `config.py` before a long-running server deployment.
+`RAW_RETENTION_DAYS = 7` exists in `config.py`, but the active cleanup logic is
+currently size-triggered.
+
+## 14. Troubleshooting
+
+### `validate.py` created repo-local directories before symlinks
+
+Stop and inspect:
+
+```bash
+cd "$APP_DIR"
+ls -ld data_raw meta state "$APP_HOME/nautilus_data" 2>/dev/null || true
+```
+
+Do not replace directories that already contain data until you have manually
+decided how to migrate them.
+
+### systemd service fails immediately
+
+Check path/user substitution first:
+
+```bash
+systemctl cat crypto-recorder.service
+systemctl cat nautilus-convert.service
+```
+
+Then inspect logs:
+
+```bash
+journalctl -u crypto-recorder.service -n 200 --no-pager
+journalctl -u nautilus-convert.service -n 200 --no-pager
+```
+
+### converter timer date seems wrong
+
+The timer is meant to run at `00:10 UTC`, and the converter default date is
+“yesterday UTC.” Confirm the installed timer rather than relying on local wall
+clock intuition:
+
+```bash
+systemctl cat nautilus-convert.timer
+systemctl list-timers --all nautilus-convert.timer
+```
+
+### converter refuses partial overwrite
+
+This is a safety feature. Prefer investigating raw depth coverage and the JSON
+report instead of forcing conversion:
+
+```bash
+python -m json.tool state/convert_reports/YYYY-MM-DD.json | sed -n '1,220p'
+```
+
+## 15. Data Sync / Syncthing Later
+
+Data sync is intentionally not configured here.
+
+Placeholder for the future deployment phase:
+
+- choose the final external data mount path
+- decide which raw/catalog/state directories should sync
+- configure Syncthing or another sync strategy after the recorder and converter
+  are stable on the Linux server
+
+## Linux Server Deployment Checklist
+
+- [ ] Linux host has Python `3.10+`, `git`, and build tools
+- [ ] repository cloned to the intended deploy path
+- [ ] `.venv` created and dependencies installed
+- [ ] large data directories and symlinks reviewed before first import
+- [ ] `python validate.py` passes
+- [ ] `python -m pytest tests/` passes
+- [ ] `python convert_day.py --help` works
+- [ ] `/etc/cryptorecorder/cryptorecorder.env` reviewed
+- [ ] systemd units generated with the correct user/path
+- [ ] `systemd-analyze verify` passes
+- [ ] live recorder is started only when intentionally beginning real collection
 
 ## More Documentation
 
-- [docs/VALIDATION.md](docs/VALIDATION.md) — Testing guide
-- [docs/OPERATIONS.md](docs/OPERATIONS.md) — Operations guide
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — System design
-- [docs/SCHEMAS.md](docs/SCHEMAS.md) — Raw and state file schemas
-- [docs/GUARANTEES.md](docs/GUARANTEES.md) — Scope boundaries
+- [docs/VALIDATION.md](docs/VALIDATION.md)
+- [docs/OPERATIONS.md](docs/OPERATIONS.md)
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
+- [docs/SCHEMAS.md](docs/SCHEMAS.md)
+- [docs/GUARANTEES.md](docs/GUARANTEES.md)

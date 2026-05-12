@@ -5,7 +5,7 @@
 | Task | Command |
 |------|---------|
 | Start recorder | `python recorder.py` |
-| Convert a day | `python convert_day.py --date YYYY-MM-DD` |
+| Convert a day | `python convert_day.py --date YYYY-MM-DD --staging` |
 | Setup validation | `python validate.py` |
 | Run tests | `pytest tests/` |
 | Smoke test | `python scripts/smoke_test.py` |
@@ -58,17 +58,17 @@ Startup and runtime reporting uses these terms:
 ## Conversion
 
 ```bash
-# Convert yesterday (default)
-python convert_day.py
+# Convert yesterday UTC using the safe staged publish flow
+python convert_day.py --staging
 
-# Convert specific date
-python convert_day.py --date 2026-04-20
-
-# Convert with staging (atomic rename on success)
+# Convert specific date using the safe staged publish flow
 python convert_day.py --date 2026-04-20 --staging
 
+# Direct non-staging conversion writes into the live catalog immediately
+python convert_day.py --date 2026-04-20
+
 # Enable optional derived depth10
-python convert_day.py --date 2026-04-20 --emit-depth10
+python convert_day.py --date 2026-04-20 --staging --emit-depth10
 ```
 
 ## Validation & Testing

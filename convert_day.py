@@ -22,6 +22,7 @@ import json
 import logging
 import os
 import shutil
+import tempfile
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -40,7 +41,7 @@ from config import (
     STATE_ROOT,
 )
 from converter.depth_phase2 import convert_depth_v2
-from converter.catalog import purge_catalog_date_range
+from converter.catalog import _parse_parquet_date_range, purge_catalog_date_range
 from converter.instruments import build_instruments, load_exchange_info
 from converter.readers import stream_raw_records
 from converter.trades import convert_trades_with_diagnostics
@@ -66,6 +67,20 @@ DERIVED_DEPTH_CAP_WARNING: str = (
     "Nautilus catalog supports OrderBookDepth10 only; full depth is available "
     "via OrderBookDeltas."
 )
+DATE_SCOPED_CATALOG_TYPES: frozenset[str] = frozenset(
+    {"trade_tick", "order_book_deltas", "order_book_depths"}
+)
+METADATA_CATALOG_TYPES: frozenset[str] = frozenset(
+    {"currency_pair", "crypto_perpetual"}
+)
+
+
+class StagingValidationError(RuntimeError):
+    """Raised when staged catalog output is not safe to publish."""
+
+
+class StagingPublishError(RuntimeError):
+    """Raised when staged catalog publication fails."""
 
 # ===================================================================
 # Main conversion logic
@@ -101,7 +116,13 @@ def convert_date(
         else None
     )
     if staging:
-        staging_dir = Path(str(target_root) + f".staging.{os.getpid()}")
+        target_root.parent.mkdir(parents=True, exist_ok=True)
+        staging_dir = Path(
+            tempfile.mkdtemp(
+                prefix=f"{target_root.name}.staging.",
+                dir=target_root.parent,
+            )
+        )
         work_root = staging_dir
     else:
         work_root = target_root
@@ -646,18 +667,33 @@ def convert_date(
             "top_real_gap_offenders": _top_real_gap_offenders(v_top_real_gap_candidates),
         }
 
-    # ── staging → atomic rename ───────────────────────────────────────
+    staging_publication: Dict[str, Any] | None = None
+    staging_status_override: str | None = None
+    staging_error: str | None = None
     if staging and total_trades + total_delta_events > 0:
-        if target_root.exists():
-            backup = Path(str(target_root) + ".bak")
-            if backup.exists():
-                shutil.rmtree(backup)
-            target_root.rename(backup)
-        staging_dir.rename(target_root)
-        logger.info(f"Staging → {target_root} (atomic rename)")
+        try:
+            staged_files = _validate_staging_catalog(staging_dir, date_str)
+            staging_publication = _publish_staged_catalog_for_date(
+                staging_dir=staging_dir,
+                target_root=target_root,
+                target_date_str=date_str,
+                staged_files=staged_files,
+            )
+            shutil.rmtree(staging_dir, ignore_errors=True)
+        except StagingValidationError as exc:
+            staging_status_override = "staging_validation_failed"
+            staging_error = str(exc)
+            logger.error("Staging validation failed; live catalog unchanged: %s", exc)
+        except StagingPublishError as exc:
+            staging_status_override = "staging_publish_failed"
+            staging_error = str(exc)
+            logger.error("Staging publish failed: %s", exc)
     elif staging:
-        if staging_dir.exists():
-            shutil.rmtree(staging_dir)
+        logger.info(
+            "Staging conversion produced no publishable trade/depth data; "
+            "live catalog unchanged."
+        )
+        shutil.rmtree(staging_dir, ignore_errors=True)
 
     # ── data presence summary ─────────────────────────────────────────
     instruments_with_both = set(instruments_with_trades) & set(instruments_with_depth)
@@ -787,7 +823,9 @@ def convert_date(
         "date": date_str,
         "timestamp": local_now_iso(),
         "runtime_sec": round(elapsed, 2),
-        "status": "ok" if (total_trades + total_delta_events) > 0 else "empty",
+        "status": staging_status_override or (
+            "ok" if (total_trades + total_delta_events) > 0 else "empty"
+        ),
         "architecture": "deterministic_native",
         "instruments_written": len(all_instruments),
         "total_trades_written": total_trades,
@@ -849,6 +887,10 @@ def convert_date(
         },
         "catalog_root": str(target_root),
     }
+    if staging_publication is not None:
+        report["staging_publication"] = staging_publication
+    if staging_error is not None:
+        report["staging_error"] = staging_error
 
     _save_report(report)
 
@@ -882,6 +924,265 @@ def _empty_report(date_str: str, t0: float, **kwargs) -> dict:
         "date": date_str,
         "runtime_sec": round(time.time() - t0, 2),
         **kwargs,
+    }
+
+
+def _target_date(target_date_str: str):
+    return datetime.strptime(target_date_str, "%Y-%m-%d").date()
+
+
+def _validate_staging_catalog(
+    staging_root: Path,
+    target_date_str: str,
+) -> List[Path]:
+    """Validate staged output before touching the live catalog.
+
+    Date-scoped Nautilus parquet files are accepted only when their timestamp
+    range overlaps the requested UTC day. That mirrors the existing date-scoped
+    purge semantics and still allows legitimate midnight carry/reseed files.
+    """
+    if not staging_root.exists():
+        raise StagingValidationError(f"staging catalog is missing: {staging_root}")
+
+    try:
+        ParquetDataCatalog(str(staging_root)).instruments()
+    except Exception as exc:
+        raise StagingValidationError(
+            f"Nautilus could not read staged instrument metadata: {exc}"
+        ) from exc
+
+    data_root = staging_root / "data"
+    if not data_root.exists():
+        raise StagingValidationError(
+            f"staging catalog has no data directory: {data_root}"
+        )
+
+    staged_files = sorted(path for path in data_root.rglob("*.parquet") if path.is_file())
+    if not staged_files:
+        raise StagingValidationError("staging catalog contains no parquet files")
+
+    target = _target_date(target_date_str)
+    metadata_files = 0
+    for path in staged_files:
+        rel = path.relative_to(staging_root)
+        if len(rel.parts) != 4 or rel.parts[0] != "data":
+            raise StagingValidationError(
+                f"unexpected staged parquet layout: {rel}"
+            )
+
+        catalog_type = rel.parts[1]
+        parsed = _parse_parquet_date_range(path.name)
+        if parsed is None:
+            raise StagingValidationError(
+                f"cannot date-scope staged parquet filename: {rel}"
+            )
+        start_date, end_date = parsed
+
+        if catalog_type in DATE_SCOPED_CATALOG_TYPES:
+            if start_date.year < 2000 or end_date.year < 2000:
+                raise StagingValidationError(
+                    f"date-scoped staged parquet has metadata-like timestamp: {rel}"
+                )
+            if not (start_date <= target <= end_date):
+                raise StagingValidationError(
+                    f"staged parquet falls outside requested UTC date "
+                    f"{target_date_str}: {rel}"
+                )
+            continue
+
+        if catalog_type in METADATA_CATALOG_TYPES:
+            metadata_files += 1
+            if start_date.year >= 2000 or end_date.year >= 2000:
+                raise StagingValidationError(
+                    f"instrument metadata parquet is not epoch-scoped: {rel}"
+                )
+            continue
+
+        raise StagingValidationError(
+            f"unsupported staged catalog type {catalog_type!r}: {rel}"
+        )
+
+    if metadata_files == 0:
+        raise StagingValidationError(
+            "staging catalog contains no instrument metadata parquet files"
+        )
+
+    logger.info(
+        "Validated staging catalog %s for UTC date %s with %d parquet files",
+        staging_root,
+        target_date_str,
+        len(staged_files),
+    )
+    return staged_files
+
+
+def _collect_live_catalog_replacements(
+    *,
+    target_root: Path,
+    target_date_str: str,
+    staged_files: Sequence[Path],
+    staging_root: Path,
+) -> List[Path]:
+    """Return live files that must be backed up before staged publication."""
+    target = _target_date(target_date_str)
+    replacements: set[Path] = set()
+
+    for staged_path in staged_files:
+        rel = staged_path.relative_to(staging_root)
+        catalog_type = rel.parts[1]
+        instrument_id = rel.parts[2]
+        live_dir = target_root / "data" / catalog_type / instrument_id
+        if not live_dir.exists():
+            continue
+
+        if catalog_type in DATE_SCOPED_CATALOG_TYPES:
+            for live_path in live_dir.glob("*.parquet"):
+                parsed = _parse_parquet_date_range(live_path.name)
+                if parsed is None:
+                    logger.warning(
+                        "Preserving unparseable live parquet during staged publish: %s",
+                        live_path,
+                    )
+                    continue
+                start_date, end_date = parsed
+                if start_date <= target <= end_date:
+                    replacements.add(live_path)
+            continue
+
+        if catalog_type in METADATA_CATALOG_TYPES:
+            replacements.update(live_dir.glob("*.parquet"))
+
+    replacement_list = sorted(replacements)
+    for path in replacement_list:
+        logger.info("Staged publish will replace live parquet: %s", path)
+    if not replacement_list:
+        logger.info(
+            "Staged publish found no existing live target-date parquet files "
+            "to replace for %s.",
+            target_date_str,
+        )
+    return replacement_list
+
+
+def _publish_staged_catalog_for_date(
+    *,
+    staging_dir: Path,
+    target_root: Path,
+    target_date_str: str,
+    staged_files: Sequence[Path],
+) -> Dict[str, Any]:
+    """Publish staged parquet files into the live catalog with rollback."""
+    if not staged_files:
+        raise StagingPublishError("no staged files were provided for publication")
+
+    target_root.parent.mkdir(parents=True, exist_ok=True)
+    if target_root.exists() and not target_root.is_dir():
+        raise StagingPublishError(f"live catalog root is not a directory: {target_root}")
+    target_root.mkdir(parents=True, exist_ok=True)
+
+    replacement_paths = _collect_live_catalog_replacements(
+        target_root=target_root,
+        target_date_str=target_date_str,
+        staged_files=staged_files,
+        staging_root=staging_dir,
+    )
+    replacement_set = set(replacement_paths)
+    for staged_path in staged_files:
+        dest = target_root / staged_path.relative_to(staging_dir)
+        if dest.exists() and dest not in replacement_set:
+            raise StagingPublishError(
+                "staged publish would overwrite an unscoped live parquet "
+                f"without backup: {dest}"
+            )
+
+    backup_root = Path(
+        tempfile.mkdtemp(
+            prefix=f"{target_root.name}.publish-backup.{target_date_str}.",
+            dir=target_root.parent,
+        )
+    )
+    moved_backups: List[Tuple[Path, Path]] = []
+    published_files: List[Tuple[Path, Path]] = []
+
+    logger.info(
+        "Publishing staged UTC date %s into live catalog %s. "
+        "The catalog root remains in place; only listed parquet files are replaced.",
+        target_date_str,
+        target_root,
+    )
+    try:
+        for live_path in replacement_paths:
+            backup_path = backup_root / live_path.relative_to(target_root)
+            backup_path.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(live_path, backup_path)
+            moved_backups.append((live_path, backup_path))
+            logger.info("Backed up live parquet before staged publish: %s", live_path)
+
+        for staged_path in staged_files:
+            dest = target_root / staged_path.relative_to(staging_dir)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(staged_path, dest)
+            published_files.append((staged_path, dest))
+            logger.info("Published staged parquet into live catalog: %s", dest)
+    except Exception as exc:
+        rollback_errors: List[str] = []
+        for staged_path, dest in reversed(published_files):
+            try:
+                staged_path.parent.mkdir(parents=True, exist_ok=True)
+                if dest.exists():
+                    os.replace(dest, staged_path)
+                    logger.warning("Rolled back published staged parquet: %s", dest)
+            except Exception as rollback_exc:
+                rollback_errors.append(
+                    f"failed to move published file {dest} back to staging: {rollback_exc}"
+                )
+
+        for live_path, backup_path in reversed(moved_backups):
+            try:
+                live_path.parent.mkdir(parents=True, exist_ok=True)
+                if backup_path.exists():
+                    os.replace(backup_path, live_path)
+                    logger.warning("Restored live parquet from staged backup: %s", live_path)
+            except Exception as rollback_exc:
+                rollback_errors.append(
+                    f"failed to restore backup {backup_path} to {live_path}: {rollback_exc}"
+                )
+
+        if rollback_errors:
+            logger.critical(
+                "Staged publish rollback incomplete. Recoverable backup kept at %s. "
+                "Errors: %s",
+                backup_root,
+                "; ".join(rollback_errors),
+            )
+            raise StagingPublishError(
+                "staged publish failed and rollback was incomplete; "
+                f"recoverable backup remains at {backup_root}: {'; '.join(rollback_errors)}"
+            ) from exc
+
+        shutil.rmtree(backup_root, ignore_errors=True)
+        raise StagingPublishError(
+            f"staged publish failed and live catalog was rolled back: {exc}"
+        ) from exc
+
+    shutil.rmtree(backup_root, ignore_errors=True)
+    logger.info(
+        "Staged publish complete for %s: %d prior live parquet files replaced, "
+        "%d staged parquet files installed. Unlisted live catalog files were preserved.",
+        target_date_str,
+        len(replacement_paths),
+        len(published_files),
+    )
+    return {
+        "target_date": target_date_str,
+        "live_catalog_root": str(target_root),
+        "replaced_live_parquet_count": len(replacement_paths),
+        "published_staged_parquet_count": len(published_files),
+        "replaced_live_parquets": [str(path) for path in replacement_paths],
+        "published_live_parquets": [str(dest) for _, dest in published_files],
+        "preserved_scope": (
+            "All live catalog files not listed in replaced_live_parquets were preserved."
+        ),
     }
 
 
@@ -1209,13 +1510,17 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         description="Convert raw Binance JSONL → Nautilus ParquetDataCatalog (deterministic native)",
     )
+    partial_ratio_help = f"{OVERWRITE_DEPTH_REFUSE_MIN_RATIO:.0%}".replace("%", "%%")
     ap.add_argument(
         "--date", type=str,
         help="Date to convert (YYYY-MM-DD). Default: yesterday UTC.",
     )
     ap.add_argument(
         "--staging", action="store_true",
-        help="Write to staging dir, then atomically rename on success.",
+        help=(
+            "Write to an isolated staging catalog, validate it, then publish "
+            "only target-date parquet files into the live catalog."
+        ),
     )
     ap.add_argument(
         "--emit-depth10",
@@ -1244,7 +1549,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=False,
         help=(
             "Allow overwriting catalog even when raw depth coverage is below "
-            f"{OVERWRITE_DEPTH_REFUSE_MIN_RATIO:.0%} of expected symbols. "
+            f"{partial_ratio_help} of expected symbols. "
             "Without this flag the conversion refuses when coverage is too low."
         ),
     )

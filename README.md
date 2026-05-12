@@ -17,6 +17,7 @@ cd CryptoRecorder
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+mkdir -p data_raw meta state/convert_reports ../nautilus_data/catalog
 
 # 2. Validate setup
 python validate.py
@@ -78,14 +79,14 @@ CryptoRecorder/
 Convert recorded data to Nautilus catalog:
 
 ```bash
-# Convert yesterday (default)
-python convert_day.py
+# Convert yesterday (default date) using safe staged publication
+python convert_day.py --staging
 
-# Convert specific date
-python convert_day.py --date 2026-04-20
+# Convert specific UTC date using safe staged publication
+python convert_day.py --date 2026-04-20 --staging
 
 # Enable optional derived OrderBookDepth10
-python convert_day.py --date 2026-04-20 --emit-depth10
+python convert_day.py --date 2026-04-20 --staging --emit-depth10
 ```
 
 This produces:
