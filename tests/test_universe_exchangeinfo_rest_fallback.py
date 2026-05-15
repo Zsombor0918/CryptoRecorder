@@ -106,9 +106,12 @@ async def test_spot_exchangeinfo_from_disk_preferred() -> None:
     mock_resp.status = 200
     mock_resp.json = AsyncMock(return_value=rest_response)
     
-    mock_session = AsyncMock()
-    mock_session.get = AsyncMock()
-    mock_session.get.return_value.__aenter__.return_value = mock_resp
+    mock_session = MagicMock()
+    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_session.__aexit__ = AsyncMock(return_value=False)
+    mock_session.get = MagicMock()
+    mock_session.get.return_value.__aenter__ = AsyncMock(return_value=mock_resp)
+    mock_session.get.return_value.__aexit__ = AsyncMock(return_value=False)
     
     with patch("binance_universe.aiohttp.ClientSession", return_value=mock_session):
         trading_symbols, error = await selector._get_spot_exchange_info_symbols()
@@ -152,9 +155,12 @@ async def test_spot_support_precheck_uses_rest_fetched_data(tmp_path: Path) -> N
     mock_resp.status = 200
     mock_resp.json = AsyncMock(return_value=rest_response)
     
-    mock_session = AsyncMock()
-    mock_session.get = AsyncMock()
-    mock_session.get.return_value.__aenter__.return_value = mock_resp
+    mock_session = MagicMock()
+    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_session.__aexit__ = AsyncMock(return_value=False)
+    mock_session.get = MagicMock()
+    mock_session.get.return_value.__aenter__ = AsyncMock(return_value=mock_resp)
+    mock_session.get.return_value.__aexit__ = AsyncMock(return_value=False)
     
     candidates = [
         {"symbol": "BTCUSDT", "quoteVolume": "1000"},
@@ -163,7 +169,8 @@ async def test_spot_support_precheck_uses_rest_fetched_data(tmp_path: Path) -> N
     ]
     
     with patch("binance_universe.aiohttp.ClientSession", return_value=mock_session):
-        kept, rejected, available, error = await selector._apply_spot_support_precheck(candidates)
+        with patch("binance_universe.DATA_ROOT", tmp_path / "empty_root"):
+            kept, rejected, available, error = await selector._apply_spot_support_precheck(candidates)
     
     # Verify precheck results
     assert error is None
