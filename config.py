@@ -10,7 +10,9 @@ from typing import Final
 # ============================================================================
 
 PROJECT_ROOT: Final = Path(__file__).parent
-DATA_ROOT: Final = PROJECT_ROOT / "data_raw"
+DATA_ROOT: Final = Path(
+    os.environ.get("CRYPTO_RECORDER_DATA_ROOT", "/data/cryptorecorder/data_raw")
+).expanduser()
 META_ROOT: Final = PROJECT_ROOT / "meta"
 STATE_ROOT: Final = PROJECT_ROOT / "state"
 
@@ -209,9 +211,11 @@ REPORT_TIMEZONE_NAME: Final = "Europe/Budapest"
 DISK_CHECK_INTERVAL_SEC: Final = 600  # 10 minutes
 
 # Disk usage limits (GB)
-DISK_SOFT_LIMIT_GB: Final = 400
-DISK_HARD_LIMIT_GB: Final = 480
-DISK_CLEANUP_TARGET_GB: Final = 350
+DISK_SOFT_LIMIT_GB: Final = int(os.environ.get("CRYPTO_RECORDER_DISK_SOFT_LIMIT_GB", "750"))
+DISK_HARD_LIMIT_GB: Final = int(os.environ.get("CRYPTO_RECORDER_DISK_HARD_LIMIT_GB", "850"))
+DISK_CLEANUP_TARGET_GB: Final = int(
+    os.environ.get("CRYPTO_RECORDER_DISK_CLEANUP_TARGET_GB", "700")
+)
 
 # ============================================================================
 # Logging Configuration
@@ -282,7 +286,12 @@ PHASE2_RESYNC_WINDOW_SEC: Final = float(
 # Converter / catalog output
 # ============================================================================
 
-NAUTILUS_CATALOG_ROOT: Final = PROJECT_ROOT.parent / "nautilus_data" / "catalog"
+NAUTILUS_CATALOG_ROOT: Final = Path(
+    os.environ.get(
+        "CRYPTO_RECORDER_NAUTILUS_CATALOG_ROOT",
+        str(PROJECT_ROOT.parent / "nautilus_data" / "catalog"),
+    )
+).expanduser()
 CONVERTER_BATCH_SIZE: Final = 1000
 MIN_TRADE_RECORDS_FOR_FULL_READY: Final = int(
     os.environ.get("CRYPTO_RECORDER_MIN_TRADE_RECORDS_FOR_FULL_READY", "1")

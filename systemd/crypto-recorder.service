@@ -7,6 +7,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=zsom
+Group=zsom
 WorkingDirectory=/home/zsom/services/CryptoRecorder
 EnvironmentFile=-/etc/cryptorecorder/cryptorecorder.env
 ExecStart=/home/zsom/services/CryptoRecorder/.venv/bin/python recorder.py

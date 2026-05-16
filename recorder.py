@@ -197,10 +197,10 @@ async def disk_check_task() -> None:
     while not shutdown_event.is_set():
         try:
             usage = await disk_monitor.check_disk_usage()
-            total = usage.get('total_gb', 0)
-            if total > DISK_SOFT_LIMIT_GB:
+            raw_gb = usage.get('data_raw_gb', 0)
+            if raw_gb > DISK_SOFT_LIMIT_GB:
                 logger.warning(
-                    f"Disk {total:.1f}GB > soft limit {DISK_SOFT_LIMIT_GB}GB")
+                    f"Raw data {raw_gb:.1f}GB > soft limit {DISK_SOFT_LIMIT_GB}GB")
                 await disk_monitor.cleanup_old_data()
         except Exception as e:
             logger.error(f"disk_check_task error: {e}", exc_info=True)

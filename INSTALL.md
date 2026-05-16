@@ -427,15 +427,16 @@ python scripts/acceptance_test.py --skip-recorder
 ## 13. Disk Cleanup Warning
 
 While the live recorder is running, `disk_monitor.py` can delete the oldest raw
-date directories after total tracked storage crosses:
+date directories after raw data storage crosses:
 
-- soft limit: `400 GB`
-- cleanup target: `350 GB`
-- hard alert threshold: `480 GB`
+- raw soft limit: `750 GB`
+- raw cleanup target: `700 GB`
+- total tracked hard alert threshold: `850 GB`
 
 Review those constants in `config.py` before a long-running server deployment.
 `RAW_RETENTION_DAYS = 7` exists in `config.py`, but the active cleanup logic is
-currently size-triggered.
+currently size-triggered. Catalog, `meta`, and `state` sizes are still reported
+for observability, but only raw data size triggers raw cleanup.
 
 ## 14. Troubleshooting
 

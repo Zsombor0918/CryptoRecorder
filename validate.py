@@ -95,19 +95,21 @@ def check_dependencies() -> list[tuple[str, bool, str]]:
 
 def check_directories() -> list[tuple[str, bool, str]]:
     """Check required directories exist."""
+    sys.path.insert(0, str(PROJECT_ROOT))
+    from config import DATA_ROOT, META_ROOT, STATE_ROOT
+
     required = [
-        ("data_raw", "Raw data storage"),
-        ("state", "Runtime state"),
-        ("meta", "Metadata storage"),
-        ("converter", "Converter package"),
-        ("tests", "Unit tests"),
+        (DATA_ROOT, "data_raw", "Raw data storage"),
+        (STATE_ROOT, "state", "Runtime state"),
+        (META_ROOT, "meta", "Metadata storage"),
+        (PROJECT_ROOT / "converter", "converter", "Converter package"),
+        (PROJECT_ROOT / "tests", "tests", "Unit tests"),
     ]
 
     results = []
-    for dirname, desc in required:
-        path = PROJECT_ROOT / dirname
+    for path, name, desc in required:
         exists = path.exists()
-        results.append((dirname, exists, desc if exists else "MISSING"))
+        results.append((name, exists, desc if exists else f"MISSING: {path}"))
 
     return results
 
