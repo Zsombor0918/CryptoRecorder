@@ -26,6 +26,7 @@ def test_writer_env_config_parsing(monkeypatch, tmp_path) -> None:
         mp.setenv("CRYPTO_RECORDER_DEPTH_BLOCK_ALERT_SEC", "7.5")
         mp.setenv("CRYPTO_RECORDER_WRITER_TELEMETRY_LOG_INTERVAL_SEC", "11")
         mp.setenv("CRYPTO_RECORDER_WRITER_COMPRESSION_WORKERS", "2")
+        mp.setenv("CRYPTO_RECORDER_WRITER_COMPRESSION_SHUTDOWN_TIMEOUT_SEC", "3.5")
 
         cfg = importlib.reload(config_mod)
         assert cfg.DATA_ROOT == tmp_path / "data"
@@ -41,6 +42,7 @@ def test_writer_env_config_parsing(monkeypatch, tmp_path) -> None:
         assert cfg.DEPTH_BLOCK_ALERT_SEC == 7.5
         assert cfg.WRITER_TELEMETRY_LOG_INTERVAL_SEC == 11
         assert cfg.WRITER_COMPRESSION_WORKERS == 2
+        assert cfg.WRITER_COMPRESSION_SHUTDOWN_TIMEOUT_SEC == 3.5
 
     importlib.reload(config_mod)
     importlib.reload(storage_mod)
@@ -216,3 +218,23 @@ async def test_rotation_schedules_compression_without_blocking_new_handle(monkey
     release.set()
     await compressor.shutdown()
     await rotator.close_all(compress=False)
+
+
+@pytest.mark.asyncio
+async def test_compression_shutdown_timeout_does_not_hang(monkeypatch, tmp_path) -> None:
+    async def stuck_compress(self, file_path):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(storage_mod.CompressionManager, "_compress_file", stuck_compress)
+
+    file_path = tmp_path / "stuck.jsonl"
+    file_path.write_text('{"n":1}\n')
+    compressor = storage_mod.CompressionManager(worker_count=1)
+
+    await compressor.enqueue(file_path)
+    await asyncio.sleep(0.01)
+    await asyncio.wait_for(compressor.shutdown(timeout_sec=0.01), timeout=0.2)
+
+    telemetry = compressor.get_telemetry()
+    assert telemetry["failed"] >= 1
+    assert "compression shutdown timed out" in telemetry["last_error"]

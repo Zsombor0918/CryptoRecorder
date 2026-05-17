@@ -28,6 +28,7 @@ from config import (
     TRADE_WRITER_QUEUE_MAX_SIZE,
     WRITER_BATCH_SIZE,
     WRITER_COMPRESSION_WORKERS,
+    WRITER_COMPRESSION_SHUTDOWN_TIMEOUT_SEC,
     WRITER_FLUSH_INTERVAL_SEC,
     WRITER_TELEMETRY_LOG_INTERVAL_SEC,
 )
@@ -101,13 +102,40 @@ class CompressionManager:
 
         await loop.run_in_executor(None, compress)
 
-    async def shutdown(self) -> None:
+    async def shutdown(
+        self,
+        timeout_sec: float = WRITER_COMPRESSION_SHUTDOWN_TIMEOUT_SEC,
+    ) -> None:
         """Wait for queued compression, then stop workers."""
         if not self._started:
             self._closed = True
             return
-        await self.queue.join()
+        timed_out = False
+        try:
+            await asyncio.wait_for(self.queue.join(), timeout=timeout_sec)
+        except asyncio.TimeoutError:
+            timed_out = True
+            self.failed += self.queue.qsize() + self.active
+            self.last_error = (
+                f"compression shutdown timed out after {timeout_sec:.1f}s "
+                f"(queued={self.queue.qsize()} active={self.active})"
+            )
+            logger.error(self.last_error)
         self._closed = True
+        if timed_out:
+            for task in self.tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*self.tasks, return_exceptions=True)
+            while not self.queue.empty():
+                try:
+                    self.queue.get_nowait()
+                    self.queue.task_done()
+                except asyncio.QueueEmpty:
+                    break
+            self.tasks.clear()
+            return
+
         for _ in self.tasks:
             await self.queue.put(None)
         await asyncio.gather(*self.tasks, return_exceptions=True)

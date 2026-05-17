@@ -320,6 +320,11 @@ WRITER_COMPRESSION_WORKERS: Final = _env_int(
     "1",
     min_value=1,
 )
+WRITER_COMPRESSION_SHUTDOWN_TIMEOUT_SEC: Final = _env_float(
+    "CRYPTO_RECORDER_WRITER_COMPRESSION_SHUTDOWN_TIMEOUT_SEC",
+    "60.0",
+    min_value=0.001,
+)
 
 # ============================================================================
 # Network / reconnect
