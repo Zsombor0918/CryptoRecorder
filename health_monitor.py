@@ -145,6 +145,7 @@ class HealthMonitor:
         # Queue drop stats – updated from StorageManager before heartbeat writes
         self.queue_drop_total: int = 0
         self.queue_drop_by_writer: Dict[str, int] = {}
+        self.writer_queue_telemetry: Dict[str, Any] = {}
         # Startup coverage / symbol-loss visibility
         self.spot_symbols_requested: int = 0
         self.futures_symbols_requested: int = 0
@@ -302,6 +303,10 @@ class HealthMonitor:
     def set_trade_health(self, trade_diagnostics: Dict[str, Any]) -> None:
         """Store trade health diagnostics for heartbeat export."""
         self.trade_health = trade_diagnostics
+
+    def set_writer_queue_telemetry(self, telemetry: Dict[str, Any]) -> None:
+        """Store writer queue and compression telemetry for heartbeat export."""
+        self.writer_queue_telemetry = telemetry
 
     def _subscribed_symbols_from_trade_health(self, venue: str) -> set[str]:
         venue_diag = self.trade_health.get(venue, {})
@@ -537,6 +542,7 @@ class HealthMonitor:
                 'total_reconnects': self.reconnect_count,
                 'queue_drop_total': self.queue_drop_total,
                 'queue_drop_by_writer': self.queue_drop_by_writer,
+                'writer_queue_telemetry': self.writer_queue_telemetry,
                 'futures_enabled': self.futures_enabled,
                 'futures_disabled_reason': self.futures_disabled_reason,
                 'snapshot_mode': self.snapshot_mode,

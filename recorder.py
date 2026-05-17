@@ -389,6 +389,9 @@ async def shutdown(background_tasks: List[asyncio.Task]) -> None:
             health_monitor.queue_drop_by_writer = {
                 k: v for k, v in drops.items() if v > 0
             }
+            health_monitor.set_writer_queue_telemetry(
+                storage_manager.get_writer_telemetry(log_summary=True)
+            )
         health_monitor.futures_enabled = futures_enabled
         health_monitor.futures_disabled_reason = futures_disabled_reason
         await health_monitor.write_heartbeat()
@@ -425,6 +428,9 @@ async def _update_drop_stats_task() -> None:
                 health_monitor.queue_drop_by_writer = {
                     k: v for k, v in drops.items() if v > 0
                 }
+                health_monitor.set_writer_queue_telemetry(
+                    storage_manager.get_writer_telemetry(log_summary=True)
+                )
             _refresh_trade_health_from_recorder()
         except Exception:
             pass

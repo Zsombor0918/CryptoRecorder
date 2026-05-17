@@ -25,6 +25,7 @@ Top-level fields:
 - `total_reconnects`
 - `queue_drop_total`
 - `queue_drop_by_writer`
+- `writer_queue_telemetry`
 - `futures_enabled`
 - `futures_disabled_reason`
 - `architecture` — always `"deterministic_native"`
@@ -37,6 +38,24 @@ Notes:
   (`+01:00` or `+02:00` depending on the date).
 - `spot_symbols_dropped*` / `futures_symbols_dropped*` summarize startup
   `runtime_dropped` symbols, not the full universe `candidate_pool`.
+
+`writer_queue_telemetry` reports recorder-side storage pressure:
+
+- `writers` — map keyed by `VENUE:SYMBOL:CHANNEL`
+- Per writer: `venue`, `symbol`, `channel`, `queue_size`,
+  `queue_max_size`, `queue_high_watermark`, `drop_count`,
+  `enqueued_count`, `write_count`, `blocked`, `current_block_sec`,
+  `max_block_sec`, `last_block_started_ts`, `last_block_ended_ts`
+- `totals` — `writer_count`, `queued_records`, `total_drops`,
+  `depth_blocked_writer_count`
+- `top_pressure_writers` — highest-pressure writers, including the writer
+  `key` plus the per-writer fields above
+- `compression` — background compression status: `queued`, `active`,
+  `completed`, `failed`, `last_error`, `worker_count`
+
+Depth writer queues do not drop on normal saturation by default; they block and
+surface `blocked` / `current_block_sec`. Trade writer queues remain bounded and
+may increment `drop_count` under sustained pressure.
 
 `trade_health` is a map keyed by venue (e.g. `BINANCE_SPOT`, `BINANCE_USDTF`) containing venue-level ingest diagnostics:
 

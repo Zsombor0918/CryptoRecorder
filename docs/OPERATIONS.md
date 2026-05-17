@@ -55,6 +55,41 @@ Startup and runtime reporting uses these terms:
 - Futures support is validated via REST exchangeInfo
 - Depth sync lifecycle handles reconnects deterministically (desync → resync)
 
+## Writer Backpressure
+
+Recorder storage uses one writer queue per `venue/symbol/channel`.
+`depth_v2` is protected first: by default it waits for writer capacity instead
+of dropping records. `trade_v2` keeps a bounded timeout and may drop under
+sustained pressure.
+
+Important environment knobs:
+
+```bash
+CRYPTO_RECORDER_DEPTH_WRITER_QUEUE_MAX_SIZE=20000
+CRYPTO_RECORDER_TRADE_WRITER_QUEUE_MAX_SIZE=5000
+CRYPTO_RECORDER_WRITER_BATCH_SIZE=1000
+CRYPTO_RECORDER_WRITER_FLUSH_INTERVAL_SEC=5.0
+CRYPTO_RECORDER_DEPTH_WRITER_ENQUEUE_TIMEOUT_SEC=0
+CRYPTO_RECORDER_TRADE_WRITER_ENQUEUE_TIMEOUT_SEC=1.0
+CRYPTO_RECORDER_DEPTH_BLOCK_WARN_INTERVAL_SEC=10.0
+CRYPTO_RECORDER_DEPTH_BLOCK_ALERT_SEC=30.0
+CRYPTO_RECORDER_WRITER_TELEMETRY_LOG_INTERVAL_SEC=60
+CRYPTO_RECORDER_WRITER_COMPRESSION_WORKERS=1
+```
+
+Use `state/heartbeat.json` → `writer_queue_telemetry` to inspect pressure:
+
+- `top_pressure_writers`: symbols/channels causing queue pressure
+- `queue_size` / `queue_high_watermark`: current and peak backlog
+- `drop_count`: lossy queue drops, normally trade-side
+- `blocked` / `current_block_sec`: depth writers waiting for capacity
+- `compression`: queued/active/completed/failed background compression work
+
+Hourly rotation closes old files quickly and queues compression in the
+background, so compression should not block the active ingest path. Any
+compression failures are left as uncompressed `.jsonl` files and surfaced in
+heartbeat telemetry.
+
 ## Conversion
 
 ```bash

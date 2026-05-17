@@ -5,6 +5,29 @@ import os
 from pathlib import Path
 from typing import Final
 
+
+def _env_int(name: str, default: str, *, min_value: int | None = None) -> int:
+    raw = os.environ.get(name, default).strip()
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer, got {raw!r}") from exc
+    if min_value is not None and value < min_value:
+        raise ValueError(f"{name} must be >= {min_value}, got {value}")
+    return value
+
+
+def _env_float(name: str, default: str, *, min_value: float | None = None) -> float:
+    raw = os.environ.get(name, default).strip()
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a number, got {raw!r}") from exc
+    if min_value is not None and value < min_value:
+        raise ValueError(f"{name} must be >= {min_value}, got {value}")
+    return value
+
+
 # ============================================================================
 # Paths
 # ============================================================================
@@ -14,7 +37,9 @@ DATA_ROOT: Final = Path(
     os.environ.get("CRYPTO_RECORDER_DATA_ROOT", "/data/cryptorecorder/data_raw")
 ).expanduser()
 META_ROOT: Final = PROJECT_ROOT / "meta"
-STATE_ROOT: Final = PROJECT_ROOT / "state"
+STATE_ROOT: Final = Path(
+    os.environ.get("CRYPTO_RECORDER_STATE_ROOT", str(PROJECT_ROOT / "state"))
+).expanduser()
 
 # Canonical data channels.  depth_v2 and trade_v2 are the only raw
 # sources on the deterministic-native mainline.
@@ -229,14 +254,72 @@ LOG_FORMAT: Final = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 # Queue / writer backpressure
 # ============================================================================
 
-# Max size of in-memory queues (to prevent memory bloat)
-QUEUE_MAX_SIZE: Final = 10000
+# Fallback max size for in-memory writer queues.
+QUEUE_MAX_SIZE: Final = _env_int(
+    "CRYPTO_RECORDER_WRITER_QUEUE_MAX_SIZE",
+    "10000",
+    min_value=1,
+)
+
+# Channel-specific queue sizes. Depth is larger because a single missing depth
+# update breaks book continuity; trades can be shed under sustained pressure.
+DEPTH_WRITER_QUEUE_MAX_SIZE: Final = _env_int(
+    "CRYPTO_RECORDER_DEPTH_WRITER_QUEUE_MAX_SIZE",
+    "20000",
+    min_value=1,
+)
+TRADE_WRITER_QUEUE_MAX_SIZE: Final = _env_int(
+    "CRYPTO_RECORDER_TRADE_WRITER_QUEUE_MAX_SIZE",
+    "5000",
+    min_value=1,
+)
 
 # Writer batch size (items per write)
-WRITER_BATCH_SIZE: Final = 100
+WRITER_BATCH_SIZE: Final = _env_int(
+    "CRYPTO_RECORDER_WRITER_BATCH_SIZE",
+    "1000",
+    min_value=1,
+)
 
 # Writer flush interval (seconds)
-WRITER_FLUSH_INTERVAL_SEC: Final = 5
+WRITER_FLUSH_INTERVAL_SEC: Final = _env_float(
+    "CRYPTO_RECORDER_WRITER_FLUSH_INTERVAL_SEC",
+    "5.0",
+    min_value=0.001,
+)
+
+# Enqueue timeout policy. A depth timeout of 0 means wait indefinitely unless the
+# coroutine is cancelled during shutdown.
+DEPTH_WRITER_ENQUEUE_TIMEOUT_SEC: Final = _env_float(
+    "CRYPTO_RECORDER_DEPTH_WRITER_ENQUEUE_TIMEOUT_SEC",
+    "0",
+    min_value=0.0,
+)
+TRADE_WRITER_ENQUEUE_TIMEOUT_SEC: Final = _env_float(
+    "CRYPTO_RECORDER_TRADE_WRITER_ENQUEUE_TIMEOUT_SEC",
+    "1.0",
+    min_value=0.0,
+)
+DEPTH_BLOCK_WARN_INTERVAL_SEC: Final = _env_float(
+    "CRYPTO_RECORDER_DEPTH_BLOCK_WARN_INTERVAL_SEC",
+    "10.0",
+    min_value=0.001,
+)
+DEPTH_BLOCK_ALERT_SEC: Final = _env_float(
+    "CRYPTO_RECORDER_DEPTH_BLOCK_ALERT_SEC",
+    "30.0",
+    min_value=0.001,
+)
+WRITER_TELEMETRY_LOG_INTERVAL_SEC: Final = _env_float(
+    "CRYPTO_RECORDER_WRITER_TELEMETRY_LOG_INTERVAL_SEC",
+    "60",
+    min_value=0.0,
+)
+WRITER_COMPRESSION_WORKERS: Final = _env_int(
+    "CRYPTO_RECORDER_WRITER_COMPRESSION_WORKERS",
+    "1",
+    min_value=1,
+)
 
 # ============================================================================
 # Network / reconnect
