@@ -31,6 +31,7 @@ handlers).
 | `convert_day.py` | CLI converter orchestrator |
 | `converter/trades.py` | Raw trade_v2 → Nautilus `TradeTick` |
 | `converter/depth_phase2.py` | Deterministic depth_v2 replay → `OrderBookDeltas` (+ optional `OrderBookDepth10`) |
+| `converter/spool.py` | Temporary SQLite spools used to keep heavy conversions memory-bounded |
 
 ## Session Ordering
 
@@ -92,6 +93,9 @@ ordering — ordering comes solely from `trade_session_seq`.
   converted to Nautilus `TradeTick`.
 - Depth records are sorted by `(stream_session_id, session_seq, raw_index)` and
   replayed through an exact `Decimal` book state to produce `OrderBookDeltas`.
+- Heavy conversions spool raw records and per-symbol Nautilus outputs to
+  temporary SQLite files, then stream catalog writes in the same `ts_init` order
+  previously produced by in-memory list sorting.
 - `OrderBookDepth10` is enabled by default and derived only from the
   replayed deterministic book state.
 - Instruments are built from exchangeInfo (`CurrencyPair` for spot,

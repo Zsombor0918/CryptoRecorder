@@ -107,6 +107,28 @@ python convert_day.py --date 2026-04-20
 python convert_day.py --date 2026-04-20 --staging --emit-depth10
 ```
 
+The converter is memory-bounded for heavy days. Raw trade/depth records are
+sorted through temporary SQLite spools, and per-symbol Nautilus outputs are
+spooled before catalog writes so the old `ts_init` write order is preserved
+without retaining full-day Python lists. This can make conversion slower on
+large days, but peak memory should track batch size plus spool overhead instead
+of compressed raw input size.
+
+Optional converter temp directory:
+
+```bash
+CRYPTO_RECORDER_CONVERTER_TEMP_DIR=/fast/local/tmp
+```
+
+For production Depth10 emission, keep the derived snapshot interval at 30s:
+
+```bash
+CRYPTO_RECORDER_DERIVED_DEPTH_SNAPSHOT_INTERVAL_SEC=30.0
+```
+
+This is a converter/runtime setting; changing converter code or temp location
+does not require restarting the live recorder service.
+
 ## Validation & Testing
 
 ```bash

@@ -76,6 +76,34 @@ def _no_trade_diag() -> dict[str, int]:
     }
 
 
+def _patch_trade_streaming(monkeypatch) -> None:
+    def fake_convert_trades_streaming(*args, on_ticks_batch, **kwargs):
+        return 0, None, None, _no_trade_diag()
+
+    monkeypatch.setattr(
+        convert_day_mod,
+        "convert_trades_streaming",
+        fake_convert_trades_streaming,
+    )
+
+
+def _patch_depth_streaming(monkeypatch, instrument) -> None:
+    def fake_convert_depth_streaming(*args, on_deltas_batch, on_depth10_batch, **kwargs):
+        on_deltas_batch([_snapshot_deltas(instrument)])
+        return Phase2ReplayMetrics(
+            snapshot_seed_count=1,
+            delta_events_written=1,
+            first_ts_ns=1_000_000_000,
+            last_ts_ns=1_000_000_000,
+        )
+
+    monkeypatch.setattr(
+        convert_day_mod,
+        "convert_depth_v2_streaming",
+        fake_convert_depth_streaming,
+    )
+
+
 def _patch_single_symbol_depth_conversion(monkeypatch) -> None:
     instrument = TestInstrumentProvider.btcusdt_binance()
     monkeypatch.setattr(
@@ -89,25 +117,8 @@ def _patch_single_symbol_depth_conversion(monkeypatch) -> None:
         "build_instruments",
         lambda venue, syms, einfo: [instrument],
     )
-    monkeypatch.setattr(
-        convert_day_mod,
-        "convert_trades_with_diagnostics",
-        lambda *args, **kwargs: ([], 0, None, None, _no_trade_diag()),
-    )
-    monkeypatch.setattr(
-        convert_day_mod,
-        "convert_depth_v2",
-        lambda *args, **kwargs: (
-            [_snapshot_deltas(instrument)],
-            [],
-            Phase2ReplayMetrics(
-                snapshot_seed_count=1,
-                delta_events_written=1,
-                first_ts_ns=1_000_000_000,
-                last_ts_ns=1_000_000_000,
-            ),
-        ),
-    )
+    _patch_trade_streaming(monkeypatch)
+    _patch_depth_streaming(monkeypatch, instrument)
     monkeypatch.setattr(
         convert_day_mod,
         "_symbols_with_raw_record_type",

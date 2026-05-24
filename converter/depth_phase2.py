@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import logging
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 from nautilus_trader.model.data import (
     BookOrder,
@@ -32,12 +32,14 @@ from config import (
     DERIVED_DEPTH_SNAPSHOT_LEVELS,
 )
 from converter.readers import stream_raw_records
+from converter.spool import DedupeSet, RawRecordSpool
 
 logger = logging.getLogger(__name__)
 
 F_LAST = 1 << 7
 F_SNAPSHOT = 1 << 5
 EPOCH_LIKE_NS_MIN = 946684800000000000  # 2000-01-01T00:00:00Z
+DEFAULT_CONVERTER_BATCH_SIZE = 5000
 
 
 @dataclass
@@ -388,76 +390,6 @@ def _should_accept_update(state: ReplayState, rec: dict) -> bool:
     return U <= (prev + 1) <= u
 
 
-def _load_repartitioned_records(
-    venue: str,
-    symbol: str,
-    date_str: str,
-    metrics: Phase2ReplayMetrics,
-) -> Tuple[List[dict], List[dict]]:
-    target_start_ns, target_end_ns = _target_bounds_ns(date_str)
-    partition_dates = [_date_shift(date_str, -1), date_str, _date_shift(date_str, 1)]
-    metrics.extra_raw_partitions_scanned = [partition_dates[0], partition_dates[2]]
-
-    target_records: List[dict] = []
-    carry_records: List[dict] = []
-    seen_target: set[Tuple[object, ...]] = set()
-
-    for source_date in partition_dates:
-        for rec in stream_raw_records(venue, symbol, "depth_v2", source_date):
-            item = dict(rec)
-            item["_source_date"] = source_date
-            ts_ns = _ts_event_ns(item)
-
-            # Existing unit fixtures often use tiny relative timestamps. Keep
-            # them path-scoped so historical tests do not masquerade as 1970.
-            if not _is_epoch_like_ns(ts_ns):
-                if source_date == date_str:
-                    key = _dedupe_key(item)
-                    if key in seen_target:
-                        metrics.duplicate_records_suppressed += 1
-                        continue
-                    seen_target.add(key)
-                    target_records.append(item)
-                continue
-
-            if target_start_ns <= ts_ns < target_end_ns:
-                key = _dedupe_key(item)
-                if key in seen_target:
-                    metrics.duplicate_records_suppressed += 1
-                    continue
-                seen_target.add(key)
-                target_records.append(item)
-                if source_date == partition_dates[0]:
-                    metrics.records_imported_from_previous_folder += 1
-                elif source_date == partition_dates[2]:
-                    metrics.records_imported_from_next_folder += 1
-            else:
-                metrics.records_dropped_outside_target_utc += 1
-                if ts_ns < target_start_ns:
-                    carry_records.append(item)
-
-    target_records.sort(key=lambda rec: _sort_key(0, rec))
-    carry_records.sort(key=lambda rec: _sort_key(0, rec))
-    return target_records, carry_records
-
-
-def _find_first_depth_update(records: List[dict]) -> Optional[dict]:
-    for rec in records:
-        if rec.get("record_type", "depth_update") == "depth_update":
-            return rec
-    return None
-
-
-def _has_snapshot_before_first_update(records: List[dict], first_update: dict) -> bool:
-    first_key = _sort_key(0, first_update)
-    for rec in records:
-        if rec.get("record_type") != "snapshot_seed":
-            continue
-        if _sort_key(0, rec) < first_key:
-            return True
-    return False
-
-
 def _fail_carry(state: ReplayState, metrics: Phase2ReplayMetrics, reason: str) -> bool:
     state.current_stream_session_id = None
     state.sync_state = "unsynced"
@@ -468,40 +400,31 @@ def _fail_carry(state: ReplayState, metrics: Phase2ReplayMetrics, reason: str) -
     return False
 
 
-def _recover_carry_state(
+def _recover_carry_state_from_spool(
     state: ReplayState,
-    carry_records: List[dict],
+    carry_spool: RawRecordSpool,
     first_update: dict,
     metrics: Phase2ReplayMetrics,
 ) -> bool:
     session_id = first_update.get("stream_session_id")
-    snapshots = [
-        rec
-        for rec in carry_records
-        if rec.get("record_type") == "snapshot_seed"
-        and rec.get("stream_session_id") == session_id
-    ]
-    if not snapshots:
+    seed = carry_spool.max_record(
+        record_type="snapshot_seed",
+        session_id=session_id,
+        first_tie=True,
+    )
+    if seed is None:
         return _fail_carry(state, metrics, "no_previous_snapshot_seed")
 
-    seed = max(snapshots, key=lambda rec: _sort_key(0, rec))
     seed_key = _sort_key(0, seed)
-    replay_records = [
-        rec
-        for rec in carry_records
-        if rec.get("stream_session_id") == session_id
-        and _sort_key(0, rec) >= seed_key
-    ]
-    if not replay_records:
-        return _fail_carry(state, metrics, "empty_carry_replay")
-
+    has_replay = False
     state.current_stream_session_id = session_id
     state.sync_state = "unsynced"
     state.last_snapshot_update_id = None
     state.prev_update_id = None
     state.reset_book()
 
-    for rec in replay_records:
+    for rec in carry_spool.iter_records(session_id=session_id, min_sort_key=seed_key):
+        has_replay = True
         metrics.carry_replay_record_count += 1
         record_type = rec.get("record_type", "depth_update")
         if record_type == "stream_lifecycle":
@@ -526,6 +449,8 @@ def _recover_carry_state(
         state.prev_update_id = rec.get("u")
         state.sync_state = "live_synced"
 
+    if not has_replay:
+        return _fail_carry(state, metrics, "empty_carry_replay")
     if state.prev_update_id is None or not state.bids or not state.asks:
         return _fail_carry(state, metrics, "carry_incomplete_book_state")
 
@@ -569,6 +494,65 @@ def _emit_synthetic_opening_snapshot(
             metrics.derived_depth_snapshots_written += 1
 
 
+def _spool_repartitioned_records(
+    venue: str,
+    symbol: str,
+    date_str: str,
+    metrics: Phase2ReplayMetrics,
+    target_spool: RawRecordSpool,
+    carry_spool: RawRecordSpool,
+    seen_target: DedupeSet,
+) -> None:
+    target_start_ns, target_end_ns = _target_bounds_ns(date_str)
+    partition_dates = [_date_shift(date_str, -1), date_str, _date_shift(date_str, 1)]
+    metrics.extra_raw_partitions_scanned = [partition_dates[0], partition_dates[2]]
+
+    target_index = 0
+    carry_index = 0
+    for source_date in partition_dates:
+        for rec in stream_raw_records(venue, symbol, "depth_v2", source_date):
+            item = dict(rec)
+            item["_source_date"] = source_date
+            item["record_type"] = item.get("record_type", "depth_update")
+            ts_ns = _ts_event_ns(item)
+
+            # Existing unit fixtures often use tiny relative timestamps. Keep
+            # them path-scoped so historical tests do not masquerade as 1970.
+            if not _is_epoch_like_ns(ts_ns):
+                if source_date == date_str:
+                    key = _dedupe_key(item)
+                    if not seen_target.add(key):
+                        metrics.duplicate_records_suppressed += 1
+                        continue
+                    sort_key = _sort_key(target_index, item)
+                    target_spool.insert(item, sort_key, target_index)
+                    target_index += 1
+                continue
+
+            if target_start_ns <= ts_ns < target_end_ns:
+                key = _dedupe_key(item)
+                if not seen_target.add(key):
+                    metrics.duplicate_records_suppressed += 1
+                    continue
+                sort_key = _sort_key(target_index, item)
+                target_spool.insert(item, sort_key, target_index)
+                target_index += 1
+                if source_date == partition_dates[0]:
+                    metrics.records_imported_from_previous_folder += 1
+                elif source_date == partition_dates[2]:
+                    metrics.records_imported_from_next_folder += 1
+            else:
+                metrics.records_dropped_outside_target_utc += 1
+                if ts_ns < target_start_ns:
+                    sort_key = _sort_key(carry_index, item)
+                    carry_spool.insert(item, sort_key, carry_index)
+                    carry_index += 1
+
+    target_spool.commit()
+    carry_spool.commit()
+    seen_target.commit()
+
+
 def convert_depth_v2(
     venue: str,
     symbol: str,
@@ -581,8 +565,50 @@ def convert_depth_v2(
     depth10_interval_sec: float = DEPTH10_INTERVAL_SEC,
     derived_depth_snapshot_levels: int = DERIVED_DEPTH_SNAPSHOT_LEVELS,
 ) -> Tuple[List[OrderBookDeltas], List[OrderBookDepth10], Phase2ReplayMetrics]:
+    deltas_out: List[OrderBookDeltas] = []
+    depth10_out: List[OrderBookDepth10] = []
+
+    def collect_deltas(batch: List[OrderBookDeltas]) -> None:
+        deltas_out.extend(batch)
+
+    def collect_depth10(batch: List[OrderBookDepth10]) -> None:
+        depth10_out.extend(batch)
+
+    metrics = convert_depth_v2_streaming(
+        venue,
+        symbol,
+        date_str,
+        instrument_id,
+        price_prec,
+        size_prec,
+        emit_depth10=emit_depth10,
+        depth10_interval_sec=depth10_interval_sec,
+        derived_depth_snapshot_levels=derived_depth_snapshot_levels,
+        on_deltas_batch=collect_deltas,
+        on_depth10_batch=collect_depth10,
+        batch_size=DEFAULT_CONVERTER_BATCH_SIZE,
+    )
+    return deltas_out, depth10_out, metrics
+
+
+def convert_depth_v2_streaming(
+    venue: str,
+    symbol: str,
+    date_str: str,
+    instrument_id: InstrumentId,
+    price_prec: int,
+    size_prec: int,
+    *,
+    on_deltas_batch: Callable[[List[OrderBookDeltas]], None],
+    on_depth10_batch: Callable[[List[OrderBookDepth10]], None],
+    batch_size: int = DEFAULT_CONVERTER_BATCH_SIZE,
+    temp_dir: str | None = None,
+    emit_depth10: bool = False,
+    depth10_interval_sec: float = DEPTH10_INTERVAL_SEC,
+    derived_depth_snapshot_levels: int = DERIVED_DEPTH_SNAPSHOT_LEVELS,
+) -> Phase2ReplayMetrics:
+    batch_size = max(1, int(batch_size))
     metrics = Phase2ReplayMetrics()
-    records, carry_records = _load_repartitioned_records(venue, symbol, date_str, metrics)
     requested_depth_snapshot_levels = max(0, int(derived_depth_snapshot_levels))
     applied_depth_snapshot_levels = min(requested_depth_snapshot_levels, 10)
     if applied_depth_snapshot_levels <= 0:
@@ -591,8 +617,6 @@ def convert_depth_v2(
     metrics.requested_depth_snapshot_levels_applied = applied_depth_snapshot_levels
     metrics.derived_depth_snapshot_levels = applied_depth_snapshot_levels
     metrics.derived_depth_snapshot_type = "OrderBookDepth10"
-    deltas_out: List[OrderBookDeltas] = []
-    depth10_out: List[OrderBookDepth10] = []
     state = ReplayState(
         instrument_id=instrument_id,
         venue=venue,
@@ -601,173 +625,213 @@ def convert_depth_v2(
         size_prec=size_prec,
     )
     interval_ns = int(depth10_interval_sec * 1e9)
+    delta_batch: List[OrderBookDeltas] = []
+    depth10_batch: List[OrderBookDepth10] = []
 
-    first_update = _find_first_depth_update(records)
-    if first_update is not None and not _has_snapshot_before_first_update(records, first_update):
-        if _recover_carry_state(state, carry_records, first_update, metrics):
-            _emit_synthetic_opening_snapshot(
-                state,
-                first_update,
-                metrics,
-                deltas_out,
-                depth10_out,
-                emit_depth10=emit_depth10,
-            )
+    def flush_deltas() -> None:
+        if not delta_batch:
+            return
+        on_deltas_batch(list(delta_batch))
+        delta_batch.clear()
 
-    ordered = sorted(
-        enumerate(records),
-        key=lambda item: _sort_key(item[0], item[1]),
-    )
-    for raw_index, rec in ordered:
-        try:
-            record_type = rec.get("record_type", "depth_update")
-            metrics.raw_record_count += 1
-            if record_type == "depth_update":
-                metrics.depth_update_record_count += 1
-            elif record_type == "sync_state":
-                metrics.sync_state_record_count += 1
-            elif record_type == "stream_lifecycle":
-                metrics.stream_lifecycle_record_count += 1
-            ts_event = _ts_event_ns(rec)
-            ts_init = int(rec.get("ts_recv_ns", ts_event))
+    def flush_depth10() -> None:
+        if not depth10_batch:
+            return
+        on_depth10_batch(list(depth10_batch))
+        depth10_batch.clear()
 
-            if metrics.first_ts_ns is None:
-                metrics.first_ts_ns = ts_event
-            metrics.last_ts_ns = ts_event
+    def maybe_flush() -> None:
+        if len(delta_batch) >= batch_size:
+            flush_deltas()
+        if len(depth10_batch) >= batch_size:
+            flush_depth10()
 
-            session_id = rec.get("stream_session_id")
-            if state.current_stream_session_id != session_id:
-                if state.fence_open is not None:
-                    state.fence_open["closed_by_session_change"] = True
-                    _close_fence(state, metrics, rec=rec, recovered=False)
-                state.current_stream_session_id = session_id
-                state.sync_state = "unsynced"
-                state.last_snapshot_update_id = None
-                state.prev_update_id = None
-                state.reset_book()
+    with (
+        RawRecordSpool(temp_dir=temp_dir, prefix="cryptorecorder-depth-target-") as target_spool,
+        RawRecordSpool(temp_dir=temp_dir, prefix="cryptorecorder-depth-carry-") as carry_spool,
+        DedupeSet(temp_dir=temp_dir, prefix="cryptorecorder-depth-dedupe-") as seen_target,
+    ):
+        _spool_repartitioned_records(
+            venue,
+            symbol,
+            date_str,
+            metrics,
+            target_spool,
+            carry_spool,
+            seen_target,
+        )
 
-            if record_type == "stream_lifecycle":
-                continue
-
-            if record_type == "sync_state":
-                state.sync_state = rec.get("state", state.sync_state)
-                if state.sync_state == "snapshot_seeded":
-                    _close_fence(state, metrics, rec=rec, recovered=True)
-                elif state.sync_state == "resync_required":
-                    reason = rec.get("reason", "resync_required")
-                    if not _is_lifecycle_resync_reason(reason):
-                        metrics.resync_count += 1
-                    _open_fence(state, metrics, reason=reason, rec=rec)
-                elif state.sync_state == "desynced":
-                    metrics.desync_events += 1
-                    _open_fence(state, metrics, reason=rec.get("reason", "desynced"), rec=rec)
-                elif state.sync_state == "fenced":
-                    _open_fence(state, metrics, reason=rec.get("reason", "fenced"), rec=rec)
-                continue
-
-            if record_type == "snapshot_seed":
-                payload = rec.get("payload", {})
-                _snapshot_to_book(state, payload)
-                state.last_snapshot_update_id = rec.get("lastUpdateId")
-                state.prev_update_id = rec.get("lastUpdateId")
-                state.sync_state = "snapshot_seeded"
-                metrics.snapshot_seed_count += 1
-                _close_fence(state, metrics, rec=rec, recovered=True)
-
-                snapshot = _snapshot_deltas(
+        first_update = target_spool.first_record(record_type="depth_update")
+        if first_update is not None and not target_spool.has_record_before(
+            "snapshot_seed",
+            _sort_key(0, first_update),
+        ):
+            if _recover_carry_state_from_spool(state, carry_spool, first_update, metrics):
+                _emit_synthetic_opening_snapshot(
                     state,
-                    payload,
-                    sequence=int(rec.get("lastUpdateId") or 0),
+                    first_update,
+                    metrics,
+                    delta_batch,
+                    depth10_batch,
+                    emit_depth10=emit_depth10,
+                )
+                maybe_flush()
+
+        for rec in target_spool.iter_records():
+            try:
+                record_type = rec.get("record_type", "depth_update")
+                metrics.raw_record_count += 1
+                if record_type == "depth_update":
+                    metrics.depth_update_record_count += 1
+                elif record_type == "sync_state":
+                    metrics.sync_state_record_count += 1
+                elif record_type == "stream_lifecycle":
+                    metrics.stream_lifecycle_record_count += 1
+                ts_event = _ts_event_ns(rec)
+                ts_init = int(rec.get("ts_recv_ns", ts_event))
+
+                if metrics.first_ts_ns is None:
+                    metrics.first_ts_ns = ts_event
+                metrics.last_ts_ns = ts_event
+
+                session_id = rec.get("stream_session_id")
+                if state.current_stream_session_id != session_id:
+                    if state.fence_open is not None:
+                        state.fence_open["closed_by_session_change"] = True
+                        _close_fence(state, metrics, rec=rec, recovered=False)
+                    state.current_stream_session_id = session_id
+                    state.sync_state = "unsynced"
+                    state.last_snapshot_update_id = None
+                    state.prev_update_id = None
+                    state.reset_book()
+
+                if record_type == "stream_lifecycle":
+                    continue
+
+                if record_type == "sync_state":
+                    state.sync_state = rec.get("state", state.sync_state)
+                    if state.sync_state == "snapshot_seeded":
+                        _close_fence(state, metrics, rec=rec, recovered=True)
+                    elif state.sync_state == "resync_required":
+                        reason = rec.get("reason", "resync_required")
+                        if not _is_lifecycle_resync_reason(reason):
+                            metrics.resync_count += 1
+                        _open_fence(state, metrics, reason=reason, rec=rec)
+                    elif state.sync_state == "desynced":
+                        metrics.desync_events += 1
+                        _open_fence(state, metrics, reason=rec.get("reason", "desynced"), rec=rec)
+                    elif state.sync_state == "fenced":
+                        _open_fence(state, metrics, reason=rec.get("reason", "fenced"), rec=rec)
+                    continue
+
+                if record_type == "snapshot_seed":
+                    payload = rec.get("payload", {})
+                    _snapshot_to_book(state, payload)
+                    state.last_snapshot_update_id = rec.get("lastUpdateId")
+                    state.prev_update_id = rec.get("lastUpdateId")
+                    state.sync_state = "snapshot_seeded"
+                    metrics.snapshot_seed_count += 1
+                    _close_fence(state, metrics, rec=rec, recovered=True)
+
+                    snapshot = _snapshot_deltas(
+                        state,
+                        payload,
+                        sequence=int(rec.get("lastUpdateId") or 0),
+                        ts_event=ts_event,
+                        ts_init=ts_init,
+                    )
+                    if snapshot is not None:
+                        delta_batch.append(snapshot)
+                        metrics.delta_events_written += 1
+                    if emit_depth10:
+                        depth = _depth10_from_state(state, ts_event=ts_event, ts_init=ts_init)
+                        if depth is not None:
+                            depth10_batch.append(depth)
+                            state.last_depth10_emit_ns = ts_event
+                            metrics.depth10_written += 1
+                            metrics.derived_depth_snapshots_written += 1
+                    maybe_flush()
+                    continue
+
+                if record_type != "depth_update":
+                    continue
+
+                if state.prev_update_id is None:
+                    _open_fence(state, metrics, reason="no_snapshot_seed", rec=rec)
+                    continue
+
+                if not _should_accept_update(state, rec):
+                    state.sync_state = "desynced"
+                    metrics.desync_events += 1
+                    _open_fence(state, metrics, reason="continuity_break", rec=rec)
+                    continue
+
+                _apply_levels(state.bids, rec.get("payload", {}).get("bids", []))
+                _apply_levels(state.asks, rec.get("payload", {}).get("asks", []))
+                state.prev_update_id = rec.get("u")
+                state.sync_state = "live_synced"
+
+                event = _live_deltas(
+                    state,
+                    rec.get("payload", {}),
+                    sequence=int(rec.get("u") or 0),
                     ts_event=ts_event,
                     ts_init=ts_init,
                 )
-                if snapshot is not None:
-                    deltas_out.append(snapshot)
+                if event is not None:
+                    delta_batch.append(event)
                     metrics.delta_events_written += 1
+
+                _close_fence(state, metrics, rec=rec, recovered=True)
+
                 if emit_depth10:
-                    depth = _depth10_from_state(state, ts_event=ts_event, ts_init=ts_init)
-                    if depth is not None:
-                        depth10_out.append(depth)
-                        state.last_depth10_emit_ns = ts_event
-                        metrics.depth10_written += 1
-                        metrics.derived_depth_snapshots_written += 1
-                continue
+                    should_emit = (
+                        state.last_depth10_emit_ns is None
+                        or interval_ns <= 0
+                        or (ts_event - state.last_depth10_emit_ns) >= interval_ns
+                    )
+                    if should_emit:
+                        depth = _depth10_from_state(state, ts_event=ts_event, ts_init=ts_init)
+                        if depth is not None:
+                            depth10_batch.append(depth)
+                            state.last_depth10_emit_ns = ts_event
+                            metrics.depth10_written += 1
+                            metrics.derived_depth_snapshots_written += 1
+                maybe_flush()
+            except Exception as exc:
+                logger.exception("Phase 2 replay error for %s/%s", venue, symbol)
+                metrics.bad_lines += 1
 
-            if record_type != "depth_update":
-                continue
+                # Capture compact diagnostic info for first 20 bad_lines
+                exc_type = type(exc).__name__
+                rec_type = rec.get("record_type", "unknown") if 'rec' in locals() else "unknown"
 
-            if state.prev_update_id is None:
-                _open_fence(state, metrics, reason="no_snapshot_seed", rec=rec)
-                continue
+                # Track counts by exception type and record type
+                metrics.bad_lines_by_exception_type[exc_type] = metrics.bad_lines_by_exception_type.get(exc_type, 0) + 1
+                metrics.bad_lines_by_record_type[rec_type] = metrics.bad_lines_by_record_type.get(rec_type, 0) + 1
 
-            if not _should_accept_update(state, rec):
-                state.sync_state = "desynced"
-                metrics.desync_events += 1
-                _open_fence(state, metrics, reason="continuity_break", rec=rec)
-                continue
+                # Keep first 20 examples (compact format)
+                if len(metrics.bad_line_examples) < 20 and 'rec' in locals():
+                    metrics.bad_line_examples.append({
+                        "venue": venue,
+                        "symbol": symbol,
+                        "record_type": rec_type,
+                        "stream_session_id": rec.get("stream_session_id"),
+                        "session_seq": rec.get("session_seq"),
+                        "ts_event_ms": rec.get("ts_event_ms"),
+                        "exception_type": exc_type,
+                        "exception_message": str(exc)[:100],
+                        "record_keys": list(rec.keys()) if isinstance(rec, dict) else [],
+                    })
 
-            _apply_levels(state.bids, rec.get("payload", {}).get("bids", []))
-            _apply_levels(state.asks, rec.get("payload", {}).get("asks", []))
-            state.prev_update_id = rec.get("u")
-            state.sync_state = "live_synced"
+        if state.fence_open is not None:
+            state.fence_open["end_ts_ns"] = metrics.last_ts_ns
+            state.fence_open["closed_at_eof"] = True
+            state.fence_open["recovered"] = False
+            metrics.fenced_ranges.append(state.fence_open)
+            state.fence_open = None
 
-            event = _live_deltas(
-                state,
-                rec.get("payload", {}),
-                sequence=int(rec.get("u") or 0),
-                ts_event=ts_event,
-                ts_init=ts_init,
-            )
-            if event is not None:
-                deltas_out.append(event)
-                metrics.delta_events_written += 1
+        flush_deltas()
+        flush_depth10()
 
-            _close_fence(state, metrics, rec=rec, recovered=True)
-
-            if emit_depth10:
-                should_emit = (
-                    state.last_depth10_emit_ns is None
-                    or interval_ns <= 0
-                    or (ts_event - state.last_depth10_emit_ns) >= interval_ns
-                )
-                if should_emit:
-                    depth = _depth10_from_state(state, ts_event=ts_event, ts_init=ts_init)
-                    if depth is not None:
-                        depth10_out.append(depth)
-                        state.last_depth10_emit_ns = ts_event
-                        metrics.depth10_written += 1
-                        metrics.derived_depth_snapshots_written += 1
-        except Exception as exc:
-            logger.exception("Phase 2 replay error for %s/%s", venue, symbol)
-            metrics.bad_lines += 1
-            
-            # Capture compact diagnostic info for first 20 bad_lines
-            exc_type = type(exc).__name__
-            rec_type = rec.get("record_type", "unknown") if 'rec' in locals() else "unknown"
-            
-            # Track counts by exception type and record type
-            metrics.bad_lines_by_exception_type[exc_type] = metrics.bad_lines_by_exception_type.get(exc_type, 0) + 1
-            metrics.bad_lines_by_record_type[rec_type] = metrics.bad_lines_by_record_type.get(rec_type, 0) + 1
-            
-            # Keep first 20 examples (compact format)
-            if len(metrics.bad_line_examples) < 20 and 'rec' in locals():
-                metrics.bad_line_examples.append({
-                    "venue": venue,
-                    "symbol": symbol,
-                    "record_type": rec_type,
-                    "stream_session_id": rec.get("stream_session_id"),
-                    "session_seq": rec.get("session_seq"),
-                    "ts_event_ms": rec.get("ts_event_ms"),
-                    "exception_type": exc_type,
-                    "exception_message": str(exc)[:100],
-                    "record_keys": list(rec.keys()) if isinstance(rec, dict) else [],
-                })
-
-    if state.fence_open is not None:
-        state.fence_open["end_ts_ns"] = metrics.last_ts_ns
-        state.fence_open["closed_at_eof"] = True
-        state.fence_open["recovered"] = False
-        metrics.fenced_ranges.append(state.fence_open)
-        state.fence_open = None
-
-    return deltas_out, depth10_out, metrics
+    return metrics

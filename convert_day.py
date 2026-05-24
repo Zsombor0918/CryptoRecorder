@@ -40,11 +40,12 @@ from config import (
     PHASE2_SNAPSHOT_LIMIT,
     STATE_ROOT,
 )
-from converter.depth_phase2 import convert_depth_v2
+from converter.depth_phase2 import convert_depth_v2_streaming
 from converter.catalog import _parse_parquet_date_range, purge_catalog_date_range
 from converter.instruments import build_instruments, load_exchange_info
 from converter.readers import stream_raw_records
-from converter.trades import convert_trades_with_diagnostics
+from converter.spool import ObjectSpool, TimestampSpool
+from converter.trades import convert_trades_streaming
 from converter.universe import resolve_universe
 from time_utils import local_now_iso
 from validators.trade_coverage import build_readiness_summary
@@ -365,233 +366,274 @@ def convert_date(
             v_symbols.append(symbol)
 
             # ── trades (trade_v2) ─────────────────────────────────────
-            ticks, bad_t, t_first, t_last, trade_diag = convert_trades_with_diagnostics(
-                venue,
-                symbol,
-                date_str,
-                iid,
-                pp,
-                sp,
-            )
-            total_bad += bad_t
+            trade_ordinal = 0
+            with ObjectSpool(prefix="cryptorecorder-trade-objects-") as trade_spool:
+                def on_trade_batch(batch: List[object]) -> None:
+                    nonlocal trade_ordinal
+                    trade_ordinal = trade_spool.insert_many(
+                        batch,
+                        start_ordinal=trade_ordinal,
+                    )
 
-            # Aggregate bad_lines tracking data from trades
-            sym_key = f"{venue}/{symbol}"
-            if bad_t > 0:
-                bad_lines_by_venue_symbol[sym_key] = (
-                    bad_lines_by_venue_symbol.get(sym_key, 0) + bad_t
+                bad_t, t_first, t_last, trade_diag = convert_trades_streaming(
+                    venue,
+                    symbol,
+                    date_str,
+                    iid,
+                    pp,
+                    sp,
+                    on_ticks_batch=on_trade_batch,
+                    batch_size=WRITE_BATCH_SIZE,
                 )
-            for exc_type, count in trade_diag.get(
-                "bad_lines_by_exception_type", {}
-            ).items():
-                bad_lines_by_exception_type[exc_type] = (
-                    bad_lines_by_exception_type.get(exc_type, 0) + count
-                )
-            for rec_type, count in trade_diag.get("bad_lines_by_record_type", {}).items():
-                bad_lines_by_record_type[rec_type] = (
-                    bad_lines_by_record_type.get(rec_type, 0) + count
-                )
-            bad_line_examples.extend(trade_diag.get("bad_line_examples", []))
-            zero_size_skipped = int(trade_diag.get("zero_size_trade_skipped", 0))
-            if zero_size_skipped > 0:
-                zero_size_trade_skipped_by_venue_symbol[sym_key] = (
-                    zero_size_trade_skipped_by_venue_symbol.get(sym_key, 0)
-                    + zero_size_skipped
-                )
-            zero_size_trade_examples.extend(trade_diag.get("zero_size_trade_examples", []))
+                total_bad += bad_t
 
-            v_trade_raw_records += int(trade_diag.get("raw_record_count", 0))
-            v_trade_raw_trade_records += int(trade_diag.get("raw_trade_record_count", 0))
-            v_trade_raw_lifecycle_records += int(trade_diag.get("raw_lifecycle_record_count", 0))
-            sym_has_trades = int(trade_diag.get("raw_trade_record_count", 0)) > 0
-            sym_has_trade_ticks = len(ticks) > 0
-            if sym_has_trades:
-                v_symbols_with_trades.append(symbol)
-            else:
-                v_symbols_without_trades.append(symbol)
-            if sym_has_trade_ticks:
-                v_symbols_with_trade_ticks.append(symbol)
-            else:
-                v_symbols_without_trade_ticks.append(symbol)
-            if (
-                int(trade_diag.get("raw_trade_record_count", 0)) == 0
-                and int(trade_diag.get("raw_lifecycle_record_count", 0)) > 0
-            ):
-                v_lifecycle_only_symbols.append(symbol)
-            v_top_symbols_by_trade_count.append(
-                (symbol, int(trade_diag.get("raw_trade_record_count", 0)))
-            )
+                # Aggregate bad_lines tracking data from trades
+                sym_key = f"{venue}/{symbol}"
+                if bad_t > 0:
+                    bad_lines_by_venue_symbol[sym_key] = (
+                        bad_lines_by_venue_symbol.get(sym_key, 0) + bad_t
+                    )
+                for exc_type, count in trade_diag.get(
+                    "bad_lines_by_exception_type", {}
+                ).items():
+                    bad_lines_by_exception_type[exc_type] = (
+                        bad_lines_by_exception_type.get(exc_type, 0) + count
+                    )
+                for rec_type, count in trade_diag.get("bad_lines_by_record_type", {}).items():
+                    bad_lines_by_record_type[rec_type] = (
+                        bad_lines_by_record_type.get(rec_type, 0) + count
+                    )
+                bad_line_examples.extend(trade_diag.get("bad_line_examples", []))
+                zero_size_skipped = int(trade_diag.get("zero_size_trade_skipped", 0))
+                if zero_size_skipped > 0:
+                    zero_size_trade_skipped_by_venue_symbol[sym_key] = (
+                        zero_size_trade_skipped_by_venue_symbol.get(sym_key, 0)
+                        + zero_size_skipped
+                    )
+                zero_size_trade_examples.extend(trade_diag.get("zero_size_trade_examples", []))
 
-            per_symbol_trade[f"{venue}/{symbol}"] = {
-                "raw_record_count": int(trade_diag.get("raw_record_count", 0)),
-                "raw_trade_record_count": int(trade_diag.get("raw_trade_record_count", 0)),
-                "raw_lifecycle_record_count": int(trade_diag.get("raw_lifecycle_record_count", 0)),
-                "ticks_written": int(trade_diag.get("ticks_written", 0)),
-                "zero_size_trade_skipped": zero_size_skipped,
-                "first_trade_ts_ns": t_first,
-                "last_trade_ts_ns": t_last,
-                "will_create_tradetick": sym_has_trade_ticks,
-            }
+                v_trade_raw_records += int(trade_diag.get("raw_record_count", 0))
+                v_trade_raw_trade_records += int(trade_diag.get("raw_trade_record_count", 0))
+                v_trade_raw_lifecycle_records += int(trade_diag.get("raw_lifecycle_record_count", 0))
+                sym_has_trades = int(trade_diag.get("raw_trade_record_count", 0)) > 0
+                sym_has_trade_ticks = trade_spool.count > 0
+                if sym_has_trades:
+                    v_symbols_with_trades.append(symbol)
+                else:
+                    v_symbols_without_trades.append(symbol)
+                if sym_has_trade_ticks:
+                    v_symbols_with_trade_ticks.append(symbol)
+                else:
+                    v_symbols_without_trade_ticks.append(symbol)
+                if (
+                    int(trade_diag.get("raw_trade_record_count", 0)) == 0
+                    and int(trade_diag.get("raw_lifecycle_record_count", 0)) > 0
+                ):
+                    v_lifecycle_only_symbols.append(symbol)
+                v_top_symbols_by_trade_count.append(
+                    (symbol, int(trade_diag.get("raw_trade_record_count", 0)))
+                )
 
-            if ticks:
-                ticks.sort(key=lambda t: t.ts_init)
-                for i in range(0, len(ticks), WRITE_BATCH_SIZE):
-                    catalog.write_data(ticks[i : i + WRITE_BATCH_SIZE])
-                v_trades += len(ticks)
-                converted_trade_symbols.add(f"{venue}/{symbol}")
-                _update_ts_range(ts_ranges["trade"], t_first, t_last)
+                per_symbol_trade[f"{venue}/{symbol}"] = {
+                    "raw_record_count": int(trade_diag.get("raw_record_count", 0)),
+                    "raw_trade_record_count": int(trade_diag.get("raw_trade_record_count", 0)),
+                    "raw_lifecycle_record_count": int(trade_diag.get("raw_lifecycle_record_count", 0)),
+                    "ticks_written": int(trade_diag.get("ticks_written", 0)),
+                    "zero_size_trade_skipped": zero_size_skipped,
+                    "first_trade_ts_ns": t_first,
+                    "last_trade_ts_ns": t_last,
+                    "will_create_tradetick": sym_has_trade_ticks,
+                }
+
+                if trade_spool.count:
+                    trades_written = _write_object_spool(catalog, trade_spool)
+                    v_trades += trades_written
+                    trade_diag["ticks_written"] = trades_written
+                    per_symbol_trade[f"{venue}/{symbol}"]["ticks_written"] = trades_written
+                    converted_trade_symbols.add(f"{venue}/{symbol}")
+                    _update_ts_range(ts_ranges["trade"], t_first, t_last)
 
             # ── depth (depth_v2 → OrderBookDeltas) ────────────────────
-            deltas, depth10s, depth_metrics = convert_depth_v2(
-                venue,
-                symbol,
-                date_str,
-                iid,
-                pp,
-                sp,
-                emit_depth10=emit_depth10,
-                depth10_interval_sec=depth10_interval_sec,
-                derived_depth_snapshot_levels=requested_depth_snapshot_levels,
-            )
-            total_bad += depth_metrics.bad_lines
-
-            # Aggregate bad_lines tracking data from depth
-            if depth_metrics.bad_lines > 0:
-                sym_key = f"{venue}/{symbol}"
-                bad_lines_by_venue_symbol[sym_key] = (
-                    bad_lines_by_venue_symbol.get(sym_key, 0)
-                    + depth_metrics.bad_lines
-                )
-            for exc_type, count in depth_metrics.bad_lines_by_exception_type.items():
-                bad_lines_by_exception_type[exc_type] = (
-                    bad_lines_by_exception_type.get(exc_type, 0) + count
-                )
-            for rec_type, count in depth_metrics.bad_lines_by_record_type.items():
-                bad_lines_by_record_type[rec_type] = (
-                    bad_lines_by_record_type.get(rec_type, 0) + count
-                )
-            bad_line_examples.extend(depth_metrics.bad_line_examples)
-
-            v_delta_events += len(deltas)
-            v_depth10 += len(depth10s)
-            v_derived_depth_snapshots += depth_metrics.derived_depth_snapshots_written
-            v_snapshot_seeds += depth_metrics.snapshot_seed_count
-            v_resyncs += depth_metrics.resync_count
-            v_desyncs += depth_metrics.desync_events
-            v_fenced_ranges += len(depth_metrics.fenced_ranges)
-            extra_raw_partitions_scanned.update(depth_metrics.extra_raw_partitions_scanned)
-            records_imported_from_previous_folder += depth_metrics.records_imported_from_previous_folder
-            records_imported_from_next_folder += depth_metrics.records_imported_from_next_folder
-            records_dropped_outside_target_utc += depth_metrics.records_dropped_outside_target_utc
-            duplicate_records_suppressed += depth_metrics.duplicate_records_suppressed
-            v_records_imported_from_previous_folder += depth_metrics.records_imported_from_previous_folder
-            v_records_imported_from_next_folder += depth_metrics.records_imported_from_next_folder
-            v_records_dropped_outside_target_utc += depth_metrics.records_dropped_outside_target_utc
-            v_duplicate_records_suppressed += depth_metrics.duplicate_records_suppressed
-            if depth_metrics.carried_seed_from_previous_day:
-                carried_seed_symbol_count += 1
-                v_carried_seed_symbol_count += 1
-            if depth_metrics.synthetic_opening_snapshot_written:
-                synthetic_opening_snapshot_count += 1
-                v_synthetic_opening_snapshot_count += 1
-            if (
-                depth_metrics.depth_update_record_count > 0
-                and depth_metrics.snapshot_seed_count == 0
-                and not depth_metrics.carried_seed_from_previous_day
+            delta_ordinal = 0
+            depth10_ordinal = 0
+            with (
+                ObjectSpool(prefix="cryptorecorder-delta-objects-") as deltas_spool,
+                ObjectSpool(prefix="cryptorecorder-depth10-objects-") as depth10_spool,
+                TimestampSpool(prefix="cryptorecorder-depth10-gap-") as depth10_ts_spool,
             ):
-                standalone_depth_day = False
-            fence_summary = _summarize_fences(depth_metrics.fenced_ranges)
-            v_fenced_ranges_low += fence_summary["fenced_ranges_low"]
-            v_fenced_ranges_medium += fence_summary["fenced_ranges_medium"]
-            v_fenced_ranges_high += fence_summary["fenced_ranges_high"]
-            v_unrecovered_fences += fence_summary["unrecovered_fences"]
-            v_bootstrap_fences += fence_summary["bootstrap_fences"]
-            v_shutdown_fences += fence_summary["shutdown_fences"]
-            v_reconnect_fences += fence_summary["reconnect_fences"]
-            v_utc_day_rollover_fences += fence_summary["utc_day_rollover_fences"]
-            v_real_desync_fences += fence_summary["real_desync_fences"]
-            v_unrecovered_real_fences += fence_summary["unrecovered_real_fences"]
-            gap_diag = _build_gap_diagnostics(venue, symbol, date_str, depth10s)
-            v_depth_gap_warnings_over_60s += int(gap_diag["depth_gap_count_over_60s"])
-            per_symbol_gap_diagnostics[f"{venue}/{symbol}"] = gap_diag
-            gap_offender = _real_gap_offender_entry(f"{venue}/{symbol}", gap_diag)
-            if gap_offender is not None:
-                top_real_gap_candidates.append(gap_offender)
-                v_top_real_gap_candidates.append(gap_offender)
-            sym_has_depth = len(deltas) > 0 or len(depth10s) > 0
-            per_symbol_depth[f"{venue}/{symbol}"] = {
-                "raw_record_count": depth_metrics.raw_record_count,
-                "snapshot_seed_count": depth_metrics.snapshot_seed_count,
-                "depth_update_record_count": depth_metrics.depth_update_record_count,
-                "sync_state_record_count": depth_metrics.sync_state_record_count,
-                "stream_lifecycle_record_count": depth_metrics.stream_lifecycle_record_count,
-                "deltas_written": int(len(deltas)),
-                "depth10_written": int(len(depth10s)),
-                "derived_depth_snapshots_written": depth_metrics.derived_depth_snapshots_written,
-                "derived_depth_snapshot_type": depth_metrics.derived_depth_snapshot_type,
-                "derived_depth_snapshot_levels": depth_metrics.derived_depth_snapshot_levels,
-                "requested_depth_snapshot_levels": depth_metrics.requested_depth_snapshot_levels,
-                "requested_depth_snapshot_levels_applied": depth_metrics.requested_depth_snapshot_levels_applied,
-                "fenced_ranges": len(depth_metrics.fenced_ranges),
-                **fence_summary,
-                **gap_diag,
-                "desync_events": depth_metrics.desync_events,
-                "resync_count": depth_metrics.resync_count,
-                "first_depth_ts_ns": depth_metrics.first_ts_ns,
-                "last_depth_ts_ns": depth_metrics.last_ts_ns,
-                "will_create_l2": len(deltas) > 0,
-                "bad_lines": depth_metrics.bad_lines,
-                "carried_seed_from_previous_day": depth_metrics.carried_seed_from_previous_day,
-                "carried_seed_date": depth_metrics.carried_seed_date,
-                "carried_seed_session_id": depth_metrics.carried_seed_session_id,
-                "carried_seed_last_update_id": depth_metrics.carried_seed_last_update_id,
-                "carry_replay_record_count": depth_metrics.carry_replay_record_count,
-                "carry_recovery_failed_reason": depth_metrics.carry_recovery_failed_reason,
-                "synthetic_opening_snapshot_written": depth_metrics.synthetic_opening_snapshot_written,
-                "timestamp_repartition_enabled": depth_metrics.timestamp_repartition_enabled,
-                "extra_raw_partitions_scanned": depth_metrics.extra_raw_partitions_scanned,
-                "records_imported_from_previous_folder": depth_metrics.records_imported_from_previous_folder,
-                "records_imported_from_next_folder": depth_metrics.records_imported_from_next_folder,
-                "records_dropped_outside_target_utc": depth_metrics.records_dropped_outside_target_utc,
-                "duplicate_records_suppressed": depth_metrics.duplicate_records_suppressed,
-            }
-            if depth_metrics.fenced_ranges:
-                annotated_fences = _annotated_fence_examples(depth_metrics.fenced_ranges)
-                per_symbol_fenced_ranges[f"{venue}/{symbol}"] = {
+                def on_deltas_batch(batch: List[object]) -> None:
+                    nonlocal delta_ordinal
+                    delta_ordinal = deltas_spool.insert_many(
+                        batch,
+                        start_ordinal=delta_ordinal,
+                    )
+
+                def on_depth10_batch(batch: List[object]) -> None:
+                    nonlocal depth10_ordinal
+                    depth10_ordinal = depth10_spool.insert_many(
+                        batch,
+                        start_ordinal=depth10_ordinal,
+                    )
+                    depth10_ts_spool.insert_many([int(item.ts_event) for item in batch])
+
+                depth_metrics = convert_depth_v2_streaming(
+                    venue,
+                    symbol,
+                    date_str,
+                    iid,
+                    pp,
+                    sp,
+                    on_deltas_batch=on_deltas_batch,
+                    on_depth10_batch=on_depth10_batch,
+                    batch_size=WRITE_BATCH_SIZE,
+                    emit_depth10=emit_depth10,
+                    depth10_interval_sec=depth10_interval_sec,
+                    derived_depth_snapshot_levels=requested_depth_snapshot_levels,
+                )
+                depth10_ts_spool.commit()
+                total_bad += depth_metrics.bad_lines
+
+                # Aggregate bad_lines tracking data from depth
+                if depth_metrics.bad_lines > 0:
+                    sym_key = f"{venue}/{symbol}"
+                    bad_lines_by_venue_symbol[sym_key] = (
+                        bad_lines_by_venue_symbol.get(sym_key, 0)
+                        + depth_metrics.bad_lines
+                    )
+                for exc_type, count in depth_metrics.bad_lines_by_exception_type.items():
+                    bad_lines_by_exception_type[exc_type] = (
+                        bad_lines_by_exception_type.get(exc_type, 0) + count
+                    )
+                for rec_type, count in depth_metrics.bad_lines_by_record_type.items():
+                    bad_lines_by_record_type[rec_type] = (
+                        bad_lines_by_record_type.get(rec_type, 0) + count
+                    )
+                bad_line_examples.extend(depth_metrics.bad_line_examples)
+
+                deltas_written = 0
+                depth10_written = 0
+                if deltas_spool.count:
+                    deltas_written = _write_object_spool(catalog, deltas_spool)
+                    converted_order_book_delta_symbols.add(f"{venue}/{symbol}")
+                    _update_ts_range(
+                        ts_ranges["order_book_deltas"],
+                        depth_metrics.first_ts_ns,
+                        depth_metrics.last_ts_ns,
+                    )
+                if depth10_spool.count:
+                    depth10_written = _write_object_spool(catalog, depth10_spool)
+                    converted_order_book_depth_symbols.add(f"{venue}/{symbol}")
+                    _update_ts_range(
+                        ts_ranges["order_book_depths"],
+                        depth_metrics.first_ts_ns,
+                        depth_metrics.last_ts_ns,
+                    )
+
+                v_delta_events += deltas_written
+                v_depth10 += depth10_written
+                v_derived_depth_snapshots += depth_metrics.derived_depth_snapshots_written
+                v_snapshot_seeds += depth_metrics.snapshot_seed_count
+                v_resyncs += depth_metrics.resync_count
+                v_desyncs += depth_metrics.desync_events
+                v_fenced_ranges += len(depth_metrics.fenced_ranges)
+                extra_raw_partitions_scanned.update(depth_metrics.extra_raw_partitions_scanned)
+                records_imported_from_previous_folder += depth_metrics.records_imported_from_previous_folder
+                records_imported_from_next_folder += depth_metrics.records_imported_from_next_folder
+                records_dropped_outside_target_utc += depth_metrics.records_dropped_outside_target_utc
+                duplicate_records_suppressed += depth_metrics.duplicate_records_suppressed
+                v_records_imported_from_previous_folder += depth_metrics.records_imported_from_previous_folder
+                v_records_imported_from_next_folder += depth_metrics.records_imported_from_next_folder
+                v_records_dropped_outside_target_utc += depth_metrics.records_dropped_outside_target_utc
+                v_duplicate_records_suppressed += depth_metrics.duplicate_records_suppressed
+                if depth_metrics.carried_seed_from_previous_day:
+                    carried_seed_symbol_count += 1
+                    v_carried_seed_symbol_count += 1
+                if depth_metrics.synthetic_opening_snapshot_written:
+                    synthetic_opening_snapshot_count += 1
+                    v_synthetic_opening_snapshot_count += 1
+                if (
+                    depth_metrics.depth_update_record_count > 0
+                    and depth_metrics.snapshot_seed_count == 0
+                    and not depth_metrics.carried_seed_from_previous_day
+                ):
+                    standalone_depth_day = False
+                fence_summary = _summarize_fences(depth_metrics.fenced_ranges)
+                v_fenced_ranges_low += fence_summary["fenced_ranges_low"]
+                v_fenced_ranges_medium += fence_summary["fenced_ranges_medium"]
+                v_fenced_ranges_high += fence_summary["fenced_ranges_high"]
+                v_unrecovered_fences += fence_summary["unrecovered_fences"]
+                v_bootstrap_fences += fence_summary["bootstrap_fences"]
+                v_shutdown_fences += fence_summary["shutdown_fences"]
+                v_reconnect_fences += fence_summary["reconnect_fences"]
+                v_utc_day_rollover_fences += fence_summary["utc_day_rollover_fences"]
+                v_real_desync_fences += fence_summary["real_desync_fences"]
+                v_unrecovered_real_fences += fence_summary["unrecovered_real_fences"]
+                gap_diag = _build_gap_diagnostics(
+                    venue,
+                    symbol,
+                    date_str,
+                    depth10_gap_counts=depth10_ts_spool.gap_counts(),
+                )
+                v_depth_gap_warnings_over_60s += int(gap_diag["depth_gap_count_over_60s"])
+                per_symbol_gap_diagnostics[f"{venue}/{symbol}"] = gap_diag
+                gap_offender = _real_gap_offender_entry(f"{venue}/{symbol}", gap_diag)
+                if gap_offender is not None:
+                    top_real_gap_candidates.append(gap_offender)
+                    v_top_real_gap_candidates.append(gap_offender)
+                sym_has_depth = deltas_written > 0 or depth10_written > 0
+                per_symbol_depth[f"{venue}/{symbol}"] = {
+                    "raw_record_count": depth_metrics.raw_record_count,
+                    "snapshot_seed_count": depth_metrics.snapshot_seed_count,
+                    "depth_update_record_count": depth_metrics.depth_update_record_count,
+                    "sync_state_record_count": depth_metrics.sync_state_record_count,
+                    "stream_lifecycle_record_count": depth_metrics.stream_lifecycle_record_count,
+                    "deltas_written": int(deltas_written),
+                    "depth10_written": int(depth10_written),
+                    "derived_depth_snapshots_written": depth_metrics.derived_depth_snapshots_written,
+                    "derived_depth_snapshot_type": depth_metrics.derived_depth_snapshot_type,
+                    "derived_depth_snapshot_levels": depth_metrics.derived_depth_snapshot_levels,
+                    "requested_depth_snapshot_levels": depth_metrics.requested_depth_snapshot_levels,
+                    "requested_depth_snapshot_levels_applied": depth_metrics.requested_depth_snapshot_levels_applied,
                     "fenced_ranges": len(depth_metrics.fenced_ranges),
                     **fence_summary,
-                    "examples": annotated_fences[:3],
-                    "lifecycle_examples": [
-                        fence
-                        for fence in annotated_fences
-                        if fence["classification"] in {"bootstrap", "shutdown", "utc_day_rollover"}
-                    ][:3],
-                    "real_examples": [
-                        fence
-                        for fence in annotated_fences
-                        if fence["classification"] in {"reconnect", "real_desync"}
-                    ][:3],
+                    **gap_diag,
+                    "desync_events": depth_metrics.desync_events,
+                    "resync_count": depth_metrics.resync_count,
+                    "first_depth_ts_ns": depth_metrics.first_ts_ns,
+                    "last_depth_ts_ns": depth_metrics.last_ts_ns,
+                    "will_create_l2": deltas_written > 0,
+                    "bad_lines": depth_metrics.bad_lines,
+                    "carried_seed_from_previous_day": depth_metrics.carried_seed_from_previous_day,
+                    "carried_seed_date": depth_metrics.carried_seed_date,
+                    "carried_seed_session_id": depth_metrics.carried_seed_session_id,
+                    "carried_seed_last_update_id": depth_metrics.carried_seed_last_update_id,
+                    "carry_replay_record_count": depth_metrics.carry_replay_record_count,
+                    "carry_recovery_failed_reason": depth_metrics.carry_recovery_failed_reason,
+                    "synthetic_opening_snapshot_written": depth_metrics.synthetic_opening_snapshot_written,
+                    "timestamp_repartition_enabled": depth_metrics.timestamp_repartition_enabled,
+                    "extra_raw_partitions_scanned": depth_metrics.extra_raw_partitions_scanned,
+                    "records_imported_from_previous_folder": depth_metrics.records_imported_from_previous_folder,
+                    "records_imported_from_next_folder": depth_metrics.records_imported_from_next_folder,
+                    "records_dropped_outside_target_utc": depth_metrics.records_dropped_outside_target_utc,
+                    "duplicate_records_suppressed": depth_metrics.duplicate_records_suppressed,
                 }
-            if deltas:
-                deltas.sort(key=lambda d: d.ts_init)
-                for i in range(0, len(deltas), WRITE_BATCH_SIZE):
-                    catalog.write_data(deltas[i : i + WRITE_BATCH_SIZE])
-                converted_order_book_delta_symbols.add(f"{venue}/{symbol}")
-                _update_ts_range(
-                    ts_ranges["order_book_deltas"],
-                    depth_metrics.first_ts_ns,
-                    depth_metrics.last_ts_ns,
-                )
-            if depth10s:
-                depth10s.sort(key=lambda d: d.ts_init)
-                for i in range(0, len(depth10s), WRITE_BATCH_SIZE):
-                    catalog.write_data(depth10s[i : i + WRITE_BATCH_SIZE])
-                converted_order_book_depth_symbols.add(f"{venue}/{symbol}")
-                _update_ts_range(
-                    ts_ranges["order_book_depths"],
-                    depth_metrics.first_ts_ns,
-                    depth_metrics.last_ts_ns,
-                )
+                if depth_metrics.fenced_ranges:
+                    annotated_fences = _annotated_fence_examples(depth_metrics.fenced_ranges)
+                    per_symbol_fenced_ranges[f"{venue}/{symbol}"] = {
+                        "fenced_ranges": len(depth_metrics.fenced_ranges),
+                        **fence_summary,
+                        "examples": annotated_fences[:3],
+                        "lifecycle_examples": [
+                            fence
+                            for fence in annotated_fences
+                            if fence["classification"] in {"bootstrap", "shutdown", "utc_day_rollover"}
+                        ][:3],
+                        "real_examples": [
+                            fence
+                            for fence in annotated_fences
+                            if fence["classification"] in {"reconnect", "real_desync"}
+                        ][:3],
+                    }
 
             # ── track data presence ───────────────────────────────────
             iid_str = str(iid)
@@ -917,6 +959,21 @@ def _update_ts_range(
     if last is not None:
         if r["end_ns"] is None or last > r["end_ns"]:
             r["end_ns"] = last
+
+
+def _write_object_spool(
+    catalog: ParquetDataCatalog,
+    spool: ObjectSpool,
+    *,
+    batch_size: int = WRITE_BATCH_SIZE,
+) -> int:
+    """Write a per-symbol object spool in the old ts_init-sorted order."""
+    spool.commit()
+    written = 0
+    for batch in spool.iter_batches(batch_size):
+        catalog.write_data(batch)
+        written += len(batch)
+    return written
 
 
 def _empty_report(date_str: str, t0: float, **kwargs) -> dict:
@@ -1246,30 +1303,40 @@ def _build_gap_diagnostics(
     venue: str,
     symbol: str,
     date_str: str,
-    depth10s: Sequence,
+    depth10s: Sequence | None = None,
+    *,
+    depth10_gap_counts: Optional[Dict[str, object]] = None,
 ) -> Dict[str, object]:
-    depth_timestamps: List[int] = []
-    trade_timestamps: List[int] = []
     lifecycle_boundaries: List[Dict[str, object]] = []
 
-    for rec in stream_raw_records(venue, symbol, "depth_v2", date_str):
-        record_type = rec.get("record_type", "depth_update")
-        if record_type == "depth_update":
-            ts_ns = _record_ts_ns(rec)
-            if ts_ns is not None:
-                depth_timestamps.append(ts_ns)
-        elif record_type == "stream_lifecycle":
-            lifecycle_boundaries.append(rec)
+    with (
+        TimestampSpool(prefix="cryptorecorder-gap-depth-") as depth_ts_spool,
+        TimestampSpool(prefix="cryptorecorder-gap-trade-") as trade_ts_spool,
+    ):
+        for rec in stream_raw_records(venue, symbol, "depth_v2", date_str):
+            record_type = rec.get("record_type", "depth_update")
+            if record_type == "depth_update":
+                ts_ns = _record_ts_ns(rec)
+                if ts_ns is not None:
+                    depth_ts_spool.insert(ts_ns)
+            elif record_type == "stream_lifecycle":
+                lifecycle_boundaries.append(rec)
 
-    for rec in stream_raw_records(venue, symbol, "trade_v2", date_str):
-        if rec.get("record_type", "trade") == "trade":
-            ts_ns = _record_ts_ns(rec, trade=True)
-            if ts_ns is not None:
-                trade_timestamps.append(ts_ns)
+        for rec in stream_raw_records(venue, symbol, "trade_v2", date_str):
+            if rec.get("record_type", "trade") == "trade":
+                ts_ns = _record_ts_ns(rec, trade=True)
+                if ts_ns is not None:
+                    trade_ts_spool.insert(ts_ns)
 
-    depth_gaps = _gap_counts(depth_timestamps)
-    trade_gaps = _gap_counts(trade_timestamps)
-    depth10_gaps = _gap_counts([int(d.ts_event) for d in depth10s])
+        depth_ts_spool.commit()
+        trade_ts_spool.commit()
+        depth_gaps = depth_ts_spool.gap_counts()
+        trade_gaps = trade_ts_spool.gap_counts()
+
+    if depth10_gap_counts is not None:
+        depth10_gaps = depth10_gap_counts
+    else:
+        depth10_gaps = _gap_counts([int(d.ts_event) for d in (depth10s or [])])
     boundary_counts = _classify_lifecycle_boundaries(lifecycle_boundaries)
     return {
         "max_depth_update_gap_sec": depth_gaps["max_gap_sec"],

@@ -105,6 +105,54 @@ def _trade_diag(n: int = 5) -> dict:
     }
 
 
+def _patch_trade_streaming(
+    monkeypatch,
+    *,
+    ticks=None,
+    diagnostics=None,
+    first_ts_ns=None,
+    last_ts_ns=None,
+) -> None:
+    ticks = list(ticks or [])
+    diagnostics = diagnostics or _no_ticks_diag()
+
+    def fake_convert_trades_streaming(*args, on_ticks_batch, **kwargs):
+        if ticks:
+            on_ticks_batch(list(ticks))
+        return 0, first_ts_ns, last_ts_ns, diagnostics
+
+    monkeypatch.setattr(
+        convert_day_mod,
+        "convert_trades_streaming",
+        fake_convert_trades_streaming,
+    )
+
+
+def _patch_depth_streaming(
+    monkeypatch,
+    *,
+    deltas=None,
+    depth10s=None,
+    metrics=None,
+) -> None:
+    deltas = list(deltas or [])
+    depth10s = list(depth10s or [])
+    metrics = metrics or Phase2ReplayMetrics()
+
+    def fake_convert_depth_streaming(*args, on_deltas_batch, on_depth10_batch, **kwargs):
+        if deltas:
+            on_deltas_batch(list(deltas))
+        if depth10s:
+            on_depth10_batch(list(depth10s))
+        return metrics
+
+    monkeypatch.setattr(
+        convert_day_mod,
+        "convert_depth_v2_streaming",
+        fake_convert_depth_streaming,
+    )
+
+
 # ---------------------------------------------------------------------------
 # per_symbol_trade diagnostics
 # ---------------------------------------------------------------------------
@@ -120,16 +168,8 @@ class TestPerSymbolTradeDiagnostics:
         monkeypatch.setattr(convert_day_mod, "load_exchange_info", lambda v, ds: {})
         monkeypatch.setattr(convert_day_mod, "build_instruments",
                             lambda v, s, e: [instrument])
-        monkeypatch.setattr(
-            convert_day_mod,
-            "convert_trades_with_diagnostics",
-            lambda *a, **kw: (ticks, 0, None, None, trade_diag),
-        )
-        monkeypatch.setattr(
-            convert_day_mod,
-            "convert_depth_v2",
-            lambda *a, **kw: ([], [], Phase2ReplayMetrics()),
-        )
+        _patch_trade_streaming(monkeypatch, ticks=ticks, diagnostics=trade_diag)
+        _patch_depth_streaming(monkeypatch)
         monkeypatch.setattr(
             convert_day_mod,
             "_symbols_with_raw_record_type",
@@ -175,16 +215,12 @@ class TestPerSymbolTradeDiagnostics:
             monkeypatch, tmp_path, instrument, diag, ticks=[tick, tick, tick]
         )
         # Override diag to reflect actual timestamp
-        monkeypatch.setattr(
-            convert_day_mod,
-            "convert_trades_with_diagnostics",
-            lambda *a, **kw: (
-                [tick, tick, tick],
-                0,
-                1_000_000_000,
-                1_000_000_000,
-                diag,
-            ),
+        _patch_trade_streaming(
+            monkeypatch,
+            ticks=[tick, tick, tick],
+            diagnostics=diag,
+            first_ts_ns=1_000_000_000,
+            last_ts_ns=1_000_000_000,
         )
         report = convert_day_mod.convert_date(
             datetime(2026, 4, 21), catalog_root=tmp_path / "cat", emit_depth10=False,
@@ -262,16 +298,8 @@ class TestPerSymbolDepthDiagnostics:
         monkeypatch.setattr(convert_day_mod, "load_exchange_info", lambda v, ds: {})
         monkeypatch.setattr(convert_day_mod, "build_instruments",
                             lambda v, s, e: [instrument])
-        monkeypatch.setattr(
-            convert_day_mod,
-            "convert_trades_with_diagnostics",
-            lambda *a, **kw: ([], 0, None, None, _no_ticks_diag()),
-        )
-        monkeypatch.setattr(
-            convert_day_mod,
-            "convert_depth_v2",
-            lambda *a, **kw: ([batch, batch], [], metrics),
-        )
+        _patch_trade_streaming(monkeypatch)
+        _patch_depth_streaming(monkeypatch, deltas=[batch, batch], metrics=metrics)
         monkeypatch.setattr(
             convert_day_mod,
             "_symbols_with_raw_record_type",
@@ -317,16 +345,8 @@ class TestPerSymbolDepthDiagnostics:
         monkeypatch.setattr(convert_day_mod, "load_exchange_info", lambda v, ds: {})
         monkeypatch.setattr(convert_day_mod, "build_instruments",
                             lambda v, s, e: [instrument])
-        monkeypatch.setattr(
-            convert_day_mod,
-            "convert_trades_with_diagnostics",
-            lambda *a, **kw: ([], 0, None, None, _no_ticks_diag()),
-        )
-        monkeypatch.setattr(
-            convert_day_mod,
-            "convert_depth_v2",
-            lambda *a, **kw: ([batch, batch], [], metrics),
-        )
+        _patch_trade_streaming(monkeypatch)
+        _patch_depth_streaming(monkeypatch, deltas=[batch, batch], metrics=metrics)
         monkeypatch.setattr(
             convert_day_mod,
             "_symbols_with_raw_record_type",
@@ -355,16 +375,8 @@ class TestPerSymbolDepthDiagnostics:
         monkeypatch.setattr(convert_day_mod, "load_exchange_info", lambda v, ds: {})
         monkeypatch.setattr(convert_day_mod, "build_instruments",
                             lambda v, s, e: [instrument])
-        monkeypatch.setattr(
-            convert_day_mod,
-            "convert_trades_with_diagnostics",
-            lambda *a, **kw: ([], 0, None, None, _no_ticks_diag()),
-        )
-        monkeypatch.setattr(
-            convert_day_mod,
-            "convert_depth_v2",
-            lambda *a, **kw: ([], [], metrics),
-        )
+        _patch_trade_streaming(monkeypatch)
+        _patch_depth_streaming(monkeypatch, metrics=metrics)
         monkeypatch.setattr(
             convert_day_mod,
             "_symbols_with_raw_record_type",
@@ -402,16 +414,8 @@ class TestPerSymbolDepthDiagnostics:
         monkeypatch.setattr(convert_day_mod, "load_exchange_info", lambda v, ds: {})
         monkeypatch.setattr(convert_day_mod, "build_instruments",
                             lambda v, s, e: [instrument])
-        monkeypatch.setattr(
-            convert_day_mod,
-            "convert_trades_with_diagnostics",
-            lambda *a, **kw: ([], 0, None, None, _no_ticks_diag()),
-        )
-        monkeypatch.setattr(
-            convert_day_mod,
-            "convert_depth_v2",
-            lambda *a, **kw: ([batch, batch], [], metrics),
-        )
+        _patch_trade_streaming(monkeypatch)
+        _patch_depth_streaming(monkeypatch, deltas=[batch, batch], metrics=metrics)
         monkeypatch.setattr(
             convert_day_mod,
             "_build_gap_diagnostics",
@@ -469,16 +473,8 @@ class TestReadinessClassification:
         monkeypatch.setattr(convert_day_mod, "load_exchange_info", lambda v, ds: {})
         monkeypatch.setattr(convert_day_mod, "build_instruments",
                             lambda v, s, e: [instrument])
-        monkeypatch.setattr(
-            convert_day_mod,
-            "convert_trades_with_diagnostics",
-            lambda *a, **kw: (ticks, 0, None, None, trade_diag),
-        )
-        monkeypatch.setattr(
-            convert_day_mod,
-            "convert_depth_v2",
-            lambda *a, **kw: (deltas, [], depth_metrics),
-        )
+        _patch_trade_streaming(monkeypatch, ticks=ticks, diagnostics=trade_diag)
+        _patch_depth_streaming(monkeypatch, deltas=deltas, metrics=depth_metrics)
         monkeypatch.setattr(
             convert_day_mod,
             "_symbols_with_raw_record_type",
@@ -587,16 +583,8 @@ class TestPartialOverwriteGuard:
         monkeypatch.setattr(convert_day_mod, "load_exchange_info", lambda v, ds: {})
         monkeypatch.setattr(convert_day_mod, "build_instruments",
                             lambda v, s, e: [instrument])
-        monkeypatch.setattr(
-            convert_day_mod,
-            "convert_trades_with_diagnostics",
-            lambda *a, **kw: ([], 0, None, None, _no_ticks_diag()),
-        )
-        monkeypatch.setattr(
-            convert_day_mod,
-            "convert_depth_v2",
-            lambda *a, **kw: ([], [], Phase2ReplayMetrics()),
-        )
+        _patch_trade_streaming(monkeypatch)
+        _patch_depth_streaming(monkeypatch)
         monkeypatch.setattr(
             convert_day_mod,
             "_symbols_with_raw_record_type",
@@ -692,16 +680,8 @@ class TestConversionIntegrityByVenue:
         monkeypatch.setattr(convert_day_mod, "load_exchange_info", lambda v, ds: {})
         monkeypatch.setattr(convert_day_mod, "build_instruments",
                             lambda v, s, e: [instrument])
-        monkeypatch.setattr(
-            convert_day_mod,
-            "convert_trades_with_diagnostics",
-            lambda *a, **kw: ([], 0, None, None, _no_ticks_diag()),
-        )
-        monkeypatch.setattr(
-            convert_day_mod,
-            "convert_depth_v2",
-            lambda *a, **kw: ([], [], Phase2ReplayMetrics()),
-        )
+        _patch_trade_streaming(monkeypatch)
+        _patch_depth_streaming(monkeypatch)
         monkeypatch.setattr(
             convert_day_mod,
             "_symbols_with_raw_record_type",
@@ -746,16 +726,8 @@ class TestConversionIntegrityByVenue:
         monkeypatch.setattr(convert_day_mod, "load_exchange_info", lambda v, ds: {})
         monkeypatch.setattr(convert_day_mod, "build_instruments",
                             lambda v, s, e: [instrument])
-        monkeypatch.setattr(
-            convert_day_mod,
-            "convert_trades_with_diagnostics",
-            lambda *a, **kw: ([], 0, None, None, _no_ticks_diag()),
-        )
-        monkeypatch.setattr(
-            convert_day_mod,
-            "convert_depth_v2",
-            lambda *a, **kw: ([], [], Phase2ReplayMetrics()),
-        )
+        _patch_trade_streaming(monkeypatch)
+        _patch_depth_streaming(monkeypatch)
         monkeypatch.setattr(
             convert_day_mod,
             "_symbols_with_raw_record_type",

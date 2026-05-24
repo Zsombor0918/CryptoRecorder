@@ -110,6 +110,46 @@ def _make_lifecycle(session_id: int, ts_recv_ns: int, event: str) -> dict:
     }
 
 
+def _patch_trade_streaming(monkeypatch, *, ticks=None, diagnostics=None) -> None:
+    ticks = list(ticks or [])
+    diagnostics = diagnostics or {
+        "raw_record_count": 0,
+        "raw_trade_record_count": 0,
+        "raw_lifecycle_record_count": 0,
+        "ticks_written": len(ticks),
+    }
+
+    def fake_convert_trades_streaming(*args, on_ticks_batch, **kwargs):
+        if ticks:
+            on_ticks_batch(list(ticks))
+        return 0, None, None, diagnostics
+
+    monkeypatch.setattr(
+        convert_day_mod,
+        "convert_trades_streaming",
+        fake_convert_trades_streaming,
+    )
+
+
+def _patch_depth_streaming(monkeypatch, *, deltas=None, depth10s=None, metrics=None) -> None:
+    deltas = list(deltas or [])
+    depth10s = list(depth10s or [])
+    metrics = metrics or Phase2ReplayMetrics()
+
+    def fake_convert_depth_streaming(*args, on_deltas_batch, on_depth10_batch, **kwargs):
+        if deltas:
+            on_deltas_batch(list(deltas))
+        if depth10s:
+            on_depth10_batch(list(depth10s))
+        return metrics
+
+    monkeypatch.setattr(
+        convert_day_mod,
+        "convert_depth_v2_streaming",
+        fake_convert_depth_streaming,
+    )
+
+
 # ── trade converter integration ─────────────────────────────────────────
 
 
@@ -306,33 +346,17 @@ class TestConvertDayIntegration:
                             lambda v, ds: {})
         monkeypatch.setattr(convert_day_mod, "build_instruments",
                             lambda v, s, e: [instrument])
-        monkeypatch.setattr(
-            convert_day_mod,
-            "convert_trades_with_diagnostics",
-            lambda *a, **kw: (
-                [],
-                0,
-                None,
-                None,
-                {
-                    "raw_record_count": 0,
-                    "raw_trade_record_count": 0,
-                    "raw_lifecycle_record_count": 0,
-                    "ticks_written": 0,
-                },
+        _patch_trade_streaming(monkeypatch)
+        _patch_depth_streaming(
+            monkeypatch,
+            deltas=[_fake_snapshot_deltas()],
+            metrics=Phase2ReplayMetrics(
+                snapshot_seed_count=1,
+                delta_events_written=1,
+                first_ts_ns=1_000_000_000,
+                last_ts_ns=1_000_000_000,
             ),
         )
-        monkeypatch.setattr(convert_day_mod, "convert_depth_v2",
-                            lambda *a, **kw: (
-                                [_fake_snapshot_deltas()],
-                                [],
-                                Phase2ReplayMetrics(
-                                    snapshot_seed_count=1,
-                                    delta_events_written=1,
-                                    first_ts_ns=1_000_000_000,
-                                    last_ts_ns=1_000_000_000,
-                                ),
-                            ))
 
         catalog_root = tmp_path / "catalog"
         report = convert_day_mod.convert_date(
@@ -376,32 +400,17 @@ class TestConvertDayIntegration:
                             lambda v, ds: {})
         monkeypatch.setattr(convert_day_mod, "build_instruments",
                             lambda v, s, e: [instrument])
-        monkeypatch.setattr(
-            convert_day_mod,
-            "convert_trades_with_diagnostics",
-            lambda *a, **kw: (
-                [],
-                0,
-                None,
-                None,
-                {
-                    "raw_record_count": 0,
-                    "raw_trade_record_count": 0,
-                    "raw_lifecycle_record_count": 0,
-                    "ticks_written": 0,
-                },
+        _patch_trade_streaming(monkeypatch)
+        _patch_depth_streaming(
+            monkeypatch,
+            deltas=[deltas_batch],
+            metrics=Phase2ReplayMetrics(
+                snapshot_seed_count=1,
+                delta_events_written=1,
+                first_ts_ns=ts_e,
+                last_ts_ns=ts_e,
             ),
         )
-        monkeypatch.setattr(convert_day_mod, "convert_depth_v2",
-                            lambda *a, **kw: (
-                                [deltas_batch], [],
-                                Phase2ReplayMetrics(
-                                    snapshot_seed_count=1,
-                                    delta_events_written=1,
-                                    first_ts_ns=ts_e,
-                                    last_ts_ns=ts_e,
-                                ),
-                            ))
 
         catalog_root = tmp_path / "catalog"
         convert_day_mod.convert_date(
