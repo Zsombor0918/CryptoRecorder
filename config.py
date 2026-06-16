@@ -41,13 +41,70 @@ STATE_ROOT: Final = Path(
     os.environ.get("CRYPTO_RECORDER_STATE_ROOT", str(PROJECT_ROOT / "state"))
 ).expanduser()
 
+# Replay store: normalized deterministic Parquet replay layer
+REPLAY_ROOT: Final = Path(
+    os.environ.get("CRYPTO_RECORDER_REPLAY_ROOT", "/data/cryptorecorder/replay_store")
+).expanduser()
+
+# Feature store: AI / strategy-selection Parquet layer
+FEATURE_ROOT: Final = Path(
+    os.environ.get("CRYPTO_RECORDER_FEATURE_ROOT", "/data/cryptorecorder/feature_store")
+).expanduser()
+
+# Catalog jobs: temporary on-demand Nautilus backtest artifacts
+CATALOG_JOBS_ROOT: Final = Path(
+    os.environ.get("CRYPTO_RECORDER_CATALOG_JOBS_ROOT", "/data/cryptorecorder/catalog_jobs")
+).expanduser()
+
+# Daily build reports
+DAILY_REPORT_ROOT: Final = Path(
+    os.environ.get("CRYPTO_RECORDER_DAILY_REPORT_ROOT", str(STATE_ROOT / "daily_build_reports"))
+).expanduser()
+
+# Archive days: future Syncthing-based backup structure
+ARCHIVE_DAYS_ROOT: Final = Path(
+    os.environ.get("CRYPTO_RECORDER_ARCHIVE_DAYS_ROOT", "/data/cryptorecorder/archive_days")
+).expanduser()
+
+# Label store: future labels / targets layer (separate from feature_store)
+LABEL_ROOT: Final = Path(
+    os.environ.get("CRYPTO_RECORDER_LABEL_ROOT", "/data/cryptorecorder/label_store")
+).expanduser()
+
 # Canonical data channels.  depth_v2 and trade_v2 are the only raw
 # sources on the deterministic-native mainline.
 CHANNELS: Final = ["depth_v2", "trade_v2", "exchangeinfo"]
 
-# Create required directories on import
-for directory in [DATA_ROOT, META_ROOT, STATE_ROOT, STATE_ROOT / "convert_reports"]:
-    directory.mkdir(parents=True, exist_ok=True)
+def ensure_runtime_directories(
+    *,
+    include_data_root: bool = False,
+    include_pipeline_roots: bool = False,
+) -> None:
+    """Create runtime directories when a command is about to use them.
+
+    Importing config must remain side-effect light so local CLI overrides can be
+    parsed before any default `/data/...` path is touched.
+    """
+    directories = [
+        META_ROOT,
+        STATE_ROOT,
+        STATE_ROOT / "convert_reports",
+    ]
+    if include_data_root:
+        directories.append(DATA_ROOT)
+    if include_pipeline_roots:
+        directories.extend(
+            [
+                REPLAY_ROOT,
+                FEATURE_ROOT,
+                CATALOG_JOBS_ROOT,
+                DAILY_REPORT_ROOT,
+                ARCHIVE_DAYS_ROOT,
+                LABEL_ROOT,
+            ]
+        )
+    for directory in directories:
+        directory.mkdir(parents=True, exist_ok=True)
 
 # ============================================================================
 # Binance API Endpoints

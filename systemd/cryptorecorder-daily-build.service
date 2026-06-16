@@ -1,0 +1,39 @@
+[Unit]
+Description=CryptoRecorder Daily Build Pipeline
+Documentation=file:///home/zsom/services/CryptoRecorder/docs/DAILY_BUILD_PIPELINE.md
+After=network.target
+PartOf=cryptorecorder.target
+
+[Service]
+Type=oneshot
+User=zsom
+Group=zsom
+WorkingDirectory=/home/zsom/services/CryptoRecorder
+
+# Load environment file from /etc/cryptorecorder/cryptorecorder.env if it exists
+# The '-' prefix means it won't fail if the file doesn't exist
+EnvironmentFile=-/etc/cryptorecorder/cryptorecorder.env
+
+# Use Python from virtualenv
+ExecStart=/home/zsom/services/CryptoRecorder/.venv/bin/python -m pipeline.daily_build --date yesterday
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cryptorecorder-daily-build
+
+# Restart policy
+Restart=on-failure
+RestartSec=300
+
+# Timeout
+TimeoutStartSec=3600
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/data/cryptorecorder /home/zsom/services/CryptoRecorder/state
+
+[Install]
+WantedBy=multi-user.target
