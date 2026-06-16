@@ -34,12 +34,22 @@ def _timeframe_to_ms(timeframe: str) -> int:
     return timeframe_map.get(timeframe, 1000)
 
 
+def _date_bounds_ns(date: str) -> tuple[int, int]:
+    start = datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    end = start + timedelta(days=1)
+    return (
+        int(start.timestamp() * 1_000_000_000),
+        int(end.timestamp() * 1_000_000_000),
+    )
+
+
 def _aggregate_window(
     venue: str,
     symbol: str,
     date: str,
     timeframe: str,
     reader: ReplayReader,
+    window_mode: str = "utc_day",
 ) -> list[dict]:
     """
     Aggregate depth and trade records into feature windows.
@@ -49,61 +59,60 @@ def _aggregate_window(
     """
     timeframe_ms = _timeframe_to_ms(timeframe)
     timeframe_ns = timeframe_ms * 1_000_000  # Convert to nanoseconds
+    day_start_ns, day_end_ns = _date_bounds_ns(date)
     
-    # Collect all records
-    depth_records = list(reader.iter_depths(venue, symbol, date))
-    trade_records = list(reader.iter_trades(venue, symbol, date))
+    # Collect one symbol/date in v0, then clamp to the requested UTC day.
+    depth_records = [
+        record
+        for record in reader.iter_depths(venue, symbol, date)
+        if day_start_ns <= int(record.get("ts_exchange_ns", 0)) < day_end_ns
+    ]
+    trade_records = [
+        record
+        for record in reader.iter_trades(venue, symbol, date)
+        if day_start_ns <= int(record.get("ts_exchange_ns", 0)) < day_end_ns
+    ]
     
     if not depth_records and not trade_records:
         logger.warning(f"No data for {venue}/{symbol}/{date}")
         return []
     
-    # Find overall time range
-    all_timestamps = []
+    all_timestamps: list[int] = []
     for d in depth_records:
-        all_timestamps.append(d.get("ts_exchange_ns", 0))
+        all_timestamps.append(int(d.get("ts_exchange_ns", 0)))
     for t in trade_records:
-        all_timestamps.append(t.get("ts_exchange_ns", 0))
+        all_timestamps.append(int(t.get("ts_exchange_ns", 0)))
     
     if not all_timestamps:
         return []
     
-    min_ts = min(all_timestamps)
-    max_ts = max(all_timestamps)
+    if window_mode not in {"observed", "utc_day"}:
+        raise ValueError(f"Unsupported window_mode: {window_mode}")
     
-    # Create time windows
+    depth_by_window: dict[int, list[dict]] = {}
+    trade_by_window: dict[int, list[dict]] = {}
+    for record in depth_records:
+        ts_ns = int(record.get("ts_exchange_ns", 0))
+        window_start = (ts_ns // timeframe_ns) * timeframe_ns
+        depth_by_window.setdefault(window_start, []).append(record)
+    for record in trade_records:
+        ts_ns = int(record.get("ts_exchange_ns", 0))
+        window_start = (ts_ns // timeframe_ns) * timeframe_ns
+        trade_by_window.setdefault(window_start, []).append(record)
+
+    # Sparse output: create only windows containing at least one record.
     features_list = []
-    current_window_start = (min_ts // timeframe_ns) * timeframe_ns
-    
-    while current_window_start <= max_ts:
+    for current_window_start in sorted(set(depth_by_window) | set(trade_by_window)):
         current_window_end = current_window_start + timeframe_ns
-        
-        # Collect records in this window
-        window_depths = [
-            d for d in depth_records
-            if current_window_start <= d.get("ts_exchange_ns", 0) < current_window_end
-        ]
-        window_trades = [
-            t for t in trade_records
-            if current_window_start <= t.get("ts_exchange_ns", 0) < current_window_end
-        ]
-        
-        # Only create feature if we have some data
-        if window_depths or window_trades:
-            # Use end-of-window timestamp for feature
-            window_end_ts = current_window_end - 1
-            
-            feature = calculate_core_features(
-                venue,
-                symbol,
-                window_end_ts,
-                timeframe,
-                window_depths,
-                window_trades,
-            )
-            features_list.append(feature)
-        
-        current_window_start = current_window_end
+        feature = calculate_core_features(
+            venue,
+            symbol,
+            current_window_end - 1,
+            timeframe,
+            depth_by_window.get(current_window_start, []),
+            trade_by_window.get(current_window_start, []),
+        )
+        features_list.append(feature)
     
     return features_list
 
@@ -115,6 +124,7 @@ def build_features_for_symbol(
     timeframes: list[str],
     replay_root: Path,
     feature_root: Path,
+    window_mode: str = "utc_day",
 ) -> dict:
     """
     Build feature store for a single venue/symbol/date across all timeframes.
@@ -139,7 +149,14 @@ def build_features_for_symbol(
                 logger.info(f"Aggregating {venue}/{symbol}/{date} @ {timeframe}...")
                 
                 # Aggregate records into features
-                features = _aggregate_window(venue, symbol, date, timeframe, reader)
+                features = _aggregate_window(
+                    venue,
+                    symbol,
+                    date,
+                    timeframe,
+                    reader,
+                    window_mode=window_mode,
+                )
                 
                 if not features:
                     logger.warning(
@@ -218,6 +235,15 @@ Examples:
         default=None,
         help=f"Feature root (default: {FEATURE_ROOT})",
     )
+    parser.add_argument(
+        "--window-mode",
+        choices=["utc_day", "observed"],
+        default="utc_day",
+        help=(
+            "Window bounds policy. utc_day clamps to [date 00:00 UTC, next day); "
+            "observed spans only observed timestamps. Output is sparse in both modes."
+        ),
+    )
     args = parser.parse_args()
 
     replay_root = args.replay_root or REPLAY_ROOT
@@ -256,7 +282,13 @@ Examples:
                 continue
             
             result = build_features_for_symbol(
-                venue, symbol, date_str, timeframes, replay_root, feature_root
+                venue,
+                symbol,
+                date_str,
+                timeframes,
+                replay_root,
+                feature_root,
+                window_mode=args.window_mode,
             )
             results.append(result)
 

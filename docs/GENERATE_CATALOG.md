@@ -332,7 +332,7 @@ for venue in venues:
             if ts_ns < start_ns:
                 continue
             if ts_ns >= end_ns:
-                break
+                continue
             
             # Convert and export
             tick = convert_trade_to_nautilus(trade, venue, symbol)

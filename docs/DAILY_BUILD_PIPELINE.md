@@ -223,10 +223,11 @@ python -m pipeline.build_feature_store --date 2026-06-15
 
 Per symbol/timeframe:
 1. Load one symbol/date of replay_store data (trades + depths) into memory in v0
-2. Aggregate into time windows (100ms, 1s, 1m)
-3. Calculate core features per window
-4. Write Parquet with Hive-style partitioning
-5. Atomic move from staging → published
+2. Clamp records to the requested UTC day
+3. Aggregate into sparse time windows (100ms, 1s, 1m); empty windows are skipped
+4. Calculate core features per window
+5. Write Parquet with Hive-style partitioning
+6. Atomic move from staging → published
 
 **Output structure**:
 ```
@@ -241,6 +242,17 @@ feature_store/
 - Malformed replay records → skip record, continue
 - Quality flags triggered → logged in feature rows
 - Large symbol/day memory use → benchmark RSS before broad production runs
+
+Audit feature output:
+
+```bash
+python -m pipeline.audit_feature_store \
+  --feature-root /tmp/test_features \
+  --date 2026-06-12 \
+  --symbols ADAUSDT \
+  --venues BINANCE_SPOT \
+  --timeframes 1m,1s,100ms
+```
 
 ### 4. Generate Daily Report
 

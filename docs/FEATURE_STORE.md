@@ -16,6 +16,25 @@ feature_store/
 
 Important limitation: the current feature builder loads one symbol/date of replay depth and trade records into memory before aggregating windows. It is useful for validation and small runs, but it is not yet proven memory-safe for full top50 production. Benchmark RSS before scaling. The next implementation step is streaming/windowed aggregation.
 
+## Window Behavior
+
+The production default is UTC-day clamped and sparse:
+
+- `--date YYYY-MM-DD` clamps input records to `[YYYY-MM-DD 00:00:00 UTC, next day 00:00:00 UTC)`.
+- `timeframe=1m` means one row per one-minute window that contains at least one depth or trade record.
+- `timeframe=1s` means one row per one-second window that contains data.
+- `timeframe=100ms` means one row per 100ms window that contains data.
+- Empty windows are skipped; the feature store does not currently force a dense full-day grid.
+- `timestamp_ns` is the end of the feature window minus one nanosecond.
+
+Dense UTC-day row counts are audit references, not guaranteed output counts:
+
+- `1m`: 1440 possible windows
+- `1s`: 86400 possible windows
+- `100ms`: 864000 possible windows
+
+`pipeline.build_feature_store` also exposes `--window-mode observed` for diagnostics. The default remains `utc_day`; both modes are sparse.
+
 ## Inputs
 
 Features are computed from replay partitions:
@@ -118,6 +137,20 @@ python -m pipeline.build_feature_store \
   --replay-root /tmp/test_replay \
   --feature-root /tmp/test_features
 ```
+
+Audit an existing feature store:
+
+```bash
+python -m pipeline.audit_feature_store \
+  --feature-root /tmp/test_features \
+  --date 2026-06-12 \
+  --symbols ADAUSDT \
+  --venues BINANCE_SPOT \
+  --timeframes 1m,1s,100ms \
+  --report-path /tmp/test_features/audit_2026-06-12.json
+```
+
+The audit reports actual row counts, expected dense row counts, min/max timestamps, rows outside the requested UTC day, duplicate timestamps, null ratios, all-null columns, `quality_ok=false` counts, and crossed-book counts.
 
 ## Validation Notes
 

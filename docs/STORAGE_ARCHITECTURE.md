@@ -151,63 +151,23 @@ feature_store/
   timeframe=1s/
     venue=BINANCE_SPOT/
       symbol=BTCUSDT/
-        date=2026-06-15.parquet      # 86400 rows (1 per second)
+        date=2026-06-15.parquet      # sparse rows for 1s windows with data
   timeframe=100ms/
     venue=BINANCE_SPOT/
       symbol=BTCUSDT/
-        date=2026-06-15.parquet      # 864000 rows (1 per 100ms)
+        date=2026-06-15.parquet      # sparse rows for 100ms windows with data
   timeframe=1m/
     venue=BINANCE_SPOT/
       symbol=BTCUSDT/
-        date=2026-06-15.parquet      # 1440 rows (1 per minute)
+        date=2026-06-15.parquet      # sparse rows for 1m windows with data
 ```
 
-**Core Features (v1, mandatory)**:
-```python
-FEATURE_SCHEMA_CORE_V1 = [
-    # Best bid/ask
-    ("ts_ns", int64),
-    ("best_bid", float64),
-    ("best_ask", float64),
-    ("best_bid_size", float64),
-    ("best_ask_size", float64),
-    
-    # Spreads
-    ("mid_price", float64),
-    ("spread_bps", float64),  # Basis points
-    ("spread_pct", float64),  # Percentage
-    
-    # Depth liquidity
-    ("bid_imbalance_l1", float64),      # Best bid size / (bid size + ask size)
-    ("ask_imbalance_l1", float64),
-    ("bid_imbalance_5", float64),       # 5-level imbalance
-    ("ask_imbalance_5", float64),
-    
-    # Trade flow
-    ("buy_volume", float64),             # Volume where buyer is aggressor
-    ("sell_volume", float64),            # Volume where seller is aggressor
-    ("buy_count", int32),
-    ("sell_count", int32),
-    ("buy_sell_ratio", float64),         # Buy volume / sell volume
-    ("vwap", float64),                   # Volume-weighted average price
-    
-    # Price changes
-    ("returns", float64),                # Log return from open to close
-    ("high", float64),
-    ("low", float64),
-    
-    # Quality metrics
-    ("trade_count", int32),
-    ("is_crossed_book", bool_),          # Bid >= ask (data problem)
-    ("is_gap_detected", bool_),          # Large price jump
-    ("is_reconnect_detected", bool_),    # Seqnum gap detected
-]
-```
+**Window behavior**:
+- `--date YYYY-MM-DD` clamps records to `[date 00:00:00 UTC, next date 00:00:00 UTC)`.
+- Output is sparse: empty windows are skipped.
+- Dense UTC-day expectations are useful for audit only: 1m = 1440, 1s = 86400, 100ms = 864000.
 
-**Advanced Features (v2, nullable, TBD)**:
-- Order flow imbalance (OFI)
-- Microstructure patterns
-- Volatility regime detection
+See [FEATURE_STORE.md](FEATURE_STORE.md) for the exact current schema. Do not use older field names such as `ts_ns`, `best_bid_size`, or `bid_imbalance_l1`; the actual schema uses `timestamp_ns`, `top1_bid_size`, and `imbalance_top1`.
 
 ### 4. Catalog Jobs (`catalog_jobs/`)
 
@@ -260,7 +220,7 @@ python -m pipeline.build_feature_store --date 2026-06-15 [--timeframes 100ms,1s,
 
 **Processing**:
 1. Per symbol/venue/timeframe: load replay trades and depths
-2. Bin records into time windows (100ms, 1s, 1m, etc)
+2. Clamp records to the requested UTC day and bin observed records into sparse windows (100ms, 1s, 1m, etc)
 3. Calculate core features per window:
    - BBO, spreads, liquidity metrics
    - Trade flow statistics
@@ -332,7 +292,7 @@ python -m pipeline.daily_build --date 2026-06-15 [--steps replay,features] [--sy
   },
   "feature_build": {
     "symbols_processed": 2500,
-    "feature_records": 18720000  # 86400 rows/day * 3 timeframes * 2500 symbols / 3
+    "feature_records": 18720000
   },
   "errors": []
 }
@@ -381,3 +341,4 @@ data_raw → replay_store → generate_catalog --profile trades_only
 - [FEATURE_STORE.md](FEATURE_STORE.md) — Feature calculations and lookahead bias
 - [DAILY_BUILD_PIPELINE.md](DAILY_BUILD_PIPELINE.md) — Operations and examples
 - [GENERATE_CATALOG.md](GENERATE_CATALOG.md) — On-demand catalog examples
+- [IMPLEMENTATION_AUDIT.md](IMPLEMENTATION_AUDIT.md) — Current validation status and limitations
