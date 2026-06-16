@@ -120,22 +120,22 @@ class TestSemanticEquivalence:
         pytest.skip("Manual test; requires both pipelines executed and catalogs loaded")
 
     def test_convert_day_backward_compatibility(self):
-        """Verify convert_day.py still works unchanged."""
+        """Verify convert_day.py remains the legacy/full-L2 converter path."""
         from pathlib import Path
         
         # Verify convert_day.py file exists and hasn't been modified
         convert_day_path = Path("/home/zsom/services/CryptoRecorder/convert_day.py")
         assert convert_day_path.exists(), "convert_day.py should not be deleted"
         
-        # Read first few lines to verify it's the original implementation
+        # Read first few lines to verify it has not been coupled to replay_store.
         with open(convert_day_path) as f:
             content = f.read(500)
         
         # Should not contain new pipeline references
         assert "replay_store" not in content, \
-            "convert_day.py should be unchanged (no replay_store references)"
+            "convert_day.py should not depend on replay_store"
         assert "feature_store" not in content, \
-            "convert_day.py should be unchanged (no feature_store references)"
+            "convert_day.py should not depend on feature_store"
 
 
 # Manual Testing Instructions

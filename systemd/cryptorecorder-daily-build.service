@@ -32,7 +32,7 @@ TimeoutStartSec=3600
 # Security hardening
 NoNewPrivileges=yes
 ProtectSystem=strict
-ProtectHome=yes
+ProtectHome=false
 ReadWritePaths=/data/cryptorecorder /home/zsom/services/CryptoRecorder/state
 
 [Install]

@@ -4,6 +4,19 @@
 
 The `generate_catalog` module creates on-demand Nautilus `ParquetDataCatalog` exports from the replay_store for specific symbols, venues, and time windows.
 
+Current status:
+
+```text
+data_raw -> replay_store -> generate_catalog --profile trades_only
+  implemented
+
+data_raw -> replay_store -> generate_catalog --profile full_l2
+  target path, not implemented yet
+
+data_raw -> convert_day.py -> full_l2 Nautilus catalog
+  current validated full-L2 path
+```
+
 **Key use cases**:
 1. **Validation**: Compare new pipeline output vs old `convert_day.py` (semantic equivalence test)
 2. **Time-windowed queries**: Extract data for specific hours/days without rebuilding entire daily catalog
@@ -73,7 +86,12 @@ python -m pipeline.generate_catalog [OPTIONS]
     - trades_only: Trades only, no order book
     
     Default: trades_only
-    Current status: depth/full_l2 catalog generation is deferred.
+
+--job-id NAME
+    Optional deterministic job id. Output directory is job_{NAME}.
+
+--overwrite
+    Delete and recreate job_{NAME} if it already exists.
 ```
 
 ## Examples
@@ -140,19 +158,24 @@ python -m pipeline.generate_catalog \
   --start 2026-06-12T00:00:00Z \
   --end 2026-06-13T00:00:00Z \
   --profile trades_only \
-  --output /tmp/test_catalogs_new
+  --output /tmp/test_catalogs_new \
+  --job-id validation_new \
+  --overwrite
 ```
 
-Compare output with old pipeline:
+Compare output with the old pipeline using the validation CLI:
 ```bash
-# Old pipeline already generated catalog via convert_day.py
-# Load both catalogs and compare:
-# - Instrument count (should match)
-# - TradeTick count (should match)
-# - Timestamp ranges (should match)
-# - First/last trade timestamps (should match)
-
-# See test_semantic_equivalence.py for detailed comparison logic
+python -m pipeline.validate_catalog_equivalence \
+  --date 2026-06-12 \
+  --symbols ADAUSDT \
+  --venues BINANCE_SPOT \
+  --data-root ./data_raw \
+  --work-root /tmp/cryptorecorder-equivalence \
+  --old-catalog-root /tmp/cryptorecorder-equivalence/old_catalog \
+  --replay-root /tmp/cryptorecorder-equivalence/replay_store \
+  --new-catalog-root /tmp/cryptorecorder-equivalence/new_catalog \
+  --profile trades_only \
+  --overwrite
 ```
 
 ## Output Structure
@@ -192,8 +215,8 @@ Includes only TradeTick events.
 # Exported as Nautilus trade_tick Parquet files under data/trade_tick/{instrument_id}/
 TradeTick(
     instrument_id=InstrumentId(symbol, venue),
-    price=Price(trade['price'], 8),
-    size=Quantity(trade['quantity'], 8),
+    price=Price.from_str(trade['price_str']),
+    size=Quantity.from_str(trade['quantity_str']),
     aggressor_side="BUY" if not trade['buyer_maker'] else "SELL",
     trade_id=str(trade['trade_id']),
     ts_event=trade['ts_exchange_ns'],
@@ -209,7 +232,7 @@ TradeTick(
 
 **Size**: ~100 KB per 100K trades
 
-### full_l2 (deferred)
+### full_l2 (deferred design)
 
 Includes TradeTick, OrderBookDeltas, and OrderBookDepth10.
 
@@ -226,11 +249,11 @@ Includes TradeTick, OrderBookDeltas, and OrderBookDepth10.
 - Order book dynamics research
 - Portfolio risk modeling
 
-**Size**: ~1-2 MB per full day (includes depths)
+**Size**: Deferred/unbenchmarked in the replay path. It is expected to be much larger than `trades_only` and may approach old Nautilus catalog size depending on expansion profile.
 
 **Status**: Deferred. The CLI currently accepts only `trades_only`.
 
-### depth_only (deferred)
+### depth_only (deferred design)
 
 Includes only OrderBookDepth10 (no trades).
 
@@ -244,9 +267,33 @@ Includes only OrderBookDepth10 (no trades).
 - Liquidity distribution research
 - Microstructure without trade information
 
-**Size**: Similar to full_l2
+**Size**: Deferred/unbenchmarked.
 
 **Status**: Deferred. The CLI currently accepts only `trades_only`.
+
+## Future Full-L2 Validation Requirements
+
+Do not treat replay-based full-L2 generation as complete until it semantically matches the old converter:
+
+```text
+data_raw -> convert_day.py
+must match
+data_raw -> replay_store -> generate_catalog --profile full_l2
+```
+
+The comparison should cover:
+
+- instruments;
+- TradeTick count and sampled equality;
+- OrderBookDeltas count;
+- first, last, and sampled deltas;
+- action, side, price, size, order_id, flags, and sequence where applicable;
+- reconstructed book checkpoints at start + 1 minute, quarter day, half day, and end - 1 minute;
+- top 10 bid/ask equality at checkpoints;
+- gap/fenced range report equality or an explicit acceptable-difference explanation;
+- optional OrderBookDepth10 semantic comparison if emitted.
+
+Acceptance is semantic equality, not byte-for-byte Parquet equality.
 
 ## Processing
 
@@ -279,9 +326,9 @@ for venue in venues:
     for symbol in symbols:
         # Stream trades from partition
         for trade in reader.iter_trades(venue, symbol, date):
-            ts_ns = trade['ts_exchange_ns']
+            ts_ns = trade['ts_receive_ns']
             
-            # Filter by time window
+            # Filter by Nautilus catalog query time (ts_init)
             if ts_ns < start_ns:
                 continue
             if ts_ns >= end_ns:
@@ -306,7 +353,7 @@ for venue in venues:
 
 ## Time Window Filtering
 
-All records are filtered by `ts_exchange_ns` (server timestamp in UTC nanoseconds).
+All records are filtered by `ts_receive_ns`, which becomes Nautilus `ts_init`. This matches bounded reads from `ParquetDataCatalog` and the old `convert_day.py` output. `ts_exchange_ns` is still preserved as `ts_event`.
 
 ### Example: 1-hour window
 
@@ -314,7 +361,7 @@ All records are filtered by `ts_exchange_ns` (server timestamp in UTC nanosecond
 --start 2026-06-15T12:00:00Z  → 1718424000 seconds → 1718424000_000000000 ns
 --end   2026-06-15T13:00:00Z  → 1718427600 seconds → 1718427600_000000000 ns
 
-Included: records where 1718424000_000000000 <= ts_ns < 1718427600_000000000
+Included: records where 1718424000_000000000 <= ts_init < 1718427600_000000000
 ```
 
 ### Partial partition filtering
@@ -340,7 +387,7 @@ python -m pipeline.generate_catalog \
 
 # Check manifest
 cat catalog_jobs/job_*/manifest.json | jq .record_counts.trade_ticks
-# This should match the number of replay trades whose ts_exchange_ns is inside [start, end).
+# This should match the number of replay trades whose ts_receive_ns is inside [start, end).
 ```
 
 ### Compare old vs new pipeline

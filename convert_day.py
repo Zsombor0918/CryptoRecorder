@@ -96,6 +96,8 @@ def convert_date(
     depth10_interval_sec: float = DEPTH10_INTERVAL_SEC,
     derived_depth_snapshot_levels: int = DERIVED_DEPTH_SNAPSHOT_LEVELS,
     allow_partial_overwrite: bool = False,
+    symbols: Optional[Sequence[str]] = None,
+    venues: Optional[Sequence[str]] = None,
 ) -> Dict:
     """Convert one UTC day's raw data → Nautilus ParquetDataCatalog.
 
@@ -133,6 +135,20 @@ def convert_date(
 
     # ── universe ──────────────────────────────────────────────────────
     universe = resolve_universe(date_str)
+    if venues:
+        venue_filter = {v.strip().upper() for v in venues if v.strip()}
+        universe = {
+            venue: syms
+            for venue, syms in universe.items()
+            if venue in venue_filter
+        }
+    if symbols:
+        symbol_filter = {s.strip().upper() for s in symbols if s.strip()}
+        universe = {
+            venue: [sym for sym in syms if sym.upper() in symbol_filter]
+            for venue, syms in universe.items()
+        }
+        universe = {venue: syms for venue, syms in universe.items() if syms}
     if not universe:
         logger.warning(f"No raw data found for {date_str}")
         return _save_report(_empty_report(
@@ -1590,6 +1606,21 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     ap.add_argument(
+        "--catalog-root",
+        type=Path,
+        help="Catalog root override. Default: configured NAUTILUS_CATALOG_ROOT.",
+    )
+    ap.add_argument(
+        "--symbols",
+        type=str,
+        help="Optional comma-separated raw symbols to convert. Default: all resolved symbols.",
+    )
+    ap.add_argument(
+        "--venues",
+        type=str,
+        help="Optional comma-separated venues to convert. Default: all resolved venues.",
+    )
+    ap.add_argument(
         "--emit-depth10",
         action="store_true",
         default=EMIT_DEPTH10_DEFAULT,
@@ -1636,11 +1667,14 @@ def main(
 
     report = convert_date(
         date,
+        catalog_root=args.catalog_root,
         staging=args.staging,
         emit_depth10=args.emit_depth10,
         depth10_interval_sec=args.depth10_interval_sec,
         derived_depth_snapshot_levels=args.derived_depth_snapshot_levels,
         allow_partial_overwrite=args.allow_partial_overwrite,
+        symbols=[s.strip() for s in args.symbols.split(",")] if args.symbols else None,
+        venues=[v.strip() for v in args.venues.split(",")] if args.venues else None,
     )
     return 0 if report.get("status") in ("ok", "no_data") else 1
 

@@ -42,6 +42,15 @@ def _event_ts_ns(raw_record: dict) -> int:
     )
 
 
+def _trade_event_ts_ns(raw_record: dict) -> int:
+    return (
+        _to_ns_from_ms(raw_record.get("ts_trade_ms"))
+        or _to_ns_from_ms(raw_record.get("ts_event_ms"))
+        or _to_ns_from_ms(raw_record.get("exchange_ts_ms"))
+        or int(raw_record.get("ts_exchange_ns") or raw_record.get("ts_recv_ns") or 0)
+    )
+
+
 def _receive_ts_ns(raw_record: dict) -> int:
     return int(
         raw_record.get("ts_receive_ns")
@@ -60,6 +69,19 @@ def _native_payload_hash(raw_record: dict) -> str | None:
 
 def _as_optional_str(value: object) -> str | None:
     return None if value is None else str(value)
+
+
+def _decimal_pair_to_level(level: object) -> dict:
+    price = level[0]  # type: ignore[index]
+    size = level[1]  # type: ignore[index]
+    price_str = str(price)
+    size_str = str(size)
+    return {
+        "price": float(price_str),
+        "size": float(size_str),
+        "price_str": price_str,
+        "size_str": size_str,
+    }
 
 
 def _convert_depth_record(raw_record: dict, venue: str, symbol: str, date: str) -> Optional[dict]:
@@ -95,9 +117,8 @@ def _convert_depth_record(raw_record: dict, venue: str, symbol: str, date: str) 
         if isinstance(asks, str):
             asks = json.loads(asks)
 
-        # Convert to nested struct format: [{"price": x, "size": y}, ...]
-        bids_struct = [{"price": float(b[0]), "size": float(b[1])} for b in bids]
-        asks_struct = [{"price": float(a[0]), "size": float(a[1])} for a in asks]
+        bids_struct = [_decimal_pair_to_level(b) for b in bids]
+        asks_struct = [_decimal_pair_to_level(a) for a in asks]
 
         # Determine flags
         is_snapshot = record_type == "snapshot_seed"
@@ -120,6 +141,7 @@ def _convert_depth_record(raw_record: dict, venue: str, symbol: str, date: str) 
             "session_seq": session_seq,
             "raw_index": raw_index,
             "record_type": record_type,
+            "U": _as_optional_str(raw_record.get("U")),
             "u": _as_optional_str(raw_record.get("u") or raw_record.get("lastUpdateId")),
             "pu": _as_optional_str(raw_record.get("pu")),
             "ts_exchange_ns": _event_ts_ns(raw_record),
@@ -168,8 +190,10 @@ def _convert_trade_record(raw_record: dict, venue: str, symbol: str, date: str) 
         agg_trade_id = raw_record.get("agg_trade_id")
 
         # Trade details
-        price = float(raw_record.get("price", 0))
-        quantity = float(raw_record.get("quantity", 0))
+        price_str = str(raw_record.get("price", "0"))
+        quantity_str = str(raw_record.get("quantity", "0"))
+        price = float(price_str)
+        quantity = float(quantity_str)
         buyer_maker = bool(raw_record.get("is_buyer_maker", raw_record.get("buyer_maker", False)))
         aggressor_side = raw_record.get("aggressor_side")
 
@@ -189,10 +213,12 @@ def _convert_trade_record(raw_record: dict, venue: str, symbol: str, date: str) 
             "market_type": market_type,
             "trade_id": _as_optional_str(trade_id),
             "agg_trade_id": _as_optional_str(agg_trade_id),
-            "ts_exchange_ns": _event_ts_ns(raw_record),
+            "ts_exchange_ns": _trade_event_ts_ns(raw_record),
             "ts_receive_ns": _receive_ts_ns(raw_record),
             "price": price,
             "quantity": quantity,
+            "price_str": price_str,
+            "quantity_str": quantity_str,
             "buyer_maker": buyer_maker,
             "aggressor_side": aggressor_side,
             "quality_flags": quality_flags,

@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import shutil
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -71,8 +72,8 @@ def _convert_trade_to_nautilus(
         if not trade_id:
             return None
         
-        price = trade.get("price", 0)
-        quantity = trade.get("quantity", 0)
+        price = trade.get("price_str") or trade.get("price", 0)
+        quantity = trade.get("quantity_str") or trade.get("quantity", 0)
         ts_ns = int(trade.get("ts_exchange_ns", 0))
         ts_recv_ns = int(trade.get("ts_receive_ns", ts_ns))
         
@@ -119,6 +120,7 @@ def generate_catalog_from_replay(
     start: datetime,
     end: datetime,
     profile: str = "trades_only",
+    overwrite: bool = False,
 ) -> dict:
     """
     Generate Nautilus catalog from replay_store.
@@ -170,6 +172,14 @@ def generate_catalog_from_replay(
     try:
         reader = ReplayReader(replay_root)
         job_dir = catalog_root / f"job_{job_id}"
+        if job_dir.exists():
+            if not overwrite:
+                status["status"] = "failed"
+                status["errors"].append(
+                    f"Catalog job already exists: {job_dir}. Use overwrite=True or --overwrite."
+                )
+                return status
+            shutil.rmtree(job_dir)
         job_dir.mkdir(parents=True, exist_ok=True)
         catalog = ParquetDataCatalog(str(job_dir))
 
@@ -222,13 +232,13 @@ def generate_catalog_from_replay(
                     # Stream and convert trades
                     trade_batch = []
                     for trade in reader.iter_trades(venue, symbol, date):
-                        ts_ns = int(trade.get("ts_exchange_ns", 0))
+                        ts_init_ns = int(trade.get("ts_receive_ns") or trade.get("ts_exchange_ns", 0))
                         
-                        # Filter by time window
-                        if ts_ns < start.timestamp() * 1e9:
+                        # Nautilus catalog bounded reads are based on ts_init.
+                        if ts_init_ns < start.timestamp() * 1e9:
                             continue
-                        if ts_ns >= end.timestamp() * 1e9:
-                            break
+                        if ts_init_ns >= end.timestamp() * 1e9:
+                            continue
                         
                         trade_tick = _convert_trade_to_nautilus(
                             trade, instrument_id, venue
@@ -290,7 +300,7 @@ def main():
         epilog="""
 Examples:
   python -m pipeline.generate_catalog --input /path/to/replay_store --symbols BTCUSDT --venues BINANCE_SPOT --start 2026-06-15T12:00:00Z --end 2026-06-15T13:00:00Z
-  python -m pipeline.generate_catalog --input /path/to/replay_store --symbols BTCUSDT,ETHUSDT --start 2026-06-15T00:00:00Z --end 2026-06-17T00:00:00Z --output /path/to/catalog_jobs/test_job
+  python -m pipeline.generate_catalog --input /path/to/replay_store --symbols BTCUSDT,ETHUSDT --start 2026-06-15T00:00:00Z --end 2026-06-17T00:00:00Z --output /path/to/catalog_jobs --job-id validation_new --overwrite
         """,
     )
     parser.add_argument(
@@ -326,10 +336,20 @@ Examples:
         help=f"Catalog output root (default: {CATALOG_JOBS_ROOT})",
     )
     parser.add_argument(
+        "--job-id",
+        default=None,
+        help="Deterministic job id. Output directory is job_{job_id}.",
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Delete and recreate job_{job_id} if it already exists.",
+    )
+    parser.add_argument(
         "--profile",
         choices=["trades_only"],
         default="trades_only",
-        help="Catalog profile (default: trades_only; depth/full_l2 is deferred)",
+        help="Catalog profile (default: trades_only)",
     )
     args = parser.parse_args()
 
@@ -346,8 +366,7 @@ Examples:
     symbols = [s.strip().upper() for s in args.symbols.split(",")]
     venues = [v.strip().upper() for v in args.venues.split(",")]
 
-    # Generate job_id from timestamp
-    job_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    job_id = args.job_id or datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 
     logger.info(
         f"Generating catalog: job_id={job_id}, symbols={symbols}, "
@@ -363,6 +382,7 @@ Examples:
         start,
         end,
         profile=args.profile,
+        overwrite=args.overwrite,
     )
 
     if result["status"] != "success":

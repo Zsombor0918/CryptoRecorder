@@ -2,14 +2,15 @@
 
 ## Overview
 
-The replay_store is a Parquet-based columnar archive of market data that serves as the primary source of truth for all downstream processing (feature calculations, catalog generation, analysis).
+The replay_store is a Parquet-based columnar replay layer. It is a candidate long-term replay source after validation, not yet a replacement for the validated full-L2 `convert_day.py` path.
 
 **Key properties**:
 - **Immutable after publication** — Each date/symbol partition is written once and never modified
 - **Deterministically sorted** — Same raw data always produces identical Parquet (enables validation)
 - **Columnar format** — Efficient for time-series queries and feature calculations
 - **Streaming access** — Load via [ReplayReader](#replayreader-api) without materializing full days in memory
-- **Nested structures** — Order book bids/asks stored as `struct<price, size>` for columnar efficiency
+- **Exact decimals preserved** — Float fields exist for feature convenience, and string fields preserve source price/size values for Nautilus reconstruction
+- **v0 write limitation** — `ReplayWriter` currently accumulates one symbol/date in memory before writing; use RSS benchmarks before large production runs
 
 ## Structure
 
@@ -44,6 +45,7 @@ DEPTH_REPLAY_SCHEMA = pa.schema([
     pa.field("session_seq", pa.uint64()),
     pa.field("raw_index", pa.uint32()),
     pa.field("record_type", pa.string()),
+    pa.field("U", pa.string()),
     pa.field("u", pa.string()),
     pa.field("pu", pa.string()),
     pa.field("ts_exchange_ns", pa.int64()),
@@ -51,10 +53,14 @@ DEPTH_REPLAY_SCHEMA = pa.schema([
     pa.field("bids", pa.list_(pa.struct([
         pa.field("price", pa.float64()),
         pa.field("size", pa.float64()),
+        pa.field("price_str", pa.string()),
+        pa.field("size_str", pa.string()),
     ]))),
     pa.field("asks", pa.list_(pa.struct([
         pa.field("price", pa.float64()),
         pa.field("size", pa.float64()),
+        pa.field("price_str", pa.string()),
+        pa.field("size_str", pa.string()),
     ]))),
     pa.field("is_snapshot_seed", pa.bool_()),
     pa.field("is_depth_update", pa.bool_()),
@@ -84,6 +90,8 @@ TRADE_REPLAY_SCHEMA = pa.schema([
     pa.field("ts_receive_ns", pa.int64()),
     pa.field("price", pa.float64()),
     pa.field("quantity", pa.float64()),
+    pa.field("price_str", pa.string()),
+    pa.field("quantity_str", pa.string()),
     pa.field("buyer_maker", pa.bool_()),
     pa.field("aggressor_side", pa.string()),
     pa.field("quality_flags", pa.string()),
@@ -158,7 +166,10 @@ for trade in reader.iter_trades(
     symbol="BTCUSDT",
     date="2026-06-15",
 ):
-    print(f"Trade: ID={trade['trade_id']}, Price={trade['price']}, Qty={trade['quantity']}")
+    print(
+        f"Trade: ID={trade['trade_id']}, "
+        f"Price={trade['price_str']}, Qty={trade['quantity_str']}"
+    )
     
     # Output:
     # Trade: ID=123456, Price=67500.25, Qty=0.5
@@ -180,8 +191,8 @@ for depth in reader.iter_depths(
     symbol="BTCUSDT",
     date="2026-06-15",
 ):
-    bids = depth["bids"]  # List of {price, size} dicts
-    asks = depth["asks"]  # List of {price, size} dicts
+    bids = depth["bids"]  # List of {price, size, price_str, size_str} dicts
+    asks = depth["asks"]  # List of {price, size, price_str, size_str} dicts
     
     best_bid = bids[0]["price"] if bids else None
     best_ask = asks[0]["price"] if asks else None
@@ -271,13 +282,15 @@ python -m pipeline.build_replay_store \
 
 For each symbol/date:
 
-1. **Stream raw data**: Read from `data_raw/{venue}/{channel}/{symbol}/{date}.jsonl.zst`
-2. **Accumulate session IDs**: Group records by streaming session (e.g., hourly)
+1. **Stream raw data**: Read from `data_raw/{VENUE}/{channel}/{SYMBOL}/{YYYY-MM-DD}/{YYYY-MM-DDTHH}.jsonl(.zst)`
+2. **Accumulate symbol/date records**: v0 accumulates one symbol/date before sorting and writing
 3. **Deterministic sort**: Sort by the depth/trade composite keys to ensure reproducibility
 4. **Convert to Parquet**: Transform raw records to columnar schema
 5. **Compute checksums**: SHA256 hash of each Parquet file for integrity
 6. **Write manifest**: Store metadata and checksums
 7. **Atomic move**: Move from staging to published directory
+
+Future optimization: replace symbol/date accumulation with a streaming external sort or SQLite-backed spool before claiming memory-bounded production replay writes.
 
 ### Deterministic Sorting
 

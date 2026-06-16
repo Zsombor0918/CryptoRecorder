@@ -15,10 +15,13 @@ import pyarrow as pa
 # Depth Replay Schema
 # ============================================================================
 
-# Nested struct for bid/ask level: [price, size]
+# Nested struct for bid/ask level. Floats are kept for feature convenience;
+# string fields preserve the exact source value for catalog reconstruction.
 _bid_ask_struct = pa.struct([
     pa.field("price", pa.float64(), nullable=False),
     pa.field("size", pa.float64(), nullable=False),
+    pa.field("price_str", pa.string(), nullable=False),
+    pa.field("size_str", pa.string(), nullable=False),
 ])
 
 DEPTH_REPLAY_SCHEMA = pa.schema([
@@ -34,6 +37,7 @@ DEPTH_REPLAY_SCHEMA = pa.schema([
     
     # Record metadata
     pa.field("record_type", pa.string(), nullable=False),  # 'snapshot_seed', 'depth_update'
+    pa.field("U", pa.string(), nullable=True),  # First update ID when available
     pa.field("u", pa.string(), nullable=True),  # Update ID (spot)
     pa.field("pu", pa.string(), nullable=True),  # Previous Update ID (futures)
     
@@ -86,6 +90,8 @@ TRADE_REPLAY_SCHEMA = pa.schema([
     # Trade details
     pa.field("price", pa.float64(), nullable=False),
     pa.field("quantity", pa.float64(), nullable=False),
+    pa.field("price_str", pa.string(), nullable=False),
+    pa.field("quantity_str", pa.string(), nullable=False),
     pa.field("buyer_maker", pa.bool_(), nullable=False),  # True if buyer is maker (taker is seller)
     pa.field("aggressor_side", pa.string(), nullable=True),  # 'BUY', 'SELL', or null if not reliably derivable
     

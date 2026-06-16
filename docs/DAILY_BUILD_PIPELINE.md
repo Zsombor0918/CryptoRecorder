@@ -176,7 +176,7 @@ coverage = scan_raw_coverage("2026-06-15", DATA_ROOT)
 ```
 
 Scans raw directory structure:
-- `data_raw/{VENUE}/{channel}/{symbol}/{date}.jsonl.zst`
+- `data_raw/{VENUE}/{channel}/{SYMBOL}/{YYYY-MM-DD}/{YYYY-MM-DDTHH}.jsonl(.zst)`
 - Builds availability map for all symbols/channels
 
 **Possible issues**:
@@ -193,7 +193,7 @@ python -m pipeline.build_replay_store --date 2026-06-15
 
 Per symbol:
 1. Stream raw JSONL.zst
-2. Accumulate session IDs from server timestamps
+2. Accumulate one symbol/date of records for deterministic sorting
 3. Deterministically sort by (session_id, session_seq, raw_index)
 4. Write Parquet with nested bids/asks structs
 5. Compute SHA256 checksum
@@ -222,7 +222,7 @@ python -m pipeline.build_feature_store --date 2026-06-15
 ```
 
 Per symbol/timeframe:
-1. Load replay_store data (trades + depths)
+1. Load one symbol/date of replay_store data (trades + depths) into memory in v0
 2. Aggregate into time windows (100ms, 1s, 1m)
 3. Calculate core features per window
 4. Write Parquet with Hive-style partitioning
@@ -240,6 +240,7 @@ feature_store/
 - Missing replay_store data → skip symbol
 - Malformed replay records → skip record, continue
 - Quality flags triggered → logged in feature rows
+- Large symbol/day memory use → benchmark RSS before broad production runs
 
 ### 4. Generate Daily Report
 
@@ -340,6 +341,76 @@ python convert_day.py --date 2026-06-12 --symbols ADAUSDT --staging
 
 Compare instruments, row counts, timestamp min/max, and bounded sample readability. Full depth/full-L2 semantic equivalence is still pending because `generate_catalog` currently implements `trades_only`.
 
+The reusable validator automates the trades-only comparison:
+
+```bash
+python -m pipeline.validate_catalog_equivalence \
+  --date 2026-06-12 \
+  --symbols ADAUSDT \
+  --venues BINANCE_SPOT \
+  --data-root ./data_raw \
+  --work-root /tmp/cryptorecorder-equivalence \
+  --old-catalog-root /tmp/cryptorecorder-equivalence/old_catalog \
+  --replay-root /tmp/cryptorecorder-equivalence/replay_store \
+  --new-catalog-root /tmp/cryptorecorder-equivalence/new_catalog \
+  --profile trades_only \
+  --overwrite
+```
+
+### 8. Local 3-day validation recipe
+
+Use this only after the one-day smoke passes. Replace the dates if your local raw fixture uses different UTC days.
+
+```bash
+BASE=/tmp/cryptorecorder-3day-validation
+rm -rf "$BASE"
+mkdir -p "$BASE"
+
+for date in 2026-06-12 2026-06-13 2026-06-14; do
+  python -m pipeline.build_replay_store \
+    --date "$date" \
+    --symbols ADAUSDT \
+    --data-root ./data_raw \
+    --replay-root "$BASE/replay_store"
+
+  python -m pipeline.build_feature_store \
+    --date "$date" \
+    --symbols ADAUSDT \
+    --timeframes 1m \
+    --replay-root "$BASE/replay_store" \
+    --feature-root "$BASE/feature_store"
+done
+
+python -m pipeline.generate_catalog \
+  --input "$BASE/replay_store" \
+  --symbols ADAUSDT \
+  --venues BINANCE_SPOT \
+  --start 2026-06-12T00:00:00Z \
+  --end 2026-06-15T00:00:00Z \
+  --output "$BASE/catalog_jobs" \
+  --profile trades_only \
+  --job-id validation_3day \
+  --overwrite
+```
+
+Run old-vs-new trades-only equivalence one day at a time:
+
+```bash
+for date in 2026-06-12 2026-06-13 2026-06-14; do
+  python -m pipeline.validate_catalog_equivalence \
+    --date "$date" \
+    --symbols ADAUSDT \
+    --venues BINANCE_SPOT \
+    --data-root ./data_raw \
+    --work-root "$BASE/equivalence_$date" \
+    --old-catalog-root "$BASE/equivalence_$date/old_catalog" \
+    --replay-root "$BASE/equivalence_$date/replay_store" \
+    --new-catalog-root "$BASE/equivalence_$date/new_catalog" \
+    --profile trades_only \
+    --overwrite
+done
+```
+
 ## Troubleshooting
 
 ### Issue: "No symbols found for date"
@@ -391,7 +462,7 @@ rm -rf /path/to/replay_store/.staging_*
 **Solution**:
 ```bash
 # Compare checksums in manifests
-cat /path/to/replay_store/venue=BINANCE_SPOT/symbol=BTCUSDT/date=2026-06-15/manifest.json | jq .checksums
+cat /path/to/replay_store/venue=BINANCE_SPOT/symbol=BTCUSDT/date=2026-06-15/manifest.json | jq '{depth_checksum,trades_checksum}'
 
 # If different, investigate:
 # 1. Raw file changed?

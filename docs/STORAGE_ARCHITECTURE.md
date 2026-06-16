@@ -2,33 +2,37 @@
 
 ## Overview
 
-The new architecture implements a **layered data pipeline** transforming raw streaming data into query-optimized feature stores:
+The new architecture implements a v0 layered pipeline around the existing recorder and converter. It is not yet the final full-L2 replacement.
 
 ```
-raw JSONL.zst data
-    ↓ [build_replay_store]
-replay_store (Parquet, Hive-partitioned)
-    ↓ [build_feature_store + generate_catalog]
-feature_store (Parquet) + Nautilus Catalog
+data_raw -> convert_day.py -> full_l2 Nautilus catalog
+  current validated full-L2 path
+
+data_raw -> replay_store -> generate_catalog --profile trades_only
+  current implemented replay-based catalog path
+
+data_raw -> replay_store -> generate_catalog --profile full_l2
+  target path, not implemented yet
 ```
 
 ### Key Design Principles
 
-1. **Never delete raw data** — Raw remains immutable archive. After replay_store is validated, old raw *may* be deleted, but decision deferred.
-2. **Deterministic replay** — Replay store sorts by `(session_id, session_seq, raw_index)` for reproducible rebuilds.
+1. **Raw retention, not automatic deletion** — Raw is the original capture/audit source while retained. Replay store is a candidate long-term replay layer after validation.
+2. **Deterministic replay** — Replay store sorts by committed stream keys plus `raw_index` for reproducible rebuilds.
 3. **Hive-style partitioning** — All stores use `venue=X/symbol=Y/date=Z` for efficient directory-based filtering.
 4. **Atomic writes** — All writers use staging directory + move pattern to prevent half-written data.
-5. **Bounded reads where implemented** — Replay reading uses Parquet batches. Feature aggregation is currently per symbol/date and should be benchmarked before large-symbol production runs.
+5. **Memory status is explicit** — v0 replay writing and feature aggregation still materialize one symbol/date. Do not claim full production memory safety until RSS benchmarks pass.
 
 ## Storage Layers
 
 ### 1. Raw Data (`data_raw/`)
 
-**Purpose**: Immutable source of truth for all market data.
+**Purpose**: Original capture/audit source while retained.
 
 **Format**: JSONL with gzip or zstd compression
-- `BINANCE_SPOT/depth_v2/{symbol}/{date}.jsonl.zst` — Order book snapshots
-- `BINANCE_SPOT/trade_v2/{symbol}/{date}.jsonl.zst` — Trade executions
+- `data_raw/{VENUE}/{channel}/{SYMBOL}/{YYYY-MM-DD}/{YYYY-MM-DDTHH}.jsonl(.zst)` — directory-based hourly files
+- `BINANCE_SPOT/depth_v2/{symbol}/{date}/{date}THH.jsonl(.zst)` — Order book snapshots and updates
+- `BINANCE_SPOT/trade_v2/{symbol}/{date}/{date}THH.jsonl(.zst)` — Trade executions and stream lifecycle records
 - `BINANCE_USDTF/` — Same structure for futures
 
 **Content**:
@@ -36,11 +40,11 @@ feature_store (Parquet) + Nautilus Catalog
 - **trade_v2**: Trade ID, price, quantity, buyer_maker flag, timestamps
 - **exchangeinfo**: Symbol metadata, decimals, min/max price limits
 
-**Retention**: Permanent (until explicit archival decision)
+**Retention**: Retained as audit source until replay validation supports an explicit archival policy.
 
 ### 2. Replay Store (`replay_store/`)
 
-**Purpose**: Columnar, deduplicated, deterministically sorted replay data. Feeds feature store and catalog generation.
+**Purpose**: Candidate long-term replay layer. Feeds feature store and the currently implemented trades-only replay catalog path.
 
 **Format**: Parquet with ZSTD compression (level 3), Hive-style partitioning
 
@@ -68,6 +72,7 @@ DEPTH_REPLAY_SCHEMA = pa.schema([
     pa.field("session_seq", pa.uint64()),
     pa.field("raw_index", pa.uint32()),
     pa.field("record_type", pa.string()),
+    pa.field("U", pa.string()),
     pa.field("u", pa.string()),
     pa.field("pu", pa.string()),
     pa.field("ts_exchange_ns", pa.int64()),
@@ -75,10 +80,14 @@ DEPTH_REPLAY_SCHEMA = pa.schema([
     pa.field("bids", pa.list_(pa.struct([
         pa.field("price", pa.float64()),
         pa.field("size", pa.float64()),
+        pa.field("price_str", pa.string()),
+        pa.field("size_str", pa.string()),
     ]))),
     pa.field("asks", pa.list_(pa.struct([
         pa.field("price", pa.float64()),
         pa.field("size", pa.float64()),
+        pa.field("price_str", pa.string()),
+        pa.field("size_str", pa.string()),
     ]))),
     pa.field("is_snapshot_seed", pa.bool_()),
     pa.field("is_depth_update", pa.bool_()),
@@ -104,6 +113,8 @@ TRADE_REPLAY_SCHEMA = pa.schema([
     pa.field("ts_receive_ns", pa.int64()),
     pa.field("price", pa.float64()),
     pa.field("quantity", pa.float64()),
+    pa.field("price_str", pa.string()),
+    pa.field("quantity_str", pa.string()),
     pa.field("buyer_maker", pa.bool_()),
     pa.field("aggressor_side", pa.string()),
     pa.field("quality_flags", pa.string()),
@@ -126,11 +137,11 @@ TRADE_REPLAY_SCHEMA = pa.schema([
 }
 ```
 
-**Retention**: Kept indefinitely; archival policy TBD after validation
+**Retention**: Candidate long-term replay layer after old-vs-new validation passes.
 
 ### 3. Feature Store (`feature_store/`)
 
-**Purpose**: Time-aggregated features for ML/analysis, computed from replay_store.
+**Purpose**: AI/selection layer computed from replay_store.
 
 **Format**: Parquet with ZSTD compression, Hive-style partitioning by timeframe
 
@@ -200,7 +211,7 @@ FEATURE_SCHEMA_CORE_V1 = [
 
 ### 4. Catalog Jobs (`catalog_jobs/`)
 
-**Purpose**: On-demand Nautilus ParquetDataCatalog exports for specific time windows and symbols.
+**Purpose**: Temporary runtime/backtest artifacts for specific time windows and symbols.
 
 **Structure**:
 ```
@@ -282,11 +293,11 @@ python -m pipeline.generate_catalog \
 1. Parse ISO 8601 time window (--start/--end)
 2. Determine date range and Hive partitions to scan
 3. Per symbol: stream replay data, filter by time window
-4. Convert to Nautilus TradeTick objects
+4. Convert to Nautilus TradeTick objects using exact replay price/quantity strings
 5. Write a Nautilus `ParquetDataCatalog` under `catalog_jobs/job_*`
 6. Generate report with coverage info
 
-Current status: `trades_only` is implemented and smoke-tested. Depth/full-L2 catalog generation is still deferred.
+Current status: `trades_only` is implemented and smoke-tested. Depth/full-L2 catalog generation is deferred; `convert_day.py` remains the only validated full-L2 path.
 
 ## Daily Build Orchestrator
 
@@ -341,25 +352,26 @@ python -m pipeline.daily_build --date 2026-06-15 [--steps replay,features] [--sy
 
 ## Migration from Old Pipeline
 
-**Old Pipeline** (convert_day.py):
+**Validated full-L2 path** (`convert_day.py`):
 ```
-raw JSONL.zst → Nautilus ParquetDataCatalog (direct)
+data_raw → Nautilus ParquetDataCatalog
 ```
 
-**New Pipeline**:
+**Implemented replay v0 path**:
 ```
-raw JSONL.zst → replay_store → [feature_store + catalog on-demand]
+data_raw → replay_store → feature_store
+data_raw → replay_store → generate_catalog --profile trades_only
 ```
 
 **Rollout**:
-1. Phase 1-6: Build new pipeline components
-2. Phase 7: Validate semantic equivalence (old vs new catalog output)
-3. Phase 8: Deploy systemd service
-4. Monitoring: Run both pipelines in parallel, compare daily_build_report
-5. Archive decision: After 90+ days validation, decide raw deletion policy
+1. Keep `convert_day.py` as the validated full-L2 path.
+2. Validate trades-only semantic equivalence with `pipeline.validate_catalog_equivalence`.
+3. Implement replay-based full-L2 generation only after validation requirements are met.
+4. Benchmark replay writer and feature builder RSS before large-symbol production runs.
+5. Decide raw archival policy only after replay validation has enough history.
 
 **Backward Compatibility**:
-- `convert_day.py` unchanged and still functional
+- `convert_day.py` remains functional and is still the full-L2 baseline
 - Can be run alongside new pipeline for comparison
 - Legacy code paths preserved for rollback
 

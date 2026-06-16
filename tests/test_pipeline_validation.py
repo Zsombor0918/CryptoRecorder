@@ -7,15 +7,23 @@ import sys
 from pathlib import Path
 
 import pyarrow.parquet as pq
+import pytest
+from nautilus_trader.model.data import TradeTick
+from nautilus_trader.model.enums import AggressorSide
+from nautilus_trader.model.identifiers import TradeId
+from nautilus_trader.model.objects import Price, Quantity
 from nautilus_trader.persistence.catalog import ParquetDataCatalog
 
 from converter.readers import stream_raw_records
+from converter.instruments import build_instruments
 from pipeline.build_replay_store import build_replay_for_symbol
 from pipeline.generate_catalog import (
     _date_range_from_window,
     _parse_iso_datetime,
     generate_catalog_from_replay,
 )
+from pipeline.validate_catalog_equivalence import validate_catalog_equivalence
+from validation.catalog_compare import compare_trade_ticks_semantic, load_trade_ticks
 
 
 def _write_jsonl(path: Path, records: list[dict]) -> None:
@@ -93,8 +101,8 @@ def _sample_raw_root(tmp_path: Path) -> Path:
                 "ts_recv_ns": base_ts_ms * 1_000_000 + 20,
                 "ts_event_ms": base_ts_ms,
                 "ts_trade_ms": base_ts_ms,
-                "price": "0.1707",
-                "quantity": "30.9",
+                "price": "0.17070000",
+                "quantity": "30.90000000",
                 "is_buyer_maker": False,
                 "exchange_trade_id": 102,
                 "native_payload": {"t": 102},
@@ -109,8 +117,8 @@ def _sample_raw_root(tmp_path: Path) -> Path:
                 "ts_recv_ns": base_ts_ms * 1_000_000 + 10,
                 "ts_event_ms": base_ts_ms + 1,
                 "ts_trade_ms": base_ts_ms + 1,
-                "price": "0.1706",
-                "quantity": "35.2",
+                "price": "0.17060000",
+                "quantity": "35.20000000",
                 "is_buyer_maker": True,
                 "exchange_trade_id": 101,
                 "native_payload": {"t": 101},
@@ -141,6 +149,38 @@ def test_pipeline_cli_help_does_not_touch_default_data_roots() -> None:
             check=False,
         )
         assert result.returncode == 0, result.stderr
+
+
+def test_generate_catalog_help_lists_only_implemented_profiles() -> None:
+    result = subprocess.run(
+        [sys.executable, "-m", "pipeline.generate_catalog", "--help"],
+        cwd=Path(__file__).resolve().parent.parent,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0
+    assert "trades_only" in result.stdout
+    assert "full_l2" not in result.stdout
+    assert "depth_only" not in result.stdout
+
+
+def test_docs_do_not_reference_convert_day_symbols_until_supported() -> None:
+    docs = "\n".join(
+        path.read_text()
+        for path in (Path(__file__).resolve().parent.parent / "docs").glob("*.md")
+    )
+    # convert_day.py now supports --symbols, so docs may use it intentionally.
+    help_result = subprocess.run(
+        [sys.executable, "convert_day.py", "--help"],
+        cwd=Path(__file__).resolve().parent.parent,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert help_result.returncode == 0
+    if "convert_day.py --date" in docs and "--symbols" in docs:
+        assert "--symbols" in help_result.stdout
 
 
 def test_stream_raw_records_uses_custom_root(tmp_path: Path) -> None:
@@ -187,8 +227,13 @@ def test_replay_build_writes_sorted_manifested_partition(tmp_path: Path) -> None
 
     trades = pq.ParquetFile(partition / "trades.parquet").read().to_pylist()
     assert [row["trade_session_seq"] for row in trades] == [1, 2]
+    assert [row["price_str"] for row in trades] == ["0.17060000", "0.17070000"]
+    assert [row["quantity_str"] for row in trades] == ["35.20000000", "30.90000000"]
     depths = pq.ParquetFile(partition / "depth.parquet").read().to_pylist()
     assert [row["session_seq"] for row in depths] == [1, 2]
+    assert depths[0]["U"] == "9"
+    assert depths[0]["bids"][0]["price_str"] == "0.1690"
+    assert depths[0]["bids"][0]["size_str"] == "150.0"
 
 
 def test_generate_catalog_date_range_uses_exclusive_end() -> None:
@@ -234,3 +279,119 @@ def test_generate_catalog_from_replay_writes_readable_trades_catalog(tmp_path: P
         end=1_781_222_400_001_000_000,
     )
     assert len(ticks) == 2
+    assert str(ticks[0].price) == "0.17060000"
+    assert str(ticks[0].size) == "35.20000000"
+
+
+def test_generate_catalog_fixed_job_id_and_overwrite(tmp_path: Path) -> None:
+    raw_root = _sample_raw_root(tmp_path)
+    replay_root = tmp_path / "replay"
+    output_root = tmp_path / "catalog_jobs"
+    build_replay_for_symbol(
+        "BINANCE_SPOT",
+        "ADAUSDT",
+        "2026-06-12",
+        raw_root,
+        replay_root,
+    )
+    kwargs = dict(
+        replay_root=replay_root,
+        catalog_root=output_root,
+        job_id="validation_new",
+        symbols=["ADAUSDT"],
+        venues=["BINANCE_SPOT"],
+        start=_parse_iso_datetime("2026-06-12T00:00:00Z"),
+        end=_parse_iso_datetime("2026-06-13T00:00:00Z"),
+        profile="trades_only",
+    )
+
+    first = generate_catalog_from_replay(**kwargs)
+    second = generate_catalog_from_replay(**kwargs)
+    third = generate_catalog_from_replay(**kwargs, overwrite=True)
+
+    assert first["status"] == "success"
+    assert (output_root / "job_validation_new").exists()
+    assert second["status"] == "failed"
+    assert "already exists" in second["errors"][0]
+    assert third["status"] == "success"
+
+
+def _write_ticks_catalog(catalog_root: Path, ticks: list[TradeTick]) -> None:
+    instrument = build_instruments("BINANCE_SPOT", ["ADAUSDT"], {})[0]
+    catalog = ParquetDataCatalog(str(catalog_root))
+    catalog.write_data([instrument])
+    catalog.write_data(ticks)
+
+
+def test_trades_only_semantic_comparison_with_synthetic_catalogs(tmp_path: Path) -> None:
+    instrument = build_instruments("BINANCE_SPOT", ["ADAUSDT"], {})[0]
+    ticks = [
+        TradeTick(
+            instrument_id=instrument.id,
+            price=Price.from_str("0.17060000"),
+            size=Quantity.from_str("35.20000000"),
+            aggressor_side=AggressorSide.SELLER,
+            trade_id=TradeId("101"),
+            ts_event=1_781_222_400_001_000_000,
+            ts_init=1_781_222_400_000_000_010,
+        ),
+        TradeTick(
+            instrument_id=instrument.id,
+            price=Price.from_str("0.17070000"),
+            size=Quantity.from_str("30.90000000"),
+            aggressor_side=AggressorSide.BUYER,
+            trade_id=TradeId("102"),
+            ts_event=1_781_222_400_000_000_000,
+            ts_init=1_781_222_400_000_000_020,
+        ),
+    ]
+    old_root = tmp_path / "old_catalog"
+    new_root = tmp_path / "new_catalog"
+    _write_ticks_catalog(old_root, ticks)
+    _write_ticks_catalog(new_root, list(ticks))
+
+    old_ticks = load_trade_ticks(old_root, "ADAUSDT.BINANCE")
+    new_ticks = load_trade_ticks(new_root, "ADAUSDT.BINANCE")
+    comparison = compare_trade_ticks_semantic(old_ticks, new_ticks)
+
+    assert comparison["passed"] is True
+    assert comparison["trade_count_match"] is True
+    assert comparison["timestamp_range_match"] is True
+    assert comparison["sample_mismatches"] == []
+
+
+def test_full_l2_validation_is_explicitly_deferred(tmp_path: Path) -> None:
+    report = validate_catalog_equivalence(
+        date="2026-06-12",
+        symbols=["ADAUSDT"],
+        venues=["BINANCE_SPOT"],
+        data_root=tmp_path / "raw",
+        work_root=tmp_path / "work",
+        old_catalog_root=tmp_path / "old",
+        replay_root=tmp_path / "replay",
+        new_catalog_root=tmp_path / "new",
+        profile="full_l2",
+        overwrite=True,
+    )
+    assert report["status"] == "skipped"
+    assert "deferred" in report["notes"][0]
+
+
+@pytest.mark.realdata
+def test_real_data_catalog_equivalence_when_enabled(tmp_path: Path) -> None:
+    real_root = os.environ.get("CRYPTO_RECORDER_REAL_DATA_ROOT")
+    if not real_root:
+        pytest.skip("Set CRYPTO_RECORDER_REAL_DATA_ROOT to run real-data equivalence")
+    report = validate_catalog_equivalence(
+        date=os.environ.get("CRYPTO_RECORDER_REAL_DATA_DATE", "2026-06-12"),
+        symbols=[os.environ.get("CRYPTO_RECORDER_REAL_DATA_SYMBOL", "ADAUSDT")],
+        venues=[os.environ.get("CRYPTO_RECORDER_REAL_DATA_VENUE", "BINANCE_SPOT")],
+        data_root=Path(real_root),
+        work_root=tmp_path / "work",
+        old_catalog_root=tmp_path / "old_catalog",
+        replay_root=tmp_path / "replay_store",
+        new_catalog_root=tmp_path / "new_catalog",
+        profile="trades_only",
+        overwrite=True,
+    )
+    assert report["status"] == "passed", json.dumps(report, indent=2, default=str)
