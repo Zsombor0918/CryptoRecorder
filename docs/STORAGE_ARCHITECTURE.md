@@ -243,19 +243,18 @@ python -m pipeline.generate_catalog \
   --input /path/to/replay_store \
   --symbols BTCUSDT,ETHUSDT \
   --venues BINANCE_SPOT,BINANCE_USDTF \
-  --start 2026-06-15T12:00:00Z \
-  --end 2026-06-15T13:00:00Z \
+  --date 2026-06-15 \
   --profile trades_only \
   --output /path/to/catalog_jobs
 ```
 
 **Processing**:
-1. Parse ISO 8601 time window (--start/--end)
+1. Parse `--date` or ISO 8601 time window (`--start/--end`)
 2. Determine date range and Hive partitions to scan
 3. Per symbol: stream replay data, filter by time window
 4. Convert to Nautilus TradeTick objects using exact replay price/quantity strings
 5. Write a Nautilus `ParquetDataCatalog` under `catalog_jobs/job_*`
-6. Generate report with coverage info
+6. Generate report with coverage info, including found/missing partitions and records read/written
 
 Current status: `trades_only` is implemented and smoke-tested. Depth/full-L2 catalog generation is deferred; `convert_day.py` remains the only validated full-L2 path.
 

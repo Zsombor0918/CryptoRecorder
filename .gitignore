@@ -14,10 +14,23 @@ venv/
 data_raw/
 meta/
 state/
+replay_store/
+feature_store/
+catalog_jobs/
+daily_reports/
+validation_reports/
 *.log
 *.jsonl
 *.jsonl.zst
 *.jsonl.gz
+*.parquet
+.staging_*
+*.staging.*
+
+# Tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
 # IDE
 .vscode/

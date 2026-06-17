@@ -17,11 +17,13 @@ from nautilus_trader.persistence.catalog import ParquetDataCatalog
 from converter.readers import stream_raw_records
 from converter.instruments import build_instruments
 from pipeline.audit_feature_store import audit_feature_store
+from pipeline.audit_replay_store import audit_replay_store
 from pipeline.build_feature_store import build_features_for_symbol
 from pipeline.build_replay_store import build_replay_for_symbol
 from pipeline.generate_catalog import (
     _date_range_from_window,
     _parse_iso_datetime,
+    _window_from_date,
     generate_catalog_from_replay,
 )
 from pipeline.validate_catalog_equivalence import validate_catalog_equivalence
@@ -199,6 +201,7 @@ def test_pipeline_cli_help_does_not_touch_default_data_roots() -> None:
         "pipeline.build_replay_store",
         "pipeline.build_feature_store",
         "pipeline.audit_feature_store",
+        "pipeline.audit_replay_store",
         "pipeline.generate_catalog",
         "pipeline.validate_catalog_equivalence",
         "pipeline.daily_build",
@@ -299,12 +302,46 @@ def test_replay_build_writes_sorted_manifested_partition(tmp_path: Path) -> None
     assert depths[0]["bids"][0]["size_str"] == "150.0"
 
 
+def test_replay_store_audit_reports_counts_checksums_and_ordering(tmp_path: Path) -> None:
+    raw_root = _sample_raw_root(tmp_path)
+    replay_root = tmp_path / "replay"
+    build_replay_for_symbol(
+        "BINANCE_SPOT",
+        "ADAUSDT",
+        "2026-06-12",
+        raw_root,
+        replay_root,
+    )
+
+    report = audit_replay_store(
+        replay_root=replay_root,
+        date="2026-06-12",
+        symbols=["ADAUSDT"],
+        venues=["BINANCE_SPOT"],
+    )
+
+    assert report["missing_partitions"] == []
+    partition = report["partitions"][0]
+    assert partition["instrument_exists"] is False
+    assert partition["manifest_count_match"] == {"depth": True, "trades": True}
+    assert partition["checksum_match"] == {"depth": True, "trades": True}
+    assert partition["depth"]["sorted"] is True
+    assert partition["trades"]["sorted"] is True
+    assert partition["depth"]["level_exact_fields_present"] is True
+    assert partition["depth"]["null_ratio"]["U"] == 0
+    assert partition["trades"]["null_ratio"]["price_str"] == 0
+    assert partition["trades"]["null_ratio"]["quantity_str"] == 0
+
+
 def test_generate_catalog_date_range_uses_exclusive_end() -> None:
     dates = _date_range_from_window(
         _parse_iso_datetime("2026-06-12T00:00:00Z"),
         _parse_iso_datetime("2026-06-13T00:00:00Z"),
     )
     assert dates == ["2026-06-12"]
+    start, end = _window_from_date("2026-06-12")
+    assert start == _parse_iso_datetime("2026-06-12T00:00:00Z")
+    assert end == _parse_iso_datetime("2026-06-13T00:00:00Z")
 
 
 def test_generate_catalog_from_replay_writes_readable_trades_catalog(tmp_path: Path) -> None:
@@ -331,6 +368,12 @@ def test_generate_catalog_from_replay_writes_readable_trades_catalog(tmp_path: P
     )
 
     assert result["status"] == "success"
+    assert result["time_filter"] == "ts_init"
+    assert result["records_read"]["trades"] == 2
+    assert result["found_partitions"] == [
+        {"venue": "BINANCE_SPOT", "symbol": "ADAUSDT", "date": "2026-06-12"}
+    ]
+    assert result["missing_partitions"] == []
     assert result["records_written"]["trade_ticks"] == 2
     catalog_root = output_root / "job_smoke"
     catalog = ParquetDataCatalog(str(catalog_root))
@@ -344,6 +387,52 @@ def test_generate_catalog_from_replay_writes_readable_trades_catalog(tmp_path: P
     assert len(ticks) == 2
     assert str(ticks[0].price) == "0.17060000"
     assert str(ticks[0].size) == "35.20000000"
+
+
+def test_generate_catalog_cli_date_shortcut(tmp_path: Path) -> None:
+    raw_root = _sample_raw_root(tmp_path)
+    replay_root = tmp_path / "replay"
+    output_root = tmp_path / "catalog_jobs"
+    build_replay_for_symbol(
+        "BINANCE_SPOT",
+        "ADAUSDT",
+        "2026-06-12",
+        raw_root,
+        replay_root,
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pipeline.generate_catalog",
+            "--input",
+            str(replay_root),
+            "--symbols",
+            "ADAUSDT",
+            "--venues",
+            "BINANCE_SPOT",
+            "--date",
+            "2026-06-12",
+            "--output",
+            str(output_root),
+            "--job-id",
+            "date_shortcut",
+            "--overwrite",
+        ],
+        cwd=Path(__file__).resolve().parent.parent,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    manifest = json.loads((output_root / "job_date_shortcut" / "manifest.json").read_text())
+    assert manifest["time_window"]["start"] == "2026-06-12T00:00:00+00:00"
+    assert manifest["time_window"]["end"] == "2026-06-13T00:00:00+00:00"
+    assert manifest["time_filter"] == "ts_init"
+    assert manifest["records_read"]["trades"] == 2
+    assert manifest["record_counts"]["trade_ticks"] == 2
 
 
 def test_generate_catalog_fixed_job_id_and_overwrite(tmp_path: Path) -> None:

@@ -292,6 +292,30 @@ For each symbol/date:
 
 Future optimization: replace symbol/date accumulation with a streaming external sort or SQLite-backed spool before claiming memory-bounded production replay writes.
 
+## Auditing Replay Store
+
+Use the non-mutating audit CLI to verify a replay partition after building:
+
+```bash
+python -m pipeline.audit_replay_store \
+  --replay-root /path/to/replay_store \
+  --date 2026-06-12 \
+  --symbols ADAUSDT \
+  --venues BINANCE_SPOT
+```
+
+The audit reports:
+
+- manifest counts vs Parquet row counts;
+- SHA256 checksum matches;
+- deterministic sortedness;
+- duplicate sequence-key counts;
+- timestamp ranges;
+- `U/u/pu` null ratios;
+- trade `price_str` / `quantity_str` null ratios;
+- nested depth `price_str` / `size_str` field presence;
+- `instrument.json` and `manifest.json` presence.
+
 ### Deterministic Sorting
 
 **Critical for reproducibility**: Same raw data always produces identical Parquet.

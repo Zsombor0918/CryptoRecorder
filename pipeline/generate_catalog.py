@@ -58,6 +58,15 @@ def _date_range_from_window(start: datetime, end: datetime) -> list[str]:
     return dates
 
 
+def _window_from_date(date_str: str) -> tuple[datetime, datetime]:
+    """Return the UTC day window for YYYY-MM-DD."""
+    try:
+        start = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    except ValueError as exc:
+        raise ValueError(f"Invalid date: {date_str}; expected YYYY-MM-DD") from exc
+    return start, start + timedelta(days=1)
+
+
 def _convert_trade_to_nautilus(
     trade: dict,
     instrument_id: InstrumentId,
@@ -111,6 +120,17 @@ def _convert_depth_to_nautilus(
     return None, None
 
 
+def _exchange_info_from_replay_metadata(symbol: str, metadata: Optional[dict]) -> dict[str, dict]:
+    """Return exchangeInfo-shaped metadata if the replay partition provides it."""
+    if not metadata:
+        return {}
+    if isinstance(metadata.get("exchange_info"), dict):
+        return {symbol: metadata["exchange_info"]}
+    if isinstance(metadata.get("filters"), list):
+        return {symbol: metadata}
+    return {}
+
+
 def generate_catalog_from_replay(
     replay_root: Path,
     catalog_root: Path,
@@ -146,12 +166,28 @@ def generate_catalog_from_replay(
         "profile": profile,
         "symbols_requested": symbols,
         "venues_requested": venues,
+        "requested_symbols": symbols,
+        "requested_venues": venues,
+        "time_filter": "ts_init",
         "symbols_processed": [],
+        "found_partitions": [],
+        "missing_partitions": [],
+        "date_partitions_scanned": [],
+        "records_read": {
+            "trades": 0,
+            "depth": 0,
+        },
         "records_written": {
             "trade_ticks": 0,
             "order_book_deltas": 0,
             "order_book_depth10": 0,
         },
+        "records_skipped": {
+            "outside_window": 0,
+            "invalid_trade": 0,
+        },
+        "skipped_invalid_records": 0,
+        "warnings": [],
         "errors": [],
     }
 
@@ -191,22 +227,61 @@ def generate_catalog_from_replay(
             return status
         logger.info(f"Date range: {dates[0]} to {dates[-1]} ({len(dates)} days)")
 
+        start_ns = int(start.timestamp() * 1_000_000_000)
+        end_ns = int(end.timestamp() * 1_000_000_000)
         instruments_written: set[str] = set()
-        
-        for venue in reader.iter_venues():
-            if venues and venue not in venues:
+        processed_symbols: set[str] = set()
+        available_venues = set(reader.iter_venues())
+        target_venues = venues or sorted(available_venues)
+
+        for venue in target_venues:
+            if venue not in available_venues:
+                for symbol in symbols:
+                    for date in dates:
+                        status["missing_partitions"].append({
+                            "venue": venue,
+                            "symbol": symbol,
+                            "date": date,
+                            "reason": "venue_missing",
+                        })
                 continue
 
-            for symbol in reader.iter_symbols(venue):
-                if symbols and symbol not in symbols:
+            available_symbols = set(reader.iter_symbols(venue))
+            target_symbols = symbols or sorted(available_symbols)
+            for symbol in target_symbols:
+                if symbol not in available_symbols:
+                    for date in dates:
+                        status["missing_partitions"].append({
+                            "venue": venue,
+                            "symbol": symbol,
+                            "date": date,
+                            "reason": "symbol_missing",
+                        })
                     continue
 
+                available_dates = set(reader.iter_dates(venue, symbol))
                 for date in dates:
-                    if date not in list(reader.iter_dates(venue, symbol)):
+                    if date not in available_dates:
+                        status["missing_partitions"].append({
+                            "venue": venue,
+                            "symbol": symbol,
+                            "date": date,
+                            "reason": "date_missing",
+                        })
                         continue
 
                     logger.info(f"Processing {venue}/{symbol}/{date}...")
-                    status["symbols_processed"].append(f"{venue}:{symbol}")
+                    partition_key = f"{venue}:{symbol}:{date}"
+                    status["found_partitions"].append({
+                        "venue": venue,
+                        "symbol": symbol,
+                        "date": date,
+                    })
+                    status["date_partitions_scanned"].append(partition_key)
+                    symbol_key = f"{venue}:{symbol}"
+                    if symbol_key not in processed_symbols:
+                        status["symbols_processed"].append(symbol_key)
+                        processed_symbols.add(symbol_key)
 
                     # Load instrument metadata
                     instrument_metadata = reader.load_instrument_metadata(
@@ -218,7 +293,10 @@ def generate_catalog_from_replay(
                             "using default Nautilus instrument settings"
                         )
 
-                    instruments = build_instruments(venue, [symbol], {})
+                    exchange_info = _exchange_info_from_replay_metadata(
+                        symbol, instrument_metadata
+                    )
+                    instruments = build_instruments(venue, [symbol], exchange_info)
                     if not instruments:
                         status["errors"].append(f"could not build instrument for {venue}/{symbol}")
                         continue
@@ -232,12 +310,15 @@ def generate_catalog_from_replay(
                     # Stream and convert trades
                     trade_batch = []
                     for trade in reader.iter_trades(venue, symbol, date):
+                        status["records_read"]["trades"] += 1
                         ts_init_ns = int(trade.get("ts_receive_ns") or trade.get("ts_exchange_ns", 0))
                         
                         # Nautilus catalog bounded reads are based on ts_init.
-                        if ts_init_ns < start.timestamp() * 1e9:
+                        if ts_init_ns < start_ns:
+                            status["records_skipped"]["outside_window"] += 1
                             continue
-                        if ts_init_ns >= end.timestamp() * 1e9:
+                        if ts_init_ns >= end_ns:
+                            status["records_skipped"]["outside_window"] += 1
                             continue
                         
                         trade_tick = _convert_trade_to_nautilus(
@@ -249,6 +330,9 @@ def generate_catalog_from_replay(
                             if len(trade_batch) >= 5000:
                                 catalog.write_data(trade_batch)
                                 trade_batch = []
+                        else:
+                            status["records_skipped"]["invalid_trade"] += 1
+                            status["skipped_invalid_records"] += 1
                     if trade_batch:
                         catalog.write_data(trade_batch)
 
@@ -259,19 +343,34 @@ def generate_catalog_from_replay(
                         f"{status['records_written']['trade_ticks']} trades"
                     )
 
+        if status["records_written"]["trade_ticks"] == 0:
+            status["warnings"].append(
+                "No TradeTick records were written for the requested venues/symbols/window."
+            )
+
         # Write manifest
         manifest = {
             "job_id": job_id,
             "created_at_utc": datetime.now(timezone.utc).isoformat(),
             "profile": profile,
+            "requested_symbols": symbols,
+            "requested_venues": venues,
             "symbols": status["symbols_processed"],
+            "found_partitions": status["found_partitions"],
+            "missing_partitions": status["missing_partitions"],
+            "date_partitions_scanned": status["date_partitions_scanned"],
+            "time_filter": "ts_init",
             "time_window": {
                 "start": start.isoformat(),
                 "end": end.isoformat(),
             },
+            "records_read": status["records_read"],
             "record_counts": status["records_written"],
+            "records_skipped": status["records_skipped"],
+            "skipped_invalid_records": status["skipped_invalid_records"],
             "instrument_count": len(instruments_written),
             "replay_source": str(replay_root),
+            "warnings": status["warnings"],
         }
 
         manifest_path = job_dir / "manifest.json"
@@ -300,6 +399,7 @@ def main():
         epilog="""
 Examples:
   python -m pipeline.generate_catalog --input /path/to/replay_store --symbols BTCUSDT --venues BINANCE_SPOT --start 2026-06-15T12:00:00Z --end 2026-06-15T13:00:00Z
+  python -m pipeline.generate_catalog --input /path/to/replay_store --symbols BTCUSDT --venues BINANCE_SPOT --date 2026-06-15 --job-id validation_day --overwrite
   python -m pipeline.generate_catalog --input /path/to/replay_store --symbols BTCUSDT,ETHUSDT --start 2026-06-15T00:00:00Z --end 2026-06-17T00:00:00Z --output /path/to/catalog_jobs --job-id validation_new --overwrite
         """,
     )
@@ -321,13 +421,18 @@ Examples:
     )
     parser.add_argument(
         "--start",
-        required=True,
+        default=None,
         help="Start time (ISO 8601 UTC, e.g., 2026-06-15T12:00:00Z)",
     )
     parser.add_argument(
         "--end",
-        required=True,
+        default=None,
         help="End time (ISO 8601 UTC, e.g., 2026-06-15T13:00:00Z)",
+    )
+    parser.add_argument(
+        "--date",
+        default=None,
+        help="UTC date shortcut (YYYY-MM-DD), equivalent to that full half-open UTC day.",
     )
     parser.add_argument(
         "--output",
@@ -356,12 +461,24 @@ Examples:
     replay_root = args.input or REPLAY_ROOT
     catalog_root = args.output or CATALOG_JOBS_ROOT
 
-    try:
-        start = _parse_iso_datetime(args.start)
-        end = _parse_iso_datetime(args.end)
-    except ValueError as e:
-        logger.error(f"Invalid datetime format: {e}")
-        sys.exit(1)
+    if args.date and (args.start or args.end):
+        parser.error("Use either --date or --start/--end, not both.")
+    if args.date:
+        try:
+            start, end = _window_from_date(args.date)
+        except ValueError as e:
+            parser.error(str(e))
+    else:
+        if not args.start or not args.end:
+            parser.error("Either --date or both --start and --end are required.")
+        try:
+            start = _parse_iso_datetime(args.start)
+            end = _parse_iso_datetime(args.end)
+        except ValueError as e:
+            logger.error(f"Invalid datetime format: {e}")
+            sys.exit(1)
+    if end <= start:
+        parser.error("--end must be after --start.")
 
     symbols = [s.strip().upper() for s in args.symbols.split(",")]
     venues = [v.strip().upper() for v in args.venues.split(",")]

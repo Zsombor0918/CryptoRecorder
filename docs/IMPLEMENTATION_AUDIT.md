@@ -53,7 +53,10 @@ Catalog generation:
 
 - `generate_catalog` supports `trades_only`.
 - It uses exact replay strings for Nautilus `Price` and `Quantity`.
+- It supports `--date YYYY-MM-DD` as a UTC-day shortcut for `--start/--end`.
 - It supports deterministic `--job-id` and safe `--overwrite`.
+- It writes coverage fields for requested/found/missing partitions, records read,
+  records written, skipped invalid records, and `time_filter=ts_init`.
 - It rejects non-implemented profiles by CLI choices.
 
 Validation:
@@ -69,6 +72,8 @@ Automated tests cover:
 - CLI help without touching unwritable default `/data` roots.
 - Custom raw root reading.
 - Replay manifest counts and sorted records.
+- Replay audit counts, checksums, ordering, continuity null ratios, and exact
+  nested price/size field presence.
 - Exact replay decimal preservation.
 - Depth `U/u/pu` preservation.
 - `generate_catalog` exclusive end behavior.
@@ -77,13 +82,14 @@ Automated tests cover:
 - Synthetic trades-only catalog semantic comparison.
 - Feature UTC-day clamp and sparse output.
 - Feature audit report fields.
+- `generate_catalog --date` UTC-day shortcut.
 - Explicit skipped full-L2 validation status.
 - Real-data equivalence behind `pytest.mark.realdata`.
 
 Last full local suite:
 
 ```text
-172 passed, 5 skipped
+176 passed, 2 skipped
 ```
 
 ## Smoke-Tested
@@ -154,6 +160,9 @@ Future full-L2 validation must compare:
 - `ReplayWriter` still accumulates one symbol/date in memory before writing.
 - Feature aggregation still loads one symbol/date of replay depth/trade records into memory.
 - Feature output is sparse, not dense; missing windows are expected unless dense mode is implemented later.
+- `generate_catalog` uses replay `instrument.json` only when it contains
+  exchangeInfo-shaped metadata (`filters` or `exchange_info`). Current
+  normalized v0 metadata otherwise falls back to the existing converter defaults.
 - Return and volatility fields are mostly simplified/null in v0.
 - OFI/order-pressure advanced fields are deferred.
 - The real-data equivalence test is gated by environment variables and is not part of normal CI.
@@ -182,8 +191,7 @@ python -m pipeline.generate_catalog \
   --input "$BASE/replay_store" \
   --symbols ADAUSDT \
   --venues BINANCE_SPOT \
-  --start 2026-06-12T00:00:00Z \
-  --end 2026-06-13T00:00:00Z \
+  --date 2026-06-12 \
   --output "$BASE/catalog_jobs" \
   --profile trades_only \
   --job-id validation_new \
@@ -218,6 +226,20 @@ python -m pipeline.audit_feature_store \
 ```
 
 The audit reports dense expected counts, actual row counts, date-bound violations, duplicate timestamps, null ratios, all-null columns, `quality_ok=false` count, and crossed-book totals.
+
+## Audit Replay Output
+
+```bash
+python -m pipeline.audit_replay_store \
+  --replay-root /tmp/cryptorecorder-replay-feature-validation/replay_store \
+  --date 2026-06-12 \
+  --symbols ADAUSDT \
+  --venues BINANCE_SPOT
+```
+
+The audit reports manifest-vs-Parquet counts, checksums, deterministic
+sortedness, duplicate sequence keys, timestamp ranges, `U/u/pu` null ratios,
+trade exact string null ratios, and depth nested exact string field presence.
 
 ## Next Milestone
 

@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """
-acceptance_test.py — Full acceptance test suite.
+acceptance_test.py — Legacy converter acceptance test suite.
 
-This script runs comprehensive tests to verify the complete pipeline:
+This script verifies the existing validated recorder/converter path:
   1. Recorder can run with 50 symbols for 10 minutes
-  2. Converter can process data into Nautilus catalog
+  2. convert_day.py can process data into Nautilus catalog
   3. Catalog is queryable and valid
+
+It does not validate replay_store -> generate_catalog --profile full_l2.
+That path is deferred and planned separately.
 
 Usage:
     python scripts/acceptance_test.py
@@ -48,7 +51,7 @@ class Colors:
 
 
 class AcceptanceTest:
-    """Full pipeline acceptance test."""
+    """Legacy recorder + convert_day.py acceptance test."""
 
     def __init__(
         self,
@@ -71,7 +74,7 @@ class AcceptanceTest:
     def run(self) -> Dict[str, Any]:
         """Run the full acceptance test."""
         print(f"\n{Colors.BOLD}{'=' * 60}{Colors.RESET}")
-        print(f"{Colors.BOLD}  Full Acceptance Test (deterministic native){Colors.RESET}")
+        print(f"{Colors.BOLD}  Legacy Converter Acceptance Test (deterministic native){Colors.RESET}")
         print(f"{Colors.BOLD}{'=' * 60}{Colors.RESET}\n")
 
         tests = []

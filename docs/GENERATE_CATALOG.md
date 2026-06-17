@@ -60,6 +60,15 @@ python -m pipeline.generate_catalog [OPTIONS]
     
     Format: YYYY-MM-DDTHH:MM:SSZ
     Must be after start. The window is half-open: start <= ts < end.
+
+--date DATE
+    UTC date shortcut (YYYY-MM-DD)
+
+    Equivalent to:
+      --start DATET00:00:00Z
+      --end   NEXT_DATET00:00:00Z
+
+    Use either --date or --start/--end, not both.
 ```
 
 ### Optional Arguments
@@ -126,8 +135,7 @@ python -m pipeline.generate_catalog \
   --input /data/replay_store \
   --symbols BTCUSDT,ETHUSDT,BNBUSDT \
   --venues BINANCE_SPOT,BINANCE_USDTF \
-  --start 2026-06-15T00:00:00Z \
-  --end 2026-06-16T00:00:00Z \
+  --date 2026-06-15 \
   --profile trades_only
 ```
 
@@ -155,8 +163,7 @@ python -m pipeline.generate_catalog \
   --input /tmp/test_replay \
   --symbols ADAUSDT \
   --venues BINANCE_SPOT \
-  --start 2026-06-12T00:00:00Z \
-  --end 2026-06-13T00:00:00Z \
+  --date 2026-06-12 \
   --profile trades_only \
   --output /tmp/test_catalogs_new \
   --job-id validation_new \
@@ -187,20 +194,37 @@ python -m pipeline.validate_catalog_equivalence \
   "job_id": "20260615_142530",
   "created_at_utc": "2026-06-15T14:25:30.123456Z",
   "profile": "trades_only",
+  "requested_symbols": ["BTCUSDT", "ETHUSDT"],
+  "requested_venues": ["BINANCE_SPOT", "BINANCE_USDTF"],
   "symbols": [
     "BINANCE_SPOT:BTCUSDT",
     "BINANCE_SPOT:ETHUSDT",
     "BINANCE_USDTF:BTCUSDT"
   ],
+  "found_partitions": [
+    {"venue": "BINANCE_SPOT", "symbol": "BTCUSDT", "date": "2026-06-15"}
+  ],
+  "missing_partitions": [],
+  "date_partitions_scanned": ["BINANCE_SPOT:BTCUSDT:2026-06-15"],
+  "time_filter": "ts_init",
   "time_window": {
     "start": "2026-06-15T00:00:00Z",
     "end": "2026-06-16T00:00:00Z"
+  },
+  "records_read": {
+    "trades": 123456,
+    "depth": 0
   },
   "record_counts": {
     "trade_ticks": 123456,
     "order_book_deltas": 0,
     "order_book_depth10": 0
   },
+  "records_skipped": {
+    "outside_window": 0,
+    "invalid_trade": 0
+  },
+  "skipped_invalid_records": 0,
   "replay_source": "/data/replay_store"
 }
 ```
@@ -304,6 +328,9 @@ start = datetime.fromisoformat("2026-06-15T12:00:00Z".replace("Z", "+00:00"))
 end = datetime.fromisoformat("2026-06-15T13:00:00Z".replace("Z", "+00:00"))
 ```
 
+The `--date YYYY-MM-DD` shortcut expands to the half-open UTC day
+`[date 00:00:00 UTC, next date 00:00:00 UTC)`.
+
 ### Step 2: Determine date range and Hive partitions
 
 ```python
@@ -326,12 +353,12 @@ for venue in venues:
     for symbol in symbols:
         # Stream trades from partition
         for trade in reader.iter_trades(venue, symbol, date):
-            ts_ns = trade['ts_receive_ns']
+            ts_init_ns = trade['ts_receive_ns']
             
             # Filter by Nautilus catalog query time (ts_init)
-            if ts_ns < start_ns:
+            if ts_init_ns < start_ns:
                 continue
-            if ts_ns >= end_ns:
+            if ts_init_ns >= end_ns:
                 continue
             
             # Convert and export
@@ -344,16 +371,34 @@ for venue in venues:
 ```json
 {
   "job_id": "...",
+  "requested_symbols": [...],
+  "requested_venues": [...],
   "symbols": [...],
+  "found_partitions": [...],
+  "missing_partitions": [...],
+  "date_partitions_scanned": [...],
+  "time_filter": "ts_init",
+  "records_read": {
+    "trades": 123456
+  },
   "record_counts": {
     "trade_ticks": 123456
-  }
+  },
+  "records_skipped": {
+    "outside_window": 0,
+    "invalid_trade": 0
+  },
+  "skipped_invalid_records": 0
 }
 ```
 
 ## Time Window Filtering
 
 All records are filtered by `ts_receive_ns`, which becomes Nautilus `ts_init`. This matches bounded reads from `ParquetDataCatalog` and the old `convert_day.py` output. `ts_exchange_ns` is still preserved as `ts_event`.
+
+Future design note: if exchange-time filtering becomes useful, add an explicit
+`--time-filter ts_init|ts_event` option. Do not silently change the current
+`ts_init` behavior.
 
 ### Example: 1-hour window
 
@@ -382,8 +427,7 @@ dates = _date_range_from_window(start, end)
 python -m pipeline.generate_catalog \
   --input /data/replay_store \
   --symbols BTCUSDT \
-  --start 2026-06-15T00:00:00Z \
-  --end 2026-06-16T00:00:00Z
+  --date 2026-06-15
 
 # Check manifest
 cat catalog_jobs/job_*/manifest.json | jq .record_counts.trade_ticks
@@ -400,8 +444,7 @@ python convert_day.py --date 2026-06-15
 python -m pipeline.generate_catalog \
   --input /data/replay_store \
   --symbols BTCUSDT \
-  --start 2026-06-15T00:00:00Z \
-  --end 2026-06-16T00:00:00Z
+  --date 2026-06-15
 
 # Load both with Nautilus ParquetDataCatalog or inspect the new files under:
 # catalog_jobs/job_*/data/trade_tick/{instrument_id}/*.parquet

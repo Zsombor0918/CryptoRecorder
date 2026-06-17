@@ -10,7 +10,31 @@ objects, and writes a queryable `ParquetDataCatalog`.
 and trades, recorded via native Binance WebSockets (no third-party feed
 handlers).
 
-## Pipeline
+## Current Pipeline Paths
+
+Validated full-L2 path:
+
+```text
+data_raw -> convert_day.py -> Nautilus catalog
+```
+
+Validated replay/feature v0 path:
+
+```text
+data_raw -> replay_store -> feature_store
+replay_store -> generate_catalog --profile trades_only
+```
+
+Future target path:
+
+```text
+replay_store -> generate_catalog --profile full_l2
+```
+
+The future full-L2 replay path is not implemented yet. `convert_day.py` remains
+the validated full-L2 converter.
+
+## Recorder Pipeline
 
 1. `binance_universe.py` builds a ranked daily universe for spot and futures.
 2. `recorder.py` launches native WebSocket recorders for `depth_v2` and `trade_v2`.
@@ -32,6 +56,13 @@ handlers).
 | `converter/trades.py` | Raw trade_v2 → Nautilus `TradeTick` |
 | `converter/depth_phase2.py` | Deterministic depth_v2 replay → `OrderBookDeltas` (+ optional `OrderBookDepth10`) |
 | `converter/spool.py` | Temporary SQLite spools used to keep heavy conversions memory-bounded |
+| `stores/` | Replay and feature Parquet schemas/readers/writers |
+| `pipeline/build_replay_store.py` | Raw JSONL -> replay_store v0 |
+| `pipeline/build_feature_store.py` | replay_store -> sparse UTC-day feature_store |
+| `pipeline/generate_catalog.py` | replay_store -> Nautilus `trades_only` catalog jobs |
+| `pipeline/audit_replay_store.py` | Non-mutating replay partition audit |
+| `pipeline/audit_feature_store.py` | Non-mutating feature output audit |
+| `pipeline/validate_catalog_equivalence.py` | Old-vs-new trades-only semantic comparison |
 
 ## Session Ordering
 
