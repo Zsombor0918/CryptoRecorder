@@ -4,10 +4,20 @@ Use this page as the current documentation map.
 
 ## Start Here
 
+- [Project Status](PROJECT_STATUS.md) — validated vs deferred; read this first.
 - [Architecture](ARCHITECTURE.md) — high-level system paths and module roles.
 - [Repo Structure](REPO_STRUCTURE.md) — binding folder contract; read before adding files.
 - [Implementation Audit](IMPLEMENTATION_AUDIT.md) — what is validated, smoke-tested, limited, and deferred.
 - [Repo Cleanup Audit](REPO_CLEANUP_AUDIT.md) — repository structure, generated files, and cleanup decisions.
+
+## Governance And Deployment
+
+- [AI Workflow](AI_WORKFLOW.md) — the step-by-step procedure agents must follow.
+- [Versioning](VERSIONING.md) — version lines and the v2.0.0 full-L2 gate.
+- [Deployment](DEPLOYMENT.md) — the `deploy_linux_server.sh` targets and flags.
+- [Linux Server](LINUX_SERVER.md) — dev (WSL) vs production (Ubuntu) layout and services.
+- Agent rules live in [../AGENTS.md](../AGENTS.md); change history in [../CHANGELOG.md](../CHANGELOG.md).
+
 
 ## Runtime And Conversion
 

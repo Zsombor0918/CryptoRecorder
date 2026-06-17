@@ -95,6 +95,8 @@ Start with [docs/README.md](docs/README.md).
 
 Key references:
 
+- [Project Status](docs/PROJECT_STATUS.md) — validated vs deferred.
+- [Repo Structure](docs/REPO_STRUCTURE.md) — frozen folder contract.
 - [Architecture](docs/ARCHITECTURE.md)
 - [Storage Architecture](docs/STORAGE_ARCHITECTURE.md)
 - [Replay Store](docs/REPLAY_STORE.md)
@@ -103,7 +105,10 @@ Key references:
 - [Implementation Audit](docs/IMPLEMENTATION_AUDIT.md)
 - [Full-L2 Replay Plan](docs/FULL_L2_REPLAY_CATALOG_PLAN.md)
 - [Operations](docs/OPERATIONS.md)
+- [Deployment](docs/DEPLOYMENT.md) · [Linux Server](docs/LINUX_SERVER.md) · [AI Workflow](docs/AI_WORKFLOW.md) · [Versioning](docs/VERSIONING.md)
 - [Installation](INSTALL.md)
+
+Agent rules: [AGENTS.md](AGENTS.md). Version: see [VERSION](VERSION) and [CHANGELOG.md](CHANGELOG.md).
 
 ## Current Guarantees
 

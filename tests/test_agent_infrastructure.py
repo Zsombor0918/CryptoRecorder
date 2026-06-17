@@ -1,0 +1,224 @@
+"""
+Tests for the AI-agent + deployment infrastructure.
+
+Validates that the governance, status, versioning, and deployment files exist,
+cross-link correctly, stay honest about deferred work (no false `full_l2` or
+Syncthing claims), and that the deploy script dry-run is safe.
+
+Run with normal pytest; no real data required.
+"""
+from __future__ import annotations
+
+import re
+import subprocess
+from pathlib import Path
+
+import pytest
+
+ROOT = Path(__file__).resolve().parent.parent
+DOCS = ROOT / "docs"
+GITHUB = ROOT / ".github"
+DEPLOY_SCRIPT = ROOT / "scripts" / "deploy_linux_server.sh"
+
+DEPLOY_TARGETS = ["all", "recorder", "legacy-converter", "replay-build", "feature-build"]
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _all_markdown() -> list[Path]:
+    """Every tracked Markdown doc (root, docs/, .github/)."""
+    files = list(ROOT.glob("*.md")) + list(DOCS.glob("*.md")) + list(GITHUB.glob("*.md"))
+    return sorted(set(files))
+
+
+def _normalize(text: str) -> str:
+    """Lowercase, strip markdown emphasis/backticks, collapse whitespace."""
+    text = text.lower().replace("`", "").replace("*", "")
+    return re.sub(r"\s+", " ", text)
+
+
+# ---------------------------------------------------------------------------
+# Required files exist
+# ---------------------------------------------------------------------------
+
+REQUIRED_FILES = [
+    ROOT / "AGENTS.md",
+    ROOT / "VERSION",
+    ROOT / "CHANGELOG.md",
+    DOCS / "PROJECT_STATUS.md",
+    DOCS / "DEPLOYMENT.md",
+    DOCS / "LINUX_SERVER.md",
+    DOCS / "AI_WORKFLOW.md",
+    DOCS / "VERSIONING.md",
+    GITHUB / "copilot-instructions.md",
+    ROOT / "systemd" / "cryptorecorder.env.example",
+    DEPLOY_SCRIPT,
+]
+
+
+@pytest.mark.parametrize("path", REQUIRED_FILES, ids=lambda p: str(p.relative_to(ROOT)))
+def test_required_infrastructure_file_exists(path: Path) -> None:
+    assert path.is_file(), f"required infrastructure file missing: {path.relative_to(ROOT)}"
+
+
+# ---------------------------------------------------------------------------
+# Cross-links
+# ---------------------------------------------------------------------------
+
+def test_readme_links_docs_readme() -> None:
+    text = (ROOT / "README.md").read_text()
+    assert "docs/README.md" in text, "README.md must link to docs/README.md"
+
+
+def test_docs_readme_links_key_docs() -> None:
+    text = (DOCS / "README.md").read_text()
+    for target in (
+        "PROJECT_STATUS.md",
+        "REPO_STRUCTURE.md",
+        "AI_WORKFLOW.md",
+        "DEPLOYMENT.md",
+        "LINUX_SERVER.md",
+    ):
+        assert target in text, f"docs/README.md must link {target}"
+
+
+def test_changelog_contains_current_version() -> None:
+    version = (ROOT / "VERSION").read_text().strip()
+    changelog = (ROOT / "CHANGELOG.md").read_text()
+    assert version in changelog, f"CHANGELOG.md must mention current version {version!r}"
+
+
+# ---------------------------------------------------------------------------
+# Honesty guards
+# ---------------------------------------------------------------------------
+
+def test_docs_do_not_reference_validators_active_path() -> None:
+    """No doc may reference the removed validators/ package as an active path."""
+    forbidden = [
+        "from validators.",
+        "import validators.",
+        "python validators/",
+        "python -m validators.",
+    ]
+    for md in _all_markdown():
+        text = md.read_text()
+        for pattern in forbidden:
+            assert pattern not in text, (
+                f"{md.relative_to(ROOT)} references active validators path '{pattern}'"
+            )
+
+
+# Affirmative "it is done" claim phrases (word-boundary matched after normalization).
+_CLAIM_PHRASES = [
+    "is implemented",
+    "is validated",
+    "is working",
+    "works",
+    "is complete",
+    "is done",
+    "is ready",
+    "is production",
+    "is available",
+    "is supported",
+    "is enabled",
+    "is configured",
+    "is deployed",
+    "is running",
+]
+
+
+def _claim_present(normalized: str, token: str, claim: str) -> bool:
+    """True if `token claim` reads as an affirmative "it is done" assertion.
+
+    Matches preceded by a deferral qualifier (e.g. "until full-L2 is validated")
+    are treated as honest deferral statements, not claims of completion.
+    """
+    deferral = ("until", "not", "once", "when", "after", "pending", "before", "unvalidated")
+    pattern = r"(?<![\w])" + re.escape(token) + r"\s+" + re.escape(claim) + r"(?![\w])"
+    for match in re.finditer(pattern, normalized):
+        prefix_words = normalized[max(0, match.start() - 16):match.start()].split()
+        if any(word in deferral for word in prefix_words):
+            continue
+        return True
+    return False
+
+
+def test_no_doc_claims_full_l2_done() -> None:
+    """The `full_l2` replay profile is deferred; no doc may claim it works/validated.
+
+    Only the underscore profile identifier `full_l2` is guarded. Prose about the
+    *validated* ``convert_day.py`` full-L2 catalog path (written "full-L2") is allowed.
+    """
+    for md in _all_markdown():
+        normalized = _normalize(md.read_text())
+        for claim in _CLAIM_PHRASES:
+            assert not _claim_present(normalized, "full_l2", claim), (
+                f"{md.relative_to(ROOT)} claims 'full_l2 {claim}', but the full_l2 "
+                "replay profile is deferred"
+            )
+
+
+def test_no_doc_claims_syncthing_done() -> None:
+    """Syncthing is not implemented; no doc may describe it as implemented/enabled."""
+    for md in _all_markdown():
+        normalized = _normalize(md.read_text())
+        for claim in _CLAIM_PHRASES:
+            assert not _claim_present(normalized, "syncthing", claim), (
+                f"{md.relative_to(ROOT)} claims 'syncthing {claim}', but Syncthing is not implemented"
+            )
+
+
+# ---------------------------------------------------------------------------
+# Deploy script
+# ---------------------------------------------------------------------------
+
+def test_deploy_script_has_safe_header() -> None:
+    text = DEPLOY_SCRIPT.read_text()
+    assert text.startswith("#!/usr/bin/env bash"), "deploy script must have a bash shebang"
+    assert "set -euo pipefail" in text, "deploy script must use 'set -euo pipefail'"
+
+
+def test_deploy_script_documents_targets_and_flags() -> None:
+    text = DEPLOY_SCRIPT.read_text()
+    for target in DEPLOY_TARGETS:
+        assert target in text, f"deploy script must mention target '{target}'"
+    for flag in ("--dry-run", "--no-systemd", "--install-only", "--enable", "--start", "--restart"):
+        assert flag in text, f"deploy script must support flag '{flag}'"
+
+
+def test_deploy_script_dry_run_all_is_safe() -> None:
+    """`--target all --dry-run --no-systemd` must exit 0 and touch nothing."""
+    result = subprocess.run(
+        ["bash", str(DEPLOY_SCRIPT), "--target", "all", "--dry-run", "--no-systemd"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "skipped (--no-systemd)" in result.stdout
+
+
+@pytest.mark.parametrize("target", DEPLOY_TARGETS)
+def test_deploy_script_dry_run_each_target(target: str) -> None:
+    result = subprocess.run(
+        ["bash", str(DEPLOY_SCRIPT), "--target", target, "--dry-run", "--no-systemd"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, f"target {target} dry-run failed: {result.stderr}"
+
+
+def test_deploy_script_rejects_invalid_target() -> None:
+    result = subprocess.run(
+        ["bash", str(DEPLOY_SCRIPT), "--target", "syncthing", "--dry-run", "--no-systemd"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode != 0, "deploy script must reject unknown targets"

@@ -1,0 +1,27 @@
+[Unit]
+Description=CryptoRecorder Replay Store Build (previous UTC day)
+Documentation=file:///home/zsom/services/CryptoRecorder/docs/REPLAY_STORE.md
+After=network.target
+
+[Service]
+Type=oneshot
+User=zsom
+Group=zsom
+WorkingDirectory=/home/zsom/services/CryptoRecorder
+EnvironmentFile=-/etc/cryptorecorder/cryptorecorder.env
+# build_replay_store requires an explicit YYYY-MM-DD date; daily_build resolves
+# 'yesterday' to the previous completed UTC day and runs the replay step only.
+ExecStart=/home/zsom/services/CryptoRecorder/.venv/bin/python -m pipeline.daily_build --steps replay --date yesterday
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cryptorecorder-replay-build
+
+Restart=on-failure
+RestartSec=300
+TimeoutStartSec=3600
+
+# Security hardening
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

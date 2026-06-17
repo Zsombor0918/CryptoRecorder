@@ -21,8 +21,14 @@ These are the only Python entrypoints and project files permitted at the root:
 | `INSTALL.md` | Machine setup guide |
 | `requirements.txt` | Python dependencies |
 | `pytest.ini` | Test runner config |
+| `AGENTS.md` | Binding rules for AI agents |
+| `VERSION` | Current version string (e.g. `1.1.0-dev`) |
+| `CHANGELOG.md` | Keep-a-Changelog history |
 
 All other Python entrypoints belong in a package, not at the root.
+
+The `.github/` directory (e.g. `copilot-instructions.md`) is an allowed
+configuration directory; it contains no importable Python.
 
 ---
 
@@ -257,3 +263,4 @@ replay_store -> generate_catalog --profile full_l2
 | Date | Change |
 |---|---|
 | 2026-06-17 | Initial structure contract created; `validators/` removed, `converter/trade_coverage.py` added; audit CLIs moved from `pipeline/` to `validation/` |
+| 2026-06-17 | Added AI/deployment infrastructure: root files `AGENTS.md`, `VERSION`, `CHANGELOG.md`; `.github/copilot-instructions.md`; deployment/status docs; per-service systemd units; `scripts/deploy_linux_server.sh`; `tests/test_agent_infrastructure.py` |
