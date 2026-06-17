@@ -324,7 +324,7 @@ data_raw → replay_store → generate_catalog --profile trades_only
 
 **Rollout**:
 1. Keep `convert_day.py` as the validated full-L2 path.
-2. Validate trades-only semantic equivalence with `pipeline.validate_catalog_equivalence`.
+2. Validate trades-only semantic equivalence with `validation.validate_catalog_equivalence`.
 3. Implement replay-based full-L2 generation only after validation requirements are met.
 4. Benchmark replay writer and feature builder RSS before large-symbol production runs.
 5. Decide raw archival policy only after replay validation has enough history.

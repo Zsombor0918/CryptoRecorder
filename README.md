@@ -84,8 +84,8 @@ python -m pipeline.generate_catalog \
 | `convert_day.py` | Validated raw -> Nautilus full-L2 converter |
 | `converter/` | Legacy converter implementation |
 | `stores/` | Replay and feature Parquet schemas/readers/writers |
-| `pipeline/` | Replay, feature, catalog, audit, and equivalence CLIs |
-| `validation/` | Semantic catalog comparison utilities |
+| `pipeline/` | Replay, feature, and catalog build/transform CLIs |
+| `validation/` | Audit, equivalence check, and catalog inspection CLIs |
 | `scripts/` | Manual recorder and legacy-converter smoke scripts |
 | `docs/` | Detailed documentation |
 

@@ -48,7 +48,7 @@ from converter.spool import ObjectSpool, TimestampSpool
 from converter.trades import convert_trades_streaming
 from converter.universe import resolve_universe
 from time_utils import local_now_iso
-from validators.trade_coverage import build_readiness_summary
+from converter.trade_coverage import build_readiness_summary
 
 # ---------------------------------------------------------------------------
 logging.basicConfig(

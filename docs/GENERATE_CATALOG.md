@@ -172,7 +172,7 @@ python -m pipeline.generate_catalog \
 
 Compare output with the old pipeline using the validation CLI:
 ```bash
-python -m pipeline.validate_catalog_equivalence \
+python -m validation.validate_catalog_equivalence \
   --date 2026-06-12 \
   --symbols ADAUSDT \
   --venues BINANCE_SPOT \

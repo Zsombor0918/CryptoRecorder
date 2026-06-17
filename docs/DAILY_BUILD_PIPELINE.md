@@ -246,7 +246,7 @@ feature_store/
 Audit feature output:
 
 ```bash
-python -m pipeline.audit_feature_store \
+python -m validation.audit_feature_store \
   --feature-root /tmp/test_features \
   --date 2026-06-12 \
   --symbols ADAUSDT \
@@ -356,7 +356,7 @@ Compare instruments, row counts, timestamp min/max, and bounded sample readabili
 The reusable validator automates the trades-only comparison:
 
 ```bash
-python -m pipeline.validate_catalog_equivalence \
+python -m validation.validate_catalog_equivalence \
   --date 2026-06-12 \
   --symbols ADAUSDT \
   --venues BINANCE_SPOT \
@@ -409,7 +409,7 @@ Run old-vs-new trades-only equivalence one day at a time:
 
 ```bash
 for date in 2026-06-12 2026-06-13 2026-06-14; do
-  python -m pipeline.validate_catalog_equivalence \
+  python -m validation.validate_catalog_equivalence \
     --date "$date" \
     --symbols ADAUSDT \
     --venues BINANCE_SPOT \

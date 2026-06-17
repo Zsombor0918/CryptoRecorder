@@ -26,7 +26,6 @@ their existing packages:
 - `config.py`
 - `time_utils.py`
 - `validate.py`
-- `validators/`
 
 Decision: keep. Do not alter recorder semantics during replay cleanup.
 
@@ -62,12 +61,15 @@ Current validated v0 foundation:
   - `raw_manifest.py`
   - `build_replay_store.py`
   - `build_feature_store.py`
+  - `generate_catalog.py`
+  - `daily_build.py`
+- `validation/`
+  - `catalog_compare.py`
   - `audit_replay_store.py`
   - `audit_feature_store.py`
-  - `generate_catalog.py`
   - `validate_catalog_equivalence.py`
-  - `daily_build.py`
-- `validation/catalog_compare.py`
+  - `catalog_inspect.py`
+  - `phase2_report.py`
 
 Decision: keep. `generate_catalog` is currently `trades_only`; full-L2 replay
 catalog generation is deferred.
@@ -88,7 +90,7 @@ Future optional cleanup:
 - Add `scripts/smoke_replay_feature.py` if a shell-level replay/feature smoke is
   useful after the full-L2 replay milestone.
 - Add `scripts/validate_trades_only_equivalence.py` only if the CLI wrapper adds
-  value beyond `python -m pipeline.validate_catalog_equivalence`.
+  value beyond `python -m validation.validate_catalog_equivalence`.
 
 ## E. Tests
 
@@ -171,12 +173,20 @@ Manual scripts remain in:
 
 - `scripts/`
 
+## Completed Cleanup Items (2026-06-17 structure stabilization)
+
+- `validators/` removed. `trade_coverage.py` moved to `converter/trade_coverage.py`.
+  `catalog_inspect.py` and `phase2_report.py` moved to `validation/`.
+- `pipeline/audit_feature_store.py`, `pipeline/audit_replay_store.py`, and
+  `pipeline/validate_catalog_equivalence.py` moved to `validation/`.
+- `tests/test_pipeline_validation.py` split into focused files:
+  `test_replay_store.py`, `test_feature_store.py`, `test_generate_catalog.py`,
+  `test_catalog_equivalence.py`.
+- `tests/test_repo_structure.py` added to enforce folder contract.
+- `docs/REPO_STRUCTURE.md` created as the binding structure contract.
+
 ## Open Cleanup Items
 
 - Consider renaming `scripts/acceptance_test.py` to
   `scripts/acceptance_legacy_converter.py` in a future low-risk PR if operators
   are not depending on the old filename.
-- Consider splitting `tests/test_pipeline_validation.py` into
-  `test_replay_store.py`, `test_feature_store.py`, `test_generate_catalog.py`,
-  and `test_catalog_equivalence.py` after the full-L2 milestone. It is currently
-  compact and passing, so this pass avoided pure churn.

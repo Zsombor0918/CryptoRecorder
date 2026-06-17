@@ -141,7 +141,7 @@ python -m pipeline.build_feature_store \
 Audit an existing feature store:
 
 ```bash
-python -m pipeline.audit_feature_store \
+python -m validation.audit_feature_store \
   --feature-root /tmp/test_features \
   --date 2026-06-12 \
   --symbols ADAUSDT \

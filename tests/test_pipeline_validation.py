@@ -16,8 +16,8 @@ from nautilus_trader.persistence.catalog import ParquetDataCatalog
 
 from converter.readers import stream_raw_records
 from converter.instruments import build_instruments
-from pipeline.audit_feature_store import audit_feature_store
-from pipeline.audit_replay_store import audit_replay_store
+from validation.audit_feature_store import audit_feature_store
+from validation.audit_replay_store import audit_replay_store
 from pipeline.build_feature_store import build_features_for_symbol
 from pipeline.build_replay_store import build_replay_for_symbol
 from pipeline.generate_catalog import (
@@ -26,7 +26,7 @@ from pipeline.generate_catalog import (
     _window_from_date,
     generate_catalog_from_replay,
 )
-from pipeline.validate_catalog_equivalence import validate_catalog_equivalence
+from validation.validate_catalog_equivalence import validate_catalog_equivalence
 from validation.catalog_compare import compare_trade_ticks_semantic, load_trade_ticks
 
 
@@ -200,10 +200,10 @@ def test_pipeline_cli_help_does_not_touch_default_data_roots() -> None:
     for module in (
         "pipeline.build_replay_store",
         "pipeline.build_feature_store",
-        "pipeline.audit_feature_store",
-        "pipeline.audit_replay_store",
+        "validation.audit_feature_store",
+        "validation.audit_replay_store",
         "pipeline.generate_catalog",
-        "pipeline.validate_catalog_equivalence",
+        "validation.validate_catalog_equivalence",
         "pipeline.daily_build",
     ):
         result = subprocess.run(

@@ -297,7 +297,7 @@ Future optimization: replace symbol/date accumulation with a streaming external 
 Use the non-mutating audit CLI to verify a replay partition after building:
 
 ```bash
-python -m pipeline.audit_replay_store \
+python -m validation.audit_replay_store \
   --replay-root /path/to/replay_store \
   --date 2026-06-12 \
   --symbols ADAUSDT \

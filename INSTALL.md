@@ -397,13 +397,13 @@ source .venv/bin/activate
 
 python -m json.tool state/heartbeat.json | sed -n '1,120p'
 python -m json.tool state/startup_coverage.json | sed -n '1,160p'
-python validators/phase2_report.py state/convert_reports/YYYY-MM-DD.json
+python -m validation.phase2_report state/convert_reports/YYYY-MM-DD.json
 ```
 
 The repository does not ship a browser catalog viewer. Use the CLI inspector:
 
 ```bash
-python validators/catalog_inspect.py \
+python -m validation.catalog_inspect \
   "$APP_HOME/nautilus_data/catalog" \
   BTCUSDT.BINANCE
 ```

@@ -5,6 +5,7 @@ Use this page as the current documentation map.
 ## Start Here
 
 - [Architecture](ARCHITECTURE.md) — high-level system paths and module roles.
+- [Repo Structure](REPO_STRUCTURE.md) — binding folder contract; read before adding files.
 - [Implementation Audit](IMPLEMENTATION_AUDIT.md) — what is validated, smoke-tested, limited, and deferred.
 - [Repo Cleanup Audit](REPO_CLEANUP_AUDIT.md) — repository structure, generated files, and cleanup decisions.
 

@@ -4,8 +4,8 @@ import json
 from pathlib import Path
 
 import converter.readers as readers_mod
-from validators.trade_coverage import build_readiness_summary, summarize_trade_coverage
-import validators.trade_coverage as trade_coverage_mod
+from converter.trade_coverage import build_readiness_summary, summarize_trade_coverage
+import converter.trade_coverage as trade_coverage_mod
 
 
 def _write_raw_records(tmp_path: Path, venue: str, symbol: str, date_str: str, records: list[dict]) -> None:

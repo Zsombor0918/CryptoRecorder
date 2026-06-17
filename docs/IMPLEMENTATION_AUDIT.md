@@ -61,7 +61,7 @@ Catalog generation:
 
 Validation:
 
-- `pipeline.validate_catalog_equivalence` builds old and new catalogs and compares semantic TradeTick equality.
+- `validation.validate_catalog_equivalence` builds old and new catalogs and compares semantic TradeTick equality.
 - It compares instrument IDs, counts, timestamp ranges, first/last/sample trades, price, size, side, `trade_id`, `ts_event`, and `ts_init`.
 - It writes JSON reports and exits nonzero on failed comparison.
 
@@ -201,7 +201,7 @@ python -m pipeline.generate_catalog \
 ## Run Old-vs-New Validation
 
 ```bash
-python -m pipeline.validate_catalog_equivalence \
+python -m validation.validate_catalog_equivalence \
   --date 2026-06-12 \
   --symbols ADAUSDT \
   --venues BINANCE_SPOT \
@@ -217,7 +217,7 @@ python -m pipeline.validate_catalog_equivalence \
 ## Audit Feature Output
 
 ```bash
-python -m pipeline.audit_feature_store \
+python -m validation.audit_feature_store \
   --feature-root /tmp/cryptorecorder-replay-feature-validation/feature_store \
   --date 2026-06-12 \
   --symbols ADAUSDT \
@@ -230,7 +230,7 @@ The audit reports dense expected counts, actual row counts, date-bound violation
 ## Audit Replay Output
 
 ```bash
-python -m pipeline.audit_replay_store \
+python -m validation.audit_replay_store \
   --replay-root /tmp/cryptorecorder-replay-feature-validation/replay_store \
   --date 2026-06-12 \
   --symbols ADAUSDT \

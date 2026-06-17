@@ -16,6 +16,12 @@ data_raw -> convert_day.py -> Nautilus full-L2 catalog
 
 Do not replace `convert_day.py` until equivalence is proven.
 
+> **Status (2026-06-17)**: `full_l2` is **not implemented**. `convert_day.py`
+> remains the source of truth for full-L2 Nautilus catalogs. The replay-based
+> full-L2 path must reuse the old converter semantics — preferred path is a
+> shared core from `converter/depth_phase2.py`. Do not write a second
+> independent depth converter. See the Preferred Implementation section below.
+
 ## Current Status
 
 Implemented:
@@ -159,7 +165,7 @@ pytest -m realdata
 or:
 
 ```bash
-python -m pipeline.validate_catalog_equivalence \
+python -m validation.validate_catalog_equivalence \
   --date 2026-06-12 \
   --symbols ADAUSDT \
   --venues BINANCE_SPOT \
