@@ -17,7 +17,7 @@ Read these, in order, before proposing or making changes:
 1. [docs/REPO_STRUCTURE.md](docs/REPO_STRUCTURE.md) — the frozen folder/file contract.
 2. [docs/PROJECT_STATUS.md](docs/PROJECT_STATUS.md) — what is validated vs deferred.
 3. [docs/IMPLEMENTATION_AUDIT.md](docs/IMPLEMENTATION_AUDIT.md) — ground-truth of what exists.
-4. [docs/FULL_L2_REPLAY_CATALOG_PLAN.md](docs/FULL_L2_REPLAY_CATALOG_PLAN.md) — deferred full-L2 path.
+4. [docs/FULL_L2_REPLAY_CATALOG_PLAN.md](docs/FULL_L2_REPLAY_CATALOG_PLAN.md) — full-L2 replay path (validated on the ADAUSDT smoke; broader validation pending).
 5. [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) — how the system is deployed.
 6. [docs/LINUX_SERVER.md](docs/LINUX_SERVER.md) — dev (WSL) vs prod (Ubuntu) layout.
 7. [docs/AI_WORKFLOW.md](docs/AI_WORKFLOW.md) — the step-by-step working procedure.
@@ -38,8 +38,10 @@ If any of these contradict the task you were given, **stop and ask** instead of 
 - Do **not** delete or rewrite `convert_day.py`. It is the reference converter.
 
 ### Status honesty
-- Do **not** claim the `replay_store → full_l2 catalog` path works. It is **deferred**
-  until it is validated for semantic equivalence against `convert_day.py`.
+- The `replay_store → full_l2 catalog` path is implemented and validated on the
+  **ADAUSDT single-day smoke** against `convert_day.py`. Do **not** claim broader
+  top50/multi-day equivalence (the `v2.0.0` gate) until that wider validation
+  passes; `convert_day.py` remains the production reference.
 - Do **not** describe Syncthing, archive, or import features as implemented.
   `ARCHIVE_DAYS_ROOT` and `LABEL_ROOT` in `config.py` are **placeholders only**.
 - Never mark a deferred item as done.

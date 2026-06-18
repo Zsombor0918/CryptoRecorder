@@ -256,7 +256,11 @@ python -m pipeline.generate_catalog \
 5. Write a Nautilus `ParquetDataCatalog` under `catalog_jobs/job_*`
 6. Generate report with coverage info, including found/missing partitions and records read/written
 
-Current status: `trades_only` is implemented and smoke-tested. Depth/full-L2 catalog generation is deferred; `convert_day.py` remains the only validated full-L2 path.
+Current status: `trades_only` is implemented and smoke-tested. The `full_l2`,
+`depth_only`, and `depth10` profiles are implemented and semantically validated on
+the ADAUSDT single-day smoke against `convert_day.py`; broader top50/multi-day
+validation is pending and `convert_day.py` remains the production reference
+full-L2 path.
 
 ## Daily Build Orchestrator
 

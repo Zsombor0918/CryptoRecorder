@@ -3,26 +3,26 @@
 CryptoRecorder records native Binance spot and USDT-M futures market data for
 deterministic Nautilus Trader backtesting.
 
-The repo currently has two catalog-related paths:
+The repo currently has these catalog-related paths:
 
 ```text
 data_raw -> convert_day.py -> Nautilus full-L2 catalog
-  validated production/full-L2 path
+  production reference full-L2 path
 
 data_raw -> replay_store -> feature_store
 data_raw -> replay_store -> generate_catalog --profile trades_only
   validated v0 replay/feature foundation
-```
 
-The next milestone is replay-based full-L2 catalog generation:
-
-```text
 data_raw -> replay_store -> generate_catalog --profile full_l2
+  implemented; semantically validated on the ADAUSDT single-day smoke
+  vs convert_day.py (trades + OrderBookDeltas + OrderBookDepth10 + checkpoints)
 ```
 
-That full-L2 replay path is not implemented yet. Until it is semantically
-validated against `convert_day.py`, the old converter remains the source of
-truth for full-L2 Nautilus catalogs.
+The `full_l2` replay path reuses the old converter's shared depth engine. It
+passes the ADAUSDT single-day smoke against `convert_day.py`, but **broader
+top50/multi-day validation is still pending** — that wider validation is the
+`v2.0.0` gate, and `v2.0.0` is not declared. `convert_day.py` remains the
+production reference for full-L2 Nautilus catalogs.
 
 ## Quick Start
 
@@ -119,4 +119,7 @@ Agent rules: [AGENTS.md](AGENTS.md). Version: see [VERSION](VERSION) and [CHANGE
 - Feature store is UTC-day clamped and sparse.
 - `generate_catalog --profile trades_only` can be validated against the old
   converter for TradeTick semantic equality.
-- Replay-based `full_l2` catalog generation is deferred until the next milestone.
+- Replay-based `generate_catalog --profile full_l2` is implemented and
+  semantically validated on the ADAUSDT single-day smoke against `convert_day.py`
+  (trades, OrderBookDeltas, OrderBookDepth10, and book checkpoints all match).
+  Broader top50/multi-day validation is pending before `v2.0.0`.

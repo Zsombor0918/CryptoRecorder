@@ -255,7 +255,7 @@ def test_generate_catalog_fixed_job_id_and_overwrite(tmp_path: Path) -> None:
     assert third["status"] == "success"
 
 
-def test_generate_catalog_help_lists_only_implemented_profiles() -> None:
+def test_generate_catalog_help_lists_supported_profiles() -> None:
     result = subprocess.run(
         [sys.executable, "-m", "pipeline.generate_catalog", "--help"],
         cwd=Path(__file__).resolve().parent.parent,
@@ -264,6 +264,9 @@ def test_generate_catalog_help_lists_only_implemented_profiles() -> None:
         check=False,
     )
     assert result.returncode == 0
+    # full_l2 is now implemented (replay -> converter engine via adapter), so all
+    # supported profiles must be advertised in the CLI help.
     assert "trades_only" in result.stdout
-    assert "full_l2" not in result.stdout
-    assert "depth_only" not in result.stdout
+    assert "full_l2" in result.stdout
+    assert "depth_only" in result.stdout
+    assert "depth10" in result.stdout

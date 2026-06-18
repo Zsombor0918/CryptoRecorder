@@ -25,14 +25,15 @@ data_raw -> replay_store -> feature_store
 replay_store -> generate_catalog --profile trades_only
 ```
 
-Future target path:
+Replay-based full-L2 path:
 
 ```text
 replay_store -> generate_catalog --profile full_l2
 ```
 
-The future full-L2 replay path is not implemented yet. `convert_day.py` remains
-the validated full-L2 converter.
+This path is implemented and semantically validated on the ADAUSDT single-day
+smoke against `convert_day.py`; broader top50/multi-day validation is pending.
+`convert_day.py` remains the production reference full-L2 converter.
 
 ## Recorder Pipeline
 

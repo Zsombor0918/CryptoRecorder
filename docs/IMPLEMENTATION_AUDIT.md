@@ -2,9 +2,11 @@
 
 ## Summary
 
-This repo currently has a validated v0 replay/feature foundation.
-It does not yet have validated `replay_store -> full_l2 Nautilus catalog` generation.
-Old `convert_day.py` remains the validated full-L2 path.
+This repo currently has a validated v0 replay/feature foundation plus a
+`replay_store -> full_l2 Nautilus catalog` path that is **semantically validated
+on the ADAUSDT single-day smoke** against `convert_day.py`. Broader top50/multi-day
+validation is still pending. Old `convert_day.py` remains the production reference
+full-L2 path.
 
 Current paths:
 
@@ -22,7 +24,8 @@ replay_store -> generate_catalog --profile trades_only
   implemented and semantically validated for a real ADAUSDT spot day
 
 replay_store -> generate_catalog --profile full_l2
-  deferred
+  implemented; semantically validated on the ADAUSDT single-day smoke
+  vs convert_day.py. Broader top50/multi-day validation pending.
 ```
 
 ## What Works
@@ -51,18 +54,24 @@ Feature store:
 
 Catalog generation:
 
-- `generate_catalog` supports `trades_only`.
+- `generate_catalog` supports `trades_only`, `full_l2`, `depth_only`, and `depth10`.
+- `full_l2`/`depth_only`/`depth10` reuse the shared depth engine in
+  `converter/depth_phase2.py` via `stores/replay_depth_adapter.py` (no second
+  depth converter); the manifest records `depth_diagnostics`, `fenced_ranges`, and
+  `equivalence_caveats`.
 - It uses exact replay strings for Nautilus `Price` and `Quantity`.
 - It supports `--date YYYY-MM-DD` as a UTC-day shortcut for `--start/--end`.
 - It supports deterministic `--job-id` and safe `--overwrite`.
 - It writes coverage fields for requested/found/missing partitions, records read,
   records written, skipped invalid records, and `time_filter=ts_init`.
-- It rejects non-implemented profiles by CLI choices.
+- It rejects unknown profiles by CLI choices.
 
 Validation:
 
 - `validation.validate_catalog_equivalence` builds old and new catalogs and compares semantic TradeTick equality.
 - It compares instrument IDs, counts, timestamp ranges, first/last/sample trades, price, size, side, `trade_id`, `ts_event`, and `ts_init`.
+- For `full_l2` it also compares `OrderBookDeltas` (multiset-semantic),
+  `OrderBookDepth10`, and reconstructed top-10 book checkpoints.
 - It writes JSON reports and exits nonzero on failed comparison.
 
 ## Tested
@@ -80,16 +89,19 @@ Automated tests cover:
 - Nautilus readability for generated trades-only catalogs.
 - Deterministic `--job-id` and `--overwrite`.
 - Synthetic trades-only catalog semantic comparison.
+- Synthetic full-L2 convert_day-vs-replay semantic equivalence (clean bootstrap day).
+- Replay depth adapter mapping and canonical re-sort.
+- `full_l2`/`depth_only`/`depth10` profile write-flags and manifest diagnostics.
 - Feature UTC-day clamp and sparse output.
 - Feature audit report fields.
 - `generate_catalog --date` UTC-day shortcut.
-- Explicit skipped full-L2 validation status.
+- Validator skips unsupported profiles (`depth10`).
 - Real-data equivalence behind `pytest.mark.realdata`.
 
 Last full local suite:
 
 ```text
-176 passed, 2 skipped
+240 passed, 3 skipped
 ```
 
 ## Smoke-Tested
@@ -114,6 +126,20 @@ timestamp_range_match: true
 sample_mismatches: 0
 ```
 
+Full-L2 real local validation was run for the same date/venue/symbol:
+
+```text
+profile: full_l2
+status: passed
+trade_ticks         old 124457   new 124457   range match  0 mismatches
+order_book_deltas   old 1231284  new 1231284  range match  0 mismatches
+order_book_depth10  old 71341    new 71341    range match  0 mismatches
+book checkpoints    7/7 match, no crossed books
+```
+
+Report: `validation_reports/full_l2_equivalence_2026-06-12_ADAUSDT.json` (local,
+gitignored). This is a single-symbol, single-day smoke — not a universe benchmark.
+
 Feature audit for `2026-06-12`, `BINANCE_SPOT/ADAUSDT`, `1m`:
 
 ```text
@@ -135,15 +161,21 @@ Report path from the local run:
 
 ## Deferred
 
-Replay-based full-L2 catalog generation is not implemented.
+Broader `full_l2` validation across the top50 universe and multiple days is not
+yet done. The `full_l2` path is implemented and passes the ADAUSDT single-day
+smoke (see Smoke-Tested above), but it is **not** declared `v2.0.0` until the
+wider validation passes.
 
-Deferred path:
+Pending validation path:
 
 ```text
+top50 + multi-day:
+data_raw -> convert_day.py
+must match
 data_raw -> replay_store -> generate_catalog --profile full_l2
 ```
 
-Future full-L2 validation must compare:
+That wider validation compares the same fields proven on the ADAUSDT smoke:
 
 - instruments;
 - TradeTick count and sampled equality;
@@ -153,7 +185,11 @@ Future full-L2 validation must compare:
 - reconstructed book checkpoints;
 - top 10 bid/ask equality at checkpoints;
 - gap/fenced range report equality or documented acceptable differences;
-- optional OrderBookDepth10 semantic equality if emitted.
+- OrderBookDepth10 semantic equality when emitted.
+
+See [FULL_L2_REPLAY_CATALOG_PLAN.md](FULL_L2_REPLAY_CATALOG_PLAN.md) for the
+documented equivalence boundary (which old-converter internals are intentionally
+not reproduced byte-for-byte).
 
 ## Known Limitations
 

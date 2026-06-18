@@ -8,13 +8,15 @@ Current status:
 
 ```text
 data_raw -> replay_store -> generate_catalog --profile trades_only
-  implemented
+  implemented, semantically validated
 
 data_raw -> replay_store -> generate_catalog --profile full_l2
-  target path, not implemented yet
+  implemented; semantically validated on the ADAUSDT single-day smoke
+  (trades + OrderBookDeltas + OrderBookDepth10 + book checkpoints match
+   convert_day.py). Broader top50/multi-day validation pending.
 
 data_raw -> convert_day.py -> full_l2 Nautilus catalog
-  current validated full-L2 path
+  production reference full-L2 path (unchanged)
 ```
 
 **Key use cases**:
@@ -93,8 +95,27 @@ python -m pipeline.generate_catalog [OPTIONS]
     
     Options:
     - trades_only: Trades only, no order book
+    - full_l2:     Trades + OrderBookDeltas + (optional) OrderBookDepth10
+    - depth_only:  OrderBookDeltas only (no trades, no Depth10)
+    - depth10:     OrderBookDepth10 snapshots only
     
     Default: trades_only
+
+--emit-depth10 / --no-emit-depth10
+    For full_l2 / depth10: emit derived OrderBookDepth10 snapshots.
+    Default: emit (config.EMIT_DEPTH10_DEFAULT).
+
+--depth10-interval-sec SECONDS
+    Sampling interval for derived Depth10 snapshots.
+    Default: config.DEPTH10_INTERVAL_SEC (1.0).
+
+--derived-depth-snapshot-levels N
+    Number of book levels per derived Depth10 snapshot.
+    Default: config.DERIVED_DEPTH_SNAPSHOT_LEVELS (10).
+
+--time-filter {ts_init,ts_event}
+    Field used for the [start, end) window filter when reading back.
+    Default: ts_init (matches Nautilus catalog query semantics).
 
 --job-id NAME
     Optional deterministic job id. Output directory is job_{NAME}.
@@ -102,6 +123,13 @@ python -m pipeline.generate_catalog [OPTIONS]
 --overwrite
     Delete and recreate job_{NAME} if it already exists.
 ```
+
+For `full_l2`, the catalog reproduces the `convert_day.py` semantics through the
+shared depth engine in `converter/depth_phase2.py` (via
+`stores/replay_depth_adapter.py`). The manifest records `depth_diagnostics`,
+`fenced_ranges`, and `equivalence_caveats`. See
+[FULL_L2_REPLAY_CATALOG_PLAN.md](FULL_L2_REPLAY_CATALOG_PLAN.md) for the
+equivalence boundary and the ADAUSDT smoke result.
 
 ## Examples
 
@@ -185,6 +213,31 @@ python -m validation.validate_catalog_equivalence \
   --overwrite
 ```
 
+### Full-L2 generation + equivalence (ADAUSDT smoke)
+
+```bash
+# Generate a full-L2 catalog (trades + OrderBookDeltas + Depth10).
+python -m pipeline.generate_catalog \
+  --input /tmp/test_replay \
+  --symbols ADAUSDT \
+  --venues BINANCE_SPOT \
+  --date 2026-06-12 \
+  --profile full_l2 \
+  --output /tmp/test_catalogs_new \
+  --job-id validation_full_l2 \
+  --overwrite
+
+# One-shot build + convert_day + compare (writes a report under validation_reports/).
+python -m validation.validate_catalog_equivalence \
+  --date 2026-06-12 \
+  --symbols ADAUSDT \
+  --venues BINANCE_SPOT \
+  --data-root ./data_raw \
+  --work-root /tmp/cryptorecorder-equivalence \
+  --profile full_l2 \
+  --overwrite
+```
+
 ## Output Structure
 
 ### Manifest
@@ -231,7 +284,7 @@ python -m validation.validate_catalog_equivalence \
 
 ## Profiles
 
-### trades_only (default and currently implemented)
+### trades_only (default)
 
 Includes only TradeTick events.
 
@@ -256,15 +309,15 @@ TradeTick(
 
 **Size**: ~100 KB per 100K trades
 
-### full_l2 (deferred design)
+### full_l2 (implemented; validated on ADAUSDT smoke)
 
-Includes TradeTick, OrderBookDeltas, and OrderBookDepth10.
+Includes TradeTick, OrderBookDeltas, and (optionally) OrderBookDepth10.
 
 ```python
-# Exported as:
-# - trade_ticks.parquet
-# - order_book_deltas.parquet (one row per depth change)
-# - order_book_depth10.parquet (depth snapshots, top 10 levels)
+# Exported as Nautilus Parquet under the job's data/ dir:
+# - trade_tick/{instrument_id}/*.parquet
+# - order_book_deltas/{instrument_id}/*.parquet (one row per book change)
+# - order_book_depths/{instrument_id}/*.parquet (Depth10 snapshots, top 10 levels)
 ```
 
 **Use cases**:
@@ -273,17 +326,38 @@ Includes TradeTick, OrderBookDeltas, and OrderBookDepth10.
 - Order book dynamics research
 - Portfolio risk modeling
 
-**Size**: Deferred/unbenchmarked in the replay path. It is expected to be much larger than `trades_only` and may approach old Nautilus catalog size depending on expansion profile.
+**Size**: Measured ADAUSDT 2026-06-12 full day ≈ **32 MiB** (order_book_deltas
+22.5 MiB + order_book_depths 6.9 MiB + trade_tick 2.6 MiB), the same size class as
+the `convert_day.py` catalog (33 MiB). See
+[STORAGE_SIZE_AUDIT.md](STORAGE_SIZE_AUDIT.md).
 
-**Status**: Deferred. The CLI currently accepts only `trades_only`.
+**Status**: Implemented. Semantically validated on the ADAUSDT single-day smoke
+against `convert_day.py`; broader top50/multi-day validation pending.
 
-### depth_only (deferred design)
+### depth_only (implemented)
 
-Includes only OrderBookDepth10 (no trades).
+Includes only OrderBookDeltas (no trades, no Depth10).
 
 ```python
 # Exported as:
-# - order_book_depth10.parquet
+# - order_book_deltas/{instrument_id}/*.parquet
+```
+
+**Use cases**:
+- Order book reconstruction without trade information
+- Liquidity / book-shape research
+
+**Size**: ≈ order_book_deltas component of full_l2 (≈ 22 MiB/day for ADAUSDT).
+
+**Status**: Implemented (shares the full_l2 depth engine).
+
+### depth10 (implemented)
+
+Includes only derived OrderBookDepth10 snapshots.
+
+```python
+# Exported as:
+# - order_book_depths/{instrument_id}/*.parquet
 ```
 
 **Use cases**:
@@ -291,21 +365,25 @@ Includes only OrderBookDepth10 (no trades).
 - Liquidity distribution research
 - Microstructure without trade information
 
-**Size**: Deferred/unbenchmarked.
+**Size**: ≈ Depth10 component of full_l2 (≈ 7 MiB/day for ADAUSDT).
 
-**Status**: Deferred. The CLI currently accepts only `trades_only`.
+**Status**: Implemented (shares the full_l2 depth engine).
 
 ## Future Full-L2 Validation Requirements
 
-Do not treat replay-based full-L2 generation as complete until it semantically matches the old converter:
+## Full-L2 Validation Status
+
+The replay-based full-L2 path is validated for semantic equivalence against the
+old converter **on the ADAUSDT single-day smoke**; broader universe/multi-day
+validation is still pending before `v2.0.0`:
 
 ```text
 data_raw -> convert_day.py
-must match
+matches (ADAUSDT 2026-06-12 smoke)
 data_raw -> replay_store -> generate_catalog --profile full_l2
 ```
 
-The comparison should cover:
+The comparison covers:
 
 - instruments;
 - TradeTick count and sampled equality;

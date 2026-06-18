@@ -2,7 +2,11 @@
 
 ## Overview
 
-The replay_store is a Parquet-based columnar replay layer. It is a candidate long-term replay source after validation, not yet a replacement for the validated full-L2 `convert_day.py` path.
+The replay_store is a Parquet-based columnar replay layer. It now backs both
+`generate_catalog --profile trades_only` and `--profile full_l2` (the latter
+semantically validated on the ADAUSDT single-day smoke against `convert_day.py`,
+with broader validation pending). It remains a candidate long-term replay source;
+`convert_day.py` is still the production reference full-L2 path.
 
 **Key properties**:
 - **Immutable after publication** — Each date/symbol partition is written once and never modified

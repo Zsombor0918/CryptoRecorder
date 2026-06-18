@@ -19,8 +19,9 @@ python scripts/smoke_test.py --runtime 60 # 1 minute
 
 ### acceptance_test.py
 Legacy converter acceptance test (recorder → `convert_day.py` → Nautilus
-catalog validation). It does not validate replay_store → full_l2 catalog
-generation; that path is explicitly deferred.
+catalog validation). It does not exercise the replay_store → full_l2 catalog
+path; for that, use `python -m validation.validate_catalog_equivalence
+--profile full_l2` (validated on the ADAUSDT smoke, broader validation pending).
 
 ```bash
 python scripts/acceptance_test.py              # Full test (10 min recorder)

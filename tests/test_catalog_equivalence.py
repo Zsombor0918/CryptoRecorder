@@ -61,9 +61,9 @@ def test_trades_only_semantic_comparison_with_synthetic_catalogs(tmp_path: Path)
     assert comparison["sample_mismatches"] == []
 
 
-def test_full_l2_validation_is_explicitly_deferred(tmp_path: Path) -> None:
-    # generate_catalog --profile full_l2 is deferred; this test must remain
-    # skipped (status=skipped) until full_l2 is implemented.
+def test_validator_skips_unsupported_profiles(tmp_path: Path) -> None:
+    # The validator supports trades_only + full_l2; other profiles short-circuit
+    # to status=skipped (depth_only / depth10 have no convert_day reference).
     report = validate_catalog_equivalence(
         date="2026-06-12",
         symbols=["ADAUSDT"],
@@ -73,11 +73,109 @@ def test_full_l2_validation_is_explicitly_deferred(tmp_path: Path) -> None:
         old_catalog_root=tmp_path / "old",
         replay_root=tmp_path / "replay",
         new_catalog_root=tmp_path / "new",
-        profile="full_l2",
+        profile="depth10",
         overwrite=True,
     )
     assert report["status"] == "skipped"
-    assert "deferred" in report["notes"][0]
+
+
+def _write_clean_raw_day(data_root: Path) -> None:
+    """A single-session bootstrap day (snapshot + continuous updates + trades).
+
+    No cross-day carry, clock skew, sync_state, or duplicates — the regime where
+    convert_day.py and the replay full_l2 path share the same engine output.
+    """
+    venue, symbol, date = "BINANCE_SPOT", "ADAUSDT", "2026-06-12"
+    base = 1_781_222_400_000
+
+    def _jsonl(path: Path, records: list[dict]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w") as f:
+            for rec in records:
+                f.write(json.dumps(rec) + "\n")
+
+    _jsonl(
+        data_root / venue / "depth_v2" / symbol / date / "2026-06-12T00.jsonl",
+        [
+            {
+                "record_type": "snapshot_seed", "venue": venue, "symbol": symbol,
+                "stream_session_id": 1, "session_seq": 0,
+                "ts_recv_ns": base * 1_000_000 + 1, "ts_event_ms": base,
+                "lastUpdateId": 100,
+                "payload": {
+                    "bids": [["0.1700", "100.0"], ["0.1699", "50.0"]],
+                    "asks": [["0.1710", "200.0"], ["0.1711", "60.0"]],
+                },
+            },
+            {
+                "record_type": "depth_update", "venue": venue, "symbol": symbol,
+                "stream_session_id": 1, "session_seq": 1,
+                "ts_recv_ns": base * 1_000_000 + 2_000_000_000,
+                "ts_event_ms": base + 2_000,
+                "U": 101, "u": 105, "pu": None,
+                "payload": {"bids": [["0.1700", "120.0"]], "asks": [["0.1710", "180.0"]]},
+            },
+            {
+                "record_type": "depth_update", "venue": venue, "symbol": symbol,
+                "stream_session_id": 1, "session_seq": 2,
+                "ts_recv_ns": base * 1_000_000 + 4_000_000_000,
+                "ts_event_ms": base + 4_000,
+                "U": 106, "u": 110, "pu": None,
+                "payload": {"bids": [["0.1698", "40.0"]], "asks": [["0.1712", "70.0"]]},
+            },
+        ],
+    )
+    _jsonl(
+        data_root / venue / "trade_v2" / symbol / date / "2026-06-12T00.jsonl",
+        [
+            {
+                "record_type": "trade", "venue": venue, "market_type": "spot",
+                "symbol": symbol, "trade_stream_session_id": 1, "trade_session_seq": 1,
+                "ts_recv_ns": base * 1_000_000 + 10, "ts_event_ms": base, "ts_trade_ms": base,
+                "price": "0.17060000", "quantity": "35.20000000",
+                "is_buyer_maker": True, "exchange_trade_id": 101, "native_payload": {"t": 101},
+            },
+            {
+                "record_type": "trade", "venue": venue, "market_type": "spot",
+                "symbol": symbol, "trade_stream_session_id": 1, "trade_session_seq": 2,
+                "ts_recv_ns": base * 1_000_000 + 20, "ts_event_ms": base, "ts_trade_ms": base,
+                "price": "0.17070000", "quantity": "30.90000000",
+                "is_buyer_maker": False, "exchange_trade_id": 102, "native_payload": {"t": 102},
+            },
+        ],
+    )
+
+
+def test_full_l2_validator_matches_convert_day_on_clean_synthetic_day(tmp_path: Path) -> None:
+    """End-to-end gate: convert_day.py vs replay full_l2 on a clean bootstrap day.
+
+    full_l2 is no longer deferred — the validator must run (not skip) and, on a
+    clean single-session day, report semantic equivalence between the validated
+    convert_day catalog and the replay-generated catalog.
+    """
+    data_root = tmp_path / "data_raw"
+    _write_clean_raw_day(data_root)
+
+    report = validate_catalog_equivalence(
+        date="2026-06-12",
+        symbols=["ADAUSDT"],
+        venues=["BINANCE_SPOT"],
+        data_root=data_root,
+        work_root=tmp_path / "work",
+        old_catalog_root=tmp_path / "old_catalog",
+        replay_root=tmp_path / "replay_store",
+        new_catalog_root=tmp_path / "new_catalog",
+        profile="full_l2",
+        overwrite=True,
+    )
+
+    assert report["status"] != "skipped", json.dumps(report, indent=2, default=str)
+    assert report["profile"] == "full_l2"
+    assert report["status"] == "passed", json.dumps(report, indent=2, default=str)
+    comparison = report["comparison"]
+    assert comparison["trade_ticks"]["passed"] is True
+    assert comparison["order_book_deltas"]["passed"] is True
+    assert comparison["book_checkpoints"]["passed"] is True
 
 
 @pytest.mark.realdata

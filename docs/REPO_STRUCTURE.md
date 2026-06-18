@@ -63,15 +63,17 @@ commands; those belong in `validation/`.
 feature_store. Pure data access layer; no CLI entrypoints.
 
 **`validation/`** — The single general validation package. Contains all
-audit CLIs (audit_feature_store, audit_replay_store), equivalence checks
-(validate_catalog_equivalence), catalog comparison utilities (catalog_compare),
-catalog inspection (catalog_inspect), and report validation (phase2_report).
-Does **not** contain build/transform logic; that belongs in `pipeline/`.
+audit CLIs (audit_feature_store, audit_replay_store, audit_storage_size),
+equivalence checks (validate_catalog_equivalence), catalog comparison utilities
+(catalog_compare), catalog inspection (catalog_inspect), and report validation
+(phase2_report). Does **not** contain build/transform logic; that belongs in
+`pipeline/`.
 
 **`scripts/`** — Thin operator wrappers only. Scripts may call subprocesses or
 invoke pipeline/validation CLIs, but must not contain importable business logic.
-No new script should claim to validate replay full-L2 until that milestone is
-implemented and declared done.
+The replay full-L2 path is implemented and validated on the ADAUSDT smoke; no
+script may claim broader top50/multi-day full-L2 equivalence until that wider
+validation is run and declared done.
 
 **`tests/`** — All automated tests. No test file outside this directory. Tests
 are organized by subsystem:
@@ -174,6 +176,7 @@ existing artifacts:
 
 - `audit_feature_store.py`
 - `audit_replay_store.py`
+- `audit_storage_size.py`
 - `validate_catalog_equivalence.py`
 - `catalog_compare.py`
 - `catalog_inspect.py`
@@ -253,7 +256,10 @@ replay_store -> generate_catalog --profile trades_only
   IMPLEMENTED: semantically validated
 
 replay_store -> generate_catalog --profile full_l2
-  DEFERRED: see docs/FULL_L2_REPLAY_CATALOG_PLAN.md
+  IMPLEMENTED: semantically validated on ADAUSDT smoke
+  (BINANCE_SPOT/ADAUSDT/2026-06-12 vs convert_day.py: trades, OrderBookDeltas,
+   OrderBookDepth10, and book checkpoints all match). Broader top50/multi-day
+   validation still pending. See docs/FULL_L2_REPLAY_CATALOG_PLAN.md.
 ```
 
 ---

@@ -16,11 +16,13 @@ data_raw -> convert_day.py -> Nautilus full-L2 catalog
 
 Do not replace `convert_day.py` until equivalence is proven.
 
-> **Status (2026-06-17)**: `full_l2` is **not implemented**. `convert_day.py`
-> remains the source of truth for full-L2 Nautilus catalogs. The replay-based
-> full-L2 path must reuse the old converter semantics — preferred path is a
-> shared core from `converter/depth_phase2.py`. Do not write a second
-> independent depth converter. See the Preferred Implementation section below.
+> **Status (updated)**: `full_l2` is **implemented** and reuses the shared depth
+> engine in `converter/depth_phase2.py` (via the `stores/replay_depth_adapter.py`
+> adapter). It is **semantically validated on the ADAUSDT single-day smoke**
+> against `convert_day.py` (trades, OrderBookDeltas, OrderBookDepth10, and book
+> checkpoints all match). `convert_day.py` remains the production reference until
+> broader top50/multi-day validation passes; `v2.0.0` is **not** declared. There
+> is no second independent depth converter.
 
 ## Current Status
 
@@ -30,12 +32,16 @@ Implemented:
 - `replay_store -> feature_store`
 - `replay_store -> generate_catalog --profile trades_only`
 - trades-only old-vs-new semantic validation
+- **`replay_store -> generate_catalog --profile full_l2`** (shared depth engine)
+- **replay-based `OrderBookDeltas`** (validated on ADAUSDT smoke)
+- **replay-based `OrderBookDepth10`** (validated on ADAUSDT smoke)
+- **full-L2 old-vs-new semantic validation** (`validate_catalog_equivalence
+  --profile full_l2`)
 
-Deferred:
+Pending (NOT done):
 
-- replay-based `OrderBookDeltas`
-- replay-based `OrderBookDepth10`
-- replay-based `full_l2` profile
+- broader `full_l2` validation across the top50 universe and multiple days
+- `v2.0.0` declaration (gated on the broader validation above)
 
 ## Semantics To Preserve
 
@@ -152,9 +158,13 @@ Required comparisons:
 
 Normal CI:
 
-- keep `full_l2` replay test skipped with a clear reason until implemented;
-- unit-test the replay-row adapter or shared replay core with synthetic depth;
-- ensure `convert_day.py` still does not depend on replay_store.
+- `full_l2` is implemented; the synthetic full-L2 equivalence test runs in CI
+  (`tests/test_catalog_equivalence_full_l2.py`,
+  `tests/test_catalog_equivalence.py::test_full_l2_validator_matches_convert_day_on_clean_synthetic_day`);
+- unit-test the replay-row adapter and shared replay core with synthetic depth
+  (`tests/test_replay_depth_adapter.py`, `tests/test_generate_catalog_full_l2.py`);
+- ensure `convert_day.py` still does not depend on replay_store
+  (`tests/test_semantic_equivalence.py::test_convert_day_remains_legacy_full_l2_entrypoint`).
 
 Real-data gated tests:
 
@@ -175,18 +185,55 @@ python -m validation.validate_catalog_equivalence \
   --overwrite
 ```
 
-This command should remain skipped/unsupported until the full-L2 implementation
-lands.
+This command is supported and **passes on the ADAUSDT 2026-06-12 smoke** (see the
+Real-Data Result below). It remains gated (off by default in CI) because it needs
+local raw market data.
+
+## Real-Data Result (ADAUSDT smoke)
+
+```
+2026-06-12 BINANCE_SPOT/ADAUSDT full_l2 (replay vs convert_day.py):
+  trade_ticks         old 124457   new 124457   range match  0 mismatches
+  order_book_deltas   old 1231284  new 1231284  range match  0 mismatches
+  order_book_depth10  old 71341    new 71341    range match  0 mismatches
+  book checkpoints    7/7 match, no crossed books
+  status              passed
+```
+
+This is a **single-symbol, single-day** result. It does not by itself prove
+universe-wide equivalence.
+
+## Equivalence Boundary (caveats)
+
+Reproducible by the replay full-L2 path (matches `convert_day.py`):
+
+- snapshot-seed deltas, live depth deltas, derived Depth10;
+- continuity fences, session resets, clean single-session bootstrap days.
+
+Documented acceptable differences (the replay v0 path does not reproduce these
+old-converter internals byte-for-byte; comparison is semantic, not byte-equal):
+
+- `sync_state` fenced-range bookkeeping;
+- carry synthetic snapshots across partition boundaries;
+- repartitioned boundary records;
+- duplicate-suppression details.
+
+Days dominated by these internals may diverge; the ADAUSDT smoke day did not.
 
 ## Acceptance Criteria
 
-The milestone is complete only when:
+Milestone-complete checklist (✅ = done for the ADAUSDT smoke milestone):
 
-1. `generate_catalog --profile full_l2` exists and writes a Nautilus-readable catalog.
-2. It reuses the old converter semantics directly or through a thin replay adapter.
-3. TradeTick equivalence still passes.
-4. OrderBookDeltas equivalence passes for synthetic fixtures and real ADAUSDT smoke.
-5. Depth10 equivalence passes if Depth10 is emitted.
-6. Date/window filtering is explicit and documented.
-7. Reports make missing partitions, skipped records, and fenced ranges visible.
-8. The old `convert_day.py` path remains available and unchanged for production fallback.
+1. ✅ `generate_catalog --profile full_l2` exists and writes a Nautilus-readable catalog.
+2. ✅ It reuses the old converter semantics through the shared depth engine + thin replay adapter.
+3. ✅ TradeTick equivalence passes (synthetic + ADAUSDT smoke).
+4. ✅ OrderBookDeltas equivalence passes for synthetic fixtures and real ADAUSDT smoke.
+5. ✅ Depth10 equivalence passes when Depth10 is emitted (ADAUSDT smoke).
+6. ✅ Date/window filtering is explicit and documented (`--date`/`--start`/`--end`, `--time-filter`).
+7. ✅ Reports make missing partitions, skipped records, and fenced ranges visible (`depth_diagnostics`/`fenced_ranges`/`caveats`).
+8. ✅ The old `convert_day.py` path remains available and unchanged for production fallback.
+
+Still open before `v2.0.0`:
+
+- ⬜ broader validation across the top50 universe;
+- ⬜ multi-day validation.

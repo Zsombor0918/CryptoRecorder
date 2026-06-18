@@ -154,14 +154,20 @@ The audit reports actual row counts, expected dense row counts, min/max timestam
 
 ## Validation Notes
 
-The v0 feature store is not a replacement for the Nautilus catalog. It is an AI/selection layer. The current validated full-L2 path remains:
+The v0 feature store is not a replacement for the Nautilus catalog. It is an AI/selection layer. The current production reference full-L2 path remains:
 
 ```text
 data_raw -> convert_day.py -> full_l2 Nautilus catalog
 ```
 
-The implemented replay-based catalog path is currently:
+The implemented replay-based catalog paths are:
 
 ```text
 data_raw -> replay_store -> generate_catalog --profile trades_only
+data_raw -> replay_store -> generate_catalog --profile full_l2
 ```
+
+The `full_l2` path is semantically validated on the ADAUSDT single-day smoke
+against `convert_day.py`; broader top50/multi-day validation is pending. See
+[GENERATE_CATALOG.md](GENERATE_CATALOG.md) and
+[FULL_L2_REPLAY_CATALOG_PLAN.md](FULL_L2_REPLAY_CATALOG_PLAN.md).

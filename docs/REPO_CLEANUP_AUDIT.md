@@ -110,9 +110,13 @@ Current grouping by purpose:
 - Semantic equivalence guards:
   - `tests/test_semantic_equivalence.py`
 
-Decision: keep one clear skipped full-L2 replay test with the reason that
-`generate_catalog full_l2` is deferred. Remove misleading manual/TODO skip piles.
-Real-data equivalence stays behind `pytest.mark.realdata`.
+Decision (updated): the `full_l2` replay path is now implemented and validated on
+the ADAUSDT single-day smoke, so the former "skipped because deferred" test was
+replaced by real synthetic + real-data equivalence tests
+(`tests/test_catalog_equivalence_full_l2.py`, the synthetic full-L2 test in
+`tests/test_catalog_equivalence.py`, and the `realdata`-gated
+`tests/test_full_l2_realdata_gate.py`). Misleading manual/TODO skip piles were
+removed. Real-data equivalence stays behind `pytest.mark.realdata`.
 
 ## F. Generated, Local, Or Trash
 

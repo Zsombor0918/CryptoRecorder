@@ -32,22 +32,25 @@ Use this page as the current documentation map.
 - [Storage Architecture](STORAGE_ARCHITECTURE.md) — roles of `data_raw`, `replay_store`, `feature_store`, catalog jobs, and reports.
 - [Replay Store](REPLAY_STORE.md) — actual replay Parquet schema and replay reader behavior.
 - [Feature Store](FEATURE_STORE.md) — actual feature schema, sparse UTC-day window behavior, and deferred feature fields.
-- [Generate Catalog](GENERATE_CATALOG.md) — implemented `trades_only` catalog generation and validation commands.
+- [Generate Catalog](GENERATE_CATALOG.md) — `trades_only` and `full_l2` catalog generation and validation commands.
+- [Storage Size Audit](STORAGE_SIZE_AUDIT.md) — measured ADAUSDT replay/catalog footprint (single-symbol smoke, not a universe benchmark).
+- [Feature Store Requirements Audit](FEATURE_STORE_REQUIREMENTS_AUDIT.md) — honest met/partial/deferred status of the feature store.
 
 ## Next Milestone
 
-- [Full-L2 Replay Catalog Plan](FULL_L2_REPLAY_CATALOG_PLAN.md) — plan for implementing `replay_store -> generate_catalog --profile full_l2` by reusing the old converter semantics.
+- [Full-L2 Replay Catalog Plan](FULL_L2_REPLAY_CATALOG_PLAN.md) — `replay_store -> generate_catalog --profile full_l2` reuses the old converter semantics; implemented and validated on the ADAUSDT smoke, broader validation pending.
 
 Current status:
 
 ```text
 data_raw -> convert_day.py -> Nautilus full-L2 catalog
-  validated full-L2 path
+  production reference full-L2 path
 
 data_raw -> replay_store -> feature_store
 replay_store -> generate_catalog --profile trades_only
   validated v0 replay/feature foundation
 
 replay_store -> generate_catalog --profile full_l2
-  deferred
+  implemented; semantically validated on the ADAUSDT single-day smoke
+  vs convert_day.py. Broader top50/multi-day validation pending (v2.0.0 gate).
 ```

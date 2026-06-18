@@ -217,7 +217,7 @@ def test_pipeline_cli_help_does_not_touch_default_data_roots() -> None:
         assert result.returncode == 0, result.stderr
 
 
-def test_generate_catalog_help_lists_only_implemented_profiles() -> None:
+def test_generate_catalog_help_lists_supported_profiles() -> None:
     result = subprocess.run(
         [sys.executable, "-m", "pipeline.generate_catalog", "--help"],
         cwd=Path(__file__).resolve().parent.parent,
@@ -227,8 +227,9 @@ def test_generate_catalog_help_lists_only_implemented_profiles() -> None:
     )
     assert result.returncode == 0
     assert "trades_only" in result.stdout
-    assert "full_l2" not in result.stdout
-    assert "depth_only" not in result.stdout
+    assert "full_l2" in result.stdout
+    assert "depth_only" in result.stdout
+    assert "depth10" in result.stdout
 
 
 def test_docs_do_not_reference_convert_day_symbols_until_supported() -> None:
@@ -584,7 +585,9 @@ def test_feature_store_audit_reports_sparse_utc_day_output(tmp_path: Path) -> No
     assert "return_1s" in item["all_null_columns"]
 
 
-def test_full_l2_validation_is_explicitly_deferred(tmp_path: Path) -> None:
+def test_validator_skips_unsupported_profiles(tmp_path: Path) -> None:
+    # full_l2 is now implemented and validated elsewhere; the validator still
+    # short-circuits profiles it has no convert_day reference for (depth10).
     report = validate_catalog_equivalence(
         date="2026-06-12",
         symbols=["ADAUSDT"],
@@ -594,11 +597,10 @@ def test_full_l2_validation_is_explicitly_deferred(tmp_path: Path) -> None:
         old_catalog_root=tmp_path / "old",
         replay_root=tmp_path / "replay",
         new_catalog_root=tmp_path / "new",
-        profile="full_l2",
+        profile="depth10",
         overwrite=True,
     )
     assert report["status"] == "skipped"
-    assert "deferred" in report["notes"][0]
 
 
 @pytest.mark.realdata

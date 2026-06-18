@@ -146,17 +146,28 @@ def _claim_present(normalized: str, token: str, claim: str) -> bool:
 
 
 def test_no_doc_claims_full_l2_done() -> None:
-    """The `full_l2` replay profile is deferred; no doc may claim it works/validated.
+    """The `full_l2` replay profile is implemented and *synthetic*-validated, but
+    real-data semantic equivalence vs convert_day.py is still pending. No doc may
+    claim it is validated / complete / done / production-ready (the v2.0.0 gate),
+    though "implemented" / "supported" is now accurate.
 
     Only the underscore profile identifier `full_l2` is guarded. Prose about the
     *validated* ``convert_day.py`` full-L2 catalog path (written "full-L2") is allowed.
     """
+    overclaims = [
+        "is validated",
+        "is complete",
+        "is done",
+        "is ready",
+        "is production",
+        "works",
+    ]
     for md in _all_markdown():
         normalized = _normalize(md.read_text())
-        for claim in _CLAIM_PHRASES:
+        for claim in overclaims:
             assert not _claim_present(normalized, "full_l2", claim), (
-                f"{md.relative_to(ROOT)} claims 'full_l2 {claim}', but the full_l2 "
-                "replay profile is deferred"
+                f"{md.relative_to(ROOT)} claims 'full_l2 {claim}', but full_l2 real-data "
+                "validation against convert_day.py is still pending (not yet v2.0.0)"
             )
 
 

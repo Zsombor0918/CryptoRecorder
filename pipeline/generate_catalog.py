@@ -31,11 +31,53 @@ except ImportError:
     logger = logging.getLogger(__name__)
     logger.warning("Nautilus not available; generate_catalog will not work")
 
-from config import CATALOG_JOBS_ROOT, REPLAY_ROOT
+from config import (
+    CATALOG_JOBS_ROOT,
+    DEPTH10_INTERVAL_SEC,
+    DERIVED_DEPTH_SNAPSHOT_LEVELS,
+    EMIT_DEPTH10_DEFAULT,
+    REPLAY_ROOT,
+)
+from converter.depth_phase2 import replay_records_to_depth_streaming
 from converter.instruments import build_instruments
+from converter.spool import ObjectSpool
+from stores.replay_depth_adapter import iter_replay_depth_records
 from stores.replay_reader import ReplayReader
 
 logger = logging.getLogger(__name__)
+
+WRITE_BATCH_SIZE = 5000
+
+# Supported catalog profiles:
+#   trades_only — instruments + TradeTick (validated equivalent path)
+#   full_l2     — instruments + TradeTick + OrderBookDeltas (+ optional Depth10)
+#   depth_only  — instruments + OrderBookDeltas (+ optional Depth10), no trades
+#   depth10     — instruments + OrderBookDepth10 only
+SUPPORTED_PROFILES = ("trades_only", "full_l2", "depth_only", "depth10")
+
+# Documented equivalence caveats for the replay-based full_l2 path. These stem
+# from replay_store v0 NOT persisting sync_state/stream_lifecycle records and
+# NOT performing cross-day repartitioning/carry recovery. See
+# docs/FULL_L2_REPLAY_CATALOG_PLAN.md for the full equivalence boundary.
+FULL_L2_CAVEATS = [
+    "sync_state-driven fenced ranges are not regenerated (replay v0 drops sync_state records)",
+    "cross-day carry / synthetic opening snapshot is not reproduced (no prev/next repartitioning)",
+    "UTC-boundary repartitioning of clock-skewed records is not applied",
+    "duplicate depth suppression relies on the replay builder, not the converter spool",
+]
+
+
+def _profile_write_flags(profile: str, emit_depth10: bool) -> tuple[bool, bool, bool]:
+    """Resolve (writes_trades, writes_deltas, writes_depth10) for a profile."""
+    if profile == "trades_only":
+        return True, False, False
+    if profile == "full_l2":
+        return True, True, emit_depth10
+    if profile == "depth_only":
+        return False, True, emit_depth10
+    if profile == "depth10":
+        return False, False, True
+    raise ValueError(f"Unsupported profile: {profile}")
 
 
 def _parse_iso_datetime(iso_str: str) -> datetime:
@@ -106,18 +148,102 @@ def _convert_trade_to_nautilus(
         return None
 
 
-def _convert_depth_to_nautilus(
-    depth: dict,
-    instrument_id: InstrumentId,
-    emit_depth10: bool = True,
-) -> tuple[Optional[OrderBookDeltas], Optional[OrderBookDepth10]]:
-    """Convert replay depth record to Nautilus OrderBookDeltas + OrderBookDepth10."""
-    if not NAUTILUS_AVAILABLE:
-        return None, None
-    
-    # Simplified stub - full implementation would require building order book state
-    # For now, return None to indicate feature is deferred
-    return None, None
+def _write_depth_for_partition(
+    *,
+    reader: ReplayReader,
+    venue: str,
+    symbol: str,
+    date: str,
+    instrument,
+    catalog,
+    start_ns: int,
+    end_ns: int,
+    writes_deltas: bool,
+    writes_depth10: bool,
+    depth10_interval_sec: float,
+    derived_depth_snapshot_levels: int,
+    time_filter: str,
+    batch_size: int = WRITE_BATCH_SIZE,
+):
+    """Replay one partition's depth through the shared engine and write to catalog.
+
+    Reuses the validated ``converter.depth_phase2`` engine (via the replay
+    adapter) so OrderBookDeltas / Depth10 semantics match the raw path exactly.
+    Objects are buffered in disk-backed :class:`ObjectSpool`s (memory-bounded)
+    and written in the same ``ts_init``-ordered batches as ``convert_day.py``.
+
+    Returns ``(metrics, deltas_written, depth10_written, deltas_skipped,
+    depth10_skipped)``.
+    """
+    iid = instrument.id
+    price_prec = instrument.price_precision
+    size_prec = instrument.size_precision
+
+    def _ts(obj) -> int:
+        return int(obj.ts_init) if time_filter == "ts_init" else int(obj.ts_event)
+
+    def _in_window(obj) -> bool:
+        ts = _ts(obj)
+        return start_ns <= ts < end_ns
+
+    deltas_skipped = 0
+    depth10_skipped = 0
+
+    with (
+        ObjectSpool(prefix="cryptorecorder-gc-delta-") as deltas_spool,
+        ObjectSpool(prefix="cryptorecorder-gc-depth10-") as depth10_spool,
+    ):
+        delta_ordinal = 0
+        depth10_ordinal = 0
+
+        def on_deltas_batch(batch):
+            nonlocal delta_ordinal, deltas_skipped
+            if not writes_deltas:
+                return
+            kept = [d for d in batch if _in_window(d)]
+            deltas_skipped += len(batch) - len(kept)
+            if kept:
+                delta_ordinal = deltas_spool.insert_many(kept, start_ordinal=delta_ordinal)
+
+        def on_depth10_batch(batch):
+            nonlocal depth10_ordinal, depth10_skipped
+            if not writes_depth10:
+                return
+            kept = [d for d in batch if _in_window(d)]
+            depth10_skipped += len(batch) - len(kept)
+            if kept:
+                depth10_ordinal = depth10_spool.insert_many(kept, start_ordinal=depth10_ordinal)
+
+        records = iter_replay_depth_records(reader.iter_depths(venue, symbol, date))
+        metrics = replay_records_to_depth_streaming(
+            records,
+            venue,
+            symbol,
+            iid,
+            price_prec,
+            size_prec,
+            on_deltas_batch=on_deltas_batch,
+            on_depth10_batch=on_depth10_batch,
+            batch_size=batch_size,
+            emit_depth10=writes_depth10,
+            depth10_interval_sec=depth10_interval_sec,
+            derived_depth_snapshot_levels=derived_depth_snapshot_levels,
+        )
+
+        deltas_written = 0
+        depth10_written = 0
+        if writes_deltas and deltas_spool.count:
+            deltas_spool.commit()
+            for spool_batch in deltas_spool.iter_batches(batch_size):
+                catalog.write_data(spool_batch)
+                deltas_written += len(spool_batch)
+        if writes_depth10 and depth10_spool.count:
+            depth10_spool.commit()
+            for spool_batch in depth10_spool.iter_batches(batch_size):
+                catalog.write_data(spool_batch)
+                depth10_written += len(spool_batch)
+
+    return metrics, deltas_written, depth10_written, deltas_skipped, depth10_skipped
 
 
 def _exchange_info_from_replay_metadata(symbol: str, metadata: Optional[dict]) -> dict[str, dict]:
@@ -141,6 +267,11 @@ def generate_catalog_from_replay(
     end: datetime,
     profile: str = "trades_only",
     overwrite: bool = False,
+    *,
+    emit_depth10: bool = EMIT_DEPTH10_DEFAULT,
+    depth10_interval_sec: float = DEPTH10_INTERVAL_SEC,
+    derived_depth_snapshot_levels: int = DERIVED_DEPTH_SNAPSHOT_LEVELS,
+    time_filter: str = "ts_init",
 ) -> dict:
     """
     Generate Nautilus catalog from replay_store.
@@ -153,7 +284,13 @@ def generate_catalog_from_replay(
         venues: List of venues to include
         start: Start datetime (UTC)
         end: End datetime (UTC)
-        profile: Catalog profile. Only 'trades_only' is currently implemented.
+        profile: Catalog profile. One of SUPPORTED_PROFILES
+            (trades_only, full_l2, depth_only, depth10).
+        overwrite: Delete and recreate the job dir if it exists.
+        emit_depth10: Whether full_l2/depth_only also emit OrderBookDepth10.
+        depth10_interval_sec: Minimum interval between derived Depth10 snapshots.
+        derived_depth_snapshot_levels: Levels per derived Depth10 snapshot (<=10).
+        time_filter: Window filter field for catalog reads ('ts_init' or 'ts_event').
 
     Returns:
         Status dict with manifest
@@ -168,7 +305,7 @@ def generate_catalog_from_replay(
         "venues_requested": venues,
         "requested_symbols": symbols,
         "requested_venues": venues,
-        "time_filter": "ts_init",
+        "time_filter": time_filter,
         "symbols_processed": [],
         "found_partitions": [],
         "missing_partitions": [],
@@ -185,8 +322,22 @@ def generate_catalog_from_replay(
         "records_skipped": {
             "outside_window": 0,
             "invalid_trade": 0,
+            "depth_outside_window": 0,
         },
         "skipped_invalid_records": 0,
+        "depth_diagnostics": {
+            "raw_depth_records_read": 0,
+            "snapshot_seeds": 0,
+            "resyncs": 0,
+            "desyncs": 0,
+            "fenced_range_count": 0,
+            "bad_lines": 0,
+            "emit_depth10": emit_depth10,
+            "depth10_interval_sec": depth10_interval_sec,
+            "derived_depth_snapshot_levels": derived_depth_snapshot_levels,
+        },
+        "fenced_ranges": [],
+        "caveats": list(FULL_L2_CAVEATS) if profile in ("full_l2", "depth_only", "depth10") else [],
         "warnings": [],
         "errors": [],
     }
@@ -197,13 +348,21 @@ def generate_catalog_from_replay(
         logger.error("Nautilus not available for catalog generation")
         return status
 
-    if profile != "trades_only":
+    if profile not in SUPPORTED_PROFILES:
         status["status"] = "failed"
         status["errors"].append(
-            "Only trades_only catalog generation is currently implemented; "
-            "depth/full_l2 generation is deferred."
+            f"Unsupported profile: {profile}. Supported: {', '.join(SUPPORTED_PROFILES)}."
         )
         return status
+
+    if time_filter not in ("ts_init", "ts_event"):
+        status["status"] = "failed"
+        status["errors"].append(
+            f"Unsupported time_filter: {time_filter}. Use 'ts_init' or 'ts_event'."
+        )
+        return status
+
+    writes_trades, writes_deltas, writes_depth10 = _profile_write_flags(profile, emit_depth10)
 
     try:
         reader = ReplayReader(replay_root)
@@ -308,44 +467,93 @@ def generate_catalog_from_replay(
                         instruments_written.add(instrument_key)
 
                     # Stream and convert trades
-                    trade_batch = []
-                    for trade in reader.iter_trades(venue, symbol, date):
-                        status["records_read"]["trades"] += 1
-                        ts_init_ns = int(trade.get("ts_receive_ns") or trade.get("ts_exchange_ns", 0))
-                        
-                        # Nautilus catalog bounded reads are based on ts_init.
-                        if ts_init_ns < start_ns:
-                            status["records_skipped"]["outside_window"] += 1
-                            continue
-                        if ts_init_ns >= end_ns:
-                            status["records_skipped"]["outside_window"] += 1
-                            continue
-                        
-                        trade_tick = _convert_trade_to_nautilus(
-                            trade, instrument_id, venue
-                        )
-                        if trade_tick:
-                            trade_batch.append(trade_tick)
-                            status["records_written"]["trade_ticks"] += 1
-                            if len(trade_batch) >= 5000:
-                                catalog.write_data(trade_batch)
-                                trade_batch = []
-                        else:
-                            status["records_skipped"]["invalid_trade"] += 1
-                            status["skipped_invalid_records"] += 1
-                    if trade_batch:
-                        catalog.write_data(trade_batch)
+                    if writes_trades:
+                        trade_batch = []
+                        for trade in reader.iter_trades(venue, symbol, date):
+                            status["records_read"]["trades"] += 1
+                            ts_init_ns = int(trade.get("ts_receive_ns") or trade.get("ts_exchange_ns", 0))
 
-                    # Depth records (deferred for full implementation)
-                    # For now, we only support trades_only profile
+                            # Nautilus catalog bounded reads are based on ts_init.
+                            if ts_init_ns < start_ns:
+                                status["records_skipped"]["outside_window"] += 1
+                                continue
+                            if ts_init_ns >= end_ns:
+                                status["records_skipped"]["outside_window"] += 1
+                                continue
+
+                            trade_tick = _convert_trade_to_nautilus(
+                                trade, instrument_id, venue
+                            )
+                            if trade_tick:
+                                trade_batch.append(trade_tick)
+                                status["records_written"]["trade_ticks"] += 1
+                                if len(trade_batch) >= 5000:
+                                    catalog.write_data(trade_batch)
+                                    trade_batch = []
+                            else:
+                                status["records_skipped"]["invalid_trade"] += 1
+                                status["skipped_invalid_records"] += 1
+                        if trade_batch:
+                            catalog.write_data(trade_batch)
+
+                    # Depth records (OrderBookDeltas / OrderBookDepth10) via the
+                    # shared, validated converter engine + replay adapter.
+                    if writes_deltas or writes_depth10:
+                        (
+                            depth_metrics,
+                            deltas_written,
+                            depth10_written,
+                            deltas_skipped,
+                            depth10_skipped,
+                        ) = _write_depth_for_partition(
+                            reader=reader,
+                            venue=venue,
+                            symbol=symbol,
+                            date=date,
+                            instrument=instrument,
+                            catalog=catalog,
+                            start_ns=start_ns,
+                            end_ns=end_ns,
+                            writes_deltas=writes_deltas,
+                            writes_depth10=writes_depth10,
+                            depth10_interval_sec=depth10_interval_sec,
+                            derived_depth_snapshot_levels=derived_depth_snapshot_levels,
+                            time_filter=time_filter,
+                        )
+                        status["records_read"]["depth"] += depth_metrics.raw_record_count
+                        status["records_written"]["order_book_deltas"] += deltas_written
+                        status["records_written"]["order_book_depth10"] += depth10_written
+                        status["records_skipped"]["depth_outside_window"] += (
+                            deltas_skipped + depth10_skipped
+                        )
+                        diag = status["depth_diagnostics"]
+                        diag["raw_depth_records_read"] += depth_metrics.raw_record_count
+                        diag["snapshot_seeds"] += depth_metrics.snapshot_seed_count
+                        diag["resyncs"] += depth_metrics.resync_count
+                        diag["desyncs"] += depth_metrics.desync_events
+                        diag["fenced_range_count"] += len(depth_metrics.fenced_ranges)
+                        diag["bad_lines"] += depth_metrics.bad_lines
+                        for fence in depth_metrics.fenced_ranges:
+                            enriched = dict(fence)
+                            enriched.setdefault("venue", venue)
+                            enriched.setdefault("symbol", symbol)
+                            enriched["date"] = date
+                            status["fenced_ranges"].append(enriched)
+
                     logger.info(
-                        f"Processed {venue}/{symbol}: "
-                        f"{status['records_written']['trade_ticks']} trades"
+                        f"Processed {venue}/{symbol}/{date}: "
+                        f"trades={status['records_written']['trade_ticks']}, "
+                        f"deltas={status['records_written']['order_book_deltas']}, "
+                        f"depth10={status['records_written']['order_book_depth10']}"
                     )
 
-        if status["records_written"]["trade_ticks"] == 0:
+        if writes_trades and status["records_written"]["trade_ticks"] == 0:
             status["warnings"].append(
                 "No TradeTick records were written for the requested venues/symbols/window."
+            )
+        if writes_deltas and status["records_written"]["order_book_deltas"] == 0:
+            status["warnings"].append(
+                "No OrderBookDeltas records were written for the requested venues/symbols/window."
             )
 
         # Write manifest
@@ -359,7 +567,7 @@ def generate_catalog_from_replay(
             "found_partitions": status["found_partitions"],
             "missing_partitions": status["missing_partitions"],
             "date_partitions_scanned": status["date_partitions_scanned"],
-            "time_filter": "ts_init",
+            "time_filter": time_filter,
             "time_window": {
                 "start": start.isoformat(),
                 "end": end.isoformat(),
@@ -370,6 +578,9 @@ def generate_catalog_from_replay(
             "skipped_invalid_records": status["skipped_invalid_records"],
             "instrument_count": len(instruments_written),
             "replay_source": str(replay_root),
+            "depth_diagnostics": status["depth_diagnostics"],
+            "fenced_ranges": status["fenced_ranges"],
+            "equivalence_caveats": status["caveats"],
             "warnings": status["warnings"],
         }
 
@@ -378,9 +589,11 @@ def generate_catalog_from_replay(
             json.dump(manifest, f, indent=2)
 
         logger.info(
-            f"✓ Catalog generated: job_id={job_id}, "
+            f"✓ Catalog generated: job_id={job_id}, profile={profile}, "
             f"symbols={len(status['symbols_processed'])}, "
-            f"trades={status['records_written']['trade_ticks']}"
+            f"trades={status['records_written']['trade_ticks']}, "
+            f"deltas={status['records_written']['order_book_deltas']}, "
+            f"depth10={status['records_written']['order_book_depth10']}"
         )
 
     except Exception as e:
@@ -452,9 +665,45 @@ Examples:
     )
     parser.add_argument(
         "--profile",
-        choices=["trades_only"],
+        choices=list(SUPPORTED_PROFILES),
         default="trades_only",
-        help="Catalog profile (default: trades_only)",
+        help=(
+            "Catalog profile (default: trades_only). "
+            "full_l2 = trades + OrderBookDeltas (+ Depth10); "
+            "depth_only = OrderBookDeltas (+ Depth10); "
+            "depth10 = OrderBookDepth10 only."
+        ),
+    )
+    parser.add_argument(
+        "--emit-depth10",
+        dest="emit_depth10",
+        action="store_true",
+        default=EMIT_DEPTH10_DEFAULT,
+        help="Emit derived OrderBookDepth10 snapshots (full_l2/depth_only). Default: on.",
+    )
+    parser.add_argument(
+        "--no-emit-depth10",
+        dest="emit_depth10",
+        action="store_false",
+        help="Do not emit derived OrderBookDepth10 snapshots (full_l2/depth_only).",
+    )
+    parser.add_argument(
+        "--depth10-interval-sec",
+        type=float,
+        default=DEPTH10_INTERVAL_SEC,
+        help=f"Minimum seconds between derived Depth10 snapshots (default: {DEPTH10_INTERVAL_SEC}).",
+    )
+    parser.add_argument(
+        "--derived-depth-snapshot-levels",
+        type=int,
+        default=DERIVED_DEPTH_SNAPSHOT_LEVELS,
+        help=f"Levels per derived Depth10 snapshot, <=10 (default: {DERIVED_DEPTH_SNAPSHOT_LEVELS}).",
+    )
+    parser.add_argument(
+        "--time-filter",
+        choices=["ts_init", "ts_event"],
+        default="ts_init",
+        help="Window filter field for catalog reads (default: ts_init).",
     )
     args = parser.parse_args()
 
@@ -500,6 +749,10 @@ Examples:
         end,
         profile=args.profile,
         overwrite=args.overwrite,
+        emit_depth10=args.emit_depth10,
+        depth10_interval_sec=args.depth10_interval_sec,
+        derived_depth_snapshot_levels=args.derived_depth_snapshot_levels,
+        time_filter=args.time_filter,
     )
 
     if result["status"] != "success":
