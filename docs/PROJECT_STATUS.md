@@ -99,5 +99,5 @@ This is a **single-symbol single-day smoke**, not a universe benchmark.
    `convert_day.py` remains the **production reference** for full order-book
    catalogs until broader top50/multi-day validation passes.
 
-See [DEPLOYMENT.md](DEPLOYMENT.md) and [LINUX_SERVER.md](LINUX_SERVER.md) for the
+See [OPERATIONS.md](OPERATIONS.md) and [OPERATIONS.md](OPERATIONS.md) for the
 service layout that runs these steps.

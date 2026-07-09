@@ -18,10 +18,9 @@ Read these, in order, before proposing or making changes:
 2. [docs/PROJECT_STATUS.md](docs/PROJECT_STATUS.md) — what is validated vs deferred.
 3. [docs/IMPLEMENTATION_AUDIT.md](docs/IMPLEMENTATION_AUDIT.md) — ground-truth of what exists.
 4. [docs/FULL_L2_REPLAY_CATALOG_PLAN.md](docs/FULL_L2_REPLAY_CATALOG_PLAN.md) — full-L2 replay path (validated on the ADAUSDT smoke; broader validation pending).
-5. [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) — how the system is deployed.
-6. [docs/LINUX_SERVER.md](docs/LINUX_SERVER.md) — dev (WSL) vs prod (Ubuntu) layout.
-7. [docs/AI_WORKFLOW.md](docs/AI_WORKFLOW.md) — the step-by-step working procedure.
-8. [CHANGELOG.md](CHANGELOG.md) — recent changes and version state.
+5. [docs/OPERATIONS.md](docs/OPERATIONS.md) — how the system is deployed and run (includes Linux server layout, deployment script, and state file schemas).
+6. [docs/AI_WORKFLOW.md](docs/AI_WORKFLOW.md) — the step-by-step working procedure.
+7. [CHANGELOG.md](CHANGELOG.md) — recent changes, version state, and versioning policy.
 
 If any of these contradict the task you were given, **stop and ask** instead of guessing.
 
@@ -45,6 +44,35 @@ If any of these contradict the task you were given, **stop and ask** instead of 
 - Do **not** describe Syncthing, archive, or import features as implemented.
   `ARCHIVE_DAYS_ROOT` and `LABEL_ROOT` in `config.py` are **placeholders only**.
 - Never mark a deferred item as done.
+
+### No New Docs Files Without Contract Amendment
+
+The docs structure is intentionally **fixed at 14 files**. Before creating any
+new file in `docs/`, you **must** identify which existing file is the right home
+for the content, add it as a new section there, and (only if no existing file
+fits) amend `docs/REPO_STRUCTURE.md` with a justification.
+
+| New content type | Write it into |
+|-----------------|---------------|
+| Status / validation changes | `docs/PROJECT_STATUS.md` |
+| Architecture / design decisions | `docs/ARCHITECTURE.md` |
+| Storage schemas / build pipeline details | `docs/ARCHITECTURE.md` |
+| Operational procedures / deployment | `docs/OPERATIONS.md` |
+| Linux server / production paths | `docs/OPERATIONS.md` |
+| State file schemas (heartbeat, startup, convert) | `docs/OPERATIONS.md` |
+| Ground-truth what exists / audit snapshot | `docs/IMPLEMENTATION_AUDIT.md` |
+| Requirements audit / storage size measurement | `docs/IMPLEMENTATION_AUDIT.md` |
+| Validation layers and CLI reference | `docs/VALIDATION.md` |
+| Feature reference (replay) | `docs/REPLAY_STORE.md` |
+| Feature reference (features) | `docs/FEATURE_STORE.md` |
+| Feature reference (catalog) | `docs/GENERATE_CATALOG.md` |
+| Feature reference (daily build) | `docs/DAILY_BUILD_PIPELINE.md` |
+| Full-L2 plan / gate status | `docs/FULL_L2_REPLAY_CATALOG_PLAN.md` |
+| Change audit entries | `docs/CHANGE_AUDIT.md` (append-only) |
+| Version history | `CHANGELOG.md` |
+
+If the agent is unsure which file to update, **stop and ask** rather than
+creating a new file.
 
 ### Folder boundaries (see docs/REPO_STRUCTURE.md)
 - Do **not** add new top-level folders without first amending
@@ -72,6 +100,9 @@ A change is **not** done until all of the following are true:
    `validation/validate_catalog_equivalence.py`) and reported the result.
 5. Status stays **honest**: validated stays validated, deferred stays deferred.
 6. You stated explicitly **what was not done** / out of scope.
+7. **A change audit entry has been written** in [docs/CHANGE_AUDIT.md](docs/CHANGE_AUDIT.md)
+   and `python -m validation.audit_change_compliance --staged` reports PASS
+   (see Section 6 below).
 
 ---
 
@@ -94,10 +125,57 @@ A change is **not** done until all of the following are true:
 - **Stop and ask** if you are uncertain about a path, a destructive action, or
   whether raw-side changes are in scope.
 - Do **not** invent production paths. The canonical prod layout lives in
-  [docs/LINUX_SERVER.md](docs/LINUX_SERVER.md); use those values, do not guess.
+  [docs/LINUX_SERVER.md](docs/OPERATIONS.md) in the `## Linux Server Layout` section of [docs/OPERATIONS.md](docs/OPERATIONS.md); use those values, do not guess.
 - Do **not** delete data directories (`data_raw/`, `replay_store/`, `feature_store/`,
   `state/`, catalog outputs).
 - Do **not** mark deferred work as done to "close" a task.
 - Prefer **small, reviewable changes** over large sweeping rewrites.
 - When in doubt about whether a folder/file is allowed, consult
   [docs/REPO_STRUCTURE.md](docs/REPO_STRUCTURE.md) first.
+
+---
+
+## 6. Mandatory change audit before commit
+
+Every non-trivial change — code, schema, pipeline, storage, deployment, feature,
+validation, or documentation-affecting — **must** include a change audit entry in
+[docs/CHANGE_AUDIT.md](docs/CHANGE_AUDIT.md) before the change is considered
+complete.
+
+### When is an audit entry required?
+
+An entry is required for **any** commit that touches:
+- Python source files (`*.py`) anywhere in the repo
+- Schema, config, or deployment files (`config.py`, `systemd/`, `requirements.txt`)
+- Documentation files if the change affects status claims, validated/deferred state,
+  or the repo structure contract
+
+An entry **may be skipped** only for:
+- Commits that exclusively fix typos or whitespace in docs (no status/claim changes)
+- The audit entry commit itself (to avoid infinite recursion)
+
+### Checklist an agent must satisfy before claiming complete
+
+No agent may claim the task is done unless **all** of the following are true:
+
+- [ ] Relevant contract docs were read (AGENTS.md, REPO_STRUCTURE.md, PROJECT_STATUS.md,
+      IMPLEMENTATION_AUDIT.md, and any relevant feature doc).
+- [ ] Affected docs were updated **or** explicitly marked "No docs update required
+      because: \<reason\>" in the audit entry.
+- [ ] `CHANGELOG.md [Unreleased]` was updated **or** explicitly justified as not
+      applicable in the audit entry.
+- [ ] `docs/PROJECT_STATUS.md` was updated if any validated/deferred status changed.
+- [ ] Tests were run and listed in the audit entry.
+- [ ] Required validation/audit CLIs were run and listed in the audit entry.
+- [ ] Out-of-scope and deferred work was explicitly stated in the audit entry.
+- [ ] No deferred feature was promoted to validated without recorded evidence.
+- [ ] `python -m validation.audit_change_compliance --staged` passes.
+
+If the agent is **unsure** whether docs, status, or changelog are required, it must
+**stop and ask** rather than guess or skip the entry.
+
+### What to do if the pre-commit hook blocks a commit
+
+Run `python -m validation.audit_change_compliance --staged` to see the full
+PASS/FAIL report with actionable messages. Fix each listed failure before
+retrying the commit.

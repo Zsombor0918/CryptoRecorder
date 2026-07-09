@@ -490,6 +490,6 @@ ls -lh /path/to/replay_store/venue=BINANCE_SPOT/symbol=BTCUSDT/date=2026-06-15/
 
 ## See Also
 
-- [STORAGE_ARCHITECTURE.md](STORAGE_ARCHITECTURE.md) — Overall pipeline
+- [ARCHITECTURE.md](ARCHITECTURE.md) — Overall pipeline
 - [FEATURE_STORE.md](FEATURE_STORE.md) — Feature calculations
 - [DAILY_BUILD_PIPELINE.md](DAILY_BUILD_PIPELINE.md) — How to build

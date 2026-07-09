@@ -556,7 +556,7 @@ sudo systemctl restart cryptorecorder-daily-build.timer
 
 ## See Also
 
-- [STORAGE_ARCHITECTURE.md](STORAGE_ARCHITECTURE.md) — Data pipeline overview
+- [ARCHITECTURE.md](ARCHITECTURE.md) — Data pipeline overview
 - [REPLAY_STORE.md](REPLAY_STORE.md) — Replay store schema
 - [FEATURE_STORE.md](FEATURE_STORE.md) — Feature calculations
 - [GENERATE_CATALOG.md](GENERATE_CATALOG.md) — On-demand catalog generation

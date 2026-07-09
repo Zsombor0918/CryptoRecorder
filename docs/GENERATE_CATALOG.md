@@ -329,7 +329,7 @@ Includes TradeTick, OrderBookDeltas, and (optionally) OrderBookDepth10.
 **Size**: Measured ADAUSDT 2026-06-12 full day ≈ **32 MiB** (order_book_deltas
 22.5 MiB + order_book_depths 6.9 MiB + trade_tick 2.6 MiB), the same size class as
 the `convert_day.py` catalog (33 MiB). See
-[STORAGE_SIZE_AUDIT.md](STORAGE_SIZE_AUDIT.md).
+[IMPLEMENTATION_AUDIT.md](IMPLEMENTATION_AUDIT.md).
 
 **Status**: Implemented. Semantically validated on the ADAUSDT single-day smoke
 against `convert_day.py`; broader top50/multi-day validation pending.
@@ -597,7 +597,7 @@ ERROR: Invalid ISO 8601 datetime: 2026-06-15 12:00:00
 
 ## See Also
 
-- [STORAGE_ARCHITECTURE.md](STORAGE_ARCHITECTURE.md) — Overall pipeline
+- [ARCHITECTURE.md](ARCHITECTURE.md) — Overall pipeline
 - [REPLAY_STORE.md](REPLAY_STORE.md) — Replay data format
 - [DAILY_BUILD_PIPELINE.md](DAILY_BUILD_PIPELINE.md) — Daily build operations
 - [test_semantic_equivalence.py](../tests/test_semantic_equivalence.py) — Validation testing

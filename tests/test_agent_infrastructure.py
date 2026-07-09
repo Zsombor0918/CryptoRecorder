@@ -48,10 +48,8 @@ REQUIRED_FILES = [
     ROOT / "VERSION",
     ROOT / "CHANGELOG.md",
     DOCS / "PROJECT_STATUS.md",
-    DOCS / "DEPLOYMENT.md",
-    DOCS / "LINUX_SERVER.md",
+    DOCS / "OPERATIONS.md",
     DOCS / "AI_WORKFLOW.md",
-    DOCS / "VERSIONING.md",
     GITHUB / "copilot-instructions.md",
     ROOT / "systemd" / "cryptorecorder.env.example",
     DEPLOY_SCRIPT,
@@ -78,8 +76,7 @@ def test_docs_readme_links_key_docs() -> None:
         "PROJECT_STATUS.md",
         "REPO_STRUCTURE.md",
         "AI_WORKFLOW.md",
-        "DEPLOYMENT.md",
-        "LINUX_SERVER.md",
+        "OPERATIONS.md",
     ):
         assert target in text, f"docs/README.md must link {target}"
 

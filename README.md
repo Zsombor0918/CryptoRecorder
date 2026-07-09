@@ -97,15 +97,12 @@ Key references:
 
 - [Project Status](docs/PROJECT_STATUS.md) — validated vs deferred.
 - [Repo Structure](docs/REPO_STRUCTURE.md) — frozen folder contract.
-- [Architecture](docs/ARCHITECTURE.md)
-- [Storage Architecture](docs/STORAGE_ARCHITECTURE.md)
-- [Replay Store](docs/REPLAY_STORE.md)
-- [Feature Store](docs/FEATURE_STORE.md)
-- [Generate Catalog](docs/GENERATE_CATALOG.md)
-- [Implementation Audit](docs/IMPLEMENTATION_AUDIT.md)
+- [Architecture](docs/ARCHITECTURE.md) — design, storage layers, guarantees.
+- [Operations](docs/OPERATIONS.md) — deployment, Linux server, state schemas.
+- [Implementation Audit](docs/IMPLEMENTATION_AUDIT.md) — ground-truth, audit history.
+- [Replay Store](docs/REPLAY_STORE.md) · [Feature Store](docs/FEATURE_STORE.md) · [Generate Catalog](docs/GENERATE_CATALOG.md)
 - [Full-L2 Replay Plan](docs/FULL_L2_REPLAY_CATALOG_PLAN.md)
-- [Operations](docs/OPERATIONS.md)
-- [Deployment](docs/DEPLOYMENT.md) · [Linux Server](docs/LINUX_SERVER.md) · [AI Workflow](docs/AI_WORKFLOW.md) · [Versioning](docs/VERSIONING.md)
+- [AI Workflow](docs/AI_WORKFLOW.md) · [Versioning Policy](CHANGELOG.md) · [Docs Index](docs/README.md)
 - [Installation](INSTALL.md)
 
 Agent rules: [AGENTS.md](AGENTS.md). Version: see [VERSION](VERSION) and [CHANGELOG.md](CHANGELOG.md).

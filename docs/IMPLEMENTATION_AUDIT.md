@@ -290,3 +290,341 @@ data_raw -> replay_store -> generate_catalog --profile full_l2
 ```
 
 Only after that should the project consider replay-store raw archival policy or broad production replacement of the old converter path.
+
+
+---
+
+## Repo Cleanup History
+
+> Content merged from the former `IMPLEMENTATION_AUDIT.md`.
+
+Date: 2026-06-16
+
+## Summary
+
+This cleanup pass keeps the repository understandable before the next full-L2
+replay milestone. It does not change recorder behavior, raw schemas, raw
+layout, raw retention, or the legacy `convert_day.py` full-L2 converter.
+
+No code files were deleted or moved in this pass. The only script cleanup was
+wording: existing script names were kept, but their scope is now explicit.
+
+## A. Core Recorder Runtime
+
+These files are the live raw recording path and should stay root-level or in
+their existing packages:
+
+- `recorder.py`
+- `phase2_depth.py`
+- `native_trades.py`
+- `storage.py`
+- `binance_universe.py`
+- `health_monitor.py`
+- `disk_monitor.py`
+- `config.py`
+- `time_utils.py`
+- `validate.py`
+
+Decision: keep. Do not alter recorder semantics during replay cleanup.
+
+## B. Legacy Full-L2 Converter
+
+This remains the validated full-L2 Nautilus catalog path:
+
+- `convert_day.py`
+- `converter/`
+- converter-focused tests such as:
+  - `tests/test_convert_day_phase2.py`
+  - `tests/test_converter_integration.py`
+  - `tests/test_depth_deterministic.py`
+  - `tests/test_trade_deterministic.py`
+  - `tests/test_staging_publish.py`
+  - `tests/test_streaming_conversion_memory.py`
+
+Decision: keep. `convert_day.py` is still the source of truth for full-L2
+catalog behavior until replay-based full-L2 is implemented and validated.
+
+## C. New Replay/Feature Pipeline
+
+Current validated v0 foundation:
+
+- `stores/`
+  - `replay_schema.py`
+  - `replay_writer.py`
+  - `replay_reader.py`
+  - `feature_schema.py`
+  - `feature_calc.py`
+  - `feature_writer.py`
+- `pipeline/`
+  - `raw_manifest.py`
+  - `build_replay_store.py`
+  - `build_feature_store.py`
+  - `generate_catalog.py`
+  - `daily_build.py`
+- `validation/`
+  - `catalog_compare.py`
+  - `audit_replay_store.py`
+  - `audit_feature_store.py`
+  - `validate_catalog_equivalence.py`
+  - `catalog_inspect.py`
+  - `phase2_report.py`
+
+Decision: keep. `generate_catalog` is currently `trades_only`; full-L2 replay
+catalog generation is deferred.
+
+## D. Operational Scripts
+
+Current scripts:
+
+- `scripts/smoke_test.py` — recorder-only smoke test.
+- `scripts/acceptance_test.py` — legacy recorder + `convert_day.py` acceptance.
+- `scripts/README.md` — script scope documentation.
+
+Decision: keep filenames to avoid operational churn. Updated wording so
+`acceptance_test.py` no longer claims to validate replay full-L2.
+
+Future optional cleanup:
+
+- Add `scripts/smoke_replay_feature.py` if a shell-level replay/feature smoke is
+  useful after the full-L2 replay milestone.
+- Add `scripts/validate_trades_only_equivalence.py` only if the CLI wrapper adds
+  value beyond `python -m validation.validate_catalog_equivalence`.
+
+## E. Tests
+
+Normal unit/integration tests live under `tests/`.
+
+Current grouping by purpose:
+
+- Recorder/raw runtime:
+  - `tests/test_native_trades_ingest.py`
+  - `tests/test_storage_rotation.py`
+  - `tests/test_writer_backpressure.py`
+  - heartbeat/universe/disk-monitor tests
+- Legacy converter:
+  - converter, depth, trade, staging, purge, and memory tests
+- Replay/feature/catalog v0:
+  - `tests/test_pipeline_validation.py`
+- Semantic equivalence guards:
+  - `tests/test_semantic_equivalence.py`
+
+Decision (updated): the `full_l2` replay path is now implemented and validated on
+the ADAUSDT single-day smoke, so the former "skipped because deferred" test was
+replaced by real synthetic + real-data equivalence tests
+(`tests/test_catalog_equivalence_full_l2.py`, the synthetic full-L2 test in
+`tests/test_catalog_equivalence.py`, and the `realdata`-gated
+`tests/test_full_l2_realdata_gate.py`). Misleading manual/TODO skip piles were
+removed. Real-data equivalence stays behind `pytest.mark.realdata`.
+
+## F. Generated, Local, Or Trash
+
+These should not be committed:
+
+- Python/tool caches:
+  - `__pycache__/`
+  - `.pytest_cache/`
+  - `.mypy_cache/`
+  - `.ruff_cache/`
+- Raw/runtime data:
+  - `data_raw/`
+  - `meta/`
+  - `state/`
+  - `*.log`
+  - `*.jsonl`
+  - `*.jsonl.zst`
+  - `*.jsonl.gz`
+- Generated replay/feature/catalog artifacts:
+  - `*.parquet`
+  - `replay_store/`
+  - `feature_store/`
+  - `catalog_jobs/`
+  - `daily_reports/`
+  - `validation_reports/`
+  - `.staging_*`
+  - `*.staging.*`
+
+Decision: update `.gitignore` for generated replay/feature/catalog outputs and
+tool caches. Generated Python/test caches were removed locally. Runtime `state/`
+files and logs were left in place to avoid deleting potentially useful local
+operator context. No source code was deleted in this pass.
+
+## Current Clean Organization
+
+Recommended root-level Python entrypoints:
+
+- `recorder.py` — raw recorder.
+- `convert_day.py` — validated full-L2 converter.
+- `config.py` — lazy configuration and roots.
+- `validate.py` — setup validation.
+
+New pipeline code remains in:
+
+- `pipeline/`
+- `stores/`
+- `validation/`
+
+Docs remain in:
+
+- `docs/`
+
+Tests remain in:
+
+- `tests/`
+
+Manual scripts remain in:
+
+- `scripts/`
+
+## Completed Cleanup Items (2026-06-17 structure stabilization)
+
+- `validators/` removed. `trade_coverage.py` moved to `converter/trade_coverage.py`.
+  `catalog_inspect.py` and `phase2_report.py` moved to `validation/`.
+- `pipeline/audit_feature_store.py`, `pipeline/audit_replay_store.py`, and
+  `pipeline/validate_catalog_equivalence.py` moved to `validation/`.
+- `tests/test_pipeline_validation.py` split into focused files:
+  `test_replay_store.py`, `test_feature_store.py`, `test_generate_catalog.py`,
+  `test_catalog_equivalence.py`.
+- `tests/test_repo_structure.py` added to enforce folder contract.
+- `docs/REPO_STRUCTURE.md` created as the binding structure contract.
+
+## Open Cleanup Items
+
+- Consider renaming `scripts/acceptance_test.py` to
+  `scripts/acceptance_legacy_converter.py` in a future low-risk PR if operators
+  are not depending on the old filename.
+
+---
+
+## Feature Store Requirements Audit
+
+> Content merged from the former `IMPLEMENTATION_AUDIT.md`.
+
+> Honest status snapshot of the v0 feature store against its intended
+> requirements. "Status" uses: **met**, **partial**, **deferred**. Evidence
+> points at code/tests/docs that back the claim. This audit does not change
+> behavior; it records where the feature store actually stands.
+
+The feature store is an **AI/selection analysis layer**, not a backtest data
+source. The validated backtest path is the Nautilus catalog (see
+[VALIDATION.md](VALIDATION.md)). Nothing here promotes the feature store to a
+catalog replacement.
+
+## Requirements
+
+| # | Requirement | Status | Evidence | Gap / Next action |
+|---|---|---|---|---|
+| 1 | Build features from `replay_store` only (no raw, no future data) | met | `pipeline/build_feature_store.py` reads `replay_store/.../depth.parquet`+`trades.parquet`; [FEATURE_STORE.md](FEATURE_STORE.md) "Inputs" | — |
+| 2 | No look-ahead leakage (no future returns/labels/MAE/MFE/slippage) | met | No label/outcome fields in `stores/feature_schema.py::FEATURE_SCHEMA_CORE_V1`; leakage rule stated in [FEATURE_STORE.md](FEATURE_STORE.md) | Keep leakage guard in code review; no automated leakage test yet |
+| 3 | Deterministic, UTC-day clamped windows | met | `--date` clamps to `[00:00:00Z, next 00:00:00Z)`; `timestamp_ns = window_end - 1ns` | — |
+| 4 | Sparse windows documented (no dense-grid guarantee) | met (by design) | ADAUSDT 2026-06-12 1m = 1,428/1,440 rows; dense counts labeled "audit references" | Dense-grid output is **deferred**, not a bug |
+| 5 | Core L1/L2 microstructure fields (spread, imbalance, notionals) | met | Schema fields `best_bid…imbalance_top50`; computed in `stores/feature_calc.py` | — |
+| 6 | Trade-flow fields (signed volume, aggressor ratios) | met | Schema `trade_count…large_trade_count`; `buyer_maker` maps to aggressor side | — |
+| 7 | Return / realized-vol / jump fields | partial | Fields exist in schema but are placeholders/simplified in v0 | Implement rolling history windows; nulls are expected for now |
+| 8 | Quality fields (gaps, crossed book, stale, latency) | partial | Schema `depth_update_count…latency_ms_p95` present | Some fields summarized only; verify population per field |
+| 9 | Advanced schema (`FEATURE_SCHEMA_ADVANCED`) | deferred | Defined in code but **not written**; `FeatureWriter` writes core v1 only | Do not rely on advanced fields until writer emits them |
+| 10 | Memory-safe for full top50 production | deferred | Builder loads one symbol/date into memory before aggregating | Streaming/windowed aggregation + RSS benchmark before scaling |
+| 11 | Auditable output (row counts, nulls, dupes, crossed books) | met | `validation/audit_feature_store.py`; null-ratio/dup/crossed-book report | — |
+| 12 | Storage footprint understood | partial | 1m parquet is tens of KiB/day for ADAUSDT (see [STORAGE_SIZE_AUDIT.md](IMPLEMENTATION_AUDIT.md)) | Multi-symbol/timeframe storage projection pending |
+
+## Summary
+
+- **Met**: input boundary, no-leakage construction, deterministic UTC-day
+  windows, core microstructure + trade-flow fields, auditability.
+- **Partial**: return/vol/jump placeholders, some quality fields, storage
+  projection.
+- **Deferred**: advanced schema emission, memory-safe streaming for the full
+  universe, dense-grid output.
+
+The feature store is **useful for validation and small runs today** and is
+explicitly **not yet proven for full top50 production**. That limitation is
+recorded here and in [FEATURE_STORE.md](FEATURE_STORE.md); it is not closed.
+
+---
+
+## Storage Size Audit
+
+> Content merged from the former `IMPLEMENTATION_AUDIT.md`.
+
+> **Scope honesty**: every number below is **measured from a single
+> venue/symbol/date** (`BINANCE_SPOT/ADAUSDT/2026-06-12`). Universe-level
+> figures are **rough extrapolations, not benchmarks**. Liquidity (and therefore
+> depth-update volume) varies by one to two orders of magnitude across the
+> universe, so do not budget production storage from this page alone — re-measure
+> on a representative symbol sample before scaling.
+
+## How to reproduce
+
+```bash
+python -m validation.audit_storage_size \
+  --venue BINANCE_SPOT --symbol ADAUSDT --date 2026-06-12 \
+  --replay-root <replay_store_root> \
+  --catalog-root <generated job_* catalog root>
+```
+
+The CLI is audit-only (it lives in `validation/`); it reads file sizes and writes
+nothing.
+
+## Measured: ADAUSDT 2026-06-12 (1 symbol, 1 UTC day)
+
+Record counts (from the replay build / catalog generation logs):
+
+| Stage | depth records | trade records | depth10 snapshots |
+|---|---:|---:|---:|
+| raw (`data_raw`) | 412,336 | 124,457 | — |
+| replay_store | 412,336 | 124,457 | — |
+| full_l2 catalog | 1,231,284 deltas | 124,457 trades | 71,341 |
+
+Note: one raw/replay depth record expands to several individual
+`OrderBookDelta` rows (one per changed price level), which is why the flattened
+delta count (1.23M) is larger than the depth-record count (412K).
+
+On-disk bytes:
+
+| Artifact | Size |
+|---|---:|
+| raw depth (`.jsonl.zst`) | 19.0 MiB |
+| raw trades (`.jsonl.zst`) | 3.5 MiB |
+| **raw total** | **~22.5 MiB** |
+| replay `depth.parquet` | 32.9 MiB |
+| replay `trades.parquet` | 6.8 MiB |
+| **replay_store total** | **~39.7 MiB** |
+| catalog `trade_tick` | 2.6 MiB |
+| catalog `order_book_deltas` | 22.5 MiB |
+| catalog `order_book_depths` (Depth10) | 6.9 MiB |
+| **full_l2 catalog total** | **~32.1 MiB** |
+
+The `convert_day.py` full-L2 catalog for the same day measured **33 MiB**, i.e.
+the replay `full_l2` catalog is the **same size class** as the validated
+reference (it carries the same TradeTick / OrderBookDeltas / Depth10 content —
+see [VALIDATION.md](VALIDATION.md) and the equivalence report under
+`validation_reports/`).
+
+Feature store (1m, same day): a sparse UTC-day file with **1,428 of 1,440**
+possible one-minute rows populated (12 empty minutes skipped). The 1m parquet is
+small (tens of KiB) relative to the L2 catalog and is not the storage driver.
+
+## Rough universe extrapolation (NOT a benchmark)
+
+ADAUSDT is a moderately liquid mid-cap. Treating it as a single sample and
+scaling linearly by symbol count gives only an order-of-magnitude estimate:
+
+| Quantity (per day) | ADAUSDT measured | × 50 (rough) |
+|---|---:|---:|
+| raw (compressed) | ~22.5 MiB | ~1.1 GiB |
+| replay_store | ~39.7 MiB | ~1.9 GiB |
+| full_l2 catalog | ~32.1 MiB | ~1.6 GiB |
+
+Caveats that make the ×50 column unreliable:
+
+- The most active majors (e.g. BTC/ETH) produce far more depth updates per day
+  than ADAUSDT; the least active symbols produce far fewer.
+- Futures (`BINANCE_USDTF`) carry a different update cadence than spot.
+- A real budget must measure a stratified sample across the liquidity spectrum,
+  not multiply one mid-cap by the symbol count.
+
+## Status
+
+- **Measured**: ADAUSDT single-day replay + full_l2 catalog footprint.
+- **Pending**: a stratified multi-symbol storage benchmark across the top50 and a
+  multi-day projection. Until that exists, production storage sizing is an open
+  question, not a settled number.

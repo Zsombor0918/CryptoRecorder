@@ -212,7 +212,43 @@ Expected:
 - the unit test suite passes
 - `convert_day.py --help` exits successfully and documents `--staging`
 
-## 7. Configuration and Environment Variables
+## 7. Activate the Git Pre-Commit Hook
+
+This repository ships a pre-commit hook in `.githooks/pre-commit` that runs the
+mandatory change-audit compliance check before every commit. It blocks the commit
+if staged changes violate the rules in `AGENTS.md` Section 6.
+
+Activate it **once per clone**:
+
+```bash
+cd "$APP_DIR"
+git config core.hooksPath .githooks
+```
+
+Verify it is wired up:
+
+```bash
+git config core.hooksPath
+# expected output: .githooks
+```
+
+To test the hook without committing:
+
+```bash
+source .venv/bin/activate
+python -m validation.audit_change_compliance --staged
+```
+
+**Bypass (exceptional use only):**
+
+```bash
+git commit --no-verify
+```
+
+Using `--no-verify` does **not** exempt you from writing the audit entry; you
+must still add it to `docs/CHANGE_AUDIT.md` before the PR is complete.
+
+## 8. Configuration and Environment Variables
 
 There is no secret config file in this repo. Operational tuning is read from
 environment variables in `config.py` and `recorder.py`.
@@ -256,7 +292,7 @@ Path caveat:
 - use the symlink layout above if the server should store large data under
   `/data/cryptorecorder`
 
-## 8. Install systemd Units Safely
+## 9. Install systemd Units Safely
 
 Do not copy the repository unit files unchanged. They still contain the
 development checkout path `/home/zsom/services/CryptoRecorder` and
@@ -302,7 +338,7 @@ systemctl cat nautilus-convert.timer
 systemctl list-timers --all nautilus-convert.timer
 ```
 
-## 9. Start Services Only When Live Recording Is Intended
+## 10. Start Services Only When Live Recording Is Intended
 
 These commands begin real server operation.
 
@@ -516,7 +552,5 @@ Placeholder for the future deployment phase:
 ## More Documentation
 
 - [docs/VALIDATION.md](docs/VALIDATION.md)
-- [docs/OPERATIONS.md](docs/OPERATIONS.md)
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
-- [docs/SCHEMAS.md](docs/SCHEMAS.md)
-- [docs/GUARANTEES.md](docs/GUARANTEES.md)
+- [docs/OPERATIONS.md](docs/OPERATIONS.md) — operations, deployment, Linux server, state schemas
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — design, storage layers, guarantees

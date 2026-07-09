@@ -22,13 +22,23 @@ CryptoRecorder. It operationalizes the rules in [../AGENTS.md](../AGENTS.md).
    matching audit/validation CLI and capture the numbers.
 6. **Update docs + changelog.** Update the affected `docs/`, `README.md` if needed,
    `PROJECT_STATUS.md` if status changed, and add a `CHANGELOG.md [Unreleased]` entry.
-7. **Keep status honest.** Do not promote deferred work to validated without recorded
+7. **Write the change audit entry.** Before commit or PR handoff, append an entry to
+   [../docs/CHANGE_AUDIT.md](CHANGE_AUDIT.md) using the required template. The entry
+   must list: docs reviewed, docs updated (or explicit "no docs impact" reasoning),
+   CHANGELOG updated (or explicit justification), status/validation impact,
+   tests run with commands, validation CLIs run with commands, and known limitations
+   or out-of-scope work. Then run `python -m validation.audit_change_compliance --staged`
+   and confirm it reports PASS. **This step is not optional.**
+8. **Keep status honest.** Do not promote deferred work to validated without recorded
    evidence. Do not claim full-L2, Syncthing, archive, or import work as done.
-8. **Report what was NOT done.** State explicitly what is out of scope or left for
+9. **Report what was NOT done.** State explicitly what is out of scope or left for
    later, and surface any uncertainty instead of guessing.
 
 ## Examples of BAD behavior (do not do these)
 
+- **Skipping the change audit entry.** Every non-trivial commit requires an entry in
+  `docs/CHANGE_AUDIT.md` and a passing `python -m validation.audit_change_compliance
+  --staged`. Claiming "done" without the audit entry violates the Definition of Done.
 - **Recreating `validators/`.** That package was removed; audit CLIs live in
   `validation/`. Re-adding `validators/` violates the frozen structure.
 - **Putting an audit CLI in `pipeline/`.** `pipeline/` is build/transform only.
@@ -42,7 +52,7 @@ CryptoRecorder. It operationalizes the rules in [../AGENTS.md](../AGENTS.md).
 - **Claiming that `full_l2` already works.** The `replay_store → full_l2` catalog path
   is deferred until validated against `convert_day.py`. Never describe it as working.
 - **Inventing a deployment path or data root.** Use the canonical values in
-  [LINUX_SERVER.md](LINUX_SERVER.md) (`APP_DIR`, `DATA_BASE`, `ENV_FILE`). Do not
+  [OPERATIONS.md](OPERATIONS.md) (`APP_DIR`, `DATA_BASE`, `ENV_FILE`). Do not
   guess production paths.
 
 When any step is unclear: **stop and ask.**

@@ -30,6 +30,10 @@ All other Python entrypoints belong in a package, not at the root.
 The `.github/` directory (e.g. `copilot-instructions.md`) is an allowed
 configuration directory; it contains no importable Python.
 
+The `.githooks/` directory contains version-controlled git hook scripts (e.g.
+`pre-commit`). It is an allowed configuration directory; it contains no
+importable Python. Activate hooks with `git config core.hooksPath .githooks`.
+
 ---
 
 ## Root-Level Packages (allowed)
@@ -85,6 +89,24 @@ are organized by subsystem:
 - Legacy converter tests remain named as-is
 
 **`docs/`** — Documentation and plans. No importable Python code here.
+The docs structure is fixed at **14 files** (see "No New Docs Files" rule below).
+
+| File | Content home |
+|------|-------------|
+| `README.md` | Navigation index and "where to update what" map |
+| `REPO_STRUCTURE.md` | This file — frozen folder contract |
+| `PROJECT_STATUS.md` | Validated vs deferred truth |
+| `AI_WORKFLOW.md` | Step-by-step agent workflow |
+| `CHANGE_AUDIT.md` | Append-only change audit log |
+| `ARCHITECTURE.md` | System design, storage layers, schemas, guarantees |
+| `OPERATIONS.md` | Operations, deployment script, Linux server, state schemas |
+| `VALIDATION.md` | Validation layer reference |
+| `IMPLEMENTATION_AUDIT.md` | Ground-truth audit, cleanup history, requirements, sizes |
+| `REPLAY_STORE.md` | Replay store feature reference |
+| `FEATURE_STORE.md` | Feature store feature reference |
+| `GENERATE_CATALOG.md` | Catalog generation reference |
+| `DAILY_BUILD_PIPELINE.md` | Daily build pipeline reference |
+| `FULL_L2_REPLAY_CATALOG_PLAN.md` | Full-L2 plan and gate status |
 
 ---
 
@@ -118,6 +140,17 @@ recorder.log
 ---
 
 ## Rules
+
+### No New Docs Files Without Contract Amendment
+
+The docs structure is intentionally **fixed at 14 files**. Before creating any
+new file in `docs/`, you **must** identify which existing file is the right home
+for the content, add it as a new section there, and (only if no existing file
+fits) amend this file (`docs/REPO_STRUCTURE.md`) with a justification.
+
+Use the table in the `docs/` package entry above to find the right file for any
+new content. If the agent is unsure which file to update, **stop and ask** rather
+than creating a new file. See also the matching rule in `AGENTS.md` Section 2.
 
 ### No New Top-Level Packages Without Contract Amendment
 
@@ -174,6 +207,7 @@ Audit and equivalence modules live in `validation/`, not `pipeline/`.
 `validation/` contains only modules that **inspect, compare, or audit**
 existing artifacts:
 
+- `audit_change_compliance.py`
 - `audit_feature_store.py`
 - `audit_replay_store.py`
 - `audit_storage_size.py`
@@ -214,6 +248,12 @@ python -m validation.audit_feature_store --date YYYY-MM-DD [OPTIONS]
 
 # Audit replay store partitions
 python -m validation.audit_replay_store --date YYYY-MM-DD [OPTIONS]
+
+# Check change-audit compliance (pre-commit hook mode)
+python -m validation.audit_change_compliance --staged
+
+# Check change-audit compliance vs a base branch
+python -m validation.audit_change_compliance --base main
 
 # Compare old convert_day catalog vs new replay catalog
 python -m validation.validate_catalog_equivalence --date YYYY-MM-DD [OPTIONS]
@@ -270,3 +310,5 @@ replay_store -> generate_catalog --profile full_l2
 |---|---|
 | 2026-06-17 | Initial structure contract created; `validators/` removed, `converter/trade_coverage.py` added; audit CLIs moved from `pipeline/` to `validation/` |
 | 2026-06-17 | Added AI/deployment infrastructure: root files `AGENTS.md`, `VERSION`, `CHANGELOG.md`; `.github/copilot-instructions.md`; deployment/status docs; per-service systemd units; `scripts/deploy_linux_server.sh`; `tests/test_agent_infrastructure.py` |
+| 2026-07-09 | Added mandatory change-audit infrastructure: `docs/CHANGE_AUDIT.md`; `validation/audit_change_compliance.py`; `.githooks/pre-commit`; AGENTS.md Section 6; AI_WORKFLOW.md Step 7 |
+| 2026-07-09 | Docs structure consolidation: merged 9 small docs into ARCHITECTURE.md, OPERATIONS.md, IMPLEMENTATION_AUDIT.md, and CHANGELOG.md; fixed docs/ at 14 files; added "No New Docs" rules in AGENTS.md and REPO_STRUCTURE.md |
