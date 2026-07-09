@@ -63,6 +63,12 @@ full-L2 catalog generation from the replay store stays **deferred** (see
 ## [Unreleased]
 
 ### Added
+- `.githooks/commit-msg` — conventional commits enforcement hook. Blocks commits
+  whose message does not match `<type>(<scope>): <subject>` where type is one of
+  `feat|fix|docs|style|refactor|perf|test|chore`, subject starts lowercase, and
+  subject has no trailing period. Blank-line-before-body is also enforced.
+- `AGENTS.md` Section 7 "Commit message style" — full format reference, type table,
+  subject rules, valid/invalid examples, and bypass guidance.
 - Docs structure consolidation: merged 9 small docs into 4 comprehensive files
   (all content preserved). `ARCHITECTURE.md` absorbs `STORAGE_ARCHITECTURE.md`
   and `GUARANTEES.md`; `OPERATIONS.md` absorbs `DEPLOYMENT.md`, `LINUX_SERVER.md`,

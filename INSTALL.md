@@ -232,6 +232,12 @@ git config core.hooksPath
 # expected output: .githooks
 ```
 
+Both hooks are active once `.githooks` is the hooks path:
+- **`pre-commit`** — runs `python -m validation.audit_change_compliance --staged`
+  before every commit and blocks on failure.
+- **`commit-msg`** — validates the commit message format:
+  `<type>(<scope>): <subject>` (conventional commits; see `AGENTS.md` Section 7).
+
 To test the hook without committing:
 
 ```bash

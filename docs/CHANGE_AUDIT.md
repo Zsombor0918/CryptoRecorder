@@ -190,6 +190,72 @@ status claims are honest.
 
 ---
 
+## 2026-07-09 — Conventional commits enforcement (commit-msg hook + AGENTS.md Section 7)
+
+### Change summary
+- Created `.githooks/commit-msg` — bash hook that validates every commit message
+  against the conventional commits format before the commit is accepted.
+  Enforces: correct type, no capital first letter, no trailing period, blank line
+  before body. Skips auto-generated messages (Merge, Revert, fixup!, squash!).
+- Added `AGENTS.md` Section 7 "Commit message style" with full format reference,
+  type table, subject rules, valid/invalid examples, and bypass guidance.
+- Updated `docs/AI_WORKFLOW.md` Step 7 to include commit message format requirement.
+- Added a new "bad behavior" example for malformed commit messages.
+- Fixed workflow heading: "The 8-step workflow" → "The 9-step workflow".
+- Updated `docs/REPO_STRUCTURE.md`: expanded `.githooks/` description to list both hooks.
+- Updated `INSTALL.md` Section 7 to describe both hooks.
+- Updated `docs/REPO_STRUCTURE.md` amendment log.
+
+### Files/packages touched
+- .githooks/commit-msg (new)
+- AGENTS.md
+- docs/AI_WORKFLOW.md
+- docs/REPO_STRUCTURE.md
+- INSTALL.md
+- docs/CHANGE_AUDIT.md (this entry)
+- CHANGELOG.md
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] docs/REPO_STRUCTURE.md
+- [x] docs/PROJECT_STATUS.md
+- [x] docs/IMPLEMENTATION_AUDIT.md
+- [ ] relevant feature docs:
+  - none applicable — infrastructure only
+
+### Docs updated
+- [x] CHANGELOG.md
+- [ ] README.md — no change needed
+- [ ] docs/PROJECT_STATUS.md — no status change
+- [x] docs/REPO_STRUCTURE.md — .githooks/ description + amendment log
+- [ ] relevant feature docs:
+  - none applicable
+
+### Status / validation impact
+- Validated status changed: no
+- Deferred status changed: no
+- New claims added: no
+- Evidence for any new validation claim:
+  - n/a
+
+### Tests run
+```bash
+pytest tests/test_agent_infrastructure.py tests/test_repo_structure.py -q
+# 37 passed
+```
+
+### Validation CLIs run
+```bash
+python -m validation.audit_change_compliance --staged
+```
+
+### Known limitations / out of scope
+- The hook cannot verify imperative tense ("add" vs "adding") — that is documented
+  but not mechanically checked.
+- No changes to recorder, stores, pipeline, converter, or validation Python code.
+
+---
+
 ## 2026-07-09 — Docs structure consolidation (14-file fixed structure)
 
 ### Change summary

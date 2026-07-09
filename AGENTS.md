@@ -179,3 +179,91 @@ If the agent is **unsure** whether docs, status, or changelog are required, it m
 Run `python -m validation.audit_change_compliance --staged` to see the full
 PASS/FAIL report with actionable messages. Fix each listed failure before
 retrying the commit.
+
+---
+
+## 7. Commit message style
+
+Every commit must follow **conventional commits** format. The `.githooks/commit-msg`
+hook enforces this automatically and blocks non-conforming commits.
+
+### Format
+
+```
+<type>(<scope>): <subject>
+
+<body>
+
+<footer>
+```
+
+### Fields
+
+| Field | Required | Rules |
+|-------|----------|-------|
+| `type` | **mandatory** | one of the 8 types below; lowercase |
+| `scope` | recommended | in parentheses; indicates affected area, e.g. `(stores)`, `(pipeline)` |
+| `subject` | **mandatory** | imperative present tense; **no capital first letter**; **no trailing dot** |
+| `body` | optional | explains motivation and contrasts with previous behavior; separated from subject by a blank line |
+| `footer` | optional | breaking changes, issue references |
+
+### Allowed types
+
+| Type | When to use |
+|------|-------------|
+| `feat` | new feature for the user |
+| `fix` | bug fix relevant to the user |
+| `docs` | documentation changes only |
+| `style` | formatting, whitespace, missing semicolons (no logic change) |
+| `refactor` | neither fixes a bug nor adds a feature |
+| `perf` | performance improvement |
+| `test` | changes to tests only |
+| `chore` | build process, hooks, auxiliary tools, not relevant to users |
+
+### Subject rules
+
+- Use **imperative, present tense**: write `add` not `added` or `adds`
+- **Do not** capitalize the first letter: `add adapter` not `Add adapter`
+- **Do not** end with a period: `add adapter` not `add adapter.`
+
+### Footer examples
+
+```
+Closes #313
+BREAKING CHANGE: replay schema v1 removed; migrate with migration/replay_v0_to_v1.py
+```
+
+### Valid examples
+
+```
+feat(stores): add replay depth adapter
+fix(pipeline): correct date parsing for yesterday flag
+docs: update AI_WORKFLOW step numbering
+chore(.githooks): add commit-msg style enforcement hook
+test(catalog): add synthetic full-l2 equivalence case
+refactor(converter): extract book state into separate module
+```
+
+### Invalid examples (hook will block)
+
+```
+Add replay depth adapter          ← missing type
+feat: Add replay depth adapter    ← capital first letter in subject
+feat(stores): add adapter.        ← trailing period
+feat(stores): add adapter
+no blank line here                ← body requires blank separator line
+```
+
+### What to do if the commit-msg hook blocks a commit
+
+Read the error message — it states exactly which rule was violated and shows an
+example of the correct format. Fix the commit message with `git commit --amend`
+or re-run `git commit` with the corrected message.
+
+To bypass in genuinely exceptional circumstances:
+
+```bash
+git commit --no-verify
+```
+
+`--no-verify` does **not** exempt you from the audit-entry requirement in Section 6.

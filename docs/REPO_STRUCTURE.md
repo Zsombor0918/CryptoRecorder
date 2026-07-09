@@ -30,9 +30,12 @@ All other Python entrypoints belong in a package, not at the root.
 The `.github/` directory (e.g. `copilot-instructions.md`) is an allowed
 configuration directory; it contains no importable Python.
 
-The `.githooks/` directory contains version-controlled git hook scripts (e.g.
-`pre-commit`). It is an allowed configuration directory; it contains no
-importable Python. Activate hooks with `git config core.hooksPath .githooks`.
+The `.githooks/` directory contains version-controlled git hook scripts:
+- `pre-commit` — runs change-audit compliance check before every commit.
+- `commit-msg` — validates commit message format (conventional commits style).
+
+It is an allowed configuration directory; it contains no importable Python.
+Activate hooks with `git config core.hooksPath .githooks`.
 
 ---
 
@@ -312,3 +315,4 @@ replay_store -> generate_catalog --profile full_l2
 | 2026-06-17 | Added AI/deployment infrastructure: root files `AGENTS.md`, `VERSION`, `CHANGELOG.md`; `.github/copilot-instructions.md`; deployment/status docs; per-service systemd units; `scripts/deploy_linux_server.sh`; `tests/test_agent_infrastructure.py` |
 | 2026-07-09 | Added mandatory change-audit infrastructure: `docs/CHANGE_AUDIT.md`; `validation/audit_change_compliance.py`; `.githooks/pre-commit`; AGENTS.md Section 6; AI_WORKFLOW.md Step 7 |
 | 2026-07-09 | Docs structure consolidation: merged 9 small docs into ARCHITECTURE.md, OPERATIONS.md, IMPLEMENTATION_AUDIT.md, and CHANGELOG.md; fixed docs/ at 14 files; added "No New Docs" rules in AGENTS.md and REPO_STRUCTURE.md |
+| 2026-07-09 | Added `.githooks/commit-msg` — conventional commits enforcement hook; AGENTS.md Section 7 commit style rules |

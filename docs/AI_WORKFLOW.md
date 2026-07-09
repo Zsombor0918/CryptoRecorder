@@ -3,7 +3,7 @@
 This is the step-by-step procedure an AI agent must follow when working in
 CryptoRecorder. It operationalizes the rules in [../AGENTS.md](../AGENTS.md).
 
-## The 8-step workflow
+## The 9-step workflow
 
 1. **Read the contract.** Read [REPO_STRUCTURE.md](REPO_STRUCTURE.md),
    [PROJECT_STATUS.md](PROJECT_STATUS.md), and the relevant feature doc before
@@ -29,6 +29,10 @@ CryptoRecorder. It operationalizes the rules in [../AGENTS.md](../AGENTS.md).
    tests run with commands, validation CLIs run with commands, and known limitations
    or out-of-scope work. Then run `python -m validation.audit_change_compliance --staged`
    and confirm it reports PASS. **This step is not optional.**
+   Then write the commit message following the **conventional commits** format
+   (see [AGENTS.md](../AGENTS.md) Section 7): `<type>(<scope>): <subject>` with
+   imperative lowercase subject, blank line before body, and no trailing period.
+   The `.githooks/commit-msg` hook enforces this and will block a malformed message.
 8. **Keep status honest.** Do not promote deferred work to validated without recorded
    evidence. Do not claim full-L2, Syncthing, archive, or import work as done.
 9. **Report what was NOT done.** State explicitly what is out of scope or left for
@@ -39,6 +43,10 @@ CryptoRecorder. It operationalizes the rules in [../AGENTS.md](../AGENTS.md).
 - **Skipping the change audit entry.** Every non-trivial commit requires an entry in
   `docs/CHANGE_AUDIT.md` and a passing `python -m validation.audit_change_compliance
   --staged`. Claiming "done" without the audit entry violates the Definition of Done.
+- **Writing a non-conforming commit message.** Messages must follow
+  `<type>(<scope>): <subject>` with a lowercase subject and no trailing period.
+  The `.githooks/commit-msg` hook blocks commits that don't conform. Fix with
+  `git commit --amend`. See AGENTS.md Section 7 for the full reference.
 - **Recreating `validators/`.** That package was removed; audit CLIs live in
   `validation/`. Re-adding `validators/` violates the frozen structure.
 - **Putting an audit CLI in `pipeline/`.** `pipeline/` is build/transform only.
