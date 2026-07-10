@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# .githooks/pre-commit
+#
+# Mandatory change-audit compliance check.
+# Runs before every commit and blocks if staged changes violate the audit rules
+# defined in AGENTS.md Section 6 and docs/CHANGE_AUDIT.md.
+#
+# Activation (one-time per clone):
+#   git config core.hooksPath .githooks
+#
+# To bypass in exceptional circumstances (document why in the commit message):
+#   git commit --no-verify
+#   # Note: --no-verify does NOT exempt you from writing the audit entry later.
+
+set -euo pipefail
+
+# Locate the repo root (the directory containing this hooks folder).
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT"
+
+# Locate a Python interpreter: prefer the project venv, fall back to system.
+PYTHON=""
+if [ -x "$REPO_ROOT/.venv/bin/python" ]; then
+    PYTHON="$REPO_ROOT/.venv/bin/python"
+elif command -v python3 &>/dev/null; then
+    PYTHON="python3"
+elif command -v python &>/dev/null; then
+    PYTHON="python"
+fi
+
+if [ -z "$PYTHON" ]; then
+    echo "pre-commit: ERROR: no Python interpreter found." >&2
+    echo "  Activate the project venv first:  source .venv/bin/activate" >&2
+    exit 1
+fi
+
+echo ""
+echo "pre-commit: running change-audit compliance check …"
+echo ""
+
+# Run the compliance CLI in --staged mode.
+# Exit code 0 = PASS, 1 = FAIL, 2 = git/config error.
+if ! "$PYTHON" -m validation.audit_change_compliance --staged; then
+    echo ""
+    echo "pre-commit: BLOCKED — fix the failures listed above, then retry." >&2
+    echo "  Quick reference: python -m validation.audit_change_compliance --staged" >&2
+    echo "  Audit log: docs/CHANGE_AUDIT.md" >&2
+    echo "  Rules:     AGENTS.md Section 6" >&2
+    echo ""
+    exit 1
+fi
+
+exit 0

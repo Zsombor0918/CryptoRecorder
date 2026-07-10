@@ -1,0 +1,29 @@
+[Unit]
+Description=CryptoRecorder Recorder (Binance spot + USDT-M futures ingestion)
+Documentation=file:///home/zsom/services/CryptoRecorder/docs/LINUX_SERVER.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=zsom
+Group=zsom
+WorkingDirectory=/home/zsom/services/CryptoRecorder
+EnvironmentFile=-/etc/cryptorecorder/cryptorecorder.env
+ExecStart=/home/zsom/services/CryptoRecorder/.venv/bin/python recorder.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cryptorecorder-recorder
+
+# Resource limits
+MemoryMax=8G
+CPUQuota=50%
+
+# Security
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

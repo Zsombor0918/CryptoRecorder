@@ -1,102 +1,122 @@
 # CryptoRecorder
 
-CryptoRecorder is a Phase 1 Binance market-data pipeline for backtesting.
+CryptoRecorder records native Binance spot and USDT-M futures market data for
+deterministic Nautilus Trader backtesting.
 
-**Phase 1 Target:** 50 spot instruments with trades + approximate L2 depth,
-converted to a Nautilus-queryable `ParquetDataCatalog`.
+The repo currently has these catalog-related paths:
+
+```text
+data_raw -> convert_day.py -> Nautilus full-L2 catalog
+  production reference full-L2 path
+
+data_raw -> replay_store -> feature_store
+data_raw -> replay_store -> generate_catalog --profile trades_only
+  validated v0 replay/feature foundation
+
+data_raw -> replay_store -> generate_catalog --profile full_l2
+  implemented; semantically validated on the ADAUSDT single-day smoke
+  vs convert_day.py (trades + OrderBookDeltas + OrderBookDepth10 + checkpoints)
+```
+
+The `full_l2` replay path reuses the old converter's shared depth engine. It
+passes the ADAUSDT single-day smoke against `convert_day.py`, but **broader
+top50/multi-day validation is still pending** — that wider validation is the
+`v2.0.0` gate, and `v2.0.0` is not declared. `convert_day.py` remains the
+production reference for full-L2 Nautilus catalogs.
 
 ## Quick Start
 
 ```bash
-# 1. Clone and setup
-git clone <repo>
-cd CryptoRecorder
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 
-# 2. Validate setup
 python validate.py
+pytest
+```
 
-# 3. Run unit tests
-pytest tests/
+Run the recorder:
 
-# 4. Start the recorder
+```bash
 python recorder.py
 ```
 
-## Project Structure
-
-```
-CryptoRecorder/
-├── recorder.py          # Main recorder (starts here)
-├── convert_day.py       # Convert raw data to Nautilus catalog
-├── validate.py          # Setup validation (run on new machine)
-│
-├── converter/           # Conversion logic
-│   ├── book.py          # L2 book reconstruction
-│   ├── trades.py        # Trade conversion
-│   └── instruments.py   # Instrument building
-│
-├── tests/               # Unit tests (run with pytest)
-│   ├── test_bookbuilder.py
-│   ├── test_depth_reconstruction_phase1.py
-│   └── ...
-│
-├── scripts/             # Operational scripts
-│   ├── smoke_test.py    # Quick 3-min recorder test
-│   └── acceptance_test.py # Full pipeline test
-│
-├── docs/                # Documentation
-│   ├── ARCHITECTURE.md  # System design
-│   ├── VALIDATION.md    # Testing/validation details
-│   └── GUARANTEES.md    # What Phase 1 guarantees
-│
-├── data_raw/            # Raw recorded data (gitignored)
-├── state/               # Runtime state files
-└── meta/                # Metadata storage
-```
-
-## Testing & Validation
-
-| What | Command | When |
-|------|---------|------|
-| Setup validation | `python validate.py` | After cloning/setup |
-| Unit tests | `pytest tests/` | After code changes |
-| Smoke test | `python scripts/smoke_test.py` | Verify recorder works |
-| Full acceptance | `python scripts/acceptance_test.py` | Release readiness |
-
-## Conversion
-
-Convert recorded data to Nautilus catalog:
+Convert one UTC day with the validated full-L2 converter:
 
 ```bash
-python convert_day.py --date 2026-04-20
+python convert_day.py --date 2026-06-12 --staging
 ```
 
-This produces:
-- `TradeTick` objects from raw trades
-- `OrderBookDepth10` snapshots from L2 deltas
-- `CurrencyPair` / `CryptoPerpetual` instruments
+Build the replay/feature v0 path with explicit temp roots:
 
-## Phase 1 Scope
+```bash
+python -m pipeline.build_replay_store \
+  --date 2026-06-12 \
+  --symbols ADAUSDT \
+  --data-root ./data_raw \
+  --replay-root /tmp/replay_store
 
-**What it does:**
-- Records trades + L2 deltas via cryptofeed
-- Converts to Nautilus-native format
-- Ensures no crossed-book snapshots in catalog
-- Tracks data quality metrics
+python -m pipeline.build_feature_store \
+  --date 2026-06-12 \
+  --symbols ADAUSDT \
+  --replay-root /tmp/replay_store \
+  --feature-root /tmp/feature_store
 
-**What it doesn't do:**
-- Deterministic Binance U/u/pu replay
-- Bit-exact order book reconstruction
-- REST depth polling (causes rate limits)
+python -m pipeline.generate_catalog \
+  --input /tmp/replay_store \
+  --symbols ADAUSDT \
+  --venues BINANCE_SPOT \
+  --date 2026-06-12 \
+  --profile trades_only \
+  --output /tmp/catalog_jobs \
+  --job-id validation_trades \
+  --overwrite
+```
 
-See [docs/GUARANTEES.md](docs/GUARANTEES.md) for full details.
+## Main Components
+
+| Path | Purpose |
+| --- | --- |
+| `recorder.py` | Main raw recorder entrypoint |
+| `phase2_depth.py` | Native Binance depth recorder |
+| `native_trades.py` | Native Binance trade recorder |
+| `storage.py` | Hourly JSONL(.zst) raw writer |
+| `convert_day.py` | Validated raw -> Nautilus full-L2 converter |
+| `converter/` | Legacy converter implementation |
+| `stores/` | Replay and feature Parquet schemas/readers/writers |
+| `pipeline/` | Replay, feature, and catalog build/transform CLIs |
+| `validation/` | Audit, equivalence check, and catalog inspection CLIs |
+| `scripts/` | Manual recorder and legacy-converter smoke scripts |
+| `docs/` | Detailed documentation |
 
 ## Documentation
 
-- [Architecture](docs/ARCHITECTURE.md) — System design and pipeline
-- [Validation](docs/VALIDATION.md) — Testing layers and checks
-- [Guarantees](docs/GUARANTEES.md) — Phase 1 scope boundaries
-- [Installation](INSTALL.md) — Detailed setup guide
+Start with [docs/README.md](docs/README.md).
+
+Key references:
+
+- [Project Status](docs/PROJECT_STATUS.md) — validated vs deferred.
+- [Repo Structure](docs/REPO_STRUCTURE.md) — frozen folder contract.
+- [Architecture](docs/ARCHITECTURE.md) — design, storage layers, guarantees.
+- [Operations](docs/OPERATIONS.md) — deployment, Linux server, state schemas.
+- [Implementation Audit](docs/IMPLEMENTATION_AUDIT.md) — ground-truth, audit history.
+- [Replay Store](docs/REPLAY_STORE.md) · [Feature Store](docs/FEATURE_STORE.md) · [Generate Catalog](docs/GENERATE_CATALOG.md)
+- [Full-L2 Replay Plan](docs/FULL_L2_REPLAY_CATALOG_PLAN.md)
+- [AI Workflow](docs/AI_WORKFLOW.md) · [Versioning Policy](CHANGELOG.md) · [Docs Index](docs/README.md)
+- [Installation](INSTALL.md)
+
+Agent rules: [AGENTS.md](AGENTS.md). Version: see [VERSION](VERSION) and [CHANGELOG.md](CHANGELOG.md).
+
+## Current Guarantees
+
+- Raw recorder behavior and raw layout are unchanged.
+- `convert_day.py` remains the validated full-L2 Nautilus converter.
+- Replay store preserves exact price/quantity strings and depth continuity
+  fields needed for future full-L2 reconstruction.
+- Feature store is UTC-day clamped and sparse.
+- `generate_catalog --profile trades_only` can be validated against the old
+  converter for TradeTick semantic equality.
+- Replay-based `generate_catalog --profile full_l2` is implemented and
+  semantically validated on the ADAUSDT single-day smoke against `convert_day.py`
+  (trades, OrderBookDeltas, OrderBookDepth10, and book checkpoints all match).
+  Broader top50/multi-day validation is pending before `v2.0.0`.

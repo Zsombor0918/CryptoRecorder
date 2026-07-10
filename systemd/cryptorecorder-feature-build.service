@@ -1,0 +1,27 @@
+[Unit]
+Description=CryptoRecorder Feature Store Build (previous UTC day)
+Documentation=file:///home/zsom/services/CryptoRecorder/docs/FEATURE_STORE.md
+After=network.target cryptorecorder-replay-build.service
+
+[Service]
+Type=oneshot
+User=zsom
+Group=zsom
+WorkingDirectory=/home/zsom/services/CryptoRecorder
+EnvironmentFile=-/etc/cryptorecorder/cryptorecorder.env
+# build_feature_store requires an explicit YYYY-MM-DD date; daily_build resolves
+# 'yesterday' to the previous completed UTC day and runs the features step only.
+ExecStart=/home/zsom/services/CryptoRecorder/.venv/bin/python -m pipeline.daily_build --steps features --date yesterday
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cryptorecorder-feature-build
+
+Restart=on-failure
+RestartSec=300
+TimeoutStartSec=3600
+
+# Security hardening
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

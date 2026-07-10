@@ -28,7 +28,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -101,7 +101,7 @@ def run_smoke_test(runtime_sec: int = DEFAULT_RUNTIME_SEC) -> Dict[str, Any]:
     # Run checks
     checks = [
         ("No rate limit errors", _check_no_rate_limit(log)),
-        ("No callback errors", _check_no_callback_errors(log)),
+        ("No WS errors", _check_no_ws_errors(log)),
         ("Raw files created", _check_raw_files_created(t0)),
         ("Heartbeat exists", _check_heartbeat()),
         ("Clean shutdown", _check_clean_shutdown(log, proc.returncode)),
@@ -144,10 +144,11 @@ def _check_no_rate_limit(log: str) -> tuple[bool, str]:
     return True, ""
 
 
-def _check_no_callback_errors(log: str) -> tuple[bool, str]:
-    hits = len(re.findall(r"Error in on_l2_book|Error in on_trade", log, re.I))
+def _check_no_ws_errors(log: str) -> tuple[bool, str]:
+    """Check for WebSocket connection errors (not transient reconnects)."""
+    hits = len(re.findall(r"WebSocket.*fatal|unrecoverable.*error", log, re.I))
     if hits:
-        return False, f"{hits} callback errors"
+        return False, f"{hits} WS errors"
     return True, ""
 
 
@@ -162,7 +163,9 @@ def _check_raw_files_created(t0: float) -> tuple[bool, str]:
 
     if not files:
         return False, "No files created"
-    return True, f"{len(files)} files"
+    depth_files = [f for f in files if "/depth_v2/" in str(f)]
+    trade_files = [f for f in files if "/trade_v2/" in str(f)]
+    return True, f"{len(files)} files ({len(depth_files)} depth_v2, {len(trade_files)} trade_v2)"
 
 
 def _check_heartbeat() -> tuple[bool, str]:
@@ -173,13 +176,13 @@ def _check_heartbeat() -> tuple[bool, str]:
         d = json.loads(hb.read_text())
         msgs = d.get("total_messages", 0)
         syms = d.get("total_symbols", 0)
-        return True, f"{msgs} messages, {syms} symbols"
+        arch = d.get("architecture", "unknown")
+        return True, f"{msgs} messages, {syms} symbols, arch={arch}"
     except Exception as e:
         return False, str(e)
 
 
 def _check_clean_shutdown(log: str, returncode: int) -> tuple[bool, str]:
-    # Check for async issues
     issues = []
     if re.search(r"watchdog fired", log, re.I):
         issues.append("watchdog fired")

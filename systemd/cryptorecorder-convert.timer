@@ -1,0 +1,15 @@
+[Unit]
+Description=CryptoRecorder Legacy Converter Timer (daily, 00:10 UTC)
+
+[Timer]
+# Run after the previous UTC day has fully closed.
+OnCalendar=*-*-* 00:10:00 UTC
+Timezone=UTC
+Unit=cryptorecorder-convert.service
+
+# If the system was off at 00:10 UTC, run as soon as possible after boot.
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

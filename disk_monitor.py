@@ -258,20 +258,21 @@ class DiskMonitor:
         """
         usage = await self.check_disk_usage()
         
-        if usage["total_gb"] <= self.soft_limit_gb:
+        raw_gb = usage["data_raw_gb"]
+        if raw_gb <= self.soft_limit_gb:
             logger.debug("Disk usage within limits, no cleanup needed")
             return False
         
         logger.info(
-            f"Disk usage {usage['total_gb']}GB > soft limit {self.soft_limit_gb}GB, "
-            f"cleaning up oldest data..."
+            f"Raw data usage {raw_gb}GB > soft limit {self.soft_limit_gb}GB "
+            f"(total tracked: {usage['total_gb']}GB), cleaning up oldest raw data..."
         )
         
         # Delete oldest date directories until we hit cleanup target
         deleted_count = 0
         max_attempts = 10
         
-        while usage["total_gb"] > self.cleanup_target_gb and deleted_count < max_attempts:
+        while usage["data_raw_gb"] > self.cleanup_target_gb and deleted_count < max_attempts:
             oldest_dir = await self.get_oldest_date_dir()
             
             if not oldest_dir:
@@ -297,14 +298,18 @@ class DiskMonitor:
                 
                 # Re-check usage
                 usage = await self.check_disk_usage()
-                logger.info(f"After cleanup: {usage['total_gb']}GB")
+                logger.info(
+                    f"After cleanup: raw={usage['data_raw_gb']}GB, "
+                    f"total={usage['total_gb']}GB"
+                )
             except Exception as e:
                 logger.error(f"Error deleting {oldest_dir}: {e}")
                 break
         
         logger.info(
             f"Cleanup complete: deleted {deleted_count} date directories, "
-            f"current size: {usage['total_gb']}GB"
+            f"current raw size: {usage['data_raw_gb']}GB, "
+            f"current total tracked size: {usage['total_gb']}GB"
         )
         
         return deleted_count > 0
@@ -320,8 +325,8 @@ class DiskMonitor:
                 usage = await self.check_disk_usage()
                 await self.write_usage_report(usage)
                 
-                # Cleanup if needed
-                if usage["total_gb"] > self.soft_limit_gb:
+                # Cleanup raw data only when raw storage exceeds the limit.
+                if usage["data_raw_gb"] > self.soft_limit_gb:
                     await self.cleanup_old_data()
                 
             except Exception as e:

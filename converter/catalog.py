@@ -53,7 +53,7 @@ def purge_catalog_date_range(
 ) -> int:
     """Delete Parquet files that overlap the target date only.
 
-    - For ``trade_tick/`` and ``order_book_depths/``: delete files whose
+    - For ``trade_tick/``, ``order_book_deltas/`` and ``order_book_depths/``: delete files whose
       ``[start_date, end_date]`` overlaps ``target_date``.
     - For ``currency_pair/`` and ``crypto_perpetual/``: delete metadata
       parquets for the given instruments (cheap to regenerate, timestamps
@@ -73,7 +73,7 @@ def purge_catalog_date_range(
     iid_strs = {str(iid) for iid in instrument_ids}
 
     # ── data files (date-scoped) ─────────────────────────────────────
-    for subdir in ("trade_tick", "order_book_depths"):
+    for subdir in ("trade_tick", "order_book_deltas", "order_book_depths"):
         type_dir = data_dir / subdir
         if not type_dir.exists():
             continue
@@ -135,7 +135,7 @@ def purge_catalog_data(catalog_root: Path, instruments) -> int:
 
     purged = 0
     iid_strs = {str(inst.id) for inst in instruments}
-    for subdir in ("trade_tick", "order_book_depths"):
+    for subdir in ("trade_tick", "order_book_deltas", "order_book_depths"):
         type_dir = data_dir / subdir
         if not type_dir.exists():
             continue

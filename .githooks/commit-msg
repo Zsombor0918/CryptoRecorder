@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+# .githooks/commit-msg
+#
+# Validates that the commit message follows the conventional commits style
+# defined in AGENTS.md Section 7.
+#
+# Required format:
+#   <type>(<scope>): <subject>
+#
+#   <body>
+#
+#   <footer>
+#
+# Where:
+#   type    — mandatory: feat|fix|docs|style|refactor|perf|test|chore
+#   scope   — optional: indicates the affected area, e.g. (stores) or (pipeline)
+#   subject — mandatory: imperative present tense; no capital first letter; no trailing dot
+#   body    — optional: motivation and contrast; separated from subject by a blank line
+#   footer  — optional: breaking changes, issue refs (Closes #123, BREAKING CHANGE: ...)
+#
+# Activation (one-time per clone):
+#   git config core.hooksPath .githooks
+#
+# Bypass in exceptional circumstances (document why in the commit message):
+#   git commit --no-verify
+#   Note: --no-verify does NOT exempt the commit from audit-entry requirements.
+
+set -uo pipefail
+
+COMMIT_MSG_FILE="$1"
+
+# ---------------------------------------------------------------------------
+# Read the first non-comment, non-empty line as the header
+# ---------------------------------------------------------------------------
+HEADER=""
+while IFS= read -r line; do
+    line="${line%$'\r'}"          # strip Windows carriage return
+    [[ "$line" =~ ^# ]] && continue
+    [[ -z "$line" ]] && continue
+    HEADER="$line"
+    break
+done < "$COMMIT_MSG_FILE"
+
+if [[ -z "$HEADER" ]]; then
+    echo "" >&2
+    echo "commit-msg: ERROR: commit message is empty." >&2
+    echo "" >&2
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Skip automatically generated commit messages
+# ---------------------------------------------------------------------------
+if [[ "$HEADER" =~ ^(Merge\ |Revert\ |fixup\!|squash\!) ]]; then
+    exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Validate header format: type(scope): subject
+# ---------------------------------------------------------------------------
+VALID_TYPES="feat|fix|docs|style|refactor|perf|test|chore"
+HEADER_RE="^(${VALID_TYPES})(\([^)]+\))?: .+"
+
+if ! [[ "$HEADER" =~ $HEADER_RE ]]; then
+    echo "" >&2
+    echo "commit-msg: BLOCKED — commit header does not follow conventional commits format." >&2
+    echo "" >&2
+    echo "  Required:   <type>(<scope>): <subject>" >&2
+    echo "  Example:    feat(stores): add replay depth adapter" >&2
+    echo "  Example:    fix(pipeline): correct date parsing for yesterday" >&2
+    echo "  Example:    docs: update AI_WORKFLOW step numbering" >&2
+    echo "" >&2
+    echo "  Allowed types (mandatory, lowercase):" >&2
+    echo "    feat      — new feature for the user" >&2
+    echo "    fix       — bug fix relevant to the user" >&2
+    echo "    docs      — documentation changes only" >&2
+    echo "    style     — formatting, whitespace (no logic change)" >&2
+    echo "    refactor  — neither fixes a bug nor adds a feature" >&2
+    echo "    perf      — performance improvement" >&2
+    echo "    test      — changes to tests only" >&2
+    echo "    chore     — build process or auxiliary tools" >&2
+    echo "" >&2
+    echo "  Scope: optional, e.g. (stores), (pipeline), (validation), (recorder)" >&2
+    echo "" >&2
+    echo "  Your header: $HEADER" >&2
+    echo "" >&2
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Extract subject (text after the first ': ')
+# ---------------------------------------------------------------------------
+SUBJECT="${HEADER#*: }"
+
+# Subject must not start with a capital letter
+if [[ "${SUBJECT:0:1}" =~ [A-Z] ]]; then
+    echo "" >&2
+    echo "commit-msg: BLOCKED — subject must not start with a capital letter." >&2
+    echo "  Got:      \"$SUBJECT\"" >&2
+    echo "  Hint:     use imperative present tense with lowercase first letter" >&2
+    echo "  Example:  \"add replay depth adapter\" not \"Add replay depth adapter\"" >&2
+    echo "" >&2
+    exit 1
+fi
+
+# Subject must not end with a period
+if [[ "${SUBJECT: -1}" == "." ]]; then
+    echo "" >&2
+    echo "commit-msg: BLOCKED — subject must not end with a period." >&2
+    echo "  Got: \"$SUBJECT\"" >&2
+    echo "" >&2
+    exit 1
+fi
+
+# Subject must not be empty after ': '
+if [[ -z "$SUBJECT" ]]; then
+    echo "" >&2
+    echo "commit-msg: BLOCKED — subject is empty." >&2
+    echo "" >&2
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# If a body is present, validate that line 2 (non-comment) is blank
+# ---------------------------------------------------------------------------
+NON_COMMENT_LINES=()
+while IFS= read -r line; do
+    line="${line%$'\r'}"
+    [[ "$line" =~ ^# ]] && continue
+    NON_COMMENT_LINES+=("$line")
+done < "$COMMIT_MSG_FILE"
+
+if [[ "${#NON_COMMENT_LINES[@]}" -ge 2 && -n "${NON_COMMENT_LINES[1]}" ]]; then
+    echo "" >&2
+    echo "commit-msg: BLOCKED — a blank line is required between the subject and the body." >&2
+    echo "" >&2
+    echo "  Correct format:" >&2
+    echo "    feat(stores): add replay depth adapter" >&2
+    echo "    <blank line>" >&2
+    echo "    Body text explaining the motivation..." >&2
+    echo "" >&2
+    exit 1
+fi
+
+exit 0

@@ -1,0 +1,423 @@
+"""
+test_convert_day_phase2.py — Deterministic native convert_date tests.
+
+Validates that convert_date produces the correct report shape and catalog
+output for the deterministic native architecture (no Phase 1 / mode flag).
+"""
+from __future__ import annotations
+
+import json
+from datetime import datetime
+from pathlib import Path
+
+from nautilus_trader.model.data import BookOrder, OrderBookDelta, OrderBookDeltas
+from nautilus_trader.model.enums import BookAction, OrderSide
+from nautilus_trader.model.objects import Price, Quantity
+from nautilus_trader.persistence.catalog import ParquetDataCatalog
+from nautilus_trader.test_kit.providers import TestInstrumentProvider
+
+import convert_day as convert_day_mod
+from converter.depth_phase2 import Phase2ReplayMetrics
+
+
+def _order(side: OrderSide, price: str, size: str) -> BookOrder:
+    return BookOrder(
+        side=side,
+        price=Price.from_str(price),
+        size=Quantity.from_str(size),
+        order_id=0,
+    )
+
+
+def _snapshot_deltas(instrument) -> OrderBookDeltas:
+    ts_event = 1_000_000_000
+    ts_init = 1_000_000_100
+    deltas = [
+        OrderBookDelta.clear(instrument.id, 100, ts_event, ts_init),
+        OrderBookDelta(
+            instrument.id,
+            BookAction.UPDATE,
+            _order(OrderSide.BUY, "100.0", "1.0"),
+            flags=32,
+            sequence=100,
+            ts_event=ts_event,
+            ts_init=ts_init,
+        ),
+        OrderBookDelta(
+            instrument.id,
+            BookAction.UPDATE,
+            _order(OrderSide.SELL, "101.0", "2.0"),
+            flags=32 | 128,
+            sequence=100,
+            ts_event=ts_event,
+            ts_init=ts_init,
+        ),
+    ]
+    return OrderBookDeltas(instrument.id, deltas)
+
+
+def _live_deltas(instrument) -> OrderBookDeltas:
+    ts_event = 2_000_000_000
+    ts_init = 2_000_000_100
+    deltas = [
+        OrderBookDelta(
+            instrument.id,
+            BookAction.UPDATE,
+            _order(OrderSide.BUY, "100.0", "1.5"),
+            flags=128,
+            sequence=101,
+            ts_event=ts_event,
+            ts_init=ts_init,
+        ),
+    ]
+    return OrderBookDeltas(instrument.id, deltas)
+
+
+def _patch_trade_streaming(
+    monkeypatch,
+    *,
+    ticks=None,
+    bad: int = 0,
+    first_ts_ns=None,
+    last_ts_ns=None,
+    diagnostics=None,
+) -> None:
+    ticks = list(ticks or [])
+    diagnostics = diagnostics or {
+        "raw_record_count": 0,
+        "raw_trade_record_count": 0,
+        "raw_lifecycle_record_count": 0,
+        "ticks_written": len(ticks),
+    }
+
+    def fake_convert_trades_streaming(*args, on_ticks_batch, **kwargs):
+        if ticks:
+            on_ticks_batch(list(ticks))
+        return bad, first_ts_ns, last_ts_ns, diagnostics
+
+    monkeypatch.setattr(
+        convert_day_mod,
+        "convert_trades_streaming",
+        fake_convert_trades_streaming,
+    )
+
+
+def _patch_depth_streaming(
+    monkeypatch,
+    *,
+    deltas=None,
+    depth10s=None,
+    metrics=None,
+    captured_kwargs=None,
+) -> None:
+    deltas = list(deltas or [])
+    depth10s = list(depth10s or [])
+    metrics = metrics or Phase2ReplayMetrics()
+
+    def fake_convert_depth_streaming(*args, on_deltas_batch, on_depth10_batch, **kwargs):
+        if captured_kwargs is not None:
+            captured_kwargs.update(kwargs)
+        if deltas:
+            on_deltas_batch(list(deltas))
+        if depth10s:
+            on_depth10_batch(list(depth10s))
+        return metrics
+
+    monkeypatch.setattr(
+        convert_day_mod,
+        "convert_depth_v2_streaming",
+        fake_convert_depth_streaming,
+    )
+
+
+def test_convert_date_writes_state_and_catalog_sibling_reports(monkeypatch, tmp_path: Path) -> None:
+    """convert_date writes the existing report plus the Nautilus sibling copy."""
+    state_root = tmp_path / "state"
+    catalog_root = tmp_path / "nautilus_data" / "catalog"
+    expected_state_report = state_root / "convert_reports" / "2026-04-21.json"
+    expected_extra_report = tmp_path / "nautilus_data" / "convert_reports" / "2026-04-21.json"
+
+    monkeypatch.setattr(convert_day_mod, "STATE_ROOT", state_root)
+    monkeypatch.setattr(convert_day_mod, "resolve_universe", lambda date_str: {})
+
+    report = convert_day_mod.convert_date(
+        datetime(2026, 4, 21),
+        catalog_root=catalog_root,
+        emit_depth10=False,
+    )
+
+    assert expected_state_report.exists()
+    assert expected_extra_report.exists()
+    assert report["catalog_root"] == str(catalog_root)
+    assert report["convert_report_extra_path"] == str(expected_extra_report)
+    assert report["report_paths"] == [str(expected_state_report), str(expected_extra_report)]
+
+    state_payload = json.loads(expected_state_report.read_text())
+    extra_payload = json.loads(expected_extra_report.read_text())
+    assert state_payload == extra_payload == report
+
+
+def test_convert_date_writes_order_book_deltas_without_depth10(monkeypatch, tmp_path: Path) -> None:
+    """convert_date emits no Depth10 when emit_depth10 is explicitly False."""
+    instrument = TestInstrumentProvider.btcusdt_binance()
+
+    monkeypatch.setattr(
+        convert_day_mod,
+        "resolve_universe",
+        lambda date_str: {"BINANCE_SPOT": ["BTCUSDT"]},
+    )
+    monkeypatch.setattr(convert_day_mod, "load_exchange_info", lambda venue, date_str: {})
+    monkeypatch.setattr(convert_day_mod, "build_instruments", lambda venue, syms, einfo: [instrument])
+    _patch_trade_streaming(monkeypatch)
+    _patch_depth_streaming(
+        monkeypatch,
+        deltas=[_snapshot_deltas(instrument), _live_deltas(instrument)],
+        metrics=Phase2ReplayMetrics(
+            snapshot_seed_count=1,
+            delta_events_written=2,
+            first_ts_ns=1_000_000_000,
+            last_ts_ns=2_000_000_000,
+        ),
+    )
+
+    catalog_root = tmp_path / "catalog"
+    report = convert_day_mod.convert_date(
+        datetime(2026, 4, 21),
+        catalog_root=catalog_root,
+        emit_depth10=False,
+    )
+
+    catalog = ParquetDataCatalog(str(catalog_root))
+    deltas = catalog.order_book_deltas(instrument_ids=[instrument.id], batched=True)
+    depth10 = catalog.order_book_depth10(instrument_ids=[instrument.id])
+
+    assert report["architecture"] == "deterministic_native"
+    assert report["total_order_book_deltas_written"] == 2
+    assert report["total_depth10_written"] == 0
+    assert report["total_trades_written"] == 0
+    assert "per_symbol_trade" in report
+    assert report["per_symbol_trade"]["BINANCE_SPOT/BTCUSDT"]["raw_record_count"] == 0
+    assert report["per_symbol_trade"]["BINANCE_SPOT/BTCUSDT"]["ticks_written"] == 0
+    assert report["per_symbol_depth"]["BINANCE_SPOT/BTCUSDT"]["deltas_written"] == 2
+    assert "venues" in report
+    assert report["venues"]["BINANCE_SPOT"]["trades_written"] == 0
+    assert report["venues"]["BINANCE_SPOT"]["trade_raw_record_count"] == 0
+    assert report["venues"]["BINANCE_SPOT"]["symbols_with_trades"] == []
+    assert report["venues"]["BINANCE_SPOT"]["symbols_without_trades"] == ["BTCUSDT"]
+    assert report["venues"]["BINANCE_SPOT"]["symbols_with_trade_ticks"] == []
+    assert report["venues"]["BINANCE_SPOT"]["symbols_without_trade_ticks"] == ["BTCUSDT"]
+    assert report["readiness"]["per_symbol"]["BINANCE_SPOT/BTCUSDT"]["readiness"] == "l2_ready"
+    assert "conversion_integrity" in report
+    assert report["conversion_integrity"]["expected_symbols_total"] == 1
+    assert report["conversion_integrity"]["converted_order_book_delta_symbols"] == ["BINANCE_SPOT/BTCUSDT"]
+    assert report["conversion_integrity"]["missing_depth_after_convert"] == []
+    assert report["conversion_integrity"]["overwrite_enabled"] is True
+    assert report["conversion_integrity"]["date_converted"] == "2026-04-21"
+    assert report["full_depth_source"] == "OrderBookDeltas"
+    assert report["derived_depth_snapshot_type"] == "OrderBookDepth10"
+    assert len(deltas) == 2
+    assert depth10 == []
+
+
+def test_requested_derived_snapshot_levels_are_capped_and_explained(monkeypatch, tmp_path: Path) -> None:
+    instrument = TestInstrumentProvider.btcusdt_binance()
+    monkeypatch.setattr(
+        convert_day_mod,
+        "resolve_universe",
+        lambda date_str: {"BINANCE_SPOT": ["BTCUSDT"]},
+    )
+    monkeypatch.setattr(convert_day_mod, "load_exchange_info", lambda venue, date_str: {})
+    monkeypatch.setattr(convert_day_mod, "build_instruments", lambda venue, syms, einfo: [instrument])
+    _patch_trade_streaming(monkeypatch)
+
+    captured_kwargs = {}
+
+    metrics = Phase2ReplayMetrics(
+        snapshot_seed_count=1,
+        delta_events_written=2,
+        depth10_written=1,
+        derived_depth_snapshots_written=1,
+        first_ts_ns=1_000_000_000,
+        last_ts_ns=2_000_000_000,
+    )
+    metrics.requested_depth_snapshot_levels = 1000
+    metrics.requested_depth_snapshot_levels_applied = 10
+    metrics.derived_depth_snapshot_levels = 10
+    _patch_depth_streaming(
+        monkeypatch,
+        deltas=[_snapshot_deltas(instrument), _live_deltas(instrument)],
+        metrics=metrics,
+        captured_kwargs=captured_kwargs,
+    )
+
+    monkeypatch.setattr(
+        convert_day_mod,
+        "_symbols_with_raw_record_type",
+        lambda *a, **kw: {"BINANCE_SPOT/BTCUSDT"},
+    )
+
+    report = convert_day_mod.convert_date(
+        datetime(2026, 4, 21),
+        catalog_root=tmp_path / "catalog",
+        emit_depth10=True,
+        depth10_interval_sec=0.0,
+        derived_depth_snapshot_levels=1000,
+    )
+
+    assert captured_kwargs["derived_depth_snapshot_levels"] == 1000
+    assert report["full_depth_source"] == "OrderBookDeltas"
+    assert report["derived_depth_snapshot_type"] == "OrderBookDepth10"
+    assert report["requested_depth_snapshot_levels"] == 1000
+    assert report["requested_depth_snapshot_levels_applied"] == 10
+    assert report["derived_depth_snapshot_levels"] == 10
+    assert "OrderBookDepth10 only" in report["derived_depth_snapshot_warning"]
+    assert report["total_order_book_deltas_written"] == 2
+    assert report["total_depth10_written"] == 0
+
+
+def test_convert_date_does_not_call_list_returning_converters(monkeypatch, tmp_path: Path) -> None:
+    instrument = TestInstrumentProvider.btcusdt_binance()
+    monkeypatch.setattr(
+        convert_day_mod,
+        "resolve_universe",
+        lambda date_str: {"BINANCE_SPOT": ["BTCUSDT"]},
+    )
+    monkeypatch.setattr(convert_day_mod, "load_exchange_info", lambda venue, date_str: {})
+    monkeypatch.setattr(convert_day_mod, "build_instruments", lambda venue, syms, einfo: [instrument])
+
+    def fail_list_converter(*args, **kwargs):
+        raise AssertionError("list-returning converter must not be called")
+
+    monkeypatch.setattr(
+        convert_day_mod,
+        "convert_trades_with_diagnostics",
+        fail_list_converter,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        convert_day_mod,
+        "convert_depth_v2",
+        fail_list_converter,
+        raising=False,
+    )
+    _patch_trade_streaming(monkeypatch)
+    _patch_depth_streaming(
+        monkeypatch,
+        deltas=[_snapshot_deltas(instrument)],
+        metrics=Phase2ReplayMetrics(delta_events_written=1),
+    )
+    monkeypatch.setattr(
+        convert_day_mod,
+        "_symbols_with_raw_record_type",
+        lambda *a, **kw: {"BINANCE_SPOT/BTCUSDT"},
+    )
+
+    report = convert_day_mod.convert_date(
+        datetime(2026, 4, 21),
+        catalog_root=tmp_path / "catalog",
+        emit_depth10=False,
+    )
+
+    assert report["total_order_book_deltas_written"] == 1
+
+
+def test_convert_date_writes_streamed_outputs_in_ts_init_order(monkeypatch, tmp_path: Path) -> None:
+    instrument = TestInstrumentProvider.btcusdt_binance()
+    monkeypatch.setattr(
+        convert_day_mod,
+        "resolve_universe",
+        lambda date_str: {"BINANCE_SPOT": ["BTCUSDT"]},
+    )
+    monkeypatch.setattr(convert_day_mod, "load_exchange_info", lambda venue, date_str: {})
+    monkeypatch.setattr(convert_day_mod, "build_instruments", lambda venue, syms, einfo: [instrument])
+
+    early = _snapshot_deltas(instrument)
+    late = _live_deltas(instrument)
+    streamed_order = [late, early]
+    written_ts_init = []
+
+    class FakeCatalog:
+        def __init__(self, root: str):
+            self.root = root
+
+        def write_data(self, data):
+            for item in data:
+                if hasattr(item, "ts_init"):
+                    written_ts_init.append(int(item.ts_init))
+
+    monkeypatch.setattr(convert_day_mod, "ParquetDataCatalog", FakeCatalog)
+    _patch_trade_streaming(monkeypatch)
+    _patch_depth_streaming(
+        monkeypatch,
+        deltas=streamed_order,
+        metrics=Phase2ReplayMetrics(delta_events_written=2),
+    )
+    monkeypatch.setattr(
+        convert_day_mod,
+        "_symbols_with_raw_record_type",
+        lambda *a, **kw: {"BINANCE_SPOT/BTCUSDT"},
+    )
+
+    convert_day_mod.convert_date(
+        datetime(2026, 4, 21),
+        catalog_root=tmp_path / "catalog",
+        emit_depth10=False,
+    )
+
+    assert written_ts_init == sorted(written_ts_init)
+
+
+def test_gap_diagnostics_can_use_streamed_depth10_counts(monkeypatch) -> None:
+    class ExplodingSequence:
+        def __iter__(self):
+            raise AssertionError("depth10 sequence should not be consumed")
+
+    monkeypatch.setattr(convert_day_mod, "stream_raw_records", lambda *args, **kwargs: [])
+    diag = convert_day_mod._build_gap_diagnostics(
+        "BINANCE_SPOT",
+        "BTCUSDT",
+        "2026-04-21",
+        ExplodingSequence(),
+        depth10_gap_counts={
+            "max_gap_sec": 42.0,
+            "gap_count_over_1s": 3,
+            "gap_count_over_5s": 2,
+            "gap_count_over_60s": 1,
+        },
+    )
+
+    assert diag["max_depth10_gap_sec"] == 42.0
+
+def test_convert_date_warns_on_partial_raw_depth_overwrite(monkeypatch, tmp_path: Path) -> None:
+    instrument = TestInstrumentProvider.btcusdt_binance()
+
+    monkeypatch.setattr(
+        convert_day_mod,
+        "resolve_universe",
+        lambda date_str: {"BINANCE_SPOT": ["BTCUSDT"]},
+    )
+    monkeypatch.setattr(convert_day_mod, "load_exchange_info", lambda venue, date_str: {})
+    monkeypatch.setattr(
+        convert_day_mod,
+        "build_instruments",
+        lambda venue, syms, einfo: [instrument],
+    )
+    _patch_trade_streaming(monkeypatch)
+    _patch_depth_streaming(monkeypatch)
+    monkeypatch.setattr(
+        convert_day_mod,
+        "_symbols_with_raw_record_type",
+        lambda universe, date_str, channel, record_type: set(),
+    )
+    monkeypatch.setattr(convert_day_mod, "OVERWRITE_DEPTH_REFUSE_MIN_EXPECTED_SYMBOLS", 1)
+    monkeypatch.setattr(convert_day_mod, "OVERWRITE_DEPTH_REFUSE_MIN_RATIO", 0.8)
+
+    report = convert_day_mod.convert_date(
+        datetime(2026, 4, 21),
+        catalog_root=tmp_path / "catalog",
+        emit_depth10=False,
+    )
+
+    warnings = report["conversion_integrity"]["warnings"]
+    assert warnings
+    assert "partial raw depth" in warnings[0]

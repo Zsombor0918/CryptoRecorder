@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """
-acceptance_test.py — Full acceptance test suite.
+acceptance_test.py — Legacy converter acceptance test suite.
 
-This script runs comprehensive tests to verify the complete pipeline:
+This script verifies the existing validated recorder/converter path:
   1. Recorder can run with 50 symbols for 10 minutes
-  2. Converter can process data into Nautilus catalog
+  2. convert_day.py can process data into Nautilus catalog
   3. Catalog is queryable and valid
+
+It does not validate replay_store -> generate_catalog --profile full_l2.
+That path is deferred and planned separately.
 
 Usage:
     python scripts/acceptance_test.py
@@ -48,18 +51,21 @@ class Colors:
 
 
 class AcceptanceTest:
-    """Full pipeline acceptance test."""
+    """Legacy recorder + convert_day.py acceptance test."""
 
     def __init__(
         self,
         runtime_sec: int = DEFAULT_RUNTIME_SEC,
         skip_recorder: bool = False,
+        emit_depth10: bool = False,
     ):
         self.runtime_sec = runtime_sec
         self.skip_recorder = skip_recorder
+        self.emit_depth10 = emit_depth10
         self.results: Dict[str, Any] = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "runtime_sec": runtime_sec,
+            "architecture": "deterministic_native",
             "tests": {},
             "passed": False,
         }
@@ -67,9 +73,9 @@ class AcceptanceTest:
 
     def run(self) -> Dict[str, Any]:
         """Run the full acceptance test."""
-        print(f"\n{Colors.BOLD}{'═' * 60}{Colors.RESET}")
-        print(f"{Colors.BOLD}  Full Acceptance Test{Colors.RESET}")
-        print(f"{Colors.BOLD}{'═' * 60}{Colors.RESET}\n")
+        print(f"\n{Colors.BOLD}{'=' * 60}{Colors.RESET}")
+        print(f"{Colors.BOLD}  Legacy Converter Acceptance Test (deterministic native){Colors.RESET}")
+        print(f"{Colors.BOLD}{'=' * 60}{Colors.RESET}\n")
 
         tests = []
 
@@ -97,12 +103,12 @@ class AcceptanceTest:
         self.results["passed"] = all_passed
 
         # Summary
-        print(f"\n{Colors.BOLD}{'═' * 60}{Colors.RESET}")
+        print(f"\n{Colors.BOLD}{'=' * 60}{Colors.RESET}")
         if all_passed:
-            print(f"{Colors.GREEN}✓ All acceptance tests PASSED{Colors.RESET}")
+            print(f"{Colors.GREEN}All acceptance tests PASSED{Colors.RESET}")
         else:
-            print(f"{Colors.RED}✗ Some acceptance tests FAILED{Colors.RESET}")
-        print(f"{Colors.BOLD}{'═' * 60}{Colors.RESET}\n")
+            print(f"{Colors.RED}Some acceptance tests FAILED{Colors.RESET}")
+        print(f"{Colors.BOLD}{'=' * 60}{Colors.RESET}\n")
 
         # Save results
         results_path = STATE_ROOT / "acceptance_test_results.json"
@@ -151,11 +157,15 @@ class AcceptanceTest:
         # Check results
         details = {}
 
-        # Count symbols with data
-        spot_syms = self._count_symbols_with_data("BINANCE_SPOT", "depth")
-        fut_syms = self._count_symbols_with_data("BINANCE_USDTF", "depth")
-        details["spot_symbols_with_data"] = spot_syms
-        details["futures_symbols_with_data"] = fut_syms
+        # Count symbols with data across both channels
+        spot_depth = self._count_symbols_with_data("BINANCE_SPOT", "depth_v2")
+        spot_trade = self._count_symbols_with_data("BINANCE_SPOT", "trade_v2")
+        fut_depth = self._count_symbols_with_data("BINANCE_USDTF", "depth_v2")
+        fut_trade = self._count_symbols_with_data("BINANCE_USDTF", "trade_v2")
+        details["spot_depth_symbols"] = spot_depth
+        details["spot_trade_symbols"] = spot_trade
+        details["futures_depth_symbols"] = fut_depth
+        details["futures_trade_symbols"] = fut_trade
 
         # Check heartbeat
         hb = STATE_ROOT / "heartbeat.json"
@@ -163,6 +173,7 @@ class AcceptanceTest:
             hb_data = json.loads(hb.read_text())
             details["total_messages"] = hb_data.get("total_messages", 0)
             details["futures_enabled"] = hb_data.get("futures_enabled", False)
+            details["architecture"] = hb_data.get("architecture")
 
         # Check for rate limits
         rate_limits = len(re.findall(r"429|418", log, re.I))
@@ -170,9 +181,11 @@ class AcceptanceTest:
 
         # Pass criteria
         ok = (
-            spot_syms >= 10
+            spot_depth >= 10
+            and spot_trade >= 10
             and details.get("total_messages", 0) > 0
             and rate_limits == 0
+            and details.get("architecture") == "deterministic_native"
         )
 
         for key, value in details.items():
@@ -182,12 +195,9 @@ class AcceptanceTest:
 
     def _test_converter(self) -> tuple[bool, dict]:
         """Test converter can process data."""
-        # Find a date with data
+        date_dirs = self._find_dates_with_data()
         yesterday = datetime.now(timezone.utc) - timedelta(days=1)
         date_str = yesterday.strftime("%Y-%m-%d")
-
-        # Check if we have data for yesterday, or use today
-        date_dirs = self._find_dates_with_data()
         if date_str not in date_dirs and date_dirs:
             date_str = date_dirs[0]
 
@@ -196,8 +206,17 @@ class AcceptanceTest:
         venv_py = PROJECT_ROOT / ".venv" / "bin" / "python3"
         py = str(venv_py) if venv_py.exists() else sys.executable
 
+        cmd = [
+            py,
+            str(PROJECT_ROOT / "convert_day.py"),
+            "--date",
+            date_str,
+        ]
+        if self.emit_depth10:
+            cmd.append("--emit-depth10")
+
         result = subprocess.run(
-            [py, str(PROJECT_ROOT / "convert_day.py"), "--date", date_str],
+            cmd,
             capture_output=True,
             text=True,
             cwd=str(PROJECT_ROOT),
@@ -213,10 +232,12 @@ class AcceptanceTest:
         report_path = STATE_ROOT / "convert_reports" / f"{date_str}.json"
         if report_path.exists():
             report = json.loads(report_path.read_text())
+            details["architecture"] = report.get("architecture", "unknown")
             details["instruments_written"] = report.get("instruments_written", 0)
             details["trades_written"] = report.get("total_trades_written", 0)
-            details["depth_written"] = report.get("total_depth_snapshots_written", 0)
-            details["crossed_book_events"] = report.get("crossed_book_events_total", 0)
+            details["delta_written"] = report.get("total_order_book_deltas_written", 0)
+            details["depth10_written"] = report.get("total_depth10_written", 0)
+            details["fenced_ranges_total"] = report.get("fenced_ranges_total", 0)
 
         for key, value in details.items():
             print(f"    {key}: {value}")
@@ -224,6 +245,7 @@ class AcceptanceTest:
         ok = (
             result.returncode == 0
             and details.get("instruments_written", 0) > 0
+            and details.get("architecture") == "deterministic_native"
         )
 
         return ok, details
@@ -243,7 +265,6 @@ class AcceptanceTest:
             instruments = catalog.instruments()
             details["instruments"] = len(instruments)
 
-            # Try querying data
             if instruments:
                 sample = instruments[0]
                 try:
@@ -253,10 +274,19 @@ class AcceptanceTest:
                     details["sample_trades"] = 0
 
                 try:
-                    depth = catalog.order_book_depth10(instrument_ids=[sample.id])
-                    details["sample_depth"] = len(depth)
+                    deltas = catalog.order_book_deltas(
+                        instrument_ids=[sample.id],
+                        batched=True,
+                    )
+                    details["sample_deltas"] = len(deltas)
                 except Exception:
-                    details["sample_depth"] = 0
+                    details["sample_deltas"] = 0
+
+                try:
+                    depth = catalog.order_book_depth10(instrument_ids=[sample.id])
+                    details["sample_depth10"] = len(depth)
+                except Exception:
+                    details["sample_depth10"] = 0
 
         except Exception as e:
             details["error"] = str(e)
@@ -320,9 +350,18 @@ def main() -> int:
         action="store_true",
         help="Skip recorder test (useful if you already have data)",
     )
+    parser.add_argument(
+        "--emit-depth10",
+        action="store_true",
+        help="Also require optional derived depth10 output.",
+    )
     args = parser.parse_args()
 
-    test = AcceptanceTest(runtime_sec=args.runtime, skip_recorder=args.skip_recorder)
+    test = AcceptanceTest(
+        runtime_sec=args.runtime,
+        skip_recorder=args.skip_recorder,
+        emit_depth10=args.emit_depth10,
+    )
     result = test.run()
     return 0 if result["passed"] else 1
 

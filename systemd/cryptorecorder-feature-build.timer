@@ -1,0 +1,14 @@
+[Unit]
+Description=CryptoRecorder Feature Store Build Timer (daily, 02:30 UTC)
+
+[Timer]
+# Run after the replay-build timer so feature rows are built from fresh replay data.
+OnCalendar=*-*-* 02:30:00 UTC
+Timezone=UTC
+Unit=cryptorecorder-feature-build.service
+
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

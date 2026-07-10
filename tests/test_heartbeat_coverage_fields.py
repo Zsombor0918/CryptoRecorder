@@ -41,6 +41,39 @@ def test_heartbeat_coverage_fields_are_exposed_consistently() -> None:
             hm.record_message("BINANCE_SPOT", "BTCUSDT", ts_event=1)
             hm.record_message("BINANCE_SPOT", "ETHUSDT", ts_event=2)
             hm.record_message("BINANCE_USDTF", "BTCUSDT", ts_event=3)
+            hm.set_writer_queue_telemetry({
+                "writers": {
+                    "BINANCE_SPOT:BTCUSDT:depth_v2": {
+                        "venue": "BINANCE_SPOT",
+                        "symbol": "BTCUSDT",
+                        "channel": "depth_v2",
+                        "queue_size": 3,
+                        "queue_max_size": 20000,
+                        "queue_high_watermark": 4,
+                        "drop_count": 0,
+                        "enqueued_count": 7,
+                        "write_count": 4,
+                        "blocked": False,
+                        "current_block_sec": 0.0,
+                        "max_block_sec": 0.0,
+                    },
+                },
+                "totals": {
+                    "writer_count": 1,
+                    "queued_records": 3,
+                    "total_drops": 0,
+                    "depth_blocked_writer_count": 0,
+                },
+                "top_pressure_writers": [],
+                "compression": {
+                    "queued": 0,
+                    "active": 0,
+                    "completed": 0,
+                    "failed": 0,
+                    "last_error": None,
+                    "worker_count": 1,
+                },
+            })
 
             asyncio.run(hm.write_heartbeat())
 
@@ -55,6 +88,10 @@ def test_heartbeat_coverage_fields_are_exposed_consistently() -> None:
             assert hb["futures_symbols_dropped_list"] == ["AGIXUSDT"]
             assert hb["spot_coverage_ratio"] == 0.4
             assert hb["futures_coverage_ratio"] == 0.25
+            assert hb["writer_queue_telemetry"]["totals"]["queued_records"] == 3
+            writer_tel = hb["writer_queue_telemetry"]["writers"]["BINANCE_SPOT:BTCUSDT:depth_v2"]
+            assert writer_tel["queue_high_watermark"] == 4
+            assert hb["writer_queue_telemetry"]["compression"]["failed"] == 0
 
             hb_ts = datetime.fromisoformat(hb["timestamp"])
             sym_ts = datetime.fromisoformat(

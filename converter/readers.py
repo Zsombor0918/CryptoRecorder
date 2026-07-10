@@ -7,7 +7,7 @@ import gzip
 import json
 import logging
 from pathlib import Path
-from typing import Generator
+from typing import Generator, Optional
 
 import zstandard as zstd
 
@@ -21,9 +21,22 @@ def stream_raw_records(
     symbol: str,
     channel: str,
     date_str: str,
+    root: Optional[Path] = None,
 ) -> Generator[dict, None, None]:
-    """Yield parsed JSON dicts from ``data_raw/{venue}/{channel}/{symbol}/{date}/``."""
-    day_path = DATA_ROOT / venue / channel / symbol / date_str
+    """
+    Yield parsed JSON dicts from ``{root}/{venue}/{channel}/{symbol}/{date}/``.
+
+    Args:
+        venue: Venue name (e.g., 'BINANCE_SPOT')
+        symbol: Symbol name (e.g., 'BTCUSDT')
+        channel: Channel name (e.g., 'depth_v2', 'trade_v2')
+        date_str: Date string (e.g., '2026-06-15')
+        root: Optional custom root path. If None, uses config.DATA_ROOT (backward compatible).
+    """
+    if root is None:
+        root = DATA_ROOT
+
+    day_path = root / venue / channel / symbol / date_str
     if not day_path.exists():
         return
     for file_path in sorted(day_path.glob("*.jsonl*")):
