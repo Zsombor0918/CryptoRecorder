@@ -201,7 +201,7 @@ See [VALIDATION.md](VALIDATION.md) for details.
 
 ## Deployment Script Reference
 
-> Content merged from the former `OPERATIONS.md`.
+> Content merged from the former `DEPLOYMENT.md`.
 
 CryptoRecorder is deployed on a Linux server with one wrapper script:
 
@@ -211,8 +211,8 @@ CryptoRecorder is deployed on a Linux server with one wrapper script:
 
 The script is a **thin operator wrapper** (no business logic). It prepares the
 environment, installs the selected systemd units, and optionally enables/starts them.
-The canonical paths and service groups it uses are defined in
-[LINUX_SERVER.md](OPERATIONS.md).
+The canonical paths and service groups it uses are defined below in the
+[Linux Server Layout](#linux-server-layout) section.
 
 ## Targets
 
@@ -291,7 +291,7 @@ still prepares the venv, dependencies, and data dirs (or prints them under `--dr
 
 ## Linux Server Layout
 
-> Content merged from the former `OPERATIONS.md`.
+> Content merged from the former `LINUX_SERVER.md`.
 
 CryptoRecorder runs in two environments. Keep them clearly separated; do not hardcode
 one environment's paths into the other.
@@ -365,13 +365,14 @@ The following are **not** part of the deployment and have **no** services here:
 `ARCHIVE_DAYS_ROOT` exists only as a configuration placeholder. `LABEL_ROOT` and
 `CATALOG_JOBS_ROOT` no longer exist (removed, issue #17).
 
-See [DEPLOYMENT.md](OPERATIONS.md) for the deploy command and flags.
+See the [Deployment Script Reference](#deployment-script-reference) section
+above for the deploy command and flags.
 
 ---
 
 ## State File Schemas
 
-> Content merged from the former `OPERATIONS.md`.
+> Content merged from the former `SCHEMAS.md`.
 
 These schemas document stable operational fields used by tooling and operators.
 They are interface notes, not a strict JSON Schema contract.

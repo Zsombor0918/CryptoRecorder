@@ -11,16 +11,13 @@ off to downstream repositories (e.g. KovacsTrader).
 
 ## Quick Start
 
-### Run today's build
-
-```bash
-cd /home/zsom/services/CryptoRecorder
-python -m pipeline.daily_build --date today
-```
+`--date` only accepts an explicit `YYYY-MM-DD` date or the literal
+`yesterday` (previous completed UTC day). There is no `today` shortcut.
 
 ### Run yesterday's build (typical cron usage)
 
 ```bash
+cd /home/zsom/services/CryptoRecorder
 python -m pipeline.daily_build --date yesterday
 ```
 
@@ -204,13 +201,31 @@ Aggregates results from the previous steps into `daily_build_{date}.json`:
 ```json
 {
   "date": "2026-06-15",
-  "status": "success|partial|failed",
+  "status": "success|partial|no_data|failed",
   "runtime_sec": 3600.0,
   "raw_coverage": {...},
   "replay_build": {...},
   "errors": [...]
 }
 ```
+
+`status` semantics (checked in this order):
+- `success` — at least one venue/symbol partition was eligible and every
+  eligible partition built successfully.
+- `partial` — at least one partition was eligible, and one or more of them
+  failed while at least one succeeded.
+- `no_data` — zero venue/symbol partitions were found/eligible for the date
+  (e.g. an empty or non-existent `data_root`, or no raw data recorded for
+  that date). This is **not** treated as success even though there were no
+  failures — `0 successful == 0 eligible` is explicitly distinguished from a
+  genuine all-success build. The CLI exits with a nonzero status code for
+  `no_data` (as it does for `partial`), so scheduler/monitoring alerts fire.
+- `failed` — an unhandled exception aborted the run before a report could be
+  generated normally (see the `except` branch in `pipeline/daily_build.py`).
+
+Only `status == "success"` results in a `0` process exit code from
+`python -m pipeline.daily_build`; `partial`, `no_data`, and unhandled
+exceptions all exit nonzero.
 
 ## Local Testing Workflow (temp-root smoke)
 

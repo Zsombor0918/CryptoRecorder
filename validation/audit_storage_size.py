@@ -1,8 +1,8 @@
 """validation.audit_storage_size — measure on-disk size of CryptoRecorder artifacts.
 
-Audit-only (no build/transform). Reports the bytes used by, and record counts of,
-the replay_store / feature_store / generated catalog for a single
-venue/symbol/date so storage growth can be tracked honestly instead of guessed.
+Audit-only (no build/transform). Reports the bytes used by the replay_store /
+generated catalog for a single venue/symbol/date so storage growth can be
+tracked honestly instead of guessed.
 
 Example::
 
@@ -50,10 +50,9 @@ def audit_storage_size(
     symbol: str,
     date: str,
     replay_root: Optional[Path] = None,
-    feature_root: Optional[Path] = None,
     catalog_root: Optional[Path] = None,
 ) -> dict[str, Any]:
-    """Collect byte sizes for the replay/feature/catalog artifacts of one partition."""
+    """Collect byte sizes for the replay/catalog artifacts of one partition."""
     components: list[dict[str, Any]] = []
 
     if replay_root is not None:
@@ -62,10 +61,6 @@ def audit_storage_size(
         trades = partition / "trades.parquet"
         components.append({"artifact": "replay.depth.parquet", "path": str(depth), "bytes": _dir_bytes(depth)})
         components.append({"artifact": "replay.trades.parquet", "path": str(trades), "bytes": _dir_bytes(trades)})
-
-    if feature_root is not None:
-        partition = _replay_partition(feature_root, venue, symbol, date)
-        components.append({"artifact": "feature_store", "path": str(partition), "bytes": _dir_bytes(partition)})
 
     if catalog_root is not None:
         data_root = catalog_root / "data"
@@ -97,7 +92,6 @@ def main() -> int:
     parser.add_argument("--symbol", required=True)
     parser.add_argument("--date", required=True, help="UTC date YYYY-MM-DD")
     parser.add_argument("--replay-root", type=Path, default=None)
-    parser.add_argument("--feature-root", type=Path, default=None)
     parser.add_argument("--catalog-root", type=Path, default=None, help="A generated job_* catalog root")
     parser.add_argument("--json", action="store_true", help="Emit JSON instead of a table")
     args = parser.parse_args()
@@ -109,7 +103,6 @@ def main() -> int:
         symbol=args.symbol,
         date=args.date,
         replay_root=args.replay_root,
-        feature_root=args.feature_root,
         catalog_root=args.catalog_root,
     )
 

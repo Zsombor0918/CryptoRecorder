@@ -6,6 +6,7 @@ Run with normal pytest; no real data required.
 """
 from __future__ import annotations
 
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -18,6 +19,113 @@ TESTS = ROOT / "tests"
 PIPELINE = ROOT / "pipeline"
 STORES = ROOT / "stores"
 VALIDATION = ROOT / "validation"
+
+
+# ---------------------------------------------------------------------------
+# Exact root-level file/docs enforcement (docs/REPO_STRUCTURE.md contract)
+# ---------------------------------------------------------------------------
+
+# Kept in sync with the "Root-Level Files (allowed)" table in
+# docs/REPO_STRUCTURE.md. If you add/remove a root file, update both.
+ALLOWED_ROOT_PY_FILES = {
+    "recorder.py",
+    "phase2_depth.py",
+    "native_trades.py",
+    "storage.py",
+    "binance_universe.py",
+    "health_monitor.py",
+    "disk_monitor.py",
+    "time_utils.py",
+    "convert_day.py",
+    "config.py",
+    "validate.py",
+    "debug_futures_trade_ws.py",
+}
+
+ALLOWED_ROOT_OTHER_FILES = {
+    "README.md",
+    "INSTALL.md",
+    "requirements.txt",
+    "pytest.ini",
+    "AGENTS.md",
+    "VERSION",
+    "CHANGELOG.md",
+    ".gitignore",
+}
+
+# Kept in sync with the fixed 12-file docs/ table in docs/REPO_STRUCTURE.md.
+ALLOWED_DOCS_FILES = {
+    "README.md",
+    "REPO_STRUCTURE.md",
+    "PROJECT_STATUS.md",
+    "AI_WORKFLOW.md",
+    "CHANGE_AUDIT.md",
+    "ARCHITECTURE.md",
+    "OPERATIONS.md",
+    "VALIDATION.md",
+    "IMPLEMENTATION_AUDIT.md",
+    "REPLAY_STORE.md",
+    "DAILY_BUILD_PIPELINE.md",
+    "FULL_L2_REPLAY_CATALOG_PLAN.md",
+}
+
+
+def test_exact_allowed_root_python_files() -> None:
+    """Only the .py files listed in docs/REPO_STRUCTURE.md may exist at the
+    repository root. This prevents unauthorized root entrypoints (e.g. a
+    stray inspect_catalog.py) from silently reappearing."""
+    actual_py = {p.name for p in ROOT.glob("*.py")}
+    unauthorized = actual_py - ALLOWED_ROOT_PY_FILES
+    missing = ALLOWED_ROOT_PY_FILES - actual_py
+    assert not unauthorized, (
+        f"Unauthorized root-level Python files: {sorted(unauthorized)}. "
+        "Edit docs/REPO_STRUCTURE.md before adding new root entrypoints, or "
+        "delete the file if unused."
+    )
+    assert not missing, (
+        f"Expected root-level Python files are missing: {sorted(missing)}. "
+        "Either restore them or update docs/REPO_STRUCTURE.md and this test."
+    )
+
+
+def test_exact_allowed_root_other_files() -> None:
+    """Only the non-Python files listed in docs/REPO_STRUCTURE.md may exist
+    at the repository root (directories are checked separately)."""
+    actual = {
+        p.name
+        for p in ROOT.iterdir()
+        if p.is_file() and not p.name.startswith(".") or p.name == ".gitignore"
+    }
+    # Exclude .py files (checked above) and any local/generated files.
+    actual = {name for name in actual if not name.endswith(".py")}
+    ignored_generated = {"recorder.log"}
+    actual -= ignored_generated
+    unauthorized = actual - ALLOWED_ROOT_OTHER_FILES
+    assert not unauthorized, (
+        f"Unauthorized root-level files: {sorted(unauthorized)}. "
+        "Edit docs/REPO_STRUCTURE.md before adding new root-level project files."
+    )
+
+
+def test_exact_docs_file_set() -> None:
+    """docs/ must contain exactly the fixed 12-file set. This prevents stale
+    files (e.g. docs/GUARANTEES.md, docs/FEATURE_STORE.md) from silently
+    reappearing via a merge."""
+    actual = {p.name for p in DOCS.glob("*.md")}
+    unauthorized = actual - ALLOWED_DOCS_FILES
+    missing = ALLOWED_DOCS_FILES - actual
+    assert not unauthorized, (
+        f"Unauthorized docs/ files: {sorted(unauthorized)}. docs/ is fixed at "
+        "12 files per docs/REPO_STRUCTURE.md; consolidate content into an "
+        "existing file or amend the contract."
+    )
+    assert not missing, f"Expected docs/ files are missing: {sorted(missing)}."
+
+
+def test_no_stray_python_modules_in_docs() -> None:
+    """docs/ must never contain importable Python (redundant with
+    test_docs_contains_no_python_modules, kept as an explicit named guard)."""
+    assert not list(DOCS.rglob("*.py"))
 
 
 # ---------------------------------------------------------------------------
@@ -124,6 +232,53 @@ def test_pipeline_does_not_contain_equivalence_module() -> None:
         "pipeline/validate_catalog_equivalence.py must not exist; "
         "use validation/validate_catalog_equivalence.py"
     )
+
+
+def test_config_does_not_contain_feature_store_roots() -> None:
+    """FEATURE_ROOT, LABEL_ROOT, and CATALOG_JOBS_ROOT were removed (issue
+    #17) and must not be reintroduced as live config.py attributes."""
+    config_text = (ROOT / "config.py").read_text()
+    for name in ("FEATURE_ROOT", "LABEL_ROOT", "CATALOG_JOBS_ROOT"):
+        assert not re.search(rf"^{name}\s*=", config_text, re.MULTILINE), (
+            f"config.py must not define {name}; the feature-store subsystem "
+            "was removed (issue #17)."
+        )
+
+
+def test_no_feature_store_cli_flags_in_pipeline_daily_build() -> None:
+    """daily_build must not expose feature-store-era CLI flags."""
+    text = (PIPELINE / "daily_build.py").read_text()
+    for flag in ("--steps", "--timeframes", "--feature-root"):
+        assert flag not in text, (
+            f"pipeline/daily_build.py must not accept '{flag}'; "
+            "daily_build is replay-only (issue #17)."
+        )
+
+
+def test_no_feature_build_systemd_units() -> None:
+    """The feature-build systemd units were deleted (issue #17)."""
+    systemd = ROOT / "systemd"
+    for name in (
+        "cryptorecorder-feature-build.service",
+        "cryptorecorder-feature-build.timer",
+    ):
+        assert not (systemd / name).exists(), (
+            f"systemd/{name} must not exist; the feature-store subsystem was removed."
+        )
+
+
+def test_no_validators_imports_in_source() -> None:
+    """No Python source file (outside .venv) may import the removed
+    validators/ package."""
+    forbidden = re.compile(r"^\s*(from|import)\s+validators\b", re.MULTILINE)
+    leaked: list[str] = []
+    for path in ROOT.rglob("*.py"):
+        if ".venv" in path.parts or "__pycache__" in path.parts:
+            continue
+        text = path.read_text(errors="ignore")
+        if forbidden.search(text):
+            leaked.append(str(path.relative_to(ROOT)))
+    assert not leaked, f"Files still import the removed validators/ package: {leaked}"
 
 
 # ---------------------------------------------------------------------------

@@ -1,6 +1,6 @@
 # Repository Structure Contract
 
-**Date**: 2026-07-15
+**Date**: 2026-07-20
 
 This document is the binding contract for all future implementation in this
 repository. Any Codex task or contributor must read this before adding files.
@@ -22,9 +22,17 @@ These are the only Python entrypoints and project files permitted at the root:
 | File | Purpose |
 |---|---|
 | `recorder.py` | Main raw recorder entrypoint |
+| `phase2_depth.py` | `BinanceNativeDepthRecorder` — depth_v2 recording (core recorder module, never change without explicit task allowance) |
+| `native_trades.py` | `BinanceNativeTradeRecorder` — trade_v2 recording (core recorder module, never change without explicit task allowance) |
+| `storage.py` | Hourly-rotated JSONL(.zst) file writer (core recorder module, never change without explicit task allowance) |
+| `binance_universe.py` | Universe selection by 24h quote volume + futures precheck |
+| `health_monitor.py` | Publishes `state/heartbeat.json` |
+| `disk_monitor.py` | Fail-safe disk usage monitoring (see issue #19 / `docs/ARCHITECTURE.md`) |
+| `time_utils.py` | Shared timestamp helpers |
 | `convert_day.py` | Validated raw → Nautilus full-L2 converter |
 | `config.py` | Configuration and storage roots |
 | `validate.py` | Setup and import validation |
+| `debug_futures_trade_ws.py` | Standalone developer debug script for the futures/spot trade WebSocket (not imported by production code) |
 | `README.md` | Project overview |
 | `INSTALL.md` | Machine setup guide |
 | `requirements.txt` | Python dependencies |
@@ -329,4 +337,4 @@ replay_store -> validation.replay_catalog_reconstruct (validation-only, no CLI)
 | 2026-07-09 | Docs structure consolidation: merged 9 small docs into ARCHITECTURE.md, OPERATIONS.md, IMPLEMENTATION_AUDIT.md, and CHANGELOG.md; fixed docs/ at 14 files; added "No New Docs" rules in AGENTS.md and REPO_STRUCTURE.md |
 | 2026-07-09 | Added `.githooks/commit-msg` — conventional commits enforcement hook; AGENTS.md Section 7 commit style rules |
 | 2026-07-15 | Issue #17: removed the feature-store subsystem (`stores/feature_*.py`, `pipeline/build_feature_store.py`, `validation/audit_feature_store.py`, `tests/test_feature_store.py`, feature-build systemd units) and the `pipeline/generate_catalog.py` product CLI (reconstruction logic moved to `validation/replay_catalog_reconstruct.py`, an internal CLI-less helper). Removed `config.py` `FEATURE_ROOT`/`LABEL_ROOT`/`CATALOG_JOBS_ROOT`. Simplified `pipeline.daily_build` to replay-only (dropped `--steps`/`--timeframes`/`--feature-root`). Deleted `docs/FEATURE_STORE.md` and `docs/GENERATE_CATALOG.md`; docs/ fixed count dropped from 14 to 12. Superseded issue #15. |
-
+| 2026-07-20 | Issues #17/#19 completion: expanded the Root-Level Files table to list every real root `.py` module; deleted stale duplicate systemd units (`crypto-recorder.service`, `nautilus-convert.{service,timer}`, `cryptorecorder-daily-build.{service,timer}`) superseded by `cryptorecorder-recorder.service`, `cryptorecorder-convert.{service,timer}`, and `cryptorecorder-replay-build.{service,timer}`, the units actually referenced by `scripts/deploy_linux_server.sh`; removed root `inspect_catalog.py` (dead code); removed `docs/GUARANTEES.md` (superseded by `ARCHITECTURE.md`); added 7 tests to `tests/test_repo_structure.py` enforcing this contract exactly. |

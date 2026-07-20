@@ -189,6 +189,158 @@ status claims are honest.
 ## Audit entries (newest first)
 
 ---
+## 2026-07-20 — complete PR #18 remaining work: strip feature-store residue, harden structure tests, fix daily_build false-success, correct systemd/doc references (issues #17, #19)
+
+### Change summary
+- Merged current `main` into `refactor/recorder-replay-only` (via cherry-pick of
+  commit `9c639b8` from `fix/disk-monitor-fail-safe-measurement`, completed as
+  `45356f9`), resolving conflicts in `CHANGELOG.md`, `docs/PROJECT_STATUS.md`, and
+  `docs/CHANGE_AUDIT.md` by hand.
+- Stripped feature-store naming from `validation/audit_storage_size.py`: removed
+  the `feature_root` parameter, its `feature_store` report component, and the
+  `--feature-root` CLI flag (the feature-store subsystem no longer exists).
+- Deleted `docs/GUARANTEES.md` — fully superseded by the existing
+  "System Guarantees" section in `docs/ARCHITECTURE.md`; no unique content lost.
+- Deleted root-level `inspect_catalog.py` — dead code from a stale merge, not
+  imported anywhere, with a docstring referencing a nonexistent `validators/`
+  package. `validation/catalog_inspect.py` is the real, currently-used CLI.
+- Reverted `validate.py` to its working form: the `main`-branch merge had
+  regressed it to import unused `cryptofeed`/`yaml` dependencies, reference a
+  nonexistent `converter.book` module, and hardcode paths instead of using
+  `config.py`'s configurable `DATA_ROOT`/`META_ROOT`/`STATE_ROOT`.
+- Hardened `tests/test_repo_structure.py` with 7 new tests enforcing the exact
+  root Python/other file sets and exact `docs/` file set from
+  `docs/REPO_STRUCTURE.md`, absence of stray Python files in `docs/`, absence of
+  feature-store config roots/CLI flags/systemd units, and absence of
+  `validators` imports. Updated `docs/REPO_STRUCTURE.md`'s Root-Level Files
+  table to list every real root `.py` module (several were previously missing).
+- Fixed `pipeline/daily_build.py`'s false-success bug: `run_build_replay_store()`
+  now reports `"no_data"` (distinct from `"success"`) when zero raw partitions
+  were eligible for the date, instead of falsely reporting `"success"`.
+  `generate_daily_report()` checks `"no_data"` explicitly before the generic
+  `"partial"` fallback. `main()` now logs a warning and returns nonzero for any
+  non-`"success"` status. Added `tests/test_daily_build.py` (4 new tests) and
+  updated `docs/DAILY_BUILD_PIPELINE.md`'s status-semantics documentation.
+- Deleted stale duplicate systemd unit files superseded by the units actually
+  referenced by `scripts/deploy_linux_server.sh`: `systemd/crypto-recorder.service`
+  (superseded by `cryptorecorder-recorder.service`),
+  `systemd/nautilus-convert.{service,timer}` (superseded by
+  `cryptorecorder-convert.{service,timer}`), and
+  `systemd/cryptorecorder-daily-build.{service,timer}` (superseded by
+  `cryptorecorder-replay-build.{service,timer}`).
+- Corrected numerous stale documentation references: `INSTALL.md`'s
+  `crypto-recorder.service`/`nautilus-convert.*` unit names and a duplicate
+  `## 10.` heading; `AGENTS.md`'s and `docs/OPERATIONS.md`'s broken
+  self-referential "merged from the former `OPERATIONS.md`" provenance notes
+  and a broken same-file link; similar self-referential provenance notes in
+  `docs/ARCHITECTURE.md` and `docs/IMPLEMENTATION_AUDIT.md`; a stale
+  `pipeline/audit_replay_store.py` table row in `docs/ARCHITECTURE.md` (real
+  path is `validation/audit_replay_store.py`); a duplicate
+  `[OPERATIONS.md](OPERATIONS.md)` link in `docs/PROJECT_STATUS.md`; a
+  misleading `--date today` example in `docs/DAILY_BUILD_PIPELINE.md` (only
+  `YYYY-MM-DD` and `yesterday` are implemented); and added a new
+  "Replay Store Validation" section to `docs/VALIDATION.md` documenting
+  `validation.audit_replay_store`, `validation.validate_catalog_equivalence`,
+  and `validation.audit_change_compliance` (previously undocumented there).
+
+### Files/packages touched
+- validation/audit_storage_size.py
+- docs/GUARANTEES.md (deleted)
+- inspect_catalog.py (deleted)
+- validate.py
+- tests/test_repo_structure.py
+- docs/REPO_STRUCTURE.md
+- pipeline/daily_build.py
+- tests/test_daily_build.py (new)
+- docs/DAILY_BUILD_PIPELINE.md
+- systemd/crypto-recorder.service (deleted)
+- systemd/nautilus-convert.service (deleted)
+- systemd/nautilus-convert.timer (deleted)
+- systemd/cryptorecorder-daily-build.service (deleted)
+- systemd/cryptorecorder-daily-build.timer (deleted)
+- systemd/cryptorecorder-recorder.service
+- systemd/cryptorecorder.env.example
+- scripts/deploy_linux_server.sh
+- INSTALL.md
+- AGENTS.md
+- docs/OPERATIONS.md
+- docs/ARCHITECTURE.md
+- docs/IMPLEMENTATION_AUDIT.md
+- docs/PROJECT_STATUS.md
+- docs/VALIDATION.md
+- CHANGELOG.md
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] docs/REPO_STRUCTURE.md
+- [x] docs/PROJECT_STATUS.md
+- [x] docs/IMPLEMENTATION_AUDIT.md
+- [x] relevant feature docs:
+  - docs/DAILY_BUILD_PIPELINE.md, docs/VALIDATION.md, docs/OPERATIONS.md,
+    docs/ARCHITECTURE.md, INSTALL.md
+
+### Docs updated
+- [x] CHANGELOG.md
+- [ ] README.md — no change needed; no stale references found in this file
+- [x] docs/PROJECT_STATUS.md — fixed duplicate link and stale "Date" header
+- [x] docs/REPO_STRUCTURE.md — root-file table completed; amendment log entry added
+- [x] relevant feature docs:
+  - docs/DAILY_BUILD_PIPELINE.md, docs/VALIDATION.md, docs/OPERATIONS.md,
+    docs/ARCHITECTURE.md, docs/IMPLEMENTATION_AUDIT.md, INSTALL.md, AGENTS.md
+
+### Status / validation impact
+- Validated status changed: no
+- Deferred status changed: no
+- New claims added: no — this entry fixes structural/doc/test defects and stale
+  references; it does not change what is validated vs deferred (full_l2
+  top50/multi-day validation remains pending, as before)
+- Evidence for any new validation claim:
+  - n/a
+
+### Tests run
+```bash
+pytest -q
+# 267 passed, 3 skipped
+
+pytest tests/test_repo_structure.py tests/test_replay_store.py \
+  tests/test_pipeline_validation.py tests/test_agent_infrastructure.py -q
+# 22 passed (test_repo_structure.py); 36 passed, 1 skipped (combined others)
+
+pytest tests/test_daily_build.py -q
+# 4 passed
+```
+
+### Validation CLIs run
+```bash
+python -m validation.audit_change_compliance --base main
+# RESULT: PASS (52 changed files vs main)
+
+python -m pipeline.build_replay_store --date 2026-06-12 --symbols ADAUSDT \
+  --data-root ./data_raw --replay-root /tmp/tmp.fRQ8vNOyNf/replay_store
+# Built replay: BINANCE_SPOT/ADAUSDT/2026-06-12 (412336 depth, 124457 trades)
+# Built replay: BINANCE_USDTF/ADAUSDT/2026-06-12 (442834 depth, 401883 trades)
+# Replay build complete: 2 successful, 0 failed
+
+python -m validation.audit_replay_store --date 2026-06-12 --symbols ADAUSDT \
+  --venues BINANCE_SPOT --replay-root /tmp/tmp.fRQ8vNOyNf/replay_store
+# depth.parquet: 412336 rows, sorted=true, 0 duplicate sequence keys, schema OK
+# trades.parquet: 124457 rows, sorted=true, 0 duplicate sequence keys, schema OK
+```
+All commands ran against temporary roots (`/tmp/...`) using the existing local
+`./data_raw` fixture; no production data, `/etc` files, or running services
+were touched.
+
+### Known limitations / out of scope
+- Broader top50/multi-day `full_l2` equivalence validation remains pending
+  (unchanged from before this entry); the `v2.0.0` gate is still not declared.
+- No live systemd install/enable/start was performed (out of scope — this is a
+  documentation/reference correction pass, not a deployment).
+- The `full_l2` semantic-equivalence smoke re-run (`convert_day.py` vs
+  `validate_catalog_equivalence --profile full_l2`) was not re-executed in this
+  session; the existing ADAUSDT smoke evidence in `docs/PROJECT_STATUS.md` and
+  `docs/IMPLEMENTATION_AUDIT.md` is unchanged and still applies.
+
+---
 ## 2026-07-20 — fix disk monitor false-zero reporting and fail-open cleanup (issue #19)
 
 ### Change summary

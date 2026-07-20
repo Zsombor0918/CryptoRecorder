@@ -10,6 +10,9 @@ CryptoRecorder has a clear separation between validation, tests, and operational
 | Unit tests | `pytest tests/` | After code changes |
 | Smoke test | `python scripts/smoke_test.py` | Verify recorder works |
 | Full acceptance | `python scripts/acceptance_test.py` | Release readiness |
+| Replay partition audit | `python -m validation.audit_replay_store` | After building `replay_store` |
+| Old-vs-new semantic equivalence | `python -m validation.validate_catalog_equivalence` | Validate `replay_store` against `convert_day.py` |
+| Change-compliance audit | `python -m validation.audit_change_compliance` | Before every commit (pre-commit hook) |
 
 ## Setup Validation (`validate.py`)
 
@@ -90,6 +93,69 @@ Checks:
 - Converter produces valid output with `architecture: deterministic_native`
 - Catalog is queryable (instruments, OrderBookDeltas, TradeTick)
 - Fenced ranges reported in convert report
+
+## Replay Store Validation (`validation/`)
+
+These commands validate `replay_store` — the recorder + replay-store output
+contract handed off to downstream repositories. They are non-mutating audits;
+none of them modify `data_raw/`, production `replay_store`, or `/etc` files.
+
+### Replay partition audit
+
+Checks schema, sort order, checksum, and null-ratio invariants for one or more
+already-built `replay_store` partitions:
+
+```bash
+python -m validation.audit_replay_store \
+  --date 2026-06-12 \
+  --symbols ADAUSDT \
+  --venues BINANCE_SPOT \
+  --replay-root ./replay_store
+```
+
+Use `--symbols all` / `--venues all` to audit every partition present for a
+date. Pass `--report-path` to write the JSON report to a file instead of
+stdout.
+
+### Old-vs-new semantic equivalence
+
+Compares `replay_store` (rebuilt into a temporary Nautilus catalog via the
+internal `validation.replay_catalog_reconstruct` helper — there is no
+`generate_catalog` product CLI) against the legacy `convert_day.py` catalog
+for the same date/symbol set:
+
+```bash
+python -m validation.validate_catalog_equivalence \
+  --date 2026-06-12 \
+  --symbols ADAUSDT \
+  --venues BINANCE_SPOT \
+  --data-root ./data_raw \
+  --work-root /tmp/cryptorecorder-equivalence \
+  --old-catalog-root /tmp/cryptorecorder-equivalence/old_catalog \
+  --replay-root /tmp/cryptorecorder-equivalence/replay_store \
+  --new-catalog-root /tmp/cryptorecorder-equivalence/new_catalog \
+  --profile trades_only \
+  --overwrite
+```
+
+`--profile` accepts `trades_only`, `full_l2`, `depth_only`, or `depth10`. The
+`full_l2` profile is validated on the ADAUSDT single-day smoke; broader
+top50/multi-day validation is pending — see
+[FULL_L2_REPLAY_CATALOG_PLAN.md](FULL_L2_REPLAY_CATALOG_PLAN.md).
+
+See [DAILY_BUILD_PIPELINE.md](DAILY_BUILD_PIPELINE.md) `## Local Testing
+Workflow (temp-root smoke)` for the full end-to-end build-then-validate
+recipe using temporary roots.
+
+### Change-compliance audit
+
+Enforces the mandatory change-audit rules in `AGENTS.md` Section 6 (run
+automatically by the pre-commit hook on staged changes):
+
+```bash
+python -m validation.audit_change_compliance --staged   # staged changes only
+python -m validation.audit_change_compliance --base main # full branch diff vs main
+```
 
 ## Reports
 

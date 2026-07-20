@@ -128,6 +128,75 @@ passes.** Until then, broader full-L2 equivalence stays **deferred** (see
   `tests/test_disk_monitor_fail_safe.py` (new), `tests/test_disk_monitor_cleanup.py`
   (updated for the new cleanup-trust contract).
 
+### Removed (issue #17 completion)
+- `feature_root` parameter, CLI flag, and `feature_store` report component from
+  `validation/audit_storage_size.py` — the feature-store subsystem no longer
+  exists, so the audit no longer measures or accepts a path for it.
+- `docs/GUARANTEES.md` — fully superseded by the "System Guarantees" section
+  already present in `docs/ARCHITECTURE.md`; no unique content was lost.
+- Root-level `inspect_catalog.py` — dead code left over from a stale merge; not
+  imported by any module, and its docstring referenced a `validators/` package
+  that does not exist in this repository. Use `validation/catalog_inspect.py`.
+- Duplicate/stale systemd unit files superseded by their real, currently-used
+  counterparts: `systemd/crypto-recorder.service` (superseded by
+  `cryptorecorder-recorder.service`), `systemd/nautilus-convert.{service,timer}`
+  (superseded by `cryptorecorder-convert.{service,timer}`), and
+  `systemd/cryptorecorder-daily-build.{service,timer}` (superseded by
+  `cryptorecorder-replay-build.{service,timer}`, the unit actually referenced by
+  `scripts/deploy_linux_server.sh`).
+
+### Fixed (issue #17/#19 completion)
+- `pipeline/daily_build.py` no longer reports a false `"success"` when zero
+  raw partitions were eligible for the requested date. `run_build_replay_store()`
+  now distinguishes `"no_data"` (zero eligible partitions) from `"success"`
+  (all eligible partitions built) and `"partial"` (some failed). `main()` exits
+  nonzero for any non-`"success"` status, including `"no_data"`. See
+  `tests/test_daily_build.py` (new) and `docs/DAILY_BUILD_PIPELINE.md`.
+- `validate.py` reverted to its working, dependency-correct form after a stale
+  `main`-branch regression reintroduced unused `cryptofeed`/`yaml` imports, a
+  reference to a nonexistent `converter.book` module, and hardcoded paths that
+  bypassed `config.py`'s configurable data/state/meta roots.
+- `tests/test_repo_structure.py` hardened with 7 additional tests enforcing the
+  exact allowed root Python/other files and the exact `docs/` file set from
+  `docs/REPO_STRUCTURE.md`, absence of stray Python/`validators` imports, and
+  absence of feature-store CLI flags/systemd units.
+
+### Changed (documentation corrections)
+- `INSTALL.md`: replaced every stale `crypto-recorder.service` reference with
+  the real `cryptorecorder-recorder.service` unit name; replaced
+  `nautilus-convert.{service,timer}` with the real
+  `cryptorecorder-convert.{service,timer}` names; added the real
+  `cryptorecorder-replay-build.{service,timer}` units to the manual-install
+  walkthrough; pointed installers at `scripts/deploy_linux_server.sh` as the
+  preferred install path; fixed a duplicate `## 10.` section heading
+  (renumbered sections 10-15 to 11-16).
+- `docs/OPERATIONS.md` and `AGENTS.md`: fixed self-referential
+  "content merged from the former `OPERATIONS.md`" provenance notes (now
+  correctly attribute `DEPLOYMENT.md`, `LINUX_SERVER.md`, `SCHEMAS.md`) and a
+  broken same-file Markdown link; `AGENTS.md` Section 5 no longer links to a
+  nonexistent `docs/LINUX_SERVER.md`.
+- `docs/ARCHITECTURE.md` and `docs/IMPLEMENTATION_AUDIT.md`: fixed similarly
+  self-referential "content merged from the former" provenance notes (now
+  correctly attribute `STORAGE_ARCHITECTURE.md`, `GUARANTEES.md`,
+  `REPO_CLEANUP_AUDIT.md`, `FEATURE_STORE.md`, `STORAGE_SIZE_AUDIT.md`); fixed
+  a stale `pipeline/audit_replay_store.py` table row to read
+  `validation/audit_replay_store.py`.
+- `docs/PROJECT_STATUS.md`: removed a duplicate `[OPERATIONS.md](OPERATIONS.md)`
+  link.
+- `docs/DAILY_BUILD_PIPELINE.md`: removed a misleading `--date today` example
+  (`daily_build` only accepts an explicit `YYYY-MM-DD` date or the literal
+  `yesterday`; there is no `today` shortcut); documented the `"no_data"` status
+  value and its nonzero exit code.
+- `docs/VALIDATION.md`: added a "Replay Store Validation" section documenting
+  `validation.audit_replay_store`, `validation.validate_catalog_equivalence`,
+  and `validation.audit_change_compliance` usage (previously undocumented in
+  this file).
+- `docs/REPO_STRUCTURE.md`: updated the "Date" header to 2026-07-20 and
+  expanded the Root-Level Files table to include every real root `.py` module
+  (`binance_universe.py`, `disk_monitor.py`, `health_monitor.py`,
+  `native_trades.py`, `phase2_depth.py`, `storage.py`, `time_utils.py`,
+  `debug_futures_trade_ws.py`) that was previously missing from the doc.
+
 ### Added (previous entry, retained)
 
   whose message does not match `<type>(<scope>): <subject>` where type is one of

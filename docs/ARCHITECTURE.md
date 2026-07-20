@@ -110,7 +110,7 @@ See `docs/OPERATIONS.md` for the full field reference and environment knobs.
 | `converter/spool.py` | Temporary SQLite spools used to keep heavy conversions memory-bounded |
 | `stores/` | Replay Parquet schemas/readers/writers (no feature/label schemas) |
 | `pipeline/build_replay_store.py` | Raw JSONL -> replay_store v0 |
-| `pipeline/audit_replay_store.py` | Non-mutating replay partition audit |
+| `validation/audit_replay_store.py` | Non-mutating replay partition audit |
 | `validation/replay_catalog_reconstruct.py` | replay_store -> temporary Nautilus catalog (validation-only, no CLI) |
 | `validation/validate_catalog_equivalence.py` | Old-vs-new semantic comparison (trades_only, full_l2, depth_only, depth10) |
 
@@ -204,7 +204,7 @@ See [VALIDATION.md](VALIDATION.md) for the complete validation layer structure:
 
 ## Storage Details
 
-> Content merged from the former `ARCHITECTURE.md`.
+> Content merged from the former `STORAGE_ARCHITECTURE.md`.
 
 ## Overview
 
@@ -523,7 +523,7 @@ The internal `validation.replay_catalog_reconstruct` helper (no CLI) supports
 
 ## System Guarantees
 
-> Content merged from the former `ARCHITECTURE.md`.
+> Content merged from the former `GUARANTEES.md`.
 
 This document states what CryptoRecorder guarantees and what it does not.
 

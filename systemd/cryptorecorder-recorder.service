@@ -1,6 +1,6 @@
 [Unit]
 Description=CryptoRecorder Recorder (Binance spot + USDT-M futures ingestion)
-Documentation=file:///home/zsom/services/CryptoRecorder/docs/LINUX_SERVER.md
+Documentation=file:///home/zsom/services/CryptoRecorder/docs/OPERATIONS.md
 After=network-online.target
 Wants=network-online.target
 

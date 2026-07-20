@@ -82,13 +82,24 @@ def run_build_replay_store(
     total_depth = sum(r.get("depth_count", 0) for r in results)
     total_trades = sum(r.get("trade_count", 0) for r in results)
     
+    if not results:
+        status = "no_data"
+        logger.warning(
+            "Replay build found no eligible venue/symbol partitions for "
+            f"{date_str} — reporting no_data (not success)."
+        )
+    elif successful == len(results):
+        status = "success"
+    else:
+        status = "partial"
+    
     logger.info(
         f"Replay build complete: {successful}/{len(results)} symbols, "
         f"{total_depth} depth, {total_trades} trades"
     )
     
     return {
-        "status": "success" if successful == len(results) else "partial",
+        "status": status,
         "symbols_processed": successful,
         "symbols_total": len(results),
         "depth_records": total_depth,
@@ -137,8 +148,14 @@ def generate_daily_report(
         "errors": [],
     }
     
-    # Check overall status
-    if replay_result.get("status") != "success":
+    # Check overall status. Distinguish "no_data" (no raw partitions were
+    # eligible to build — not a success) from "partial" (some symbols failed)
+    # from "success" (all eligible symbols built). Both no_data and partial
+    # are non-success and must produce a nonzero process exit code.
+    replay_status = replay_result.get("status")
+    if replay_status == "no_data":
+        report["status"] = "no_data"
+    elif replay_status != "success":
         report["status"] = "partial"
     
     # Collect errors
@@ -249,6 +266,11 @@ Examples:
             f"✓ Daily build complete: status={report['status']}, "
             f"runtime={runtime_sec:.1f}s"
         )
+        if report["status"] != "success":
+            logger.warning(
+                f"Daily build for {date_str} did not succeed "
+                f"(status={report['status']}); exiting with nonzero status."
+            )
 
         return 0 if report["status"] == "success" else 1
 

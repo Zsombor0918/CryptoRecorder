@@ -304,15 +304,37 @@ Do not copy the repository unit files unchanged. They still contain the
 development checkout path `/home/zsom/services/CryptoRecorder` and
 `User=zsom`.
 
-Generate host-specific units with path/user substitution:
+The repository ships `scripts/deploy_linux_server.sh`, a thin operator wrapper
+that substitutes the path/user, installs the unit files for a chosen target,
+and removes any stale units from a previous deploy. It contains no business
+logic. Prefer it over manual `sed`/`cp`:
+
+```bash
+cd "$APP_DIR"
+./scripts/deploy_linux_server.sh \
+  --target all \
+  --user "$APP_USER" \
+  --app-dir "$APP_DIR" \
+  --data-root "$DATA_BASE" \
+  --dry-run
+```
+
+Drop `--dry-run` once the printed actions look correct. Valid `--target`
+values are `all`, `recorder`, `legacy-converter`, and `replay-build`
+(`scripts/deploy_linux_server.sh --help` documents every flag).
+
+If you prefer manual installation, generate host-specific units with the same
+path/user substitution:
 
 ```bash
 cd "$APP_DIR"
 
 for unit in \
-  crypto-recorder.service \
-  nautilus-convert.service \
-  nautilus-convert.timer
+  cryptorecorder-recorder.service \
+  cryptorecorder-convert.service \
+  cryptorecorder-convert.timer \
+  cryptorecorder-replay-build.service \
+  cryptorecorder-replay-build.timer
 do
   sed \
     -e "s|User=zsom|User=$APP_USER|g" \
@@ -322,26 +344,37 @@ done
 
 sudo systemctl daemon-reload
 sudo systemd-analyze verify \
-  /etc/systemd/system/crypto-recorder.service \
-  /etc/systemd/system/nautilus-convert.service \
-  /etc/systemd/system/nautilus-convert.timer
+  /etc/systemd/system/cryptorecorder-recorder.service \
+  /etc/systemd/system/cryptorecorder-convert.service \
+  /etc/systemd/system/cryptorecorder-convert.timer \
+  /etc/systemd/system/cryptorecorder-replay-build.service \
+  /etc/systemd/system/cryptorecorder-replay-build.timer
 ```
 
 Current unit behavior:
 
-- `crypto-recorder.service` runs `recorder.py`
-- `nautilus-convert.service` runs `convert_day.py --staging`
-- `nautilus-convert.timer` schedules conversion once daily at `00:10 UTC`
-- both services write stdout/stderr to `journald`
-- both services load `/etc/cryptorecorder/cryptorecorder.env` if present
+- `cryptorecorder-recorder.service` runs `recorder.py` (live recording)
+- `cryptorecorder-convert.service` runs `convert_day.py --staging` (legacy
+  full-L2 converter, previous UTC day)
+- `cryptorecorder-convert.timer` schedules the legacy converter once daily at
+  `00:10 UTC`
+- `cryptorecorder-replay-build.service` runs
+  `python -m pipeline.daily_build --date yesterday` (builds `replay_store`)
+- `cryptorecorder-replay-build.timer` schedules the replay build once daily
+  at `01:00 UTC`
+- all services write stdout/stderr to `journald`
+- all services load `/etc/cryptorecorder/cryptorecorder.env` if present
 
 Inspect the installed units:
 
 ```bash
-systemctl cat crypto-recorder.service
-systemctl cat nautilus-convert.service
-systemctl cat nautilus-convert.timer
-systemctl list-timers --all nautilus-convert.timer
+systemctl cat cryptorecorder-recorder.service
+systemctl cat cryptorecorder-convert.service
+systemctl cat cryptorecorder-convert.timer
+systemctl list-timers --all cryptorecorder-convert.timer
+systemctl cat cryptorecorder-replay-build.service
+systemctl cat cryptorecorder-replay-build.timer
+systemctl list-timers --all cryptorecorder-replay-build.timer
 ```
 
 ## 10. Start Services Only When Live Recording Is Intended
@@ -351,38 +384,45 @@ These commands begin real server operation.
 Enable automatic startup:
 
 ```bash
-sudo systemctl enable crypto-recorder.service
-sudo systemctl enable nautilus-convert.timer
+sudo systemctl enable cryptorecorder-recorder.service
+sudo systemctl enable cryptorecorder-convert.timer
+sudo systemctl enable cryptorecorder-replay-build.timer
 ```
 
 Start live operation:
 
 ```bash
-sudo systemctl start crypto-recorder.service
-sudo systemctl start nautilus-convert.timer
+sudo systemctl start cryptorecorder-recorder.service
+sudo systemctl start cryptorecorder-convert.timer
+sudo systemctl start cryptorecorder-replay-build.timer
 ```
 
 Stop/restart later:
 
 ```bash
-sudo systemctl stop crypto-recorder.service
-sudo systemctl restart crypto-recorder.service
-sudo systemctl stop nautilus-convert.timer
-sudo systemctl start nautilus-convert.timer
+sudo systemctl stop cryptorecorder-recorder.service
+sudo systemctl restart cryptorecorder-recorder.service
+sudo systemctl stop cryptorecorder-convert.timer
+sudo systemctl start cryptorecorder-convert.timer
+sudo systemctl stop cryptorecorder-replay-build.timer
+sudo systemctl start cryptorecorder-replay-build.timer
 ```
 
 Status and logs:
 
 ```bash
-systemctl status crypto-recorder.service
-systemctl status nautilus-convert.timer
-systemctl status nautilus-convert.service
+systemctl status cryptorecorder-recorder.service
+systemctl status cryptorecorder-convert.timer
+systemctl status cryptorecorder-convert.service
+systemctl status cryptorecorder-replay-build.timer
+systemctl status cryptorecorder-replay-build.service
 
-journalctl -u crypto-recorder.service -f
-journalctl -u nautilus-convert.service -f
+journalctl -u cryptorecorder-recorder.service -f
+journalctl -u cryptorecorder-convert.service -f
+journalctl -u cryptorecorder-replay-build.service -f
 ```
 
-## 10. Manual Commands
+## 11. Manual Commands
 
 ### Live recorder
 
@@ -416,7 +456,7 @@ python convert_day.py --date YYYY-MM-DD --staging
 Do not use `--allow-partial-overwrite` casually. It bypasses the converter’s
 low-depth-coverage refusal guard for direct overwrite mode.
 
-## 11. Validation, Readiness, and Catalog Inspection
+## 12. Validation, Readiness, and Catalog Inspection
 
 Health/readiness output is file-based:
 
@@ -451,7 +491,7 @@ python -m validation.catalog_inspect \
   BTCUSDT.BINANCE
 ```
 
-## 12. Live Smoke and Acceptance Tests
+## 13. Live Smoke and Acceptance Tests
 
 These scripts start the recorder unless you use the documented skip mode.
 Run them only when live Binance test recording is acceptable.
@@ -467,7 +507,7 @@ python scripts/acceptance_test.py --runtime 300
 python scripts/acceptance_test.py --skip-recorder
 ```
 
-## 13. Disk Cleanup Warning
+## 14. Disk Cleanup Warning
 
 While the live recorder is running, `disk_monitor.py` can delete the oldest raw
 date directories after raw data storage crosses:
@@ -481,7 +521,7 @@ Review those constants in `config.py` before a long-running server deployment.
 currently size-triggered. Catalog, `meta`, and `state` sizes are still reported
 for observability, but only raw data size triggers raw cleanup.
 
-## 14. Troubleshooting
+## 15. Troubleshooting
 
 ### `validate.py` created repo-local directories before symlinks
 
@@ -500,14 +540,14 @@ decided how to migrate them.
 Check path/user substitution first:
 
 ```bash
-systemctl cat crypto-recorder.service
+systemctl cat cryptorecorder-recorder.service
 systemctl cat nautilus-convert.service
 ```
 
 Then inspect logs:
 
 ```bash
-journalctl -u crypto-recorder.service -n 200 --no-pager
+journalctl -u cryptorecorder-recorder.service -n 200 --no-pager
 journalctl -u nautilus-convert.service -n 200 --no-pager
 ```
 
@@ -531,7 +571,7 @@ report instead of forcing conversion:
 python -m json.tool state/convert_reports/YYYY-MM-DD.json | sed -n '1,220p'
 ```
 
-## 15. Data Sync / Syncthing Later
+## 16. Data Sync / Syncthing Later
 
 Data sync is intentionally not configured here.
 

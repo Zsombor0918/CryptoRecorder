@@ -127,8 +127,9 @@ A change is **not** done until all of the following are true:
 
 - **Stop and ask** if you are uncertain about a path, a destructive action, or
   whether raw-side changes are in scope.
-- Do **not** invent production paths. The canonical prod layout lives in
-  [docs/LINUX_SERVER.md](docs/OPERATIONS.md) in the `## Linux Server Layout` section of [docs/OPERATIONS.md](docs/OPERATIONS.md); use those values, do not guess.
+- Do **not** invent production paths. The canonical prod layout lives in the
+  `## Linux Server Layout` section of [docs/OPERATIONS.md](docs/OPERATIONS.md);
+  use those values, do not guess.
 - Do **not** delete data directories (`data_raw/`, `replay_store/`,
   `state/`, catalog outputs, or any pre-existing local `feature_store/` left
   over from before issue #17 — even though CryptoRecorder no longer writes to

@@ -258,7 +258,7 @@ downstream consumer repositories such as KovacsTrader.
 
 ## Repo Cleanup History
 
-> Content merged from the former `IMPLEMENTATION_AUDIT.md`.
+> Content merged from the former `REPO_CLEANUP_AUDIT.md`.
 
 Date: 2026-06-16
 
@@ -503,7 +503,7 @@ See `CHANGELOG.md` `[Unreleased]` for the full change list.
 > to downstream consumer repositories (e.g. KovacsTrader). Do not recreate any
 > of the files referenced below without a new, explicit task.
 
-> Content merged from the former `IMPLEMENTATION_AUDIT.md`.
+> Content merged from the former `FEATURE_STORE.md`.
 
 > Honest status snapshot of the v0 feature store against its intended
 > requirements, as it stood immediately before removal. "Status" uses:
@@ -548,7 +548,7 @@ recorded here and in [FEATURE_STORE.md](FEATURE_STORE.md); it is not closed.
 
 ## Storage Size Audit
 
-> Content merged from the former `IMPLEMENTATION_AUDIT.md`.
+> Content merged from the former `STORAGE_SIZE_AUDIT.md`.
 
 > **Scope honesty**: every number below is **measured from a single
 > venue/symbol/date** (`BINANCE_SPOT/ADAUSDT/2026-06-12`). Universe-level

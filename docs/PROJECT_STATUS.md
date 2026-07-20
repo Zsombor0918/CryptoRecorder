@@ -104,5 +104,4 @@ repositories (e.g. KovacsTrader).
    `convert_day.py` remains the **production reference** for full order-book
    catalogs until broader top50/multi-day validation passes.
 
-See [OPERATIONS.md](OPERATIONS.md) and [OPERATIONS.md](OPERATIONS.md) for the
-service layout that runs these steps.
+See [OPERATIONS.md](OPERATIONS.md) for the service layout that runs these steps.

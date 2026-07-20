@@ -4,7 +4,8 @@
 # Linux server. Contains NO business logic: it only prepares the environment and
 # installs/controls systemd units for the selected service group.
 #
-# See docs/DEPLOYMENT.md and docs/LINUX_SERVER.md for the full reference.
+# See docs/OPERATIONS.md for the full reference (Deployment Script Reference and
+# Linux Server Layout sections).
 #
 # It NEVER deploys Syncthing, archive, or import features (none exist), and it never
 # modifies recorder.py, the raw schema, or convert_day.py.
