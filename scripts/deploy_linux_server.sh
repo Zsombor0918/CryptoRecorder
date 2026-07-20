@@ -248,6 +248,35 @@ control_units() {
   fi
 }
 
+# Stop/disable/remove systemd units that this repo used to install but no
+# longer ships (e.g. the feature-build service group removed in issue #17).
+# On servers deployed before that refactor, the stale unit files may still be
+# present under /etc/systemd/system and would otherwise keep firing the
+# removed command on their old schedule after this repo is upgraded.
+cleanup_stale_units() {
+  if [[ "$USE_SYSTEMD" != "true" ]]; then
+    log "Cleanup stale units: skipped (--no-systemd)"
+    return 0
+  fi
+  case "$TARGET" in
+    all|replay-build) ;;
+    *) return 0 ;;
+  esac
+  local stale_unit removed_any="false"
+  for stale_unit in cryptorecorder-feature-build.timer cryptorecorder-feature-build.service; do
+    if [[ -f "/etc/systemd/system/$stale_unit" ]]; then
+      removed_any="true"
+      log "Removing stale unit from a pre-issue-#17 deploy: $stale_unit"
+      run sudo systemctl stop "$stale_unit" || true
+      run sudo systemctl disable "$stale_unit" || true
+      run sudo rm -f "/etc/systemd/system/$stale_unit"
+    fi
+  done
+  if [[ "$removed_any" == "true" ]]; then
+    run sudo systemctl daemon-reload
+  fi
+}
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -262,6 +291,7 @@ main() {
   create_data_dirs
   run_validation
   install_units
+  cleanup_stale_units
   control_units
   print_target
   log "Done."

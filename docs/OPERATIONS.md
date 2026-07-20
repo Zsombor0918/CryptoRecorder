@@ -232,6 +232,11 @@ still prepares the venv, dependencies, and data dirs (or prints them under `--dr
 - `--dry-run` makes no changes; `--no-systemd` avoids systemd and `/etc` entirely.
 - The script does **not** deploy Syncthing, archive, or import features — none exist.
 - It does **not** modify `recorder.py`, the raw schema, or `convert_day.py`.
+- On `--target all` or `--target replay-build`, the script stops, disables, and
+  removes any stale `cryptorecorder-feature-build.{service,timer}` units left
+  over from a pre-issue-#17 deploy (the feature-build service group and its
+  `daily_build --steps features` command no longer exist in this repo). This
+  cleanup step is skipped under `--no-systemd`.
 
 ---
 

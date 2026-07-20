@@ -238,10 +238,15 @@ status claims are honest.
 - Updated `tests/test_agent_infrastructure.py` `DEPLOY_TARGETS` (removed
   `feature-build`); updated `tests/test_semantic_equivalence.py` and
   `tests/test_replay_depth_adapter.py` to reference
-  `validation.replay_catalog_reconstruct` instead of `pipeline.generate_catalog`.
+  `validation.replay_catalog_reconstruct` instead of the removed
+  `pipeline/generate_catalog.py` module.
 - Cleaned `scripts/deploy_linux_server.sh` (removed the `feature-build` target
   throughout: `VALID_TARGETS`, help text, unit/control case statements,
-  directory creation list), `systemd/cryptorecorder.env.example` (removed
+  directory creation list, plus an explicit stale-unit cleanup step that
+  stops/disables/removes any previously-installed
+  `cryptorecorder-feature-build.{service,timer}` on `all`/`replay-build`
+  deploys so upgraded servers don't keep firing the removed
+  `daily_build --steps features` command), `systemd/cryptorecorder.env.example` (removed
   `CRYPTO_RECORDER_FEATURE_ROOT`, `CRYPTO_RECORDER_CATALOG_JOBS_ROOT`,
   `CRYPTO_RECORDER_LABEL_ROOT`), `systemd/cryptorecorder-replay-build.service`
   (removed the now-nonexistent `--steps replay` flag), and `scripts/README.md`.
