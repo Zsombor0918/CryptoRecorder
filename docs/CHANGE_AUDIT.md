@@ -189,6 +189,163 @@ status claims are honest.
 ## Audit entries (newest first)
 
 ---
+## 2026-07-20 — fix disk monitor false-zero reporting and fail-open cleanup (issue #19)
+
+### Change summary
+- Rewrote `disk_monitor.py` to eliminate the false-zero measurement defect: a
+  failed/timed-out recursive `du` scan previously returned numeric `0.0`, which was
+  published as `data_raw_gb=0.0` and silently disabled capacity alerts and
+  automatic cleanup (observed ~442 timeouts since June 2 against a ~410GB raw tree
+  with a 30s hard-coded timeout).
+- Added `measure_directory()` / `DirectoryMeasurement` (`ok`, `status` — one of
+  `ok`/`missing`/`timeout`/`command_error`/`malformed_output`/`error`, `error`,
+  `value_bytes`, `measured_at`, `duration_seconds`) so a failure can never be
+  represented as a bare numeric zero. A genuinely empty directory still reports
+  `ok=True, status="ok"`.
+- Switched the scan command from `du -sb` (apparent size) to `du -s -B1` (allocated
+  bytes) — documented as the intended, more honest-for-retention semantics.
+- Added last-known-good persistence (`state/disk_monitor_state.json`): on measurement
+  failure the monitor falls back to the prior successful value marked `stale=True`
+  with `measurement_age_seconds`; if no prior value exists the field is `null`, never
+  `0`. State survives process restarts (loaded in `DiskMonitor.__init__`).
+- `state/disk_usage.json` now reports per-component `measurement_ok` /
+  `measurement_status` / `measurement_error` / `measurement_timestamp` /
+  `measurement_age_seconds` / `stale`, a top-level `monitoring_health`
+  (`healthy`/`degraded`/`unhealthy`), and an `alerts` list. Retention percentages,
+  growth rate, and `days_to_full` are `null` (never derived) when the backing data is
+  unknown/stale.
+- `cleanup_old_data()` now fails closed: it refuses to run or continue unless the
+  current cycle's `data_raw` measurement is fresh and successful
+  (`retention_measurement_trustworthy=True`), re-validating before every destructive
+  deletion phase, and logs an `ERROR` (with a report alert) when skipped.
+- Added independent filesystem-capacity reporting via `measure_filesystem()`
+  (`shutil.disk_usage`), exposed under `filesystem.*` in the report, with its own
+  `DISK_FS_FREE_WARN_GB`/`DISK_FS_FREE_CRITICAL_GB` thresholds — kept semantically
+  separate from the raw-retention `DISK_SOFT_LIMIT_GB`/`DISK_HARD_LIMIT_GB` limits.
+- Growth-rate/`days_to_full` now use real sample timestamps (bounded, persisted
+  `GrowthSample` history capped by `DISK_HISTORY_MAX_SAMPLES`/`DISK_HISTORY_MAX_AGE_SEC`),
+  only recording a sample when every monitored root was measured fresh and
+  successfully in the same cycle; non-increasing timestamps are rejected; growth and
+  `days_to_full` are `null` when the valid sample span is under 1 hour.
+- Added an `asyncio.Lock` around `check_disk_usage()` to prevent overlapping scans;
+  an overlapping call returns the previous report with `skipped_duplicate=True`
+  instead of queuing or running concurrently. The lock is released via `async with`
+  on every exception path.
+- Report and companion-state writes are now atomic (`tempfile.NamedTemporaryFile` in
+  the same directory + `os.replace()`), with the temp file cleaned up on any
+  write failure.
+- `config.py`: added `DISK_SCAN_TIMEOUT_SEC` (default 60s, validated > 0),
+  `DISK_MEASUREMENT_STALE_AFTER_SEC`, `DISK_FS_FREE_WARN_GB`,
+  `DISK_FS_FREE_CRITICAL_GB`, `DISK_HISTORY_MAX_SAMPLES`, `DISK_HISTORY_MAX_AGE_SEC`;
+  existing `DISK_SOFT_LIMIT_GB`/`DISK_HARD_LIMIT_GB`/`DISK_CLEANUP_TARGET_GB` env vars
+  are unchanged for backward compatibility.
+- `recorder.py`: `disk_check_task()` updated to use `usage.get('data_raw_gb')` (no
+  longer defaults a missing/None value to `0`) before comparing against the soft
+  limit.
+- Added `tests/test_disk_monitor_fail_safe.py` (30 new tests) covering: successful/
+  empty/missing/timeout/nonzero-exit/malformed-output/unexpected-exception `du`
+  parsing; invalid-timeout config validation; last-known-good fallback marked
+  stale; restart-persisted state; no-prior-value → `null`; staleness alert;
+  misleading percentage/growth omission; cleanup skipped on unknown/stale
+  measurement with no destructive `shutil.rmtree` call; independent filesystem
+  capacity fields and low-free-space alert; separate retention/filesystem threshold
+  semantics; atomic report writing and temp-file cleanup on failure; growth from
+  real timestamps, short-span exclusion, non-increasing-timestamp rejection,
+  failed/stale-sample exclusion; overlapping-scan prevention and lock release on
+  exception.
+- Updated `tests/test_disk_monitor_cleanup.py`'s two existing fakes to include
+  `retention_measurement_trustworthy: True` (new required field in the cleanup
+  trust contract) — no behavioral change to those tests' assertions.
+- No production data, service, or `/etc` changes were made. No destructive cleanup
+  was run against real data during implementation or testing (temp dirs / mocks
+  only).
+
+### Files/packages touched
+- `disk_monitor.py` (rewritten)
+- `recorder.py` (`disk_check_task` — safe `.get()` for `data_raw_gb`)
+- `config.py` (new disk-monitor env vars + docstring clarifying retention vs
+  filesystem-threshold semantics)
+- `systemd/cryptorecorder.env.example` (documented new env vars)
+- `tests/test_disk_monitor_fail_safe.py` (new)
+- `tests/test_disk_monitor_cleanup.py` (updated fakes for the trust contract)
+- `docs/ARCHITECTURE.md` (new "Disk Monitoring Safety Invariant" section)
+- `docs/OPERATIONS.md` (new "Disk Monitoring" field/alert/threshold reference)
+- `docs/IMPLEMENTATION_AUDIT.md` (addendum under Section A)
+- `docs/PROJECT_STATUS.md` (new validated bullet + `Last updated` bump)
+- `INSTALL.md` (runtime file table: `disk_usage.json` description +
+  `disk_monitor_state.json` row)
+- `CHANGELOG.md` (`[Unreleased]` → new "Fixed" section)
+- `docs/CHANGE_AUDIT.md` (this entry)
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] docs/REPO_STRUCTURE.md
+- [x] docs/PROJECT_STATUS.md
+- [x] docs/IMPLEMENTATION_AUDIT.md
+- [x] relevant feature docs:
+  - docs/ARCHITECTURE.md, docs/OPERATIONS.md, docs/VALIDATION.md (no disk-monitor
+    content existed there; not amended), CHANGELOG.md
+
+### Docs updated
+- [x] CHANGELOG.md
+- [ ] README.md
+- [x] docs/PROJECT_STATUS.md
+- [ ] docs/REPO_STRUCTURE.md
+- [x] relevant feature docs:
+  - docs/ARCHITECTURE.md, docs/OPERATIONS.md, docs/IMPLEMENTATION_AUDIT.md,
+    INSTALL.md, systemd/cryptorecorder.env.example
+- No docs update required for README.md/REPO_STRUCTURE.md because: no new
+  top-level files/folders or root-entrypoint changes were introduced; this is an
+  internal-module fix within the existing `disk_monitor.py` file already listed
+  in `docs/REPO_STRUCTURE.md`.
+
+### Status / validation impact
+- Validated status changed: yes — `docs/PROJECT_STATUS.md` gained a new
+  "Disk monitoring (fail-safe measurement)" validated bullet.
+- Deferred status changed: no.
+- New claims added: yes — the fail-safe measurement behavior is claimed as
+  validated by the focused test suite below; **real-server verification is
+  explicitly NOT claimed** (deployment/log/report inspection is documented as a
+  manual, not-yet-performed checklist item — see PR body).
+- Evidence for any new validation claim:
+  - `pytest tests/test_disk_monitor_fail_safe.py tests/test_disk_monitor_cleanup.py -q`
+    → `30 passed`
+  - Full suite: `pytest -q` → `266 passed, 3 skipped`
+
+### Tests run
+```bash
+source .venv/bin/activate
+pytest tests/test_disk_monitor_fail_safe.py tests/test_disk_monitor_cleanup.py -q
+pytest -q
+```
+
+### Validation CLIs run
+```bash
+python -m validation.audit_change_compliance --staged
+```
+
+### Known limitations / out of scope
+- Real production-server verification (restarting the monitor/recorder service,
+  inspecting logs and `disk_usage.json` against the actual ~410GB raw tree) was
+  **not performed** as part of this change — see the manual deployment/
+  verification checklist in the PR description. No production data or services
+  were touched.
+- `get_dir_size_gb()` is retained only as a best-effort single-directory helper
+  for cleanup log messages; it is not used for any retention/cleanup decision
+  (which relies solely on the current cycle's `data_raw` `DirectoryMeasurement`).
+- Concurrent/parallel scanning across roots was deliberately **not** introduced
+  (roots are measured sequentially against the same disk) since the issue asked
+  to avoid concurrent recursive scans unless benchmarked as safe; no such
+  benchmark was performed in this change.
+- `disk_check_task()` in `recorder.py` still runs on a fixed
+  `DISK_CHECK_INTERVAL_SEC` sleep loop (unchanged); the new `asyncio.Lock`-based
+  overlap guard lives inside `DiskMonitor.check_disk_usage()` itself, which is
+  sufficient because `disk_check_task()` awaits each cycle in sequence and does
+  not spawn concurrent calls itself — this is noted for completeness, not as a
+  gap.
+
+
+---
 
 ## 2026-07-15 — Issue #17: narrow scope to recorder + replay-store ownership, remove feature-store subsystem
 

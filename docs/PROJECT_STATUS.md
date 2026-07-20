@@ -1,7 +1,7 @@
 # Project Status
 
 **Version:** `v1.1.0-dev`
-**Last updated:** 2026-07-15
+**Last updated:** 2026-07-20
 
 This document is the single source of truth for **what is validated** vs **what is
 deferred** in CryptoRecorder. Keep it honest. Do not promote a deferred item to
@@ -13,6 +13,16 @@ validated without recorded evidence.
 
 - **Recorder** — Binance spot + USDT-M futures ingestion to `data_raw/`
   (deterministic-native depth_v2 + trade_v2). Stable.
+- **Disk monitoring (fail-safe measurement)** — `disk_monitor.py` never reports a
+  failed/timed-out directory-size scan as zero. Failures fall back to a persisted
+  last-known-good value marked `stale`, or `null` if none exists;
+  `state/disk_usage.json` exposes `monitoring_health` (healthy/degraded/unhealthy)
+  and alerts; automatic cleanup fails closed on any untrusted `data_raw`
+  measurement; filesystem capacity is reported independently via
+  `shutil.disk_usage()`. See `docs/ARCHITECTURE.md` and `docs/OPERATIONS.md`.
+  Covered by `tests/test_disk_monitor_fail_safe.py` and
+  `tests/test_disk_monitor_cleanup.py`. Real-server verification (post-deploy
+  log/report inspection) is pending — see deployment checklist in the PR.
 - **`data_raw/ → convert_day.py → Nautilus full-L2 catalog`** — the reference
   production conversion path. This is the byte-for-byte validated path and must not
   regress.

@@ -277,11 +277,62 @@ REPORT_TIMEZONE_NAME: Final = "Europe/Budapest"
 # Disk usage check interval (seconds)
 DISK_CHECK_INTERVAL_SEC: Final = 600  # 10 minutes
 
-# Disk usage limits (GB)
+# Raw-data retention thresholds (GB). These apply to *tracked retention usage*
+# (data_raw + catalog + meta + state), not to filesystem capacity. See
+# DISK_FS_FREE_WARN_GB / DISK_FS_FREE_CRITICAL_GB below for filesystem-level
+# free-space thresholds, which are a separate concern.
 DISK_SOFT_LIMIT_GB: Final = int(os.environ.get("CRYPTO_RECORDER_DISK_SOFT_LIMIT_GB", "750"))
 DISK_HARD_LIMIT_GB: Final = int(os.environ.get("CRYPTO_RECORDER_DISK_HARD_LIMIT_GB", "850"))
 DISK_CLEANUP_TARGET_GB: Final = int(
     os.environ.get("CRYPTO_RECORDER_DISK_CLEANUP_TARGET_GB", "700")
+)
+
+# Timeout for a single recursive `du` directory-size scan. The raw tree has
+# grown large enough that the historical hard-coded 30s timeout no longer
+# reliably completes; default raised to a production-safe value. A scan that
+# still exceeds this is reported as an explicit "timeout" measurement status,
+# never as a fake zero.
+DISK_SCAN_TIMEOUT_SEC: Final = _env_float(
+    "CRYPTO_RECORDER_DISK_SCAN_TIMEOUT_SEC",
+    "60.0",
+    min_value=1.0,
+)
+
+# How long a last-known-good directory measurement may be reused as a stale
+# fallback before it is treated as too old to be useful (still reported, but
+# flagged with an alert). Default is 3x the check interval.
+DISK_MEASUREMENT_STALE_AFTER_SEC: Final = _env_float(
+    "CRYPTO_RECORDER_DISK_MEASUREMENT_STALE_AFTER_SEC",
+    "1800.0",
+    min_value=1.0,
+)
+
+# Filesystem-level free-space safety thresholds (GB). Independent of the
+# retention thresholds above — these come from a fast `shutil.disk_usage()`
+# call and stay meaningful even when the recursive data_raw scan fails.
+DISK_FS_FREE_WARN_GB: Final = _env_float(
+    "CRYPTO_RECORDER_DISK_FS_FREE_WARN_GB",
+    "100.0",
+    min_value=0.0,
+)
+DISK_FS_FREE_CRITICAL_GB: Final = _env_float(
+    "CRYPTO_RECORDER_DISK_FS_FREE_CRITICAL_GB",
+    "50.0",
+    min_value=0.0,
+)
+
+# Bounded growth-history retention used for growth-rate / days-to-full
+# estimation. Only successful, non-stale samples are ever recorded (see
+# disk_monitor.py), so these bounds only limit how much valid history is kept.
+DISK_HISTORY_MAX_SAMPLES: Final = _env_int(
+    "CRYPTO_RECORDER_DISK_HISTORY_MAX_SAMPLES",
+    "288",
+    min_value=2,
+)
+DISK_HISTORY_MAX_AGE_SEC: Final = _env_float(
+    "CRYPTO_RECORDER_DISK_HISTORY_MAX_AGE_SEC",
+    "172800.0",
+    min_value=60.0,
 )
 
 # ============================================================================

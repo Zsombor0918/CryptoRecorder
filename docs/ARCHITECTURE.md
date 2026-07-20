@@ -49,6 +49,52 @@ responsibilities.
 5. Recorder startup writes `state/startup_coverage.json`.
 6. `convert_day.py` converts a UTC date into Nautilus catalog output.
 
+## Disk Monitoring Safety Invariant
+
+`disk_monitor.py` measures `data_raw/`, the Nautilus catalog, `meta/`, and
+`state/` on a fixed interval (`DISK_CHECK_INTERVAL_SEC`, default 600s) via a
+recursive `du -s -B1` scan, and enforces:
+
+> If a directory-size measurement fails or is unavailable, monitoring must
+> become visibly unhealthy. It must never optimistically report zero, and
+> automatic cleanup must fail closed.
+
+Concretely:
+
+- Every scan result is a `DirectoryMeasurement` (`ok`, `status`, `error`,
+  `value_bytes`) — never a bare number. `status` is one of `ok`, `missing`,
+  `timeout`, `command_error`, `malformed_output`, `error`. A genuinely empty
+  directory reports `ok=True, status="ok", value_bytes>=0`; a failed scan
+  never reports `value_bytes=0`.
+- On failure, the monitor falls back to the last-known-good value for that
+  directory (persisted in `state/disk_monitor_state.json` so it survives a
+  restart), reported with `stale=True` and a `measurement_age_seconds`. If no
+  prior value exists, the field is `null`, never `0`.
+- `state/disk_usage.json` exposes `monitoring_health` (`healthy` / `degraded`
+  / `unhealthy`), per-component `measurement_ok` / `measurement_status` /
+  `stale` fields, and an `alerts` list. Retention percentage, growth rate, and
+  `days_to_full` are only computed from known, trustworthy values — otherwise
+  they are `null`, not misleadingly derived from a stale or missing sample.
+- Filesystem-level free space is measured independently via
+  `shutil.disk_usage(DATA_ROOT)` (fast, not a recursive scan) and reported
+  under `filesystem` with its own `DISK_FS_FREE_WARN_GB` /
+  `DISK_FS_FREE_CRITICAL_GB` thresholds. This stays operational even when the
+  recursive `data_raw` scan fails, and is never summed with retention GB.
+- Automatic cleanup (`cleanup_old_data()`) refuses to run or continue unless
+  the current cycle's `data_raw` measurement is fresh and successful
+  (`retention_measurement_trustworthy=True`); a missing, failed, timed-out, or
+  merely-stale (last-known-good) value is never treated as "below threshold".
+  Cleanup re-validates this before each destructive deletion, not just once
+  up front.
+- Overlapping scans are prevented with an `asyncio.Lock`; a scan already in
+  flight causes the next call to return the previous report with
+  `skipped_duplicate=True` rather than queuing or running concurrently.
+- `disk_usage.json` and the companion state file are written atomically
+  (temp file in the same directory + `os.replace()`), with the temp file
+  cleaned up on any write failure.
+
+See `docs/OPERATIONS.md` for the full field reference and environment knobs.
+
 ## Key Components
 
 | Module | Purpose |

@@ -54,6 +54,7 @@ async def test_catalog_size_does_not_trigger_raw_cleanup(tmp_path) -> None:
             "meta_gb": 0.0,
             "state_gb": 0.0,
             "total_gb": 810.0,
+            "retention_measurement_trustworthy": True,
         }
 
     monitor.check_disk_usage = fake_usage
@@ -80,6 +81,7 @@ async def test_cleanup_deletes_oldest_raw_date_dirs_until_raw_target(tmp_path, m
             "meta_gb": 0.0,
             "state_gb": 0.0,
             "total_gb": raw_gb,
+            "retention_measurement_trustworthy": True,
         }
 
     def run_inline(_executor, func, *args):

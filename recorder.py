@@ -198,8 +198,8 @@ async def disk_check_task() -> None:
         try:
             usage = await disk_monitor.check_disk_usage()
             await disk_monitor.write_usage_report(usage)
-            raw_gb = usage.get('data_raw_gb', 0)
-            if raw_gb > DISK_SOFT_LIMIT_GB:
+            raw_gb = usage.get('data_raw_gb')
+            if raw_gb is not None and raw_gb > DISK_SOFT_LIMIT_GB:
                 logger.warning(
                     f"Raw data {raw_gb:.1f}GB > soft limit {DISK_SOFT_LIMIT_GB}GB")
                 await disk_monitor.cleanup_old_data()

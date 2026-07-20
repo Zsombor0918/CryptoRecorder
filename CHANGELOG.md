@@ -103,8 +103,33 @@ passes.** Until then, broader full-L2 equivalence stays **deferred** (see
   issue #17's narrower recorder+replay-store scope; commented and closed as
   not planned.
 
+### Fixed
+- **Disk monitor false-zero reporting (issue #19)** — `disk_monitor.py` no longer
+  reports a failed or timed-out `data_raw` size scan as numeric `0.0`. Every scan
+  now returns a structured `DirectoryMeasurement` (`ok`/`status`/`error`); failures
+  fall back to a persisted last-known-good value marked `stale`, or `null` if none
+  exists. `state/disk_usage.json` gains `monitoring_health`
+  (`healthy`/`degraded`/`unhealthy`), per-component measurement status, an `alerts`
+  list, and independent filesystem-capacity fields via `shutil.disk_usage()`.
+  Automatic cleanup (`cleanup_old_data()`) now fails closed: it never runs (or
+  continues) unless the current `data_raw` measurement is fresh and successful.
+  Retention thresholds (`DISK_SOFT_LIMIT_GB`/`DISK_HARD_LIMIT_GB`) and new
+  filesystem free-space thresholds (`DISK_FS_FREE_WARN_GB`/`DISK_FS_FREE_CRITICAL_GB`)
+  are kept semantically separate. Growth rate / `days_to_full` are computed from
+  real sample timestamps and only successful, non-stale samples, with bounded
+  persisted history. Overlapping scans are prevented with an `asyncio.Lock`. Report
+  writes are atomic (temp file + `os.replace()`). Timed-out `du` child processes are
+  terminated and reaped rather than left running. New env vars:
+  `CRYPTO_RECORDER_DISK_SCAN_TIMEOUT_SEC`,
+  `CRYPTO_RECORDER_DISK_MEASUREMENT_STALE_AFTER_SEC`,
+  `CRYPTO_RECORDER_DISK_FS_FREE_WARN_GB`, `CRYPTO_RECORDER_DISK_FS_FREE_CRITICAL_GB`,
+  `CRYPTO_RECORDER_DISK_HISTORY_MAX_SAMPLES`, `CRYPTO_RECORDER_DISK_HISTORY_MAX_AGE_SEC`.
+  See `docs/ARCHITECTURE.md` and `docs/OPERATIONS.md`. Tests:
+  `tests/test_disk_monitor_fail_safe.py` (new), `tests/test_disk_monitor_cleanup.py`
+  (updated for the new cleanup-trust contract).
+
 ### Added (previous entry, retained)
-- `.githooks/commit-msg` — conventional commits enforcement hook. Blocks commits
+
   whose message does not match `<type>(<scope>): <subject>` where type is one of
   `feat|fix|docs|style|refactor|perf|test|chore`, subject starts lowercase, and
   subject has no trailing period. Blank-line-before-body is also enforced.

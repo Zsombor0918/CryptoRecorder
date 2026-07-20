@@ -428,7 +428,8 @@ Health/readiness output is file-based:
 | `state/universe_health/symbol_health.json` | aggregated universe-health state |
 | `state/convert_reports/YYYY-MM-DD.json` | converter report |
 | `../nautilus_data/convert_reports/YYYY-MM-DD.json` | sibling converter report copy |
-| `state/disk_usage.json` | disk usage snapshot |
+| `state/disk_usage.json` | disk usage + monitoring-health snapshot (see docs/OPERATIONS.md) |
+| `state/disk_monitor_state.json` | last-known-good disk measurements + growth history (restart-safe) |
 | `state/reconnects.log` | reconnect events |
 
 Useful checks after real data exists:

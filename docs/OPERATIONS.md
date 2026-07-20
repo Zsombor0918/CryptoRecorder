@@ -33,12 +33,61 @@ journalctl -u crypto-recorder -f
 | `state/heartbeat.json` | Live recorder status (architecture=deterministic_native) |
 | `state/startup_coverage.json` | Startup symbol coverage |
 | `state/convert_reports/YYYY-MM-DD.json` | Conversion reports |
+| `state/disk_usage.json` | Disk usage + monitoring-health report (see Disk Monitoring below) |
+| `state/disk_monitor_state.json` | Last-known-good measurements + bounded growth history (restart-safe) |
 | `recorder.log` | Recorder log file |
 
 Report timestamps use Hungary local time (`Europe/Budapest`).
 Day-scoped dates in file names remain UTC.
 
+## Disk Monitoring
+
+`disk_monitor.py` runs every `DISK_CHECK_INTERVAL_SEC` (default 600s) and
+writes `state/disk_usage.json`. A failed or unavailable directory-size
+measurement is never reported as zero — see the safety invariant in
+`docs/ARCHITECTURE.md`.
+
+### `disk_usage.json` fields
+
+| Field | Meaning |
+|-------|---------|
+| `components.<data_raw\|catalog\|meta\|state>.value_gb` | Current or last-known-good size in GB, or `null` if never measured |
+| `components.<name>.measurement_ok` | `true` only if *this cycle's* scan succeeded |
+| `components.<name>.measurement_status` | `ok` / `missing` / `timeout` / `command_error` / `malformed_output` / `error` |
+| `components.<name>.stale` | `true` when `value_gb` is a last-known-good fallback, not a fresh measurement |
+| `components.<name>.measurement_age_seconds` | Age of the fallback value, or `null` |
+| `total_gb`, `percent_of_soft_limit`, `percent_of_hard_limit` | `null` unless every component has a known value |
+| `filesystem.*` | Independent `shutil.disk_usage()` capacity fields (total/used/free/percent), unaffected by recursive-scan failures |
+| `growth_rate_gb_day`, `days_to_full` | `null` unless there is a real, non-stale timestamped history spanning enough time |
+| `growth_sample_interval_sec`, `growth_sample_oldest_timestamp`, `growth_sample_newest_timestamp` | Provenance of the growth estimate |
+| `monitoring_health` | `healthy` / `degraded` / `unhealthy` |
+| `alerts` | List of human-readable alert strings (measurement failure, staleness, low free space, threshold breaches) |
+| `retention_measurement_trustworthy` | `true` only when the current `data_raw` measurement is fresh and successful; gates automatic cleanup |
+| `skipped_duplicate` | `true` if this cycle was skipped because a previous scan was still running |
+
+### Threshold semantics (kept separate)
+
+| Threshold class | Env var | Applies to |
+|---|---|---|
+| Raw-retention soft/hard limit | `CRYPTO_RECORDER_DISK_SOFT_LIMIT_GB` / `CRYPTO_RECORDER_DISK_HARD_LIMIT_GB` | tracked retention usage (`data_raw + catalog + meta + state`), drives cleanup |
+| Raw-retention cleanup target | `CRYPTO_RECORDER_DISK_CLEANUP_TARGET_GB` | how far cleanup reduces `data_raw` |
+| Filesystem free-space warn/critical | `CRYPTO_RECORDER_DISK_FS_FREE_WARN_GB` / `CRYPTO_RECORDER_DISK_FS_FREE_CRITICAL_GB` | raw filesystem free bytes, independent of retention accounting |
+
+Retention thresholds and filesystem thresholds are never conflated: a low
+filesystem-free-space alert does not by itself authorize cleanup, and
+retention percentages are never computed from `filesystem_percent_used`.
+
+### Other disk-monitor environment knobs
+
+| Env var | Default | Purpose |
+|---|---|---|
+| `CRYPTO_RECORDER_DISK_SCAN_TIMEOUT_SEC` | `60.0` | Timeout for one recursive `du` scan; a scan that exceeds this reports `status="timeout"`, never zero |
+| `CRYPTO_RECORDER_DISK_MEASUREMENT_STALE_AFTER_SEC` | `1800.0` | How long a last-known-good value may be reused before it triggers a staleness alert |
+| `CRYPTO_RECORDER_DISK_HISTORY_MAX_SAMPLES` | `288` | Bounded growth-history sample count |
+| `CRYPTO_RECORDER_DISK_HISTORY_MAX_AGE_SEC` | `172800.0` | Bounded growth-history max age (48h) |
+
 ## Coverage Terminology
+
 
 Startup and runtime reporting uses these terms:
 

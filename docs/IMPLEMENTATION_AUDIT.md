@@ -289,6 +289,23 @@ their existing packages:
 
 Decision: keep. Do not alter recorder semantics during replay cleanup.
 
+### Addendum (2026-07-20, issue #19): `disk_monitor.py` fail-safe measurement
+
+`disk_monitor.py` was rewritten to fix a false-zero reporting defect: a failed
+or timed-out recursive `du` scan previously returned numeric `0.0`, which was
+then published as `data_raw_gb=0.0` and silently disabled capacity alerts and
+automatic cleanup. It now returns a structured `DirectoryMeasurement`
+(`ok`/`status`/`error`), falls back to a persisted last-known-good value
+marked `stale` (or `null` if none exists), reports independent filesystem
+capacity via `shutil.disk_usage()`, and fails closed in `cleanup_old_data()`
+whenever the current `data_raw` measurement is not fresh and successful. See
+`docs/ARCHITECTURE.md` ("Disk Monitoring Safety Invariant") and
+`docs/OPERATIONS.md` ("Disk Monitoring") for the full field/threshold
+reference, and `tests/test_disk_monitor_fail_safe.py` for coverage. This
+addendum does not change the status of the replay/feature/full_l2 items
+described elsewhere in this document, which predate issue #17's removal of
+the feature-store subsystem and are tracked separately.
+
 ## B. Legacy Full-L2 Converter
 
 This remains the validated full-L2 Nautilus catalog path:
