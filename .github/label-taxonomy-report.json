@@ -1,0 +1,117 @@
+{
+  "repository": "Zsombor0918/CryptoRecorder",
+  "created": [],
+  "colorsUpdated": [
+    "type:bug",
+    "type:feature",
+    "type:architecture",
+    "type:validation",
+    "area:recorder",
+    "area:storage",
+    "area:pipeline",
+    "area:conversion",
+    "area:catalog",
+    "area:features",
+    "area:nautilus",
+    "area:operations"
+  ],
+  "descriptionsUpdated": [
+    "type:bug",
+    "type:feature",
+    "type:architecture",
+    "type:validation",
+    "area:recorder",
+    "area:storage",
+    "area:pipeline",
+    "area:conversion",
+    "area:catalog",
+    "area:features",
+    "area:nautilus",
+    "area:operations"
+  ],
+  "legacyRemovedFromItems": [],
+  "classificationChanges": [],
+  "deletedDefinitions": [
+    "audit",
+    "bug",
+    "converter",
+    "deployment",
+    "documentation",
+    "duplicate",
+    "enhancement",
+    "good first issue",
+    "help wanted",
+    "invalid",
+    "manual-test",
+    "memory",
+    "ops",
+    "planning",
+    "question",
+    "wontfix"
+  ],
+  "deleteFailures": [],
+  "metadataChanges": [],
+  "finalLabels": [
+    {
+      "name": "type:bug",
+      "color": "D73A4A",
+      "description": "Broken, incorrect, or regressed behavior."
+    },
+    {
+      "name": "type:feature",
+      "color": "0E8A16",
+      "description": "New user-facing or system capability."
+    },
+    {
+      "name": "type:architecture",
+      "color": "6F42C1",
+      "description": "Repository, data-flow, component, or system-design change."
+    },
+    {
+      "name": "type:validation",
+      "color": "FBCA04",
+      "description": "Testing, auditing, benchmarking, or verification work."
+    },
+    {
+      "name": "area:recorder",
+      "color": "008672",
+      "description": "Live market-data capture, WebSockets, queues, and raw recording."
+    },
+    {
+      "name": "area:storage",
+      "color": "9C6B30",
+      "description": "Raw files, retention, disks, compression, and persistent storage."
+    },
+    {
+      "name": "area:pipeline",
+      "color": "1D76DB",
+      "description": "Daily builds, orchestration, replay-store, and data-processing pipelines."
+    },
+    {
+      "name": "area:conversion",
+      "color": "D87600",
+      "description": "Raw or replay data conversion and transformation."
+    },
+    {
+      "name": "area:catalog",
+      "color": "5319E7",
+      "description": "Nautilus catalogs, generated catalog jobs, and catalog compatibility."
+    },
+    {
+      "name": "area:features",
+      "color": "00A4B4",
+      "description": "Feature-store data, feature calculation, and feature schemas."
+    },
+    {
+      "name": "area:nautilus",
+      "color": "0052CC",
+      "description": "NautilusTrader compatibility, data types, and integration."
+    },
+    {
+      "name": "area:operations",
+      "color": "6A737D",
+      "description": "Linux server, systemd, deployment, monitoring, and maintenance."
+    }
+  ],
+  "verificationPassed": true
+}
