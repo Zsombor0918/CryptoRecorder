@@ -5,8 +5,10 @@
 Implement and validate:
 
 ```text
-data_raw -> replay_store -> generate_catalog --profile full_l2
+data_raw -> replay_store -> validation.replay_catalog_reconstruct --profile full_l2
 ```
+
+(validation-only, no CLI; invoked only by `validation.validate_catalog_equivalence`)
 
 so it is semantically equivalent to the current validated path:
 
@@ -29,14 +31,16 @@ Do not replace `convert_day.py` until equivalence is proven.
 Implemented:
 
 - `data_raw -> replay_store`
-- `replay_store -> feature_store`
-- `replay_store -> generate_catalog --profile trades_only`
+- `replay_store -> validation.replay_catalog_reconstruct --profile trades_only` (validation-only, no CLI)
 - trades-only old-vs-new semantic validation
-- **`replay_store -> generate_catalog --profile full_l2`** (shared depth engine)
+- **`replay_store -> validation.replay_catalog_reconstruct --profile full_l2`** (shared depth engine)
 - **replay-based `OrderBookDeltas`** (validated on ADAUSDT smoke)
 - **replay-based `OrderBookDepth10`** (validated on ADAUSDT smoke)
 - **full-L2 old-vs-new semantic validation** (`validate_catalog_equivalence
   --profile full_l2`)
+
+CryptoRecorder does not build a feature-store, label-store, or
+general-purpose consumer catalog from replay_store (removed, issue #17).
 
 Pending (NOT done):
 
@@ -133,7 +137,7 @@ For the same date, venues, symbols, and time window:
 
 ```text
 old = data_raw -> convert_day.py
-new = data_raw -> replay_store -> generate_catalog --profile full_l2
+new = data_raw -> replay_store -> validation.replay_catalog_reconstruct --profile full_l2
 ```
 
 Compare semantically, not byte-for-byte.
@@ -162,7 +166,7 @@ Normal CI:
   (`tests/test_catalog_equivalence_full_l2.py`,
   `tests/test_catalog_equivalence.py::test_full_l2_validator_matches_convert_day_on_clean_synthetic_day`);
 - unit-test the replay-row adapter and shared replay core with synthetic depth
-  (`tests/test_replay_depth_adapter.py`, `tests/test_generate_catalog_full_l2.py`);
+  (`tests/test_replay_depth_adapter.py`, `tests/test_replay_catalog_reconstruct.py`);
 - ensure `convert_day.py` still does not depend on replay_store
   (`tests/test_semantic_equivalence.py::test_convert_day_remains_legacy_full_l2_entrypoint`).
 
@@ -224,7 +228,7 @@ Days dominated by these internals may diverge; the ADAUSDT smoke day did not.
 
 Milestone-complete checklist (✅ = done for the ADAUSDT smoke milestone):
 
-1. ✅ `generate_catalog --profile full_l2` exists and writes a Nautilus-readable catalog.
+1. ✅ `validation.replay_catalog_reconstruct --profile full_l2` exists (validation-only, no CLI) and writes a Nautilus-readable temporary catalog.
 2. ✅ It reuses the old converter semantics through the shared depth engine + thin replay adapter.
 3. ✅ TradeTick equivalence passes (synthetic + ADAUSDT smoke).
 4. ✅ OrderBookDeltas equivalence passes for synthetic fixtures and real ADAUSDT smoke.

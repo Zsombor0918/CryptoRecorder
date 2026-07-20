@@ -51,14 +51,18 @@ CryptoRecorder. It operationalizes the rules in [../AGENTS.md](../AGENTS.md).
   `validation/`. Re-adding `validators/` violates the frozen structure.
 - **Putting an audit CLI in `pipeline/`.** `pipeline/` is build/transform only.
   Audit/compare/inspect tools belong in `validation/`.
-- **Changing the recorder schema during replay/feature work.** A task about the
-  replay or feature store must not modify `recorder.py`, `phase2_depth.py`,
+- **Changing the recorder schema during replay work.** A task about the
+  replay store must not modify `recorder.py`, `phase2_depth.py`,
   `native_trades.py`, `storage.py`, or the `data_raw/` layout.
-- **Adding Syncthing during deployment work.** Deployment covers recorder, converter,
-  replay-build, and feature-build only. Syncthing/archive/import are not implemented
-  and must not be wired up.
-- **Claiming that `full_l2` already works.** The `replay_store → full_l2` catalog path
-  is deferred until validated against `convert_day.py`. Never describe it as working.
+- **Adding Syncthing during deployment work.** Deployment covers recorder,
+  converter, and replay-build only. There is no feature-build service
+  (removed, issue #17). Syncthing/archive/import are not implemented and must
+  not be wired up.
+- **Claiming broader `full_l2` equivalence than validated.** The
+  `replay_store → validation.replay_catalog_reconstruct --profile full_l2`
+  path is implemented and passes the ADAUSDT single-day smoke against
+  `convert_day.py`, but broader top50/multi-day equivalence (the `v2.0.0`
+  gate) is not validated. Never claim it beyond that single-day smoke.
 - **Inventing a deployment path or data root.** Use the canonical values in
   [OPERATIONS.md](OPERATIONS.md) (`APP_DIR`, `DATA_BASE`, `ENV_FILE`). Do not
   guess production paths.

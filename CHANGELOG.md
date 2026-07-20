@@ -16,11 +16,12 @@ project-specific interpretation of the major/minor lines. The current version is
 
 ## Version lines
 
-### v1.x — recorder + reference converter + replay/feature foundation
+### v1.x — recorder + reference converter + replay store foundation
 The `v1` line covers the **validated core**:
 - the deterministic-native **recorder**,
 - the reference **`convert_day.py`** full-L2 converter,
-- the **replay store** and **feature store** v0 foundation.
+- the **replay store** v0 foundation (the stable contract consumed by
+  downstream repositories, e.g. KovacsTrader).
 
 This is the production baseline. Everything in `v1.x` is expected to keep the
 validated `data_raw → convert_day.py → full-L2 catalog` path intact.
@@ -36,17 +37,20 @@ The `v1.1` line adds **no new data semantics**. It focuses on:
 ### v1.2.x — one-command Linux deploy + stronger validation
 The planned `v1.2` line will harden operations:
 - a fully tested one-command Linux server deployment,
-- stronger automated validation/audit gates around replay and feature builds.
+- stronger automated validation/audit gates around the replay build.
 
-It still must **not** introduce full-L2 catalog generation from the replay store.
+It still must **not** introduce a general-purpose consumer catalog-generation
+service from the replay store; catalog reconstruction stays validation-only.
 
-### v2.0.0 — validated replay_store → full_l2 catalog
-The `v2.0.0` release is reserved for one thing: the
-**`replay_store → generate_catalog --profile full_l2`** path being **validated for
-semantic equivalence against `convert_day.py`**.
+### v2.0.0 — validated replay_store full-L2 equivalence
+The `v2.0.0` release is reserved for one thing: the internal
+**replay_store full-L2 reconstruction path** (`validation/replay_catalog_reconstruct.py`,
+exercised via `validation/validate_catalog_equivalence.py`) being **validated for
+semantic equivalence against `convert_day.py`** across the broader top50
+universe and multiple days.
 
-**No `v2` release may ship until full-L2 semantic equivalence passes.** Until then,
-full-L2 catalog generation from the replay store stays **deferred** (see
+**No `v2` release may ship until that broader full-L2 semantic equivalence
+passes.** Until then, broader full-L2 equivalence stays **deferred** (see
 [PROJECT_STATUS.md](PROJECT_STATUS.md) and
 [FULL_L2_REPLAY_CATALOG_PLAN.md](FULL_L2_REPLAY_CATALOG_PLAN.md)).
 
@@ -62,7 +66,44 @@ full-L2 catalog generation from the replay store stays **deferred** (see
 
 ## [Unreleased]
 
-### Added
+### Removed (issue #17 — recorder + replay-store ownership refactor)
+- The entire **feature-store subsystem**: `stores/feature_schema.py`,
+  `stores/feature_calc.py`, `stores/feature_writer.py`,
+  `pipeline/build_feature_store.py`, `validation/audit_feature_store.py`,
+  `tests/test_feature_store.py`, and the
+  `systemd/cryptorecorder-feature-build.{service,timer}` units.
+- `pipeline/generate_catalog.py` as a **product/runtime CLI**. Its
+  `generate_catalog_from_replay` reconstruction logic and helpers moved to
+  `validation/replay_catalog_reconstruct.py` — an internal, CLI-less,
+  validation-only helper used exclusively by
+  `validation/validate_catalog_equivalence.py`. CryptoRecorder no longer offers
+  a general-purpose consumer catalog-generation service; any repository
+  needing a temporary Nautilus catalog from replay data (e.g. KovacsTrader) is
+  expected to own that reconstruction itself.
+- `config.py`: `FEATURE_ROOT`, `LABEL_ROOT`, and `CATALOG_JOBS_ROOT` — all were
+  downstream-only or product-CLI-only placeholders with no recorder/replay
+  responsibility. `ARCHIVE_DAYS_ROOT` is unaffected (still a placeholder for a
+  future recorder-side archive feature, not implemented).
+- `docs/FEATURE_STORE.md` and `docs/GENERATE_CATALOG.md` — deleted rather than
+  left as tombstones. The documented fixed docs/ count drops from 14 to 12.
+- Feature-related CLI flags on `pipeline.daily_build`: `--steps`,
+  `--timeframes`, `--feature-root`. `daily_build` now always builds the replay
+  store only (`--date`, `--symbols`, `--data-root`, `--replay-root`,
+  `--report-root`).
+
+### Changed
+- CryptoRecorder's scope is now explicitly narrowed to
+  `Binance native market streams -> data_raw -> deterministic replay_store`,
+  handed off to downstream consumer repositories (KovacsTrader). See
+  `docs/ARCHITECTURE.md` and `README.md` for the updated ownership diagram.
+- `pipeline/daily_build.py` docstring, report shape (`daily_build_<date>.json`
+  no longer contains a `feature_build` section or `feature_root` path), and CLI
+  simplified to replay-only.
+- Superseded issue #15 (generate_catalog product-CLI proposal) in favor of
+  issue #17's narrower recorder+replay-store scope; commented and closed as
+  not planned.
+
+### Added (previous entry, retained)
 - `.githooks/commit-msg` — conventional commits enforcement hook. Blocks commits
   whose message does not match `<type>(<scope>): <subject>` where type is one of
   `feat|fix|docs|style|refactor|perf|test|chore`, subject starts lowercase, and
@@ -77,7 +118,7 @@ full-L2 catalog generation from the replay store stays **deferred** (see
   `CHANGELOG.md` absorbs versioning policy from `VERSIONING.md`.
 - `docs/README.md` rewritten as navigation index with "Where to update what" table.
 - "No New Docs Files" rule added to `AGENTS.md` Section 2 and `docs/REPO_STRUCTURE.md`:
-  docs/ is fixed at 14 files; new content goes in existing sections.
+  docs/ is fixed at 12 files; new content goes in existing sections.
 - Mandatory change-audit infrastructure (`AGENTS.md` Section 6,
   `docs/AI_WORKFLOW.md` Step 7, `docs/CHANGE_AUDIT.md`, `INSTALL.md` Section 7):
   every non-trivial commit now requires an append-only audit entry in
@@ -125,7 +166,6 @@ full-L2 catalog generation from the replay store stays **deferred** (see
   remains the `v2.0.0` gate; `v2.0.0` is **not** declared (VERSION stays
   `1.1.0-dev`).
 - Syncthing archive/backup (`ARCHIVE_DAYS_ROOT`) — placeholder env path only.
-- Label / target store (`LABEL_ROOT`) — placeholder env path only.
 - Import / restore tooling — not implemented.
 
 ## [1.1.0-dev] - 2026-06-17

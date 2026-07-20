@@ -1,20 +1,25 @@
 """
-pipeline.generate_catalog — On-demand Nautilus catalog generation from replay_store.
+validation.replay_catalog_reconstruct — Internal replay -> Nautilus catalog
+reconstruction helper.
 
-Reads replay_store data and generates temporary Nautilus ParquetDataCatalog
-for specific symbols, venues, and time windows.
+**This module is validation-only tooling. It is NOT a supported downstream
+runtime API and has no CLI entrypoint.** Its sole purpose is to let
+``validation.validate_catalog_equivalence`` reconstruct a temporary Nautilus
+``ParquetDataCatalog`` from ``replay_store`` data so it can be compared against
+the reference ``convert_day.py`` output for semantic equivalence.
 
-Critical for semantic equivalence validation:
-  old: raw → convert_day.py → catalog
-  new: raw → replay_store → generate_catalog → catalog
+Per the CryptoRecorder/KovacsTrader ownership boundary
+(see ``docs/ARCHITECTURE.md``), CryptoRecorder does not offer a general-purpose
+consumer catalog-generation service. Any downstream repository that needs a
+temporary Nautilus catalog reconstructed from replay_store data (e.g.
+KovacsTrader) is expected to own that reconstruction itself; this module exists
+only so the reference-vs-replay equivalence check keeps working.
 """
 from __future__ import annotations
 
-import argparse
 import json
 import logging
 import shutil
-import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -29,14 +34,12 @@ try:
 except ImportError:
     NAUTILUS_AVAILABLE = False
     logger = logging.getLogger(__name__)
-    logger.warning("Nautilus not available; generate_catalog will not work")
+    logger.warning("Nautilus not available; replay_catalog_reconstruct will not work")
 
 from config import (
-    CATALOG_JOBS_ROOT,
     DEPTH10_INTERVAL_SEC,
     DERIVED_DEPTH_SNAPSHOT_LEVELS,
     EMIT_DEPTH10_DEFAULT,
-    REPLAY_ROOT,
 )
 from converter.depth_phase2 import replay_records_to_depth_streaming
 from converter.instruments import build_instruments
@@ -48,16 +51,16 @@ logger = logging.getLogger(__name__)
 
 WRITE_BATCH_SIZE = 5000
 
-# Supported catalog profiles:
+# Supported reconstruction profiles:
 #   trades_only — instruments + TradeTick (validated equivalent path)
 #   full_l2     — instruments + TradeTick + OrderBookDeltas (+ optional Depth10)
 #   depth_only  — instruments + OrderBookDeltas (+ optional Depth10), no trades
 #   depth10     — instruments + OrderBookDepth10 only
 SUPPORTED_PROFILES = ("trades_only", "full_l2", "depth_only", "depth10")
 
-# Documented equivalence caveats for the replay-based full_l2 path. These stem
-# from replay_store v0 NOT persisting sync_state/stream_lifecycle records and
-# NOT performing cross-day repartitioning/carry recovery. See
+# Documented equivalence caveats for the replay-based full_l2 reconstruction.
+# These stem from replay_store v0 NOT persisting sync_state/stream_lifecycle
+# records and NOT performing cross-day repartitioning/carry recovery. See
 # docs/FULL_L2_REPLAY_CATALOG_PLAN.md for the full equivalence boundary.
 FULL_L2_CAVEATS = [
     "sync_state-driven fenced ranges are not regenerated (replay v0 drops sync_state records)",
@@ -117,22 +120,22 @@ def _convert_trade_to_nautilus(
     """Convert replay trade record to Nautilus TradeTick."""
     if not NAUTILUS_AVAILABLE:
         return None
-    
+
     try:
         trade_id = trade.get("trade_id") or trade.get("agg_trade_id")
         if not trade_id:
             return None
-        
+
         price = trade.get("price_str") or trade.get("price", 0)
         quantity = trade.get("quantity_str") or trade.get("quantity", 0)
         ts_ns = int(trade.get("ts_exchange_ns", 0))
         ts_recv_ns = int(trade.get("ts_receive_ns", ts_ns))
-        
+
         if float(price) <= 0 or float(quantity) <= 0:
             return None
-        
+
         side = AggressorSide.BUYER if not trade.get("buyer_maker", False) else AggressorSide.SELLER
-        
+
         tick = TradeTick(
             instrument_id=instrument_id,
             price=Price.from_str(str(price)),
@@ -274,11 +277,16 @@ def generate_catalog_from_replay(
     time_filter: str = "ts_init",
 ) -> dict:
     """
-    Generate Nautilus catalog from replay_store.
+    Reconstruct a temporary Nautilus catalog from replay_store.
+
+    Validation-only helper: used exclusively by
+    ``validation.validate_catalog_equivalence`` to compare replay-based
+    reconstruction against the reference ``convert_day.py`` converter. Not a
+    supported downstream runtime API — there is no CLI for this module.
 
     Args:
         replay_root: Path to replay_store
-        catalog_root: Output path for catalog_jobs
+        catalog_root: Output path for the temporary catalog job
         job_id: Unique job identifier
         symbols: List of symbols to include
         venues: List of venues to include
@@ -345,7 +353,7 @@ def generate_catalog_from_replay(
     if not NAUTILUS_AVAILABLE:
         status["status"] = "failed"
         status["errors"].append("Nautilus not installed")
-        logger.error("Nautilus not available for catalog generation")
+        logger.error("Nautilus not available for catalog reconstruction")
         return status
 
     if profile not in SUPPORTED_PROFILES:
@@ -371,7 +379,7 @@ def generate_catalog_from_replay(
             if not overwrite:
                 status["status"] = "failed"
                 status["errors"].append(
-                    f"Catalog job already exists: {job_dir}. Use overwrite=True or --overwrite."
+                    f"Catalog job already exists: {job_dir}. Use overwrite=True."
                 )
                 return status
             shutil.rmtree(job_dir)
@@ -589,7 +597,7 @@ def generate_catalog_from_replay(
             json.dump(manifest, f, indent=2)
 
         logger.info(
-            f"✓ Catalog generated: job_id={job_id}, profile={profile}, "
+            f"Catalog reconstructed: job_id={job_id}, profile={profile}, "
             f"symbols={len(status['symbols_processed'])}, "
             f"trades={status['records_written']['trade_ticks']}, "
             f"deltas={status['records_written']['order_book_deltas']}, "
@@ -599,172 +607,6 @@ def generate_catalog_from_replay(
     except Exception as e:
         status["status"] = "failed"
         status["errors"].append(str(e))
-        logger.error(f"Failed to generate catalog: {e}")
+        logger.error(f"Failed to reconstruct catalog: {e}")
 
     return status
-
-
-def main():
-    """CLI entry point for generate_catalog."""
-    parser = argparse.ArgumentParser(
-        description="Generate Nautilus catalog from replay_store",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python -m pipeline.generate_catalog --input /path/to/replay_store --symbols BTCUSDT --venues BINANCE_SPOT --start 2026-06-15T12:00:00Z --end 2026-06-15T13:00:00Z
-  python -m pipeline.generate_catalog --input /path/to/replay_store --symbols BTCUSDT --venues BINANCE_SPOT --date 2026-06-15 --job-id validation_day --overwrite
-  python -m pipeline.generate_catalog --input /path/to/replay_store --symbols BTCUSDT,ETHUSDT --start 2026-06-15T00:00:00Z --end 2026-06-17T00:00:00Z --output /path/to/catalog_jobs --job-id validation_new --overwrite
-        """,
-    )
-    parser.add_argument(
-        "--input",
-        type=Path,
-        default=None,
-        help=f"Replay store root (default: {REPLAY_ROOT})",
-    )
-    parser.add_argument(
-        "--symbols",
-        required=True,
-        help="Comma-separated symbols (e.g., BTCUSDT,ETHUSDT)",
-    )
-    parser.add_argument(
-        "--venues",
-        default="BINANCE_SPOT,BINANCE_USDTF",
-        help="Comma-separated venues (default: BINANCE_SPOT,BINANCE_USDTF)",
-    )
-    parser.add_argument(
-        "--start",
-        default=None,
-        help="Start time (ISO 8601 UTC, e.g., 2026-06-15T12:00:00Z)",
-    )
-    parser.add_argument(
-        "--end",
-        default=None,
-        help="End time (ISO 8601 UTC, e.g., 2026-06-15T13:00:00Z)",
-    )
-    parser.add_argument(
-        "--date",
-        default=None,
-        help="UTC date shortcut (YYYY-MM-DD), equivalent to that full half-open UTC day.",
-    )
-    parser.add_argument(
-        "--output",
-        type=Path,
-        default=None,
-        help=f"Catalog output root (default: {CATALOG_JOBS_ROOT})",
-    )
-    parser.add_argument(
-        "--job-id",
-        default=None,
-        help="Deterministic job id. Output directory is job_{job_id}.",
-    )
-    parser.add_argument(
-        "--overwrite",
-        action="store_true",
-        help="Delete and recreate job_{job_id} if it already exists.",
-    )
-    parser.add_argument(
-        "--profile",
-        choices=list(SUPPORTED_PROFILES),
-        default="trades_only",
-        help=(
-            "Catalog profile (default: trades_only). "
-            "full_l2 = trades + OrderBookDeltas (+ Depth10); "
-            "depth_only = OrderBookDeltas (+ Depth10); "
-            "depth10 = OrderBookDepth10 only."
-        ),
-    )
-    parser.add_argument(
-        "--emit-depth10",
-        dest="emit_depth10",
-        action="store_true",
-        default=EMIT_DEPTH10_DEFAULT,
-        help="Emit derived OrderBookDepth10 snapshots (full_l2/depth_only). Default: on.",
-    )
-    parser.add_argument(
-        "--no-emit-depth10",
-        dest="emit_depth10",
-        action="store_false",
-        help="Do not emit derived OrderBookDepth10 snapshots (full_l2/depth_only).",
-    )
-    parser.add_argument(
-        "--depth10-interval-sec",
-        type=float,
-        default=DEPTH10_INTERVAL_SEC,
-        help=f"Minimum seconds between derived Depth10 snapshots (default: {DEPTH10_INTERVAL_SEC}).",
-    )
-    parser.add_argument(
-        "--derived-depth-snapshot-levels",
-        type=int,
-        default=DERIVED_DEPTH_SNAPSHOT_LEVELS,
-        help=f"Levels per derived Depth10 snapshot, <=10 (default: {DERIVED_DEPTH_SNAPSHOT_LEVELS}).",
-    )
-    parser.add_argument(
-        "--time-filter",
-        choices=["ts_init", "ts_event"],
-        default="ts_init",
-        help="Window filter field for catalog reads (default: ts_init).",
-    )
-    args = parser.parse_args()
-
-    replay_root = args.input or REPLAY_ROOT
-    catalog_root = args.output or CATALOG_JOBS_ROOT
-
-    if args.date and (args.start or args.end):
-        parser.error("Use either --date or --start/--end, not both.")
-    if args.date:
-        try:
-            start, end = _window_from_date(args.date)
-        except ValueError as e:
-            parser.error(str(e))
-    else:
-        if not args.start or not args.end:
-            parser.error("Either --date or both --start and --end are required.")
-        try:
-            start = _parse_iso_datetime(args.start)
-            end = _parse_iso_datetime(args.end)
-        except ValueError as e:
-            logger.error(f"Invalid datetime format: {e}")
-            sys.exit(1)
-    if end <= start:
-        parser.error("--end must be after --start.")
-
-    symbols = [s.strip().upper() for s in args.symbols.split(",")]
-    venues = [v.strip().upper() for v in args.venues.split(",")]
-
-    job_id = args.job_id or datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-
-    logger.info(
-        f"Generating catalog: job_id={job_id}, symbols={symbols}, "
-        f"venues={venues}, start={start}, end={end}"
-    )
-
-    result = generate_catalog_from_replay(
-        replay_root,
-        catalog_root,
-        job_id,
-        symbols,
-        venues,
-        start,
-        end,
-        profile=args.profile,
-        overwrite=args.overwrite,
-        emit_depth10=args.emit_depth10,
-        depth10_interval_sec=args.depth10_interval_sec,
-        derived_depth_snapshot_levels=args.derived_depth_snapshot_levels,
-        time_filter=args.time_filter,
-    )
-
-    if result["status"] != "success":
-        logger.error(f"Catalog generation failed: {result['errors']}")
-        sys.exit(1)
-
-    return 0
-
-
-if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    )
-    sys.exit(main())

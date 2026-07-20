@@ -20,7 +20,7 @@ DOCS = ROOT / "docs"
 GITHUB = ROOT / ".github"
 DEPLOY_SCRIPT = ROOT / "scripts" / "deploy_linux_server.sh"
 
-DEPLOY_TARGETS = ["all", "recorder", "legacy-converter", "replay-build", "feature-build"]
+DEPLOY_TARGETS = ["all", "recorder", "legacy-converter", "replay-build"]
 
 
 # ---------------------------------------------------------------------------

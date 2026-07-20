@@ -16,6 +16,7 @@ ROOT = Path(__file__).resolve().parent.parent
 DOCS = ROOT / "docs"
 TESTS = ROOT / "tests"
 PIPELINE = ROOT / "pipeline"
+STORES = ROOT / "stores"
 VALIDATION = ROOT / "validation"
 
 
@@ -78,12 +79,42 @@ def test_no_unauthorized_top_level_packages() -> None:
 # ---------------------------------------------------------------------------
 
 def test_pipeline_does_not_contain_audit_modules() -> None:
-    """audit_feature_store and audit_replay_store must live in validation/, not pipeline/."""
-    assert not (PIPELINE / "audit_feature_store.py").exists(), (
-        "pipeline/audit_feature_store.py must not exist; use validation/audit_feature_store.py"
-    )
+    """audit_replay_store must live in validation/, not pipeline/."""
     assert not (PIPELINE / "audit_replay_store.py").exists(), (
         "pipeline/audit_replay_store.py must not exist; use validation/audit_replay_store.py"
+    )
+
+
+def test_pipeline_does_not_contain_feature_store_modules() -> None:
+    """The feature-store subsystem was removed (issue #17); it must not return
+    in pipeline/, stores/, or validation/."""
+    assert not (PIPELINE / "build_feature_store.py").exists(), (
+        "pipeline/build_feature_store.py must not exist; the feature-store "
+        "subsystem was removed. See docs/ARCHITECTURE.md."
+    )
+    assert not (VALIDATION / "audit_feature_store.py").exists(), (
+        "validation/audit_feature_store.py must not exist; the feature-store "
+        "subsystem was removed. See docs/ARCHITECTURE.md."
+    )
+    for name in ("feature_schema.py", "feature_calc.py", "feature_writer.py"):
+        assert not (STORES / name).exists(), (
+            f"stores/{name} must not exist; the feature-store subsystem was removed."
+        )
+    assert not (TESTS / "test_feature_store.py").exists(), (
+        "tests/test_feature_store.py must not exist; the feature-store subsystem was removed."
+    )
+
+
+def test_pipeline_does_not_contain_generate_catalog_cli() -> None:
+    """generate_catalog is no longer a product/runtime CLI (issue #17). Its
+    reconstruction logic moved to validation/replay_catalog_reconstruct.py,
+    which has no CLI entrypoint."""
+    assert not (PIPELINE / "generate_catalog.py").exists(), (
+        "pipeline/generate_catalog.py must not exist; use "
+        "validation/replay_catalog_reconstruct.py (validation-only, no CLI)."
+    )
+    assert (VALIDATION / "replay_catalog_reconstruct.py").exists(), (
+        "validation/replay_catalog_reconstruct.py is missing."
     )
 
 
@@ -100,12 +131,12 @@ def test_pipeline_does_not_contain_equivalence_module() -> None:
 # ---------------------------------------------------------------------------
 
 def test_validation_contains_audit_and_equivalence_modules() -> None:
-    """The three audit/equivalence modules must exist in validation/."""
+    """The audit/equivalence/reconstruction modules must exist in validation/."""
     for name in (
-        "audit_feature_store.py",
         "audit_replay_store.py",
         "validate_catalog_equivalence.py",
         "catalog_compare.py",
+        "replay_catalog_reconstruct.py",
     ):
         assert (VALIDATION / name).exists(), (
             f"validation/{name} is missing. See docs/REPO_STRUCTURE.md."
@@ -158,17 +189,6 @@ def test_docs_contains_no_python_modules() -> None:
 # CLI modules are importable under their new homes
 # ---------------------------------------------------------------------------
 
-def test_validation_audit_feature_store_cli_help() -> None:
-    result = subprocess.run(
-        [sys.executable, "-m", "validation.audit_feature_store", "--help"],
-        cwd=ROOT,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert result.returncode == 0, result.stderr
-
-
 def test_validation_audit_replay_store_cli_help() -> None:
     result = subprocess.run(
         [sys.executable, "-m", "validation.audit_replay_store", "--help"],
@@ -196,11 +216,15 @@ def test_validation_validate_catalog_equivalence_cli_help() -> None:
 # ---------------------------------------------------------------------------
 
 def test_docs_do_not_reference_pipeline_audit_modules() -> None:
-    """After the move, docs must use validation.audit_* paths, not pipeline.audit_*."""
+    """After the move, docs must use validation.audit_* paths, not pipeline.audit_*,
+    and must not reference the removed feature-store subsystem or the removed
+    pipeline.generate_catalog product CLI."""
     forbidden_patterns = [
-        "pipeline.audit_feature_store",
         "pipeline.audit_replay_store",
         "pipeline.validate_catalog_equivalence",
+        "pipeline.generate_catalog",
+        "pipeline.build_feature_store",
+        "validation.audit_feature_store",
     ]
     for md_path in DOCS.glob("*.md"):
         text = md_path.read_text()

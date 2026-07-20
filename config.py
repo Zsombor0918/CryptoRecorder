@@ -41,19 +41,12 @@ STATE_ROOT: Final = Path(
     os.environ.get("CRYPTO_RECORDER_STATE_ROOT", str(PROJECT_ROOT / "state"))
 ).expanduser()
 
-# Replay store: normalized deterministic Parquet replay layer
+# Replay store: normalized deterministic Parquet replay layer.
+# This is the stable external contract consumed by downstream repositories
+# (e.g. KovacsTrader); CryptoRecorder itself does not build feature/label
+# layers or a general-purpose consumer Nautilus catalog from it.
 REPLAY_ROOT: Final = Path(
     os.environ.get("CRYPTO_RECORDER_REPLAY_ROOT", "/data/cryptorecorder/replay_store")
-).expanduser()
-
-# Feature store: AI / strategy-selection Parquet layer
-FEATURE_ROOT: Final = Path(
-    os.environ.get("CRYPTO_RECORDER_FEATURE_ROOT", "/data/cryptorecorder/feature_store")
-).expanduser()
-
-# Catalog jobs: temporary on-demand Nautilus backtest artifacts
-CATALOG_JOBS_ROOT: Final = Path(
-    os.environ.get("CRYPTO_RECORDER_CATALOG_JOBS_ROOT", "/data/cryptorecorder/catalog_jobs")
 ).expanduser()
 
 # Daily build reports
@@ -64,11 +57,6 @@ DAILY_REPORT_ROOT: Final = Path(
 # Archive days: future Syncthing-based backup structure
 ARCHIVE_DAYS_ROOT: Final = Path(
     os.environ.get("CRYPTO_RECORDER_ARCHIVE_DAYS_ROOT", "/data/cryptorecorder/archive_days")
-).expanduser()
-
-# Label store: future labels / targets layer (separate from feature_store)
-LABEL_ROOT: Final = Path(
-    os.environ.get("CRYPTO_RECORDER_LABEL_ROOT", "/data/cryptorecorder/label_store")
 ).expanduser()
 
 # Canonical data channels.  depth_v2 and trade_v2 are the only raw
@@ -96,11 +84,8 @@ def ensure_runtime_directories(
         directories.extend(
             [
                 REPLAY_ROOT,
-                FEATURE_ROOT,
-                CATALOG_JOBS_ROOT,
                 DAILY_REPORT_ROOT,
                 ARCHIVE_DAYS_ROOT,
-                LABEL_ROOT,
             ]
         )
     for directory in directories:

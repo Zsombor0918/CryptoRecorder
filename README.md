@@ -9,16 +9,22 @@ The repo currently has these catalog-related paths:
 data_raw -> convert_day.py -> Nautilus full-L2 catalog
   production reference full-L2 path
 
-data_raw -> replay_store -> feature_store
-data_raw -> replay_store -> generate_catalog --profile trades_only
-  validated v0 replay/feature foundation
+data_raw -> replay_store
+  validated v0 replay layer; the stable external contract handed off to
+  downstream repositories (e.g. KovacsTrader)
 
-data_raw -> replay_store -> generate_catalog --profile full_l2
-  implemented; semantically validated on the ADAUSDT single-day smoke
-  vs convert_day.py (trades + OrderBookDeltas + OrderBookDepth10 + checkpoints)
+replay_store -> validation.replay_catalog_reconstruct (validation-only, no CLI)
+  internal helper used only by validation.validate_catalog_equivalence;
+  trades_only and full_l2 profiles both implemented; full_l2 semantically
+  validated on the ADAUSDT single-day smoke vs convert_day.py (trades +
+  OrderBookDeltas + OrderBookDepth10 + checkpoints)
 ```
 
-The `full_l2` replay path reuses the old converter's shared depth engine. It
+CryptoRecorder does not build a feature-store, label-store, or
+general-purpose consumer catalog from `replay_store` (removed, issue #17) —
+those are downstream responsibilities.
+
+The `full_l2` reconstruction reuses the old converter's shared depth engine. It
 passes the ADAUSDT single-day smoke against `convert_day.py`, but **broader
 top50/multi-day validation is still pending** — that wider validation is the
 `v2.0.0` gate, and `v2.0.0` is not declared. `convert_day.py` remains the
@@ -47,7 +53,7 @@ Convert one UTC day with the validated full-L2 converter:
 python convert_day.py --date 2026-06-12 --staging
 ```
 
-Build the replay/feature v0 path with explicit temp roots:
+Build the replay v0 path with explicit temp roots:
 
 ```bash
 python -m pipeline.build_replay_store \
@@ -55,21 +61,22 @@ python -m pipeline.build_replay_store \
   --symbols ADAUSDT \
   --data-root ./data_raw \
   --replay-root /tmp/replay_store
+```
 
-python -m pipeline.build_feature_store \
+There is no `generate_catalog` product CLI. To validate replay-store
+equivalence against `convert_day.py`, use the validation-only helper:
+
+```bash
+python -m validation.validate_catalog_equivalence \
   --date 2026-06-12 \
-  --symbols ADAUSDT \
-  --replay-root /tmp/replay_store \
-  --feature-root /tmp/feature_store
-
-python -m pipeline.generate_catalog \
-  --input /tmp/replay_store \
   --symbols ADAUSDT \
   --venues BINANCE_SPOT \
-  --date 2026-06-12 \
+  --data-root ./data_raw \
+  --work-root /tmp/cryptorecorder-equivalence \
+  --old-catalog-root /tmp/cryptorecorder-equivalence/old_catalog \
+  --replay-root /tmp/cryptorecorder-equivalence/replay_store \
+  --new-catalog-root /tmp/cryptorecorder-equivalence/new_catalog \
   --profile trades_only \
-  --output /tmp/catalog_jobs \
-  --job-id validation_trades \
   --overwrite
 ```
 
@@ -83,8 +90,8 @@ python -m pipeline.generate_catalog \
 | `storage.py` | Hourly JSONL(.zst) raw writer |
 | `convert_day.py` | Validated raw -> Nautilus full-L2 converter |
 | `converter/` | Legacy converter implementation |
-| `stores/` | Replay and feature Parquet schemas/readers/writers |
-| `pipeline/` | Replay, feature, and catalog build/transform CLIs |
+| `stores/` | Replay Parquet schemas/readers/writers (no feature/label schemas) |
+| `pipeline/` | Replay build/transform CLIs (`daily_build`, `build_replay_store`, `raw_manifest`) |
 | `validation/` | Audit, equivalence check, and catalog inspection CLIs |
 | `scripts/` | Manual recorder and legacy-converter smoke scripts |
 | `docs/` | Detailed documentation |
@@ -100,7 +107,7 @@ Key references:
 - [Architecture](docs/ARCHITECTURE.md) — design, storage layers, guarantees.
 - [Operations](docs/OPERATIONS.md) — deployment, Linux server, state schemas.
 - [Implementation Audit](docs/IMPLEMENTATION_AUDIT.md) — ground-truth, audit history.
-- [Replay Store](docs/REPLAY_STORE.md) · [Feature Store](docs/FEATURE_STORE.md) · [Generate Catalog](docs/GENERATE_CATALOG.md)
+- [Replay Store](docs/REPLAY_STORE.md)
 - [Full-L2 Replay Plan](docs/FULL_L2_REPLAY_CATALOG_PLAN.md)
 - [AI Workflow](docs/AI_WORKFLOW.md) · [Versioning Policy](CHANGELOG.md) · [Docs Index](docs/README.md)
 - [Installation](INSTALL.md)
@@ -112,11 +119,14 @@ Agent rules: [AGENTS.md](AGENTS.md). Version: see [VERSION](VERSION) and [CHANGE
 - Raw recorder behavior and raw layout are unchanged.
 - `convert_day.py` remains the validated full-L2 Nautilus converter.
 - Replay store preserves exact price/quantity strings and depth continuity
-  fields needed for future full-L2 reconstruction.
-- Feature store is UTC-day clamped and sparse.
-- `generate_catalog --profile trades_only` can be validated against the old
-  converter for TradeTick semantic equality.
-- Replay-based `generate_catalog --profile full_l2` is implemented and
+  fields needed for full-L2 reconstruction, and is the stable external
+  contract handed off to downstream repositories (e.g. KovacsTrader).
+- CryptoRecorder does not build a feature-store, label-store, or
+  general-purpose consumer catalog from replay_store (removed, issue #17).
+- The internal `validation.replay_catalog_reconstruct` `trades_only` profile
+  can be validated against the old converter for TradeTick semantic equality
+  via `validation.validate_catalog_equivalence`.
+- The `full_l2` profile of the same validation-only helper is implemented and
   semantically validated on the ADAUSDT single-day smoke against `convert_day.py`
   (trades, OrderBookDeltas, OrderBookDepth10, and book checkpoints all match).
   Broader top50/multi-day validation is pending before `v2.0.0`.

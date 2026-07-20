@@ -1,9 +1,17 @@
 # Repository Structure Contract
 
-**Date**: 2026-06-17
+**Date**: 2026-07-15
 
 This document is the binding contract for all future implementation in this
 repository. Any Codex task or contributor must read this before adding files.
+
+CryptoRecorder's scope is intentionally narrow: it records Binance native
+market streams into `data_raw/`, and deterministically converts that raw data
+into `replay_store/` (and, via the reference converter, a validated full-L2
+Nautilus catalog). It does **not** own a feature-store, label-store, or
+general-purpose consumer catalog-generation service — those are downstream
+responsibilities (e.g. the KovacsTrader repository). See `docs/ARCHITECTURE.md`
+for the ownership boundary.
 
 ---
 
@@ -46,7 +54,7 @@ These are the only top-level packages permitted:
 | Package | Purpose |
 |---|---|
 | `converter/` | Legacy full-L2 raw → Nautilus converter implementation |
-| `pipeline/` | Build and transform data artifacts (replay, features, catalog) |
+| `pipeline/` | Build and transform data artifacts (raw manifest, replay store) |
 | `stores/` | Parquet schema definitions and reader/writer implementations |
 | `validation/` | Inspect, audit, and compare data artifacts |
 | `scripts/` | Thin operator shell wrappers only (no importable business logic) |
@@ -62,37 +70,43 @@ These are the only top-level packages permitted:
 logic here; this package is the old-converter boundary.
 
 **`pipeline/`** — Build and transform commands that create data artifacts from
-raw or replay data. Contains daily build orchestration, replay builder, feature
-builder, and catalog generator. Does **not** contain audit or equivalence check
-commands; those belong in `validation/`.
+raw data. Contains daily build orchestration and the replay builder. Does
+**not** contain a feature-store builder or a product-facing catalog-generation
+CLI (removed; see docs/ARCHITECTURE.md), and does **not** contain audit or
+equivalence check commands; those belong in `validation/`.
 
-**`stores/`** — Parquet schemas, writers, and readers for replay_store and
-feature_store. Pure data access layer; no CLI entrypoints.
+**`stores/`** — Parquet schemas, writers, and readers for `replay_store` only.
+Pure data access layer; no CLI entrypoints. There is no feature-store or
+label-store schema/reader/writer in this package.
 
 **`validation/`** — The single general validation package. Contains all
-audit CLIs (audit_feature_store, audit_replay_store, audit_storage_size),
-equivalence checks (validate_catalog_equivalence), catalog comparison utilities
-(catalog_compare), catalog inspection (catalog_inspect), and report validation
-(phase2_report). Does **not** contain build/transform logic; that belongs in
-`pipeline/`.
+audit CLIs (audit_replay_store, audit_storage_size), equivalence checks
+(validate_catalog_equivalence), the internal validation-only replay→catalog
+reconstruction helper (replay_catalog_reconstruct — no CLI), catalog
+comparison utilities (catalog_compare), catalog inspection (catalog_inspect),
+and report validation (phase2_report). Does **not** contain build/transform
+logic; that belongs in `pipeline/`.
 
 **`scripts/`** — Thin operator wrappers only. Scripts may call subprocesses or
 invoke pipeline/validation CLIs, but must not contain importable business logic.
-The replay full-L2 path is implemented and validated on the ADAUSDT smoke; no
-script may claim broader top50/multi-day full-L2 equivalence until that wider
-validation is run and declared done.
+The replay full-L2 reconstruction path is implemented (validation-only) and
+validated on the ADAUSDT smoke; no script may claim broader top50/multi-day
+full-L2 equivalence until that wider validation is run and declared done.
 
 **`tests/`** — All automated tests. No test file outside this directory. Tests
 are organized by subsystem:
 - `test_replay_store.py` — replay build and audit
-- `test_feature_store.py` — feature build and audit
-- `test_generate_catalog.py` — catalog generation
+- `test_replay_catalog_reconstruct.py` — validation-only full_l2 reconstruction
 - `test_catalog_equivalence.py` — old-vs-new catalog comparison
 - `test_repo_structure.py` — folder contract enforcement
 - Legacy converter tests remain named as-is
 
+There is no `test_feature_store.py` and no `test_generate_catalog.py` — the
+feature-store subsystem and the `generate_catalog` product CLI were removed
+(issue #17). See `CHANGELOG.md`.
+
 **`docs/`** — Documentation and plans. No importable Python code here.
-The docs structure is fixed at **14 files** (see "No New Docs Files" rule below).
+The docs structure is fixed at **12 files** (see "No New Docs Files" rule below).
 
 | File | Content home |
 |------|-------------|
@@ -101,21 +115,27 @@ The docs structure is fixed at **14 files** (see "No New Docs Files" rule below)
 | `PROJECT_STATUS.md` | Validated vs deferred truth |
 | `AI_WORKFLOW.md` | Step-by-step agent workflow |
 | `CHANGE_AUDIT.md` | Append-only change audit log |
-| `ARCHITECTURE.md` | System design, storage layers, schemas, guarantees |
+| `ARCHITECTURE.md` | System design, storage layers, schemas, guarantees, ownership boundary |
 | `OPERATIONS.md` | Operations, deployment script, Linux server, state schemas |
 | `VALIDATION.md` | Validation layer reference |
 | `IMPLEMENTATION_AUDIT.md` | Ground-truth audit, cleanup history, requirements, sizes |
-| `REPLAY_STORE.md` | Replay store feature reference |
-| `FEATURE_STORE.md` | Feature store feature reference |
-| `GENERATE_CATALOG.md` | Catalog generation reference |
-| `DAILY_BUILD_PIPELINE.md` | Daily build pipeline reference |
-| `FULL_L2_REPLAY_CATALOG_PLAN.md` | Full-L2 plan and gate status |
+| `REPLAY_STORE.md` | Replay store feature reference (the stable external contract) |
+| `DAILY_BUILD_PIPELINE.md` | Daily build pipeline reference (replay-only) |
+| `FULL_L2_REPLAY_CATALOG_PLAN.md` | Full-L2 reconstruction plan and gate status |
+
+`FEATURE_STORE.md` and `GENERATE_CATALOG.md` were deleted (issue #17) — the
+feature-store subsystem and the `generate_catalog` product CLI no longer
+exist. Do not recreate either file; see `CHANGELOG.md` for the removal record.
 
 ---
 
 ## Generated / Local Folders (must be gitignored, never committed)
 
-These paths are runtime outputs or local caches and must never be tracked:
+These paths are runtime outputs or local caches and must never be tracked.
+`feature_store/` and `catalog_jobs/` may still exist on some machines as
+residual data from before issue #17; they are not deleted automatically and
+must not be deleted by an agent without explicit instruction, but no current
+code writes to them as a supported product path.
 
 ```
 data_raw/
@@ -146,7 +166,7 @@ recorder.log
 
 ### No New Docs Files Without Contract Amendment
 
-The docs structure is intentionally **fixed at 14 files**. Before creating any
+The docs structure is intentionally **fixed at 12 files**. Before creating any
 new file in `docs/`, you **must** identify which existing file is the right home
 for the content, add it as a new section there, and (only if no existing file
 fits) amend this file (`docs/REPO_STRUCTURE.md`) with a justification.
@@ -199,22 +219,22 @@ catalog outputs, or tool caches. Use `.gitignore` to block them.
 
 - `daily_build.py`
 - `build_replay_store.py`
-- `build_feature_store.py`
-- `generate_catalog.py`
 - `raw_manifest.py`
 
-Audit and equivalence modules live in `validation/`, not `pipeline/`.
+Audit and equivalence modules live in `validation/`, not `pipeline/`. There is
+no feature-store builder and no product-facing catalog-generation CLI here.
 
 ### `validation/` Is Inspect/Audit-Only
 
 `validation/` contains only modules that **inspect, compare, or audit**
-existing artifacts:
+existing artifacts (or, in the case of `replay_catalog_reconstruct.py`, an
+internal helper with no CLI used exclusively by the equivalence check):
 
 - `audit_change_compliance.py`
-- `audit_feature_store.py`
 - `audit_replay_store.py`
 - `audit_storage_size.py`
 - `validate_catalog_equivalence.py`
+- `replay_catalog_reconstruct.py` (no CLI; validation-only)
 - `catalog_compare.py`
 - `catalog_inspect.py`
 - `phase2_report.py`
@@ -233,22 +253,13 @@ These are the canonical commands. Documentation must not use any other paths.
 # Build replay store for one day
 python -m pipeline.build_replay_store --date YYYY-MM-DD [OPTIONS]
 
-# Build feature store from replay
-python -m pipeline.build_feature_store --date YYYY-MM-DD [OPTIONS]
-
-# Generate trades-only Nautilus catalog from replay
-python -m pipeline.generate_catalog --date YYYY-MM-DD [OPTIONS]
-
-# Run full daily build (replay + features)
+# Run daily build (raw manifest scan + replay store build + report)
 python -m pipeline.daily_build --date YYYY-MM-DD [OPTIONS]
 ```
 
 ### Audit / Validate (validation)
 
 ```bash
-# Audit feature store outputs
-python -m validation.audit_feature_store --date YYYY-MM-DD [OPTIONS]
-
 # Audit replay store partitions
 python -m validation.audit_replay_store --date YYYY-MM-DD [OPTIONS]
 
@@ -258,7 +269,7 @@ python -m validation.audit_change_compliance --staged
 # Check change-audit compliance vs a base branch
 python -m validation.audit_change_compliance --base main
 
-# Compare old convert_day catalog vs new replay catalog
+# Compare old convert_day catalog vs new replay-reconstructed catalog
 python -m validation.validate_catalog_equivalence --date YYYY-MM-DD [OPTIONS]
 
 # Inspect a Nautilus catalog instrument
@@ -267,6 +278,9 @@ python -m validation.catalog_inspect CATALOG_ROOT INSTRUMENT_ID
 # Validate a convert report JSON
 python -m validation.phase2_report PATH_TO_REPORT
 ```
+
+`validation.replay_catalog_reconstruct` has no CLI — it is an internal helper
+imported only by `validation.validate_catalog_equivalence`.
 
 ### Legacy Full-L2 Converter (root-level)
 
@@ -291,18 +305,16 @@ data_raw -> convert_day.py -> Nautilus full-L2 catalog
 
 data_raw -> replay_store
   IMPLEMENTED: v0 validated
+  This is the stable external contract handed off to downstream repositories
+  (e.g. KovacsTrader). CryptoRecorder does not build a feature/label layer or
+  a general-purpose consumer catalog from it.
 
-replay_store -> feature_store
-  IMPLEMENTED: v0, UTC-day clamped, sparse windows
-
-replay_store -> generate_catalog --profile trades_only
-  IMPLEMENTED: semantically validated
-
-replay_store -> generate_catalog --profile full_l2
-  IMPLEMENTED: semantically validated on ADAUSDT smoke
+replay_store -> validation.replay_catalog_reconstruct (validation-only, no CLI)
+  IMPLEMENTED: semantically validated on the ADAUSDT smoke
   (BINANCE_SPOT/ADAUSDT/2026-06-12 vs convert_day.py: trades, OrderBookDeltas,
    OrderBookDepth10, and book checkpoints all match). Broader top50/multi-day
-   validation still pending. See docs/FULL_L2_REPLAY_CATALOG_PLAN.md.
+   validation still pending. See docs/FULL_L2_REPLAY_CATALOG_PLAN.md. Not a
+   supported downstream runtime API.
 ```
 
 ---
@@ -316,3 +328,5 @@ replay_store -> generate_catalog --profile full_l2
 | 2026-07-09 | Added mandatory change-audit infrastructure: `docs/CHANGE_AUDIT.md`; `validation/audit_change_compliance.py`; `.githooks/pre-commit`; AGENTS.md Section 6; AI_WORKFLOW.md Step 7 |
 | 2026-07-09 | Docs structure consolidation: merged 9 small docs into ARCHITECTURE.md, OPERATIONS.md, IMPLEMENTATION_AUDIT.md, and CHANGELOG.md; fixed docs/ at 14 files; added "No New Docs" rules in AGENTS.md and REPO_STRUCTURE.md |
 | 2026-07-09 | Added `.githooks/commit-msg` — conventional commits enforcement hook; AGENTS.md Section 7 commit style rules |
+| 2026-07-15 | Issue #17: removed the feature-store subsystem (`stores/feature_*.py`, `pipeline/build_feature_store.py`, `validation/audit_feature_store.py`, `tests/test_feature_store.py`, feature-build systemd units) and the `pipeline/generate_catalog.py` product CLI (reconstruction logic moved to `validation/replay_catalog_reconstruct.py`, an internal CLI-less helper). Removed `config.py` `FEATURE_ROOT`/`LABEL_ROOT`/`CATALOG_JOBS_ROOT`. Simplified `pipeline.daily_build` to replay-only (dropped `--steps`/`--timeframes`/`--feature-root`). Deleted `docs/FEATURE_STORE.md` and `docs/GENERATE_CATALOG.md`; docs/ fixed count dropped from 14 to 12. Superseded issue #15. |
+

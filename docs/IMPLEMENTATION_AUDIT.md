@@ -2,11 +2,18 @@
 
 ## Summary
 
-This repo currently has a validated v0 replay/feature foundation plus a
-`replay_store -> full_l2 Nautilus catalog` path that is **semantically validated
-on the ADAUSDT single-day smoke** against `convert_day.py`. Broader top50/multi-day
-validation is still pending. Old `convert_day.py` remains the production reference
-full-L2 path.
+CryptoRecorder's scope is Binance native market streams -> `data_raw` ->
+deterministic `replay_store` (the stable contract consumed by downstream
+repositories, e.g. KovacsTrader), plus the legacy `convert_day.py` full-L2
+converter. It does not own a feature-store, label-store, or general-purpose
+catalog-generation service (issue #17 removed the former feature-store
+subsystem and the `pipeline/generate_catalog.py` product CLI).
+
+The internal `validation.replay_catalog_reconstruct` helper (no CLI, used only
+by `validation.validate_catalog_equivalence`) is **semantically validated on
+the ADAUSDT single-day smoke** against `convert_day.py`. Broader top50/multi-day
+validation is still pending. Old `convert_day.py` remains the production
+reference full-L2 path.
 
 Current paths:
 
@@ -15,15 +22,9 @@ data_raw -> convert_day.py -> Nautilus catalog
   validated full-L2 path
 
 data_raw -> replay_store
-  implemented v0
+  implemented v0; the stable external contract for downstream repositories
 
-replay_store -> feature_store
-  implemented v0, UTC-day clamped, sparse windows
-
-replay_store -> generate_catalog --profile trades_only
-  implemented and semantically validated for a real ADAUSDT spot day
-
-replay_store -> generate_catalog --profile full_l2
+replay_store -> validation.replay_catalog_reconstruct (validation-only, no CLI)
   implemented; semantically validated on the ADAUSDT single-day smoke
   vs convert_day.py. Broader top50/multi-day validation pending.
 ```
@@ -43,28 +44,21 @@ Replay store:
 - Publishes completed staging directories atomically.
 - Supports custom temp roots through `stream_raw_records(..., root=...)`.
 
-Feature store:
+Catalog reconstruction (validation-only, `validation/replay_catalog_reconstruct.py`):
 
-- Writes one Parquet file per timeframe/venue/symbol/date.
-- Supports `100ms`, `1s`, and `1m` windows.
-- Defaults to UTC-day clamping: `[date 00:00:00 UTC, next day 00:00:00 UTC)`.
-- Uses sparse output: empty windows are skipped.
-- Computes current core v1 fields from latest depth and trades inside each window.
-- Leaves simplified/deferred fields null where not implemented.
-
-Catalog generation:
-
-- `generate_catalog` supports `trades_only`, `full_l2`, `depth_only`, and `depth10`.
+- Supports `trades_only`, `full_l2`, `depth_only`, and `depth10` profiles.
 - `full_l2`/`depth_only`/`depth10` reuse the shared depth engine in
   `converter/depth_phase2.py` via `stores/replay_depth_adapter.py` (no second
   depth converter); the manifest records `depth_diagnostics`, `fenced_ranges`, and
   `equivalence_caveats`.
 - It uses exact replay strings for Nautilus `Price` and `Quantity`.
-- It supports `--date YYYY-MM-DD` as a UTC-day shortcut for `--start/--end`.
-- It supports deterministic `--job-id` and safe `--overwrite`.
+- It supports `--date`-equivalent `start`/`end` shortcuts (UTC-day window) via
+  its Python API (there is no CLI; it is invoked only from
+  `validation.validate_catalog_equivalence` and from tests).
+- It supports deterministic `job_id` and safe `overwrite`.
 - It writes coverage fields for requested/found/missing partitions, records read,
   records written, skipped invalid records, and `time_filter=ts_init`.
-- It rejects unknown profiles by CLI choices.
+- It rejects unknown profiles.
 
 Validation:
 
@@ -85,16 +79,13 @@ Automated tests cover:
   nested price/size field presence.
 - Exact replay decimal preservation.
 - Depth `U/u/pu` preservation.
-- `generate_catalog` exclusive end behavior.
+- `validation.replay_catalog_reconstruct` exclusive end behavior.
 - Nautilus readability for generated trades-only catalogs.
-- Deterministic `--job-id` and `--overwrite`.
+- Deterministic job id and overwrite behavior.
 - Synthetic trades-only catalog semantic comparison.
 - Synthetic full-L2 convert_day-vs-replay semantic equivalence (clean bootstrap day).
 - Replay depth adapter mapping and canonical re-sort.
 - `full_l2`/`depth_only`/`depth10` profile write-flags and manifest diagnostics.
-- Feature UTC-day clamp and sparse output.
-- Feature audit report fields.
-- `generate_catalog --date` UTC-day shortcut.
 - Validator skips unsupported profiles (`depth10`).
 - Real-data equivalence behind `pytest.mark.realdata`.
 
@@ -172,7 +163,7 @@ Pending validation path:
 top50 + multi-day:
 data_raw -> convert_day.py
 must match
-data_raw -> replay_store -> generate_catalog --profile full_l2
+data_raw -> replay_store -> validation.replay_catalog_reconstruct (full_l2, validation-only)
 ```
 
 That wider validation compares the same fields proven on the ADAUSDT smoke:
@@ -194,13 +185,9 @@ not reproduced byte-for-byte).
 ## Known Limitations
 
 - `ReplayWriter` still accumulates one symbol/date in memory before writing.
-- Feature aggregation still loads one symbol/date of replay depth/trade records into memory.
-- Feature output is sparse, not dense; missing windows are expected unless dense mode is implemented later.
-- `generate_catalog` uses replay `instrument.json` only when it contains
+- `validation.replay_catalog_reconstruct` uses replay `instrument.json` only when it contains
   exchangeInfo-shaped metadata (`filters` or `exchange_info`). Current
   normalized v0 metadata otherwise falls back to the existing converter defaults.
-- Return and volatility fields are mostly simplified/null in v0.
-- OFI/order-pressure advanced fields are deferred.
 - The real-data equivalence test is gated by environment variables and is not part of normal CI.
 
 ## Reproduce One-Day Smoke
@@ -215,24 +202,11 @@ python -m pipeline.build_replay_store \
   --symbols ADAUSDT \
   --data-root ./data_raw \
   --replay-root "$BASE/replay_store"
-
-python -m pipeline.build_feature_store \
-  --date 2026-06-12 \
-  --symbols ADAUSDT \
-  --timeframes 1m \
-  --replay-root "$BASE/replay_store" \
-  --feature-root "$BASE/feature_store"
-
-python -m pipeline.generate_catalog \
-  --input "$BASE/replay_store" \
-  --symbols ADAUSDT \
-  --venues BINANCE_SPOT \
-  --date 2026-06-12 \
-  --output "$BASE/catalog_jobs" \
-  --profile trades_only \
-  --job-id validation_new \
-  --overwrite
 ```
+
+The `validation.replay_catalog_reconstruct` helper has no CLI; it is exercised
+via `python -m validation.validate_catalog_equivalence` (see below) or directly
+from Python/tests.
 
 ## Run Old-vs-New Validation
 
@@ -250,19 +224,6 @@ python -m validation.validate_catalog_equivalence \
   --overwrite
 ```
 
-## Audit Feature Output
-
-```bash
-python -m validation.audit_feature_store \
-  --feature-root /tmp/cryptorecorder-replay-feature-validation/feature_store \
-  --date 2026-06-12 \
-  --symbols ADAUSDT \
-  --venues BINANCE_SPOT \
-  --timeframes 1m,1s,100ms
-```
-
-The audit reports dense expected counts, actual row counts, date-bound violations, duplicate timestamps, null ratios, all-null columns, `quality_ok=false` count, and crossed-book totals.
-
 ## Audit Replay Output
 
 ```bash
@@ -279,17 +240,18 @@ trade exact string null ratios, and depth nested exact string field presence.
 
 ## Next Milestone
 
-Do not expand feature engineering before the full-L2 correctness milestone.
-
 Next milestone:
 
 ```text
 data_raw -> convert_day.py
 semantically matches
-data_raw -> replay_store -> generate_catalog --profile full_l2
+data_raw -> replay_store -> validation.replay_catalog_reconstruct (full_l2, validation-only)
 ```
 
-Only after that should the project consider replay-store raw archival policy or broad production replacement of the old converter path.
+Only after broader top50/multi-day validation passes should the project
+consider replay-store raw archival policy. CryptoRecorder does not build a
+feature/label layer of its own (issue #17); that responsibility belongs to
+downstream consumer repositories such as KovacsTrader.
 
 
 ---
@@ -344,33 +306,31 @@ This remains the validated full-L2 Nautilus catalog path:
 Decision: keep. `convert_day.py` is still the source of truth for full-L2
 catalog behavior until replay-based full-L2 is implemented and validated.
 
-## C. New Replay/Feature Pipeline
+## C. New Replay Pipeline
 
-Current validated v0 foundation:
+Validated v0 foundation (updated 2026-07-15 — see "Completed Cleanup Items"
+below: issue #17 removed the feature-store subsystem and the
+`generate_catalog` product CLI from this list):
 
 - `stores/`
   - `replay_schema.py`
   - `replay_writer.py`
   - `replay_reader.py`
-  - `feature_schema.py`
-  - `feature_calc.py`
-  - `feature_writer.py`
 - `pipeline/`
   - `raw_manifest.py`
   - `build_replay_store.py`
-  - `build_feature_store.py`
-  - `generate_catalog.py`
   - `daily_build.py`
 - `validation/`
   - `catalog_compare.py`
   - `audit_replay_store.py`
-  - `audit_feature_store.py`
   - `validate_catalog_equivalence.py`
+  - `replay_catalog_reconstruct.py` (validation-only, no CLI; formerly
+    `pipeline/generate_catalog.py`)
   - `catalog_inspect.py`
   - `phase2_report.py`
 
-Decision: keep. `generate_catalog` is currently `trades_only`; full-L2 replay
-catalog generation is deferred.
+Decision: keep. The `full_l2` reconstruction profile is implemented and
+validated on the ADAUSDT smoke; broader validation is deferred.
 
 ## D. Operational Scripts
 
@@ -493,21 +453,49 @@ Manual scripts remain in:
   `scripts/acceptance_legacy_converter.py` in a future low-risk PR if operators
   are not depending on the old filename.
 
+## Completed Cleanup Items (2026-07-15 — issue #17 recorder + replay-store ownership refactor)
+
+- Removed the feature-store subsystem entirely: `stores/feature_schema.py`,
+  `stores/feature_calc.py`, `stores/feature_writer.py`,
+  `pipeline/build_feature_store.py`, `validation/audit_feature_store.py`,
+  `tests/test_feature_store.py`, and the `cryptorecorder-feature-build`
+  systemd service + timer.
+- Removed `pipeline/generate_catalog.py` as a product/runtime CLI. Its
+  reconstruction logic moved to `validation/replay_catalog_reconstruct.py`, an
+  internal, CLI-less helper used only by
+  `validation.validate_catalog_equivalence`.
+- Removed `config.py` roots `FEATURE_ROOT`, `LABEL_ROOT`, and
+  `CATALOG_JOBS_ROOT`.
+- Simplified `pipeline.daily_build` to replay-only: dropped `--steps`,
+  `--timeframes`, and `--feature-root` CLI flags.
+- Deleted `docs/FEATURE_STORE.md` and `docs/GENERATE_CATALOG.md`; the docs/
+  fixed count dropped from 14 to 12 files.
+- Superseded issue #15 (a `generate_catalog` product-CLI proposal) in favor of
+  the narrower recorder + replay-store ownership boundary.
+
+See `CHANGELOG.md` `[Unreleased]` for the full change list.
+
 ---
 
-## Feature Store Requirements Audit
+## Feature Store Requirements Audit (REMOVED — issue #17)
+
+> **This subsystem no longer exists.** The table below is preserved as a
+> historical record of the feature-store's status at the time it was removed
+> (issue #17: recorder + replay-store ownership refactor). CryptoRecorder does
+> not build a feature-store or label-store layer; that responsibility belongs
+> to downstream consumer repositories (e.g. KovacsTrader). Do not recreate any
+> of the files referenced below without a new, explicit task.
 
 > Content merged from the former `IMPLEMENTATION_AUDIT.md`.
 
 > Honest status snapshot of the v0 feature store against its intended
-> requirements. "Status" uses: **met**, **partial**, **deferred**. Evidence
-> points at code/tests/docs that back the claim. This audit does not change
-> behavior; it records where the feature store actually stands.
+> requirements, as it stood immediately before removal. "Status" uses:
+> **met**, **partial**, **deferred**. Evidence points at code/tests/docs that
+> backed the claim at the time.
 
-The feature store is an **AI/selection analysis layer**, not a backtest data
-source. The validated backtest path is the Nautilus catalog (see
-[VALIDATION.md](VALIDATION.md)). Nothing here promotes the feature store to a
-catalog replacement.
+The feature store was an **AI/selection analysis layer**, not a backtest data
+source. The validated backtest path remains the Nautilus catalog (see
+[VALIDATION.md](VALIDATION.md)).
 
 ## Requirements
 

@@ -2,11 +2,14 @@
 
 ## Overview
 
-The replay_store is a Parquet-based columnar replay layer. It now backs both
-`generate_catalog --profile trades_only` and `--profile full_l2` (the latter
+The replay_store is a Parquet-based columnar replay layer. It is the stable
+external contract consumed by downstream repositories (e.g. KovacsTrader), and
+it backs the internal, validation-only `validation.replay_catalog_reconstruct`
+helper for both `trades_only` and `full_l2` reconstruction (the latter
 semantically validated on the ADAUSDT single-day smoke against `convert_day.py`,
-with broader validation pending). It remains a candidate long-term replay source;
-`convert_day.py` is still the production reference full-L2 path.
+with broader validation pending). `convert_day.py` is still the production
+reference full-L2 path. CryptoRecorder does not build a feature-store,
+label-store, or general-purpose consumer catalog from replay_store.
 
 **Key properties**:
 - **Immutable after publication** — Each date/symbol partition is written once and never modified
@@ -491,5 +494,4 @@ ls -lh /path/to/replay_store/venue=BINANCE_SPOT/symbol=BTCUSDT/date=2026-06-15/
 ## See Also
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) — Overall pipeline
-- [FEATURE_STORE.md](FEATURE_STORE.md) — Feature calculations
 - [DAILY_BUILD_PIPELINE.md](DAILY_BUILD_PIPELINE.md) — How to build

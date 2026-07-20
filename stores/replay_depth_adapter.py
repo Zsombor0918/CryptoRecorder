@@ -3,8 +3,8 @@ stores.replay_depth_adapter — Map replay_store depth rows into the normalized
 record shape consumed by the shared depth replay engine
 (``converter.depth_phase2._run_depth_replay_loop``).
 
-This adapter lets the ``replay_store -> generate_catalog --profile full_l2``
-path reuse the *exact* validated depth-conversion semantics of the
+This adapter lets the validation-only ``validation.replay_catalog_reconstruct``
+full_l2 helper reuse the *exact* validated depth-conversion semantics of the
 ``data_raw -> convert_day.py`` path, instead of re-implementing a weaker,
 independent depth converter.
 

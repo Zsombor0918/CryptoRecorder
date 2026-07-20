@@ -190,7 +190,169 @@ status claims are honest.
 
 ---
 
-## 2026-07-09 — Conventional commits enforcement (commit-msg hook + AGENTS.md Section 7)
+## 2026-07-15 — Issue #17: narrow scope to recorder + replay-store ownership, remove feature-store subsystem
+
+### Change summary
+- Removed the entire **feature-store subsystem**: `stores/feature_schema.py`,
+  `stores/feature_calc.py`, `stores/feature_writer.py`,
+  `pipeline/build_feature_store.py`, `validation/audit_feature_store.py`,
+  `tests/test_feature_store.py`, and the
+  `systemd/cryptorecorder-feature-build.{service,timer}` units.
+- Removed `pipeline/generate_catalog.py` as a **product/runtime CLI**. Moved its
+  `generate_catalog_from_replay` reconstruction logic and helpers to
+  `validation/replay_catalog_reconstruct.py` — an internal, CLI-less,
+  validation-only helper used exclusively by
+  `validation/validate_catalog_equivalence.py`. Renamed
+  `tests/test_generate_catalog_full_l2.py` to
+  `tests/test_replay_catalog_reconstruct.py` and removed
+  `tests/test_generate_catalog.py` (trades_only product-CLI tests, no longer
+  applicable).
+- Removed `config.py`: `FEATURE_ROOT`, `LABEL_ROOT`, `CATALOG_JOBS_ROOT`.
+  `ARCHIVE_DAYS_ROOT` is unaffected (still a placeholder, not implemented).
+- Simplified `pipeline/daily_build.py`: removed `--steps`, `--timeframes`,
+  `--feature-root` CLI flags and the feature-build execution path. It now
+  always scans raw coverage and builds the replay store only; report shape no
+  longer contains a `feature_build` section.
+- Deleted `docs/FEATURE_STORE.md` and `docs/GENERATE_CATALOG.md` rather than
+  leaving tombstones — the fixed docs/ file count drops from 14 to 12.
+- Rewrote `docs/REPO_STRUCTURE.md` (12-file contract, narrowed `pipeline/`,
+  `stores/`, `validation/` package definitions, updated CLI Command Reference,
+  new Amendment Log entry), `docs/IMPLEMENTATION_AUDIT.md` (feature-store
+  sections marked removed with preservation banners, historical evidence
+  retained), `docs/PROJECT_STATUS.md` (Validated/Deferred sections updated,
+  replay_store framed as the stable external contract for downstream
+  repositories), `docs/ARCHITECTURE.md` (removed the "Feature Store" storage
+  layer and "Build Feature Store"/"Generate Catalog" pipeline sections,
+  replaced with the validation-only `validation.replay_catalog_reconstruct`
+  helper description), `docs/DAILY_BUILD_PIPELINE.md` (fully rewritten,
+  replay-only), `docs/OPERATIONS.md` (removed `feature-build` service group and
+  `FEATURE_ROOT`/`CATALOG_JOBS_ROOT`/`LABEL_ROOT` path rows), `docs/REPLAY_STORE.md`,
+  `docs/FULL_L2_REPLAY_CATALOG_PLAN.md`, `docs/AI_WORKFLOW.md`, `docs/README.md`,
+  `README.md` (root), `AGENTS.md`, and `.github/copilot-instructions.md`.
+- Rewrote `tests/test_repo_structure.py`: added
+  `test_pipeline_does_not_contain_feature_store_modules()` and
+  `test_pipeline_does_not_contain_generate_catalog_cli()`; updated
+  `test_docs_do_not_reference_pipeline_audit_modules()` forbidden-pattern list;
+  updated `test_validation_contains_audit_and_equivalence_modules()` required
+  module list; removed `test_validation_audit_feature_store_cli_help()`.
+- Updated `tests/test_agent_infrastructure.py` `DEPLOY_TARGETS` (removed
+  `feature-build`); updated `tests/test_semantic_equivalence.py` and
+  `tests/test_replay_depth_adapter.py` to reference
+  `validation.replay_catalog_reconstruct` instead of `pipeline.generate_catalog`.
+- Cleaned `scripts/deploy_linux_server.sh` (removed the `feature-build` target
+  throughout: `VALID_TARGETS`, help text, unit/control case statements,
+  directory creation list), `systemd/cryptorecorder.env.example` (removed
+  `CRYPTO_RECORDER_FEATURE_ROOT`, `CRYPTO_RECORDER_CATALOG_JOBS_ROOT`,
+  `CRYPTO_RECORDER_LABEL_ROOT`), `systemd/cryptorecorder-replay-build.service`
+  (removed the now-nonexistent `--steps replay` flag), and `scripts/README.md`.
+- Updated package docstrings: `pipeline/__init__.py`, `stores/__init__.py`,
+  `validation/__init__.py`.
+- `validation/audit_change_compliance.py`: `_REPLAY_CATALOG_PATTERNS` no longer
+  includes `stores/feature`, `pipeline/build_feature`, `pipeline/generate_catalog`,
+  or `validation/audit_feature`.
+- `validation/audit_storage_size.py` deliberately left unchanged (see "Known
+  limitations" below).
+
+### Files/packages touched
+- pipeline/__init__.py, pipeline/daily_build.py
+- pipeline/build_feature_store.py (deleted), pipeline/generate_catalog.py (deleted)
+- stores/__init__.py
+- stores/feature_schema.py, stores/feature_calc.py, stores/feature_writer.py (all deleted)
+- stores/replay_depth_adapter.py
+- validation/__init__.py
+- validation/audit_feature_store.py (deleted)
+- validation/replay_catalog_reconstruct.py (new)
+- validation/audit_change_compliance.py
+- config.py
+- tests/test_repo_structure.py
+- tests/test_agent_infrastructure.py
+- tests/test_semantic_equivalence.py
+- tests/test_replay_depth_adapter.py
+- tests/test_feature_store.py (deleted)
+- tests/test_generate_catalog.py (deleted)
+- tests/test_generate_catalog_full_l2.py → tests/test_replay_catalog_reconstruct.py (renamed)
+- scripts/acceptance_test.py, scripts/deploy_linux_server.sh, scripts/README.md
+- systemd/cryptorecorder.env.example, systemd/cryptorecorder-replay-build.service
+- systemd/cryptorecorder-feature-build.service, systemd/cryptorecorder-feature-build.timer (both deleted)
+- docs/REPO_STRUCTURE.md, docs/IMPLEMENTATION_AUDIT.md, docs/PROJECT_STATUS.md,
+  docs/ARCHITECTURE.md, docs/DAILY_BUILD_PIPELINE.md, docs/OPERATIONS.md,
+  docs/REPLAY_STORE.md, docs/FULL_L2_REPLAY_CATALOG_PLAN.md, docs/AI_WORKFLOW.md,
+  docs/README.md
+- docs/FEATURE_STORE.md, docs/GENERATE_CATALOG.md (both deleted)
+- README.md (root), AGENTS.md, .github/copilot-instructions.md
+- CHANGELOG.md
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] docs/REPO_STRUCTURE.md
+- [x] docs/PROJECT_STATUS.md
+- [x] docs/IMPLEMENTATION_AUDIT.md
+- [x] relevant feature docs:
+  - docs/ARCHITECTURE.md, docs/DAILY_BUILD_PIPELINE.md, docs/OPERATIONS.md,
+    docs/REPLAY_STORE.md, docs/FULL_L2_REPLAY_CATALOG_PLAN.md,
+    docs/AI_WORKFLOW.md, docs/README.md, docs/VALIDATION.md (verified, no
+    change needed), INSTALL.md (verified, no change needed)
+
+### Docs updated
+- [x] CHANGELOG.md
+- [x] README.md
+- [x] docs/PROJECT_STATUS.md
+- [x] docs/REPO_STRUCTURE.md
+- [x] relevant feature docs:
+  - docs/ARCHITECTURE.md, docs/DAILY_BUILD_PIPELINE.md, docs/OPERATIONS.md,
+    docs/REPLAY_STORE.md, docs/FULL_L2_REPLAY_CATALOG_PLAN.md,
+    docs/AI_WORKFLOW.md, docs/README.md, docs/IMPLEMENTATION_AUDIT.md
+
+### Status / validation impact
+- Validated status changed: no — the previously validated
+  `data_raw -> replay_store` contract and the ADAUSDT single-day `full_l2`
+  smoke evidence are unchanged and preserved verbatim in
+  `docs/PROJECT_STATUS.md` and `docs/IMPLEMENTATION_AUDIT.md`.
+- Deferred status changed: no new deferrals added beyond removing the
+  feature-store/label-store scope entirely (it is no longer "deferred", it is
+  "not this repository's responsibility").
+- New claims added: no. This is a scope-narrowing and cleanup change; no new
+  validation claims were made. Broader top50/multi-day full_l2 equivalence
+  (the `v2.0.0` gate) remains explicitly not claimed.
+- Evidence for any new validation claim:
+  - n/a — no new validation claims; existing ADAUSDT smoke evidence preserved
+    unchanged.
+
+### Tests run
+```bash
+source .venv/bin/activate && pytest -q
+# 227 passed, 3 skipped
+```
+
+### Validation CLIs run
+```bash
+# none required — this change removes/renames modules and rewrites docs; it
+# does not alter recorder, converter, or replay-store semantics. The existing
+# ADAUSDT full_l2 smoke evidence was not re-run because no code paths it
+# exercises were modified (only its call site moved from
+# pipeline/generate_catalog.py to validation/replay_catalog_reconstruct.py with
+# behavior otherwise unchanged, and this is covered by the passing pytest run
+# above, including tests/test_replay_catalog_reconstruct.py and
+# tests/test_catalog_equivalence_full_l2.py).
+```
+
+### Known limitations / out of scope
+- `validation/audit_storage_size.py` still has a generic `--feature-root` CLI
+  flag and a `feature_store` component label for measuring arbitrary directory
+  sizes. Left unchanged deliberately: it imports nothing from the deleted
+  feature-store modules and is a generic size-measurement tool, not a
+  feature-store consumer. Renaming its flag was judged out of scope for this
+  issue.
+- Broader top50/multi-day `full_l2` validation (the `v2.0.0` gate) is still
+  pending; not addressed by this change.
+- Issue #15 (the superseded `generate_catalog` product-CLI proposal) needs to
+  be manually commented on and closed as "not planned" on GitHub — not done as
+  part of this local change; requires user confirmation before performing any
+  GitHub write action.
+- Pushing the `refactor/recorder-replay-only` branch and opening a PR are not
+  done as part of this change; both require explicit user confirmation first
+  per this repository's operational safety rules.
+
 
 ### Change summary
 - Created `.githooks/commit-msg` — bash hook that validates every commit message

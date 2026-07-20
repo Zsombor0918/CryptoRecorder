@@ -29,7 +29,7 @@ ENV_FILE="/etc/cryptorecorder/cryptorecorder.env"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-VALID_TARGETS=("all" "recorder" "legacy-converter" "replay-build" "feature-build")
+VALID_TARGETS=("all" "recorder" "legacy-converter" "replay-build")
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -52,7 +52,7 @@ usage() {
 Usage: scripts/deploy_linux_server.sh [flags]
 
 Flags:
-  --target <name>     all | recorder | legacy-converter | replay-build | feature-build  (default: all)
+  --target <name>     all | recorder | legacy-converter | replay-build  (default: all)
   --dry-run           Print every action; change nothing.
   --no-systemd        Skip all systemd / /etc actions (safe in WSL).
   --install-only      Prepare env + install units; do not enable/start.
@@ -107,7 +107,6 @@ units_for_target() {
     recorder)         echo "cryptorecorder-recorder.service" ;;
     legacy-converter) echo "cryptorecorder-convert.service cryptorecorder-convert.timer" ;;
     replay-build)     echo "cryptorecorder-replay-build.service cryptorecorder-replay-build.timer" ;;
-    feature-build)    echo "cryptorecorder-feature-build.service cryptorecorder-feature-build.timer" ;;
   esac
 }
 
@@ -116,13 +115,12 @@ control_for_target() {
     recorder)         echo "cryptorecorder-recorder.service" ;;
     legacy-converter) echo "cryptorecorder-convert.timer" ;;
     replay-build)     echo "cryptorecorder-replay-build.timer" ;;
-    feature-build)    echo "cryptorecorder-feature-build.timer" ;;
   esac
 }
 
 selected_targets() {
   if [[ "$TARGET" == "all" ]]; then
-    echo "recorder legacy-converter replay-build feature-build"
+    echo "recorder legacy-converter replay-build"
   else
     echo "$TARGET"
   fi
@@ -188,8 +186,8 @@ create_env_file() {
 create_data_dirs() {
   log "Step 7/9: ensure data directories under $DATA_ROOT"
   local d
-  for d in data_raw replay_store feature_store catalog_jobs state \
-           daily_build_reports catalog archive_days label_store; do
+  for d in data_raw replay_store state \
+           daily_build_reports catalog archive_days; do
     run mkdir -p "$DATA_ROOT/$d"
   done
 }

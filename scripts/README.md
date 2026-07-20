@@ -9,8 +9,8 @@ here. All pipeline and validation commands use `python -m pipeline.*` or
 ## Available Scripts
 
 ### smoke_test.py
-Quick 3-minute raw recorder smoke test. It does not validate replay_store,
-feature_store, or Nautilus catalog generation.
+Quick 3-minute raw recorder smoke test. It does not validate replay_store or
+Nautilus catalog generation.
 
 ```bash
 python scripts/smoke_test.py              # Default 3 minutes
@@ -19,8 +19,8 @@ python scripts/smoke_test.py --runtime 60 # 1 minute
 
 ### acceptance_test.py
 Legacy converter acceptance test (recorder → `convert_day.py` → Nautilus
-catalog validation). It does not exercise the replay_store → full_l2 catalog
-path; for that, use `python -m validation.validate_catalog_equivalence
+catalog validation). It does not exercise the internal replay full-L2
+reconstruction path; for that, use `python -m validation.validate_catalog_equivalence
 --profile full_l2` (validated on the ADAUSDT smoke, broader validation pending).
 
 ```bash
@@ -38,11 +38,9 @@ python scripts/acceptance_test.py --skip-recorder # Test converter only
 | Verify recorder works | `python scripts/smoke_test.py` |
 | Legacy converter check | `python scripts/acceptance_test.py` |
 | Audit replay store | `python -m validation.audit_replay_store --date YYYY-MM-DD ...` |
-| Audit feature store | `python -m validation.audit_feature_store --date YYYY-MM-DD ...` |
 | Compare old vs new catalog | `python -m validation.validate_catalog_equivalence --date YYYY-MM-DD ...` |
 | Build replay store | `python -m pipeline.build_replay_store --date YYYY-MM-DD ...` |
-| Build feature store | `python -m pipeline.build_feature_store --date YYYY-MM-DD ...` |
-| Generate catalog | `python -m pipeline.generate_catalog --date YYYY-MM-DD ...` |
+| Run daily build (replay-only) | `python -m pipeline.daily_build --date YYYY-MM-DD ...` |
 
 ## Output
 

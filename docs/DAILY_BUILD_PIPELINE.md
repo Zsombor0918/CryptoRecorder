@@ -2,7 +2,12 @@
 
 ## Overview
 
-The daily build pipeline orchestrates the conversion of raw market data into replay_store and feature_store. It's designed to run once per day via systemd timer and supports flexible on-demand execution with custom parameters.
+The daily build pipeline orchestrates the conversion of raw market data into
+`replay_store`. It's designed to run once per day via systemd timer and
+supports flexible on-demand execution with custom parameters. It is
+replay-only: CryptoRecorder does not build a feature-store or label-store
+(removed, issue #17); `replay_store` is the stable external contract handed
+off to downstream repositories (e.g. KovacsTrader).
 
 ## Quick Start
 
@@ -22,7 +27,7 @@ python -m pipeline.daily_build --date yesterday
 ### Custom date and symbols
 
 ```bash
-python -m pipeline.daily_build --date 2026-06-15 --symbols BTCUSDT,ETHUSDT --steps replay,features
+python -m pipeline.daily_build --date 2026-06-15 --symbols BTCUSDT,ETHUSDT
 ```
 
 ## CLI Interface
@@ -45,27 +50,12 @@ python -m pipeline.daily_build [OPTIONS]
 ### Optional Arguments
 
 ```
---steps STEPS
-    Pipeline steps to run (default: replay,features)
-    
-    Options:
-    - replay: Build replay_store only
-    - features: Build feature_store only
-    - replay,features: Run both (default)
-
 --symbols SYMBOLS
     Comma-separated symbols to process (default: all from raw data)
     
     Examples:
     - --symbols BTCUSDT
     - --symbols BTCUSDT,ETHUSDT,BNBUSDT
-
---timeframes TIMEFRAMES
-    Feature timeframes (default: 100ms,1s,1m)
-    
-    Examples:
-    - --timeframes 1s
-    - --timeframes 100ms,1s,1m,5m
 
 --data-root PATH
     Raw data root (default: from config.DATA_ROOT)
@@ -75,12 +65,13 @@ python -m pipeline.daily_build [OPTIONS]
 --replay-root PATH
     Replay store root (default: from config.REPLAY_ROOT)
 
---feature-root PATH
-    Feature store root (default: from config.FEATURE_ROOT)
-
 --report-root PATH
     Report output root (default: from config.DAILY_REPORT_ROOT)
 ```
+
+There is no `--steps`, `--timeframes`, or `--feature-root` flag. `daily_build`
+always scans raw coverage and builds the replay store; there is no feature
+step to select.
 
 ## Examples
 
@@ -109,7 +100,6 @@ journalctl -u cryptorecorder-daily-build.service -f
 python -m pipeline.daily_build \
   --date 2026-06-15 \
   --symbols BTCUSDT,ETHUSDT \
-  --steps replay \
   --data-root /tmp/test_raw
 ```
 
@@ -120,7 +110,6 @@ python -m pipeline.daily_build \
   --date 2026-06-15 \
   --data-root /tmp/test_raw \
   --replay-root /tmp/test_replay \
-  --feature-root /tmp/test_features \
   --report-root /tmp/test_reports
 ```
 
@@ -149,13 +138,6 @@ Expected output:
     "symbols_total": 2500,
     "depth_records": 216000000,
     "trade_records": 112300000
-  },
-  
-  "feature_build": {
-    "status": "success",
-    "symbols_processed": 2500,
-    "symbols_total": 2500,
-    "feature_records": 18720000
   },
   
   "errors": []
@@ -213,52 +195,11 @@ replay_store/venue=BINANCE_SPOT/symbol=BTCUSDT/date=2026-06-15/
 - Out of disk space → all symbols fail
 - Schema mismatch → error logged, retry recommended
 
-### 3. Build Feature Store
-
-**Time**: ~30-60 minutes (depends on replay size and feature calculations)
-
-```bash
-python -m pipeline.build_feature_store --date 2026-06-15
-```
-
-Per symbol/timeframe:
-1. Load one symbol/date of replay_store data (trades + depths) into memory in v0
-2. Clamp records to the requested UTC day
-3. Aggregate into sparse time windows (100ms, 1s, 1m); empty windows are skipped
-4. Calculate core features per window
-5. Write Parquet with Hive-style partitioning
-6. Atomic move from staging → published
-
-**Output structure**:
-```
-feature_store/
-├── timeframe=100ms/venue=BINANCE_SPOT/symbol=BTCUSDT/date=2026-06-15.parquet
-├── timeframe=1s/venue=BINANCE_SPOT/symbol=BTCUSDT/date=2026-06-15.parquet
-└── timeframe=1m/venue=BINANCE_SPOT/symbol=BTCUSDT/date=2026-06-15.parquet
-```
-
-**Possible issues**:
-- Missing replay_store data → skip symbol
-- Malformed replay records → skip record, continue
-- Quality flags triggered → logged in feature rows
-- Large symbol/day memory use → benchmark RSS before broad production runs
-
-Audit feature output:
-
-```bash
-python -m validation.audit_feature_store \
-  --feature-root /tmp/test_features \
-  --date 2026-06-12 \
-  --symbols ADAUSDT \
-  --venues BINANCE_SPOT \
-  --timeframes 1m,1s,100ms
-```
-
-### 4. Generate Daily Report
+### 3. Generate Daily Report
 
 **Time**: <1 second
 
-Aggregates results from previous steps into `daily_build_{date}.json`:
+Aggregates results from the previous steps into `daily_build_{date}.json`:
 
 ```json
 {
@@ -267,20 +208,19 @@ Aggregates results from previous steps into `daily_build_{date}.json`:
   "runtime_sec": 3600.0,
   "raw_coverage": {...},
   "replay_build": {...},
-  "feature_build": {...},
   "errors": [...]
 }
 ```
 
 ## Local Testing Workflow (temp-root smoke)
 
-Use this workflow to validate the current replay/feature path without touching production roots.
+Use this workflow to validate the current replay path without touching production roots.
 
 ### 1. Prepare test data
 
 ```bash
 # Use an existing raw data root, or point --data-root at a copied/symlinked fixture.
-BASE=/tmp/cryptorecorder-replay-feature-validation
+BASE=/tmp/cryptorecorder-replay-validation
 rm -rf "$BASE"
 mkdir -p "$BASE"
 ```
@@ -295,67 +235,35 @@ python -m pipeline.build_replay_store \
   --replay-root "$BASE/replay_store"
 ```
 
-### 3. Build feature_store
-
-```bash
-python -m pipeline.build_feature_store \
-  --date 2026-06-12 \
-  --symbols ADAUSDT \
-  --timeframes 1m \
-  --replay-root "$BASE/replay_store" \
-  --feature-root "$BASE/feature_store"
-```
-
-### 4. Generate a trades-only Nautilus catalog
-
-```bash
-python -m pipeline.generate_catalog \
-  --input "$BASE/replay_store" \
-  --symbols ADAUSDT \
-  --venues BINANCE_SPOT \
-  --start 2026-06-12T00:00:00Z \
-  --end 2026-06-13T00:00:00Z \
-  --output "$BASE/catalog_jobs" \
-  --profile trades_only
-```
-
-### 5. Run the daily orchestrator with temp roots
+### 3. Run the daily orchestrator with temp roots
 
 ```bash
 python -m pipeline.daily_build \
   --date 2026-06-12 \
-  --steps replay,features \
   --symbols ADAUSDT \
-  --timeframes 1m \
   --data-root ./data_raw \
   --replay-root "$BASE/daily_replay_store" \
-  --feature-root "$BASE/daily_feature_store" \
   --report-root "$BASE/daily_reports"
 ```
 
-### 6. Validate outputs
+### 4. Validate outputs
 
 Check:
 - replay partitions exist under `venue=.../symbol=.../date=2026-06-12`;
 - `manifest.json` counts match Parquet metadata;
 - SHA256 checksums match the published files;
-- rows are sorted by the composite replay sort keys;
-- feature Parquet files exist for the requested timeframe;
-- the generated catalog opens with Nautilus `ParquetDataCatalog`.
+- rows are sorted by the composite replay sort keys.
 
-### 7. Semantic equivalence test
+### 5. Semantic equivalence check
 
-After the smoke test, compare against old `convert_day.py` for the same date/symbol set:
+Compare against old `convert_day.py` for the same date/symbol set. There is no
+`generate_catalog` product CLI; the reusable validator drives the internal
+`validation.replay_catalog_reconstruct` helper to rebuild a temporary catalog
+from `replay_store` and compares it directly:
 
 ```bash
 python convert_day.py --date 2026-06-12 --symbols ADAUSDT --staging
-```
 
-Compare instruments, row counts, timestamp min/max, and bounded sample readability. Full depth/full-L2 semantic equivalence is still pending because `generate_catalog` currently implements `trades_only`.
-
-The reusable validator automates the trades-only comparison:
-
-```bash
 python -m validation.validate_catalog_equivalence \
   --date 2026-06-12 \
   --symbols ADAUSDT \
@@ -369,7 +277,11 @@ python -m validation.validate_catalog_equivalence \
   --overwrite
 ```
 
-### 8. Local 3-day validation recipe
+Use `--profile full_l2` for the full order-book comparison (validated on the
+ADAUSDT single-day smoke; broader top50/multi-day validation is pending — see
+[FULL_L2_REPLAY_CATALOG_PLAN.md](FULL_L2_REPLAY_CATALOG_PLAN.md)).
+
+### 6. Local 3-day validation recipe
 
 Use this only after the one-day smoke passes. Replace the dates if your local raw fixture uses different UTC days.
 
@@ -384,25 +296,7 @@ for date in 2026-06-12 2026-06-13 2026-06-14; do
     --symbols ADAUSDT \
     --data-root ./data_raw \
     --replay-root "$BASE/replay_store"
-
-  python -m pipeline.build_feature_store \
-    --date "$date" \
-    --symbols ADAUSDT \
-    --timeframes 1m \
-    --replay-root "$BASE/replay_store" \
-    --feature-root "$BASE/feature_store"
 done
-
-python -m pipeline.generate_catalog \
-  --input "$BASE/replay_store" \
-  --symbols ADAUSDT \
-  --venues BINANCE_SPOT \
-  --start 2026-06-12T00:00:00Z \
-  --end 2026-06-15T00:00:00Z \
-  --output "$BASE/catalog_jobs" \
-  --profile trades_only \
-  --job-id validation_3day \
-  --overwrite
 ```
 
 Run old-vs-new trades-only equivalence one day at a time:
@@ -486,31 +380,6 @@ rm -rf /path/to/replay_store/venue=BINANCE_SPOT/symbol=BTCUSDT/date=2026-06-15/
 python -m pipeline.build_replay_store --date 2026-06-15
 ```
 
-### Issue: Feature calculation is slow
-
-**Symptom**:
-```
-INFO: Building feature_store for 2026-06-15...
-# ... stuck for >30 minutes with no output ...
-```
-
-**Cause**: Large replay_store file (>1GB per symbol) or slow disk I/O
-
-**Solution**:
-```bash
-# Monitor progress
-watch -n 5 'ls -lah /tmp/test_features/.staging_*/venue=BINANCE_SPOT/symbol=BTCUSDT/'
-
-# If stuck, check for I/O bottleneck
-iotop -o  # (if available)
-
-# Increase batch size in feature_calc.py
-# (modify BATCH_SIZE constant, default 5000)
-
-# Or limit to fewer symbols
-python -m pipeline.build_feature_store --date 2026-06-15 --symbols BTCUSDT
-```
-
 ## Systemd Integration
 
 ### View service status
@@ -558,6 +427,6 @@ sudo systemctl restart cryptorecorder-daily-build.timer
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) — Data pipeline overview
 - [REPLAY_STORE.md](REPLAY_STORE.md) — Replay store schema
-- [FEATURE_STORE.md](FEATURE_STORE.md) — Feature calculations
-- [GENERATE_CATALOG.md](GENERATE_CATALOG.md) — On-demand catalog generation
+- [FULL_L2_REPLAY_CATALOG_PLAN.md](FULL_L2_REPLAY_CATALOG_PLAN.md) — Validation-only full-L2 reconstruction plan
 - [OPERATIONS.md](OPERATIONS.md) — General system operations
+

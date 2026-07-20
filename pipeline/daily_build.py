@@ -1,7 +1,7 @@
 """
-pipeline.daily_build — Daily build orchestrator for replay and feature stores.
+pipeline.daily_build — Daily build orchestrator for the replay store.
 
-Orchestrates raw → replay_store → feature_store + daily_build_report generation.
+Orchestrates raw → replay_store + daily_build_report generation.
 Entry point for daily scheduled builds via systemd timer.
 """
 from __future__ import annotations
@@ -15,7 +15,7 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional
 
-from config import DATA_ROOT, REPLAY_ROOT, FEATURE_ROOT, DAILY_REPORT_ROOT
+from config import DATA_ROOT, REPLAY_ROOT, DAILY_REPORT_ROOT
 
 logger = logging.getLogger(__name__)
 
@@ -97,62 +97,13 @@ def run_build_replay_store(
     }
 
 
-def run_build_feature_store(
-    date_str: str,
-    symbols: list[str],
-    timeframes: list[str],
-    replay_root: Path,
-    feature_root: Path,
-) -> dict:
-    """Run feature store builder."""
-    logger.info(f"Building feature_store for {date_str}...")
-    
-    from pipeline.build_feature_store import build_features_for_symbol
-    from stores.replay_reader import ReplayReader
-    
-    reader = ReplayReader(replay_root)
-    results = []
-    
-    for venue in reader.iter_venues():
-        for symbol in symbols:
-            if symbol not in list(reader.iter_symbols(venue)):
-                continue
-            if date_str not in list(reader.iter_dates(venue, symbol)):
-                continue
-            
-            result = build_features_for_symbol(
-                venue, symbol, date_str, timeframes, replay_root, feature_root
-            )
-            results.append(result)
-    
-    successful = sum(1 for r in results if r["status"] == "success")
-    total_features = sum(
-        sum(r.get("timeframes_processed", {}).values()) for r in results
-    )
-    
-    logger.info(
-        f"Feature build complete: {successful}/{len(results)} symbols, "
-        f"{total_features} feature records"
-    )
-    
-    return {
-        "status": "success" if successful == len(results) else "partial",
-        "symbols_processed": successful,
-        "symbols_total": len(results),
-        "feature_records": total_features,
-        "results": results,
-    }
-
-
 def generate_daily_report(
     date_str: str,
     data_root: Path,
     replay_root: Path,
-    feature_root: Path,
     report_root: Path,
     raw_result: dict,
     replay_result: dict,
-    feature_result: dict,
     runtime_sec: float,
 ) -> dict:
     """Generate daily build report."""
@@ -165,7 +116,6 @@ def generate_daily_report(
         # Paths
         "data_root": str(data_root),
         "replay_root": str(replay_root),
-        "feature_root": str(feature_root),
         "report_root": str(report_root),
         
         # Coverage
@@ -183,28 +133,16 @@ def generate_daily_report(
             "trade_records": replay_result.get("trade_records", 0),
         },
         
-        # Feature store stats
-        "feature_build": {
-            "status": feature_result.get("status", "unknown"),
-            "symbols_processed": feature_result.get("symbols_processed", 0),
-            "symbols_total": feature_result.get("symbols_total", 0),
-            "feature_records": feature_result.get("feature_records", 0),
-        },
-        
         # Errors
         "errors": [],
     }
     
     # Check overall status
-    if replay_result.get("status") != "success" or feature_result.get("status") != "success":
+    if replay_result.get("status") != "success":
         report["status"] = "partial"
     
     # Collect errors
     for result in replay_result.get("results", []):
-        if result.get("errors"):
-            report["errors"].extend(result.get("errors", []))
-    
-    for result in feature_result.get("results", []):
         if result.get("errors"):
             report["errors"].extend(result.get("errors", []))
     
@@ -221,31 +159,21 @@ def generate_daily_report(
 def main():
     """CLI entry point for daily_build."""
     parser = argparse.ArgumentParser(
-        description="Daily build orchestrator for replay and feature stores",
+        description="Daily build orchestrator for the replay store",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   python -m pipeline.daily_build --date 2026-06-15
-  python -m pipeline.daily_build --date yesterday --steps replay,features
+  python -m pipeline.daily_build --date yesterday
   python -m pipeline.daily_build --date 2026-06-15 --symbols BTCUSDT,ETHUSDT
-  python -m pipeline.daily_build --date 2026-06-15 --data-root /custom/raw --replay-root /custom/replay --feature-root /custom/features
+  python -m pipeline.daily_build --date 2026-06-15 --data-root /custom/raw --replay-root /custom/replay
         """,
     )
     parser.add_argument("--date", required=True, help="Date (YYYY-MM-DD or 'yesterday')")
     parser.add_argument(
-        "--steps",
-        default="replay,features",
-        help="Build steps: replay, features, or both (default: replay,features)",
-    )
-    parser.add_argument(
         "--symbols",
         default=None,
         help="Comma-separated symbols to process (default: all from raw)",
-    )
-    parser.add_argument(
-        "--timeframes",
-        default="100ms,1s,1m",
-        help="Feature timeframes (default: 100ms,1s,1m)",
     )
     parser.add_argument(
         "--data-root",
@@ -260,12 +188,6 @@ Examples:
         help=f"Replay root (default: {REPLAY_ROOT})",
     )
     parser.add_argument(
-        "--feature-root",
-        type=Path,
-        default=None,
-        help=f"Feature root (default: {FEATURE_ROOT})",
-    )
-    parser.add_argument(
         "--report-root",
         type=Path,
         default=None,
@@ -277,7 +199,6 @@ Examples:
     # Parse paths
     data_root = args.data_root or DATA_ROOT
     replay_root = args.replay_root or REPLAY_ROOT
-    feature_root = args.feature_root or FEATURE_ROOT
     report_root = args.report_root or DAILY_REPORT_ROOT
 
     # Parse date
@@ -289,7 +210,7 @@ Examples:
 
     logger.info(
         f"Daily build started: {date_str}, "
-        f"data_root={data_root}, replay_root={replay_root}, feature_root={feature_root}"
+        f"data_root={data_root}, replay_root={replay_root}"
     )
 
     start_time = time.time()
@@ -309,33 +230,18 @@ Examples:
         
         logger.info(f"Processing symbols: {symbols}")
 
-        # Parse steps
-        steps = [s.strip() for s in args.steps.split(",")]
+        # Step 2: Build replay store (always run)
+        replay_result = run_build_replay_store(date_str, symbols, data_root, replay_root)
 
-        # Step 2: Build replay store
-        replay_result = {}
-        if "replay" in steps:
-            replay_result = run_build_replay_store(date_str, symbols, data_root, replay_root)
-
-        # Step 3: Build feature store
-        feature_result = {}
-        if "features" in steps:
-            timeframes = [t.strip() for t in args.timeframes.split(",")]
-            feature_result = run_build_feature_store(
-                date_str, symbols, timeframes, replay_root, feature_root
-            )
-
-        # Step 4: Generate report
+        # Step 3: Generate report
         runtime_sec = time.time() - start_time
         report = generate_daily_report(
             date_str,
             data_root,
             replay_root,
-            feature_root,
             report_root,
             raw_result,
             replay_result,
-            feature_result,
             runtime_sec,
         )
 

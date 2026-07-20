@@ -175,7 +175,6 @@ The canonical paths and service groups it uses are defined in
 | `recorder` | `cryptorecorder-recorder.service` |
 | `legacy-converter` | `cryptorecorder-convert.service` + `.timer` |
 | `replay-build` | `cryptorecorder-replay-build.service` + `.timer` |
-| `feature-build` | `cryptorecorder-feature-build.service` + `.timer` |
 
 ## Flags
 
@@ -223,9 +222,8 @@ still prepares the venv, dependencies, and data dirs (or prints them under `--dr
 # Restart just the recorder after a code update:
 ./scripts/deploy_linux_server.sh --target recorder --restart
 
-# Install the daily build timers but do not start them yet:
+# Install the daily replay-build timer but do not start it yet:
 ./scripts/deploy_linux_server.sh --target replay-build --install-only
-./scripts/deploy_linux_server.sh --target feature-build --install-only
 ```
 
 ## Safety notes
@@ -272,35 +270,35 @@ Generated data roots under `DATA_BASE` (see `config.py` and the env template):
 ```
 /data/cryptorecorder/data_raw          # CRYPTO_RECORDER_DATA_ROOT
 /data/cryptorecorder/replay_store       # CRYPTO_RECORDER_REPLAY_ROOT
-/data/cryptorecorder/feature_store      # CRYPTO_RECORDER_FEATURE_ROOT
-/data/cryptorecorder/catalog_jobs       # CRYPTO_RECORDER_CATALOG_JOBS_ROOT
 /data/cryptorecorder/archive_days       # CRYPTO_RECORDER_ARCHIVE_DAYS_ROOT (placeholder)
-/data/cryptorecorder/label_store        # CRYPTO_RECORDER_LABEL_ROOT (placeholder)
 ```
 
-> `archive_days` and `label_store` are **placeholder** roots. No archive, Syncthing,
-> or label code reads or writes them yet.
+> `archive_days` is a **placeholder** root. No archive, Syncthing, or import/restore
+> code reads or writes it yet. `FEATURE_ROOT`, `CATALOG_JOBS_ROOT`, and `LABEL_ROOT`
+> no longer exist (removed, issue #17) — CryptoRecorder does not own a
+> feature-store, catalog-jobs, or label-store data root.
 
 ## Service groups
 
-Production work is split into four service groups plus a meta target `all`.
+Production work is split into three service groups plus a meta target `all`.
 
 | Group | systemd unit(s) | Kind | Schedule | Command (in `.venv`) |
 |-------|-----------------|------|----------|----------------------|
 | `recorder` | `cryptorecorder-recorder.service` | long-running | always on | `python recorder.py` |
 | `legacy-converter` | `cryptorecorder-convert.service` + `.timer` | oneshot | ~00:10 UTC | `python convert_day.py --staging` (defaults to yesterday UTC) |
-| `replay-build` | `cryptorecorder-replay-build.service` + `.timer` | oneshot | ~01:00 UTC | `python -m pipeline.daily_build --steps replay --date yesterday` |
-| `feature-build` | `cryptorecorder-feature-build.service` + `.timer` | oneshot | ~02:30 UTC | `python -m pipeline.daily_build --steps features --date yesterday` |
+| `replay-build` | `cryptorecorder-replay-build.service` + `.timer` | oneshot | ~01:00 UTC | `python -m pipeline.daily_build --date yesterday` |
 
-Meta target **`all`** installs/controls all four groups together.
+Meta target **`all`** installs/controls all three groups together.
 
-Ordering: the daily chain runs **convert → replay → features** (each after the
-previous day has closed and the prior step has produced output).
+Ordering: the daily chain runs **convert → replay** (each after the previous
+day has closed and the prior step has produced output). There is no
+feature-build step; CryptoRecorder's scope ends at `replay_store` (removed,
+issue #17).
 
-> The replay-build and feature-build services invoke `pipeline.daily_build` because
-> `pipeline.build_replay_store` and `pipeline.build_feature_store` require an explicit
-> `YYYY-MM-DD` date and do not understand the literal `yesterday`. `daily_build`
-> resolves `yesterday` to the previous completed UTC date.
+> The replay-build service invokes `pipeline.daily_build` because
+> `pipeline.build_replay_store` requires an explicit `YYYY-MM-DD` date and does
+> not understand the literal `yesterday`. `daily_build` resolves `yesterday` to
+> the previous completed UTC date.
 
 ## Explicitly out of scope
 
@@ -310,7 +308,8 @@ The following are **not** part of the deployment and have **no** services here:
 - **archive** export,
 - **import / restore** tooling.
 
-`ARCHIVE_DAYS_ROOT` and `LABEL_ROOT` exist only as configuration placeholders.
+`ARCHIVE_DAYS_ROOT` exists only as a configuration placeholder. `LABEL_ROOT` and
+`CATALOG_JOBS_ROOT` no longer exist (removed, issue #17).
 
 See [DEPLOYMENT.md](OPERATIONS.md) for the deploy command and flags.
 

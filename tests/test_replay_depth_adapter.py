@@ -1,8 +1,8 @@
 """Unit tests for stores.replay_depth_adapter.
 
 These tests pin the field mapping and canonical ordering that let the
-``replay_store -> generate_catalog --profile full_l2`` path reuse the validated
-``convert_day.py`` depth-replay engine.
+validation-only ``validation.replay_catalog_reconstruct`` full_l2 path reuse
+the validated ``convert_day.py`` depth-replay engine.
 """
 from __future__ import annotations
 

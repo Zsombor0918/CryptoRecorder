@@ -18,7 +18,7 @@ from config import (
     EMIT_DEPTH10_DEFAULT,
 )
 from pipeline.build_replay_store import build_replay_for_symbol
-from pipeline.generate_catalog import generate_catalog_from_replay
+from validation.replay_catalog_reconstruct import generate_catalog_from_replay
 from validation.catalog_compare import (
     compare_book_checkpoints,
     compare_depth10_semantic,
