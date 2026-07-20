@@ -136,20 +136,22 @@ class LastKnownGood:
 class GrowthSample:
     """One bounded-history sample used for growth-rate estimation.
 
-    Only recorded when *every* monitored root was measured fresh and
-    successfully in the same cycle, so growth is never derived from a
-    failed/stale/fallback sample.
+    Tracks `data_raw` usage specifically (the quantity the retention hard
+    limit governs), not the cross-root observability total. Only recorded
+    when this cycle's `data_raw` measurement was itself fresh and
+    successful, so growth is never derived from a failed/stale/fallback
+    sample.
     """
 
     epoch: float
     timestamp: str  # ISO-8601
-    total_bytes: int
+    data_raw_bytes: int
 
     def to_dict(self) -> dict:
         return {
             "epoch": self.epoch,
             "timestamp": self.timestamp,
-            "total_bytes": self.total_bytes,
+            "data_raw_bytes": self.data_raw_bytes,
         }
 
     @classmethod
@@ -157,7 +159,7 @@ class GrowthSample:
         return cls(
             epoch=float(data["epoch"]),
             timestamp=str(data["timestamp"]),
-            total_bytes=int(data["total_bytes"]),
+            data_raw_bytes=int(data["data_raw_bytes"]),
         )
 
 
@@ -322,8 +324,10 @@ class DiskMonitor:
         self.state_root = config.STATE_ROOT
         self.catalog_root = config.NAUTILUS_CATALOG_ROOT
 
-        # Retention thresholds (GB). These apply to tracked retention usage,
-        # not filesystem capacity.
+        # Retention thresholds (GB). These apply to fresh `data_raw` usage
+        # only — never to the cross-root observability total (`total_gb`,
+        # which may span different filesystems) and never to filesystem
+        # capacity.
         self.soft_limit_gb = config.DISK_SOFT_LIMIT_GB
         self.hard_limit_gb = config.DISK_HARD_LIMIT_GB
         self.cleanup_target_gb = config.DISK_CLEANUP_TARGET_GB
@@ -524,7 +528,7 @@ class DiskMonitor:
         }
         return entry, lkg.value_bytes, False
 
-    def _record_growth_sample(self, now: datetime, total_bytes: int) -> None:
+    def _record_growth_sample(self, now: datetime, data_raw_bytes: int) -> None:
         epoch = now.timestamp()
         if self._growth_history and epoch <= self._growth_history[-1].epoch:
             logger.warning(
@@ -532,7 +536,7 @@ class DiskMonitor:
             )
             return
         self._growth_history.append(
-            GrowthSample(epoch=epoch, timestamp=now.isoformat(), total_bytes=total_bytes)
+            GrowthSample(epoch=epoch, timestamp=now.isoformat(), data_raw_bytes=data_raw_bytes)
         )
         self._prune_growth_history(now)
 
@@ -556,7 +560,7 @@ class DiskMonitor:
         if elapsed_sec < MIN_GROWTH_SPAN_SEC:
             return None
 
-        delta_gb = (newest.total_bytes - oldest.total_bytes) / BYTES_PER_GB
+        delta_gb = (newest.data_raw_bytes - oldest.data_raw_bytes) / BYTES_PER_GB
         if delta_gb < 0:
             # A real decrease (e.g. cleanup ran) — never report negative
             # growth. Only successful, non-stale samples ever reach this
@@ -566,7 +570,7 @@ class DiskMonitor:
         growth_rate_gb_day = delta_gb / elapsed_sec * 86400.0
 
         if growth_rate_gb_day > 0:
-            current_gb = newest.total_bytes / BYTES_PER_GB
+            current_gb = newest.data_raw_bytes / BYTES_PER_GB
             available_gb = self.hard_limit_gb - current_gb
             days_to_full = available_gb / growth_rate_gb_day if available_gb > 0 else 0.0
         else:
@@ -598,12 +602,29 @@ class DiskMonitor:
             if self._last_report is not None:
                 skipped = dict(self._last_report)
                 skipped["skipped_duplicate"] = True
+                # A skipped duplicate is never a fresh measurement, even if
+                # the previous cycle's report was trustworthy — force the
+                # flag closed so callers (in particular cleanup_old_data())
+                # cannot treat a stale duplicate as authorization to act.
+                skipped["retention_measurement_trustworthy"] = False
+                skipped_alerts = list(skipped.get("alerts", []))
+                skipped_alerts.append(
+                    "WARNING: disk check skipped (overlapping scan in progress); "
+                    "reporting the previous cycle's report, not a fresh measurement"
+                )
+                skipped["alerts"] = skipped_alerts
+                if skipped.get("monitoring_health") == "healthy":
+                    skipped["monitoring_health"] = "degraded"
                 return skipped
             return {
                 "timestamp": local_now_iso(),
                 "skipped_duplicate": True,
+                "retention_measurement_trustworthy": False,
                 "monitoring_health": "unhealthy",
-                "alerts": ["ERROR: disk check overlapped with no prior report available"],
+                "alerts": [
+                    "ERROR: disk check skipped (overlapping scan in progress) "
+                    "with no prior report available"
+                ],
             }
 
         async with self._scan_lock:
@@ -615,11 +636,17 @@ class DiskMonitor:
 
         alerts: List[str] = []
         components: Dict[str, dict] = {}
+        # Combined size across all monitored roots. This is an OBSERVABILITY
+        # aggregate only: data_raw, catalog, meta, and state may live on
+        # different filesystems, so this sum must never drive retention
+        # threshold decisions or percent-of-limit reporting — see
+        # data_raw_bytes/data_raw_trustworthy below for that.
         total_bytes = 0
         total_known = True
         all_fresh_ok = True
         unhealthy = False
         data_raw_trustworthy = False
+        data_raw_bytes: Optional[int] = None
 
         for name, measurement in measurements.items():
             entry, value_bytes, fresh_ok = self._resolve_component(
@@ -634,6 +661,7 @@ class DiskMonitor:
                 all_fresh_ok = False
             if name == "data_raw":
                 data_raw_trustworthy = fresh_ok
+                data_raw_bytes = value_bytes
                 if not fresh_ok:
                     unhealthy = True
 
@@ -655,33 +683,56 @@ class DiskMonitor:
                 f"{self.fs_free_warn_gb}GB warn threshold"
             )
 
+        # Retention soft/hard/cleanup thresholds apply to fresh `data_raw`
+        # usage only, never to the cross-root `total_gb` observability sum
+        # (which may span different filesystems) and never to a stale
+        # last-known-good fallback. A failed or stale data_raw measurement
+        # this cycle means these fields are null, not a current-looking
+        # estimate silently computed from old data.
+        data_raw_gb_for_retention = (
+            round(data_raw_bytes / BYTES_PER_GB, 2)
+            if data_raw_trustworthy and data_raw_bytes is not None
+            else None
+        )
         percent_of_soft_limit = None
         percent_of_hard_limit = None
-        if total_known:
-            percent_of_soft_limit = round(total_gb / self.soft_limit_gb * 100, 1)
-            percent_of_hard_limit = round(total_gb / self.hard_limit_gb * 100, 1)
-            if total_gb >= self.hard_limit_gb:
+        if data_raw_gb_for_retention is not None:
+            percent_of_soft_limit = round(
+                data_raw_gb_for_retention / self.soft_limit_gb * 100, 1
+            )
+            percent_of_hard_limit = round(
+                data_raw_gb_for_retention / self.hard_limit_gb * 100, 1
+            )
+            if data_raw_gb_for_retention >= self.hard_limit_gb:
                 alerts.append(
-                    f"CRITICAL: retention usage {total_gb}GB >= "
+                    f"CRITICAL: data_raw retention usage {data_raw_gb_for_retention}GB >= "
                     f"{self.hard_limit_gb}GB hard limit"
                 )
                 unhealthy = True
                 logger.critical(
-                    f"DISK CRITICAL: {total_gb}GB >= {self.hard_limit_gb}GB hard limit!"
+                    f"DISK CRITICAL: {data_raw_gb_for_retention}GB >= "
+                    f"{self.hard_limit_gb}GB hard limit!"
                 )
-            elif total_gb >= self.soft_limit_gb:
+            elif data_raw_gb_for_retention >= self.soft_limit_gb:
                 alerts.append(
-                    f"WARNING: retention usage {total_gb}GB >= "
+                    f"WARNING: data_raw retention usage {data_raw_gb_for_retention}GB >= "
                     f"{self.soft_limit_gb}GB soft limit"
                 )
                 logger.warning(
-                    f"DISK WARNING: {total_gb}GB >= {self.soft_limit_gb}GB soft limit"
+                    f"DISK WARNING: {data_raw_gb_for_retention}GB >= "
+                    f"{self.soft_limit_gb}GB soft limit"
                 )
 
-        if all_fresh_ok and total_known:
-            self._record_growth_sample(now, total_bytes)
+        # Growth history tracks data_raw only (the quantity the hard limit
+        # actually governs) and only ever records a sample when this cycle's
+        # data_raw measurement was itself fresh and successful.
+        if data_raw_trustworthy and data_raw_bytes is not None:
+            self._record_growth_sample(now, data_raw_bytes)
 
-        growth = self._compute_growth()
+        # Never report a current-looking growth rate / days-to-full derived
+        # from a stale or failed current-cycle data_raw measurement, even if
+        # the historical sample window itself remains valid.
+        growth = self._compute_growth() if data_raw_trustworthy else None
         if growth is not None:
             growth_rate_gb_day, days_to_full, sample_interval_sec, oldest_ts, newest_ts = growth
             if days_to_full is not None and days_to_full < 7:
@@ -709,6 +760,8 @@ class DiskMonitor:
             "catalog_gb": components["catalog"]["value_gb"],
             "meta_gb": components["meta"]["value_gb"],
             "state_gb": components["state"]["value_gb"],
+            # Combined observability total across all roots (may span
+            # different filesystems) — NOT the retention-limit basis.
             "total_gb": total_gb,
             "total_stale": total_stale,
             "percent_of_soft_limit": percent_of_soft_limit,
@@ -815,6 +868,14 @@ class DiskMonitor:
         """
         usage = await self.check_disk_usage()
 
+        if usage.get("skipped_duplicate"):
+            logger.error(
+                "Cleanup skipped: this disk check was skipped due to an "
+                "overlapping scan already in progress; refusing to act on a "
+                "duplicate report instead of a fresh measurement"
+            )
+            return False
+
         if not self._is_retention_measurement_trustworthy(usage):
             status = (
                 usage.get("components", {})
@@ -835,7 +896,8 @@ class DiskMonitor:
 
         logger.info(
             f"Raw data usage {raw_gb}GB > soft limit {self.soft_limit_gb}GB "
-            f"(total tracked: {usage.get('total_gb')}GB), cleaning up oldest raw data..."
+            f"(combined observability total: {usage.get('total_gb')}GB), "
+            "cleaning up oldest raw data..."
         )
 
         # Delete oldest date directories until we hit cleanup target
@@ -892,7 +954,7 @@ class DiskMonitor:
         logger.info(
             f"Cleanup complete: deleted {deleted_count} date directories, "
             f"current raw size: {usage.get('data_raw_gb')}GB, "
-            f"current total tracked size: {usage.get('total_gb')}GB"
+            f"current combined observability total: {usage.get('total_gb')}GB"
         )
 
         return deleted_count > 0

@@ -56,26 +56,28 @@ measurement is never reported as zero — see the safety invariant in
 | `components.<name>.measurement_status` | `ok` / `missing` / `timeout` / `command_error` / `malformed_output` / `error` |
 | `components.<name>.stale` | `true` when `value_gb` is a last-known-good fallback, not a fresh measurement |
 | `components.<name>.measurement_age_seconds` | Age of the fallback value, or `null` |
-| `total_gb`, `percent_of_soft_limit`, `percent_of_hard_limit` | `null` unless every component has a known value |
+| `total_gb`, `percent_of_soft_limit`, `percent_of_hard_limit` | `total_gb` is a cross-root **observability** sum (`data_raw + catalog + meta + state`); `percent_of_soft_limit`/`percent_of_hard_limit` are computed from `data_raw_gb` only, and are `null` whenever this cycle's `data_raw` measurement is not fresh and successful (never derived from a stale fallback) |
 | `filesystem.*` | Independent `shutil.disk_usage()` capacity fields (total/used/free/percent), unaffected by recursive-scan failures |
-| `growth_rate_gb_day`, `days_to_full` | `null` unless there is a real, non-stale timestamped history spanning enough time |
-| `growth_sample_interval_sec`, `growth_sample_oldest_timestamp`, `growth_sample_newest_timestamp` | Provenance of the growth estimate |
+| `growth_rate_gb_day`, `days_to_full` | `null` unless the current cycle's `data_raw` measurement is itself fresh and successful, and there is a real, non-stale timestamped history spanning enough time |
+| `growth_sample_interval_sec`, `growth_sample_oldest_timestamp`, `growth_sample_newest_timestamp` | Provenance of the growth estimate (based on `data_raw` history only) |
 | `monitoring_health` | `healthy` / `degraded` / `unhealthy` |
-| `alerts` | List of human-readable alert strings (measurement failure, staleness, low free space, threshold breaches) |
-| `retention_measurement_trustworthy` | `true` only when the current `data_raw` measurement is fresh and successful; gates automatic cleanup |
-| `skipped_duplicate` | `true` if this cycle was skipped because a previous scan was still running |
+| `alerts` | List of human-readable alert strings (measurement failure, staleness, low free space, threshold breaches, skipped overlapping scans) |
+| `retention_measurement_trustworthy` | `true` only when the current cycle's `data_raw` measurement is fresh and successful; gates automatic cleanup. Always `false` when `skipped_duplicate` is `true`, even if the previous cycle's report was trustworthy |
+| `skipped_duplicate` | `true` if this cycle was skipped because a previous scan was still running; the returned report is the previous cycle's, not a fresh measurement |
 
 ### Threshold semantics (kept separate)
 
 | Threshold class | Env var | Applies to |
 |---|---|---|
-| Raw-retention soft/hard limit | `CRYPTO_RECORDER_DISK_SOFT_LIMIT_GB` / `CRYPTO_RECORDER_DISK_HARD_LIMIT_GB` | tracked retention usage (`data_raw + catalog + meta + state`), drives cleanup |
+| Raw-retention soft/hard limit | `CRYPTO_RECORDER_DISK_SOFT_LIMIT_GB` / `CRYPTO_RECORDER_DISK_HARD_LIMIT_GB` | fresh `data_raw` usage only — never the cross-root `total_gb` sum (which may span different filesystems), and never a stale/failed measurement; drives cleanup |
 | Raw-retention cleanup target | `CRYPTO_RECORDER_DISK_CLEANUP_TARGET_GB` | how far cleanup reduces `data_raw` |
 | Filesystem free-space warn/critical | `CRYPTO_RECORDER_DISK_FS_FREE_WARN_GB` / `CRYPTO_RECORDER_DISK_FS_FREE_CRITICAL_GB` | raw filesystem free bytes, independent of retention accounting |
 
 Retention thresholds and filesystem thresholds are never conflated: a low
-filesystem-free-space alert does not by itself authorize cleanup, and
-retention percentages are never computed from `filesystem_percent_used`.
+filesystem-free-space alert does not by itself authorize cleanup, retention
+percentages are never computed from `filesystem_percent_used`, and `catalog`/
+`meta`/`state` sizes remain observability-only fields that never enter the
+retention threshold comparison (only `data_raw` does).
 
 ### Other disk-monitor environment knobs
 
@@ -236,10 +238,10 @@ The canonical paths and service groups it uses are defined below in the
 | `--enable` | `systemctl enable` the selected units. |
 | `--start` | `systemctl start` the selected units. |
 | `--restart` | `systemctl restart` the selected units. |
-| `--user <name>` | Service user. Default `zsom`. |
-| `--app-dir <path>` | Repo checkout dir. Default `/home/zsom/services/CryptoRecorder`. |
-| `--data-root <path>` | Data base dir. Default `/data/cryptorecorder`. |
-| `--env-file <path>` | Env file path. Default `/etc/cryptorecorder/cryptorecorder.env`. |
+| `--user <name>` | Service user/group. Default `zsom`. Rendered into the `User=`/`Group=` lines of every installed unit file. |
+| `--app-dir <path>` | Repo checkout dir. Default `/home/zsom/services/CryptoRecorder`. Rendered into each unit's `WorkingDirectory=`/`ExecStart=` paths. |
+| `--data-root <path>` | Data base dir. Default `/data/cryptorecorder`. Rendered into a newly created env file's `CRYPTO_RECORDER_*_ROOT` values; has no effect if the env file already exists (never overwritten). |
+| `--env-file <path>` | Env file path. Default `/etc/cryptorecorder/cryptorecorder.env`. Rendered into each unit's `EnvironmentFile=` line. |
 
 ## Common steps performed
 
@@ -250,11 +252,17 @@ For the selected target, the script runs these steps (in order):
 3. **Verify structure** — `docs/REPO_STRUCTURE.md` must exist (the frozen contract).
 4. **Create venv** — create `.venv` if missing.
 5. **Install requirements** — `pip install -r requirements.txt` into `.venv`.
-6. **Create env file** — copy `systemd/cryptorecorder.env.example` to the env-file path
-   **only if it does not already exist** (never silently overwrite an existing env file).
+6. **Create env file** — render `systemd/cryptorecorder.env.example` (substituting `--data-root`)
+   to the env-file path **only if it does not already exist** (never silently overwrite an
+   existing env file).
 7. **Create data dirs** — create the data roots under `--data-root`.
 8. **Run validation** — `python validate.py --quick`.
-9. **Print target** — show which units/groups were selected and their status.
+9. **Clean up stale units** — stop/disable/remove every legacy or renamed unit name this repo
+   has ever shipped (see Safety notes below). Runs for every target, before units are installed.
+10. **Install units** — render each unit file for the selected target (substituting `--user`,
+    `--app-dir`, and `--env-file`) and install it to `/etc/systemd/system/`.
+11. **Control units** — `enable`/`start`/`restart` the selected units if those flags were given.
+12. **Print target** — show which units/groups were selected and their status.
 
 When `--no-systemd` is set, steps that touch systemd or `/etc` are skipped; the script
 still prepares the venv, dependencies, and data dirs (or prints them under `--dry-run`).
@@ -281,11 +289,14 @@ still prepares the venv, dependencies, and data dirs (or prints them under `--dr
 - `--dry-run` makes no changes; `--no-systemd` avoids systemd and `/etc` entirely.
 - The script does **not** deploy Syncthing, archive, or import features — none exist.
 - It does **not** modify `recorder.py`, the raw schema, or `convert_day.py`.
-- On `--target all` or `--target replay-build`, the script stops, disables, and
-  removes any stale `cryptorecorder-feature-build.{service,timer}` units left
-  over from a pre-issue-#17 deploy (the feature-build service group and its
-  `daily_build --steps features` command no longer exist in this repo). This
-  cleanup step is skipped under `--no-systemd`.
+- For every target (not just `all`/`replay-build`), the script stops, disables, and removes
+  any of these legacy/renamed unit files left over from a previous deploy, before installing
+  the current unit set: `cryptorecorder-feature-build.{service,timer}` (pre-issue-#17
+  feature-build group), `crypto-recorder.service` (renamed to
+  `cryptorecorder-recorder.service`), `nautilus-convert.{service,timer}` (renamed to
+  `cryptorecorder-convert.{service,timer}`), and `cryptorecorder-daily-build.{service,timer}`
+  (renamed to `cryptorecorder-replay-build.{service,timer}`). This cleanup step is skipped
+  under `--no-systemd`.
 
 ---
 

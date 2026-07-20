@@ -6,8 +6,9 @@ found for a date (no raw data / no eligible symbols), the replay-build
 status computed `successful == len(results)` as `0 == 0` -> True, which was
 reported as "success" with exit code 0. This must instead be an explicit
 "no_data" status with a nonzero exit code, distinct from a genuine "success"
-(all eligible partitions built) and from a "partial" failure (some symbols
-failed while others succeeded).
+(all eligible partitions built), a "partial" failure (some symbols succeeded
+and some failed), and a "failed" status (partitions were attempted but zero
+succeeded).
 """
 from __future__ import annotations
 
@@ -187,3 +188,49 @@ def test_partial_failure_preserves_partial_status(
     )
     assert report["status"] == "partial"
     assert report["errors"] == ["simulated failure"]
+
+
+def test_all_partitions_failed_reports_failed_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When partitions were attempted but every single one failed (zero
+    successful, nonzero attempted), the report status must be the distinct
+    'failed' status — not 'partial' (implies some success) and not 'no_data'
+    (implies nothing was eligible)."""
+    data_root = tmp_path / "raw"
+    replay_root = tmp_path / "replay"
+    report_root = tmp_path / "reports"
+    _write_symbol_raw_data(data_root, VENUE, "ADAUSDT", DATE)
+    _write_symbol_raw_data(data_root, VENUE, "BTCUSDT", DATE)
+
+    import pipeline.build_replay_store as build_replay_store_module
+
+    def _fake_build_all_fail(venue, symbol, date, data_root_, replay_root_):
+        return {
+            "venue": venue,
+            "symbol": symbol,
+            "date": date,
+            "status": "failed",
+            "depth_count": 0,
+            "trade_count": 0,
+            "errors": [f"simulated failure for {symbol}"],
+        }
+
+    monkeypatch.setattr(
+        build_replay_store_module, "build_replay_for_symbol", _fake_build_all_fail
+    )
+
+    raw_result = daily_build.run_raw_manifest(DATE, data_root)
+    replay_result = daily_build.run_build_replay_store(
+        DATE, ["ADAUSDT", "BTCUSDT"], data_root, replay_root
+    )
+    assert replay_result["status"] == "failed"
+    assert replay_result["symbols_processed"] == 0
+    assert replay_result["symbols_total"] == 2
+
+    report = daily_build.generate_daily_report(
+        DATE, data_root, replay_root, report_root, raw_result, replay_result, 1.0
+    )
+    assert report["status"] == "failed"
+    assert report["status"] not in ("partial", "no_data", "success")
+    assert len(report["errors"]) == 2

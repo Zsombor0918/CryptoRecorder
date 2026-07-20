@@ -514,7 +514,12 @@ date directories after raw data storage crosses:
 
 - raw soft limit: `750 GB`
 - raw cleanup target: `700 GB`
-- total tracked hard alert threshold: `850 GB`
+- raw hard alert threshold: `850 GB`
+
+All three thresholds apply to fresh `data_raw` disk usage only — never to
+filesystem capacity, and never to the cross-root observability total
+(`data_raw + catalog + meta + state`), which may span different filesystems
+and never drives cleanup decisions.
 
 Review those constants in `config.py` before a long-running server deployment.
 `RAW_RETENTION_DAYS = 7` exists in `config.py`, but the active cleanup logic is
@@ -541,14 +546,14 @@ Check path/user substitution first:
 
 ```bash
 systemctl cat cryptorecorder-recorder.service
-systemctl cat nautilus-convert.service
+systemctl cat cryptorecorder-convert.service
 ```
 
 Then inspect logs:
 
 ```bash
 journalctl -u cryptorecorder-recorder.service -n 200 --no-pager
-journalctl -u nautilus-convert.service -n 200 --no-pager
+journalctl -u cryptorecorder-convert.service -n 200 --no-pager
 ```
 
 ### converter timer date seems wrong
@@ -558,8 +563,8 @@ The timer is meant to run at `00:10 UTC`, and the converter default date is
 clock intuition:
 
 ```bash
-systemctl cat nautilus-convert.timer
-systemctl list-timers --all nautilus-convert.timer
+systemctl cat cryptorecorder-convert.timer
+systemctl list-timers --all cryptorecorder-convert.timer
 ```
 
 ### converter refuses partial overwrite

@@ -453,6 +453,15 @@ python -m pipeline.daily_build --date 2026-06-15 [--symbols BTCUSDT,ETHUSDT]
 3. Generate daily_build_report.json with stats and errors
 4. Exit with success/failure status
 
+**Report `status` values**:
+- `success` — every eligible venue/symbol partition for the date built successfully
+- `partial` — at least one partition succeeded and at least one failed
+- `failed` — one or more partitions were attempted and none succeeded
+- `no_data` — zero raw partitions were eligible for the date (empty/missing raw data); distinct from `success`, since `0 successful == 0 attempted` must never be reported as a successful build
+
+All non-`success` statuses (`partial`, `failed`, `no_data`) produce a nonzero
+process exit code from `pipeline.daily_build.main()`.
+
 **Report**:
 ```json
 {
@@ -474,12 +483,12 @@ python -m pipeline.daily_build --date 2026-06-15 [--symbols BTCUSDT,ETHUSDT]
 
 ## Systemd Integration
 
-**Service**: `cryptorecorder-daily-build.service`
+**Service**: `cryptorecorder-replay-build.service`
 - Runs daily build orchestrator
 - Loads env vars from `/etc/cryptorecorder/cryptorecorder.env`
 - Restarts on failure with 5min backoff
 
-**Timer**: `cryptorecorder-daily-build.timer`
+**Timer**: `cryptorecorder-replay-build.timer`
 - Triggers at 01:00 UTC daily
 - Allows previous day hourly rotation/compression to complete
 - Persistent: runs immediately if system was down

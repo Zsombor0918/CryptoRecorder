@@ -230,3 +230,76 @@ def test_deploy_script_rejects_invalid_target() -> None:
         check=False,
     )
     assert result.returncode != 0, "deploy script must reject unknown targets"
+
+
+# Every legacy/renamed systemd unit that predates the current canonical
+# names and must be stopped/disabled/removed on upgrade so it can't keep
+# firing its old (removed or renamed) command on a stale schedule.
+LEGACY_STALE_UNITS = [
+    "cryptorecorder-feature-build.timer",
+    "cryptorecorder-feature-build.service",
+    "crypto-recorder.service",
+    "nautilus-convert.timer",
+    "nautilus-convert.service",
+    "cryptorecorder-daily-build.timer",
+    "cryptorecorder-daily-build.service",
+]
+
+
+def test_deploy_script_cleans_up_every_legacy_unit_name() -> None:
+    """cleanup_stale_units() must remove every unit name this repo has ever
+    shipped and later renamed/removed, not just the pre-issue-#17
+    feature-build units."""
+    text = DEPLOY_SCRIPT.read_text()
+    for unit in LEGACY_STALE_UNITS:
+        assert unit in text, (
+            f"deploy script must list legacy unit '{unit}' for stale-unit cleanup"
+        )
+
+
+def test_deploy_script_renders_user_app_dir_and_env_file_flags() -> None:
+    """--user/--app-dir/--env-file/--data-root must actually be rendered into
+    the dry-run plan (not silently ignored placeholders)."""
+    result = subprocess.run(
+        [
+            "bash", str(DEPLOY_SCRIPT),
+            "--target", "recorder",
+            "--dry-run",
+            "--user", "customuser",
+            "--app-dir", "/opt/customdir",
+            "--data-root", "/srv/customdata",
+            "--env-file", "/etc/customenv/cr.env",
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    out = result.stdout
+    assert "customuser" in out, "rendered --user value must appear in the dry-run plan"
+    assert "/opt/customdir" in out, "rendered --app-dir value must appear in the dry-run plan"
+    assert "/srv/customdata" in out, "rendered --data-root value must appear in the dry-run plan"
+    assert "/etc/customenv/cr.env" in out, "rendered --env-file value must appear in the dry-run plan"
+    # The script must not silently fall back to the hardcoded defaults.
+    assert "/home/zsom/services/CryptoRecorder" not in out
+    assert "/data/cryptorecorder" not in out
+    assert "/etc/cryptorecorder/cryptorecorder.env" not in out
+
+
+def test_deploy_script_never_overwrites_existing_env_file() -> None:
+    """create_env_file() must check for an existing env file and return
+    before any render/copy when one is already present."""
+    text = DEPLOY_SCRIPT.read_text()
+    match = re.search(r"create_env_file\(\) \{.*?\n\}\n", text, flags=re.DOTALL)
+    assert match, "create_env_file() function not found in deploy script"
+    body = match.group(0)
+    assert '-f "$ENV_FILE"' in body, "must check whether the env file already exists"
+    assert "never overwrite" in body.lower()
+    # The existing-file branch must return before any sed/tee render happens.
+    exists_idx = body.index('-f "$ENV_FILE"')
+    render_idx = body.index("sed \\") if "sed \\" in body else body.index("sed ")
+    return_idx = body.index("return 0", exists_idx)
+    assert exists_idx < return_idx < render_idx, (
+        "existing-file check must return before the env file is rendered/copied"
+    )

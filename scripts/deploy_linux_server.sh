@@ -60,10 +60,21 @@ Flags:
   --enable            systemctl enable the selected units.
   --start             systemctl start the selected units.
   --restart           systemctl restart the selected units.
-  --user <name>       Service user (default: zsom).
-  --app-dir <path>    Repo checkout dir (default: /home/zsom/services/CryptoRecorder).
-  --data-root <path>  Data base dir (default: /data/cryptorecorder).
-  --env-file <path>   Env file path (default: /etc/cryptorecorder/cryptorecorder.env).
+  --user <name>       Service user/group rendered into installed unit files
+                      (User=/Group= lines) and the CryptoRecorder checkout
+                      path they run as (default: zsom).
+  --app-dir <path>    Repo checkout dir rendered into WorkingDirectory=,
+                      ExecStart=, and Documentation= lines of installed unit
+                      files (default: /home/zsom/services/CryptoRecorder).
+  --data-root <path>  Data base dir rendered into a newly created env file's
+                      CRYPTO_RECORDER_*_ROOT values and used for
+                      create_data_dirs (default: /data/cryptorecorder). Has
+                      no effect if the env file already exists (never
+                      overwritten).
+  --env-file <path>   Env file path rendered into installed unit files'
+                      EnvironmentFile= lines (default:
+                      /etc/cryptorecorder/cryptorecorder.env). An existing
+                      file at this path is never overwritten.
   -h, --help          Show this help.
 EOF
 }
@@ -178,10 +189,16 @@ create_env_file() {
   fi
   if [[ -f "$ENV_FILE" ]]; then
     log "  env file exists; leaving untouched (never overwrite)"
-  else
-    run sudo mkdir -p "$(dirname "$ENV_FILE")"
-    run sudo cp "$REPO_ROOT/systemd/cryptorecorder.env.example" "$ENV_FILE"
+    return 0
   fi
+  run sudo mkdir -p "$(dirname "$ENV_FILE")"
+  printf '    + render systemd/cryptorecorder.env.example -> %s (data-root=%s)\n' \
+    "$ENV_FILE" "$DATA_ROOT"
+  if [[ "$DRY_RUN" == "true" ]]; then
+    return 0
+  fi
+  sed "s#/data/cryptorecorder#$DATA_ROOT#g" \
+    "$REPO_ROOT/systemd/cryptorecorder.env.example" | sudo tee "$ENV_FILE" >/dev/null
 }
 
 create_data_dirs() {
@@ -218,10 +235,20 @@ install_units() {
     log "Install units: skipped (--no-systemd)"
     return 0
   fi
-  log "Install systemd units"
+  log "Install systemd units (rendered for user=$SERVICE_USER app-dir=$APP_DIR env-file=$ENV_FILE)"
   local unit
   for unit in $(all_units); do
-    run sudo cp "$REPO_ROOT/systemd/$unit" "/etc/systemd/system/$unit"
+    printf '    + render+install %s (user=%s app-dir=%s env-file=%s)\n' \
+      "$unit" "$SERVICE_USER" "$APP_DIR" "$ENV_FILE"
+    if [[ "$DRY_RUN" == "true" ]]; then
+      continue
+    fi
+    sed \
+      -e "s#/home/zsom/services/CryptoRecorder#$APP_DIR#g" \
+      -e "s#^User=zsom#User=$SERVICE_USER#" \
+      -e "s#^Group=zsom#Group=$SERVICE_USER#" \
+      -e "s#/etc/cryptorecorder/cryptorecorder.env#$ENV_FILE#g" \
+      "$REPO_ROOT/systemd/$unit" | sudo tee "/etc/systemd/system/$unit" >/dev/null
   done
   run sudo systemctl daemon-reload
 }
@@ -250,24 +277,37 @@ control_units() {
 }
 
 # Stop/disable/remove systemd units that this repo used to install but no
-# longer ships (e.g. the feature-build service group removed in issue #17).
-# On servers deployed before that refactor, the stale unit files may still be
+# longer ships: the pre-issue-#17 feature-build service group, and every
+# obsolete/renamed unit superseded by the current canonical names
+# (crypto-recorder.service -> cryptorecorder-recorder.service,
+# nautilus-convert.{service,timer} -> cryptorecorder-convert.{service,timer},
+# cryptorecorder-daily-build.{service,timer} -> cryptorecorder-replay-build.{service,timer}).
+# On servers deployed before these renames, the stale unit files may still be
 # present under /etc/systemd/system and would otherwise keep firing the
-# removed command on their old schedule after this repo is upgraded.
+# removed/renamed command on their old schedule after this repo is upgraded.
+# This step always runs (regardless of --target) so an upgrade to any target
+# still cleans up every stale unit, and it always runs before install_units
+# installs the canonical replacements.
+STALE_UNITS=(
+  cryptorecorder-feature-build.timer
+  cryptorecorder-feature-build.service
+  crypto-recorder.service
+  nautilus-convert.timer
+  nautilus-convert.service
+  cryptorecorder-daily-build.timer
+  cryptorecorder-daily-build.service
+)
+
 cleanup_stale_units() {
   if [[ "$USE_SYSTEMD" != "true" ]]; then
     log "Cleanup stale units: skipped (--no-systemd)"
     return 0
   fi
-  case "$TARGET" in
-    all|replay-build) ;;
-    *) return 0 ;;
-  esac
   local stale_unit removed_any="false"
-  for stale_unit in cryptorecorder-feature-build.timer cryptorecorder-feature-build.service; do
+  for stale_unit in "${STALE_UNITS[@]}"; do
     if [[ -f "/etc/systemd/system/$stale_unit" ]]; then
       removed_any="true"
-      log "Removing stale unit from a pre-issue-#17 deploy: $stale_unit"
+      log "Removing stale/obsolete unit from a previous deploy: $stale_unit"
       run sudo systemctl stop "$stale_unit" || true
       run sudo systemctl disable "$stale_unit" || true
       run sudo rm -f "/etc/systemd/system/$stale_unit"
@@ -291,8 +331,8 @@ main() {
   create_env_file
   create_data_dirs
   run_validation
-  install_units
   cleanup_stale_units
+  install_units
   control_units
   print_target
   log "Done."

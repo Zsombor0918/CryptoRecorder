@@ -277,8 +277,10 @@ REPORT_TIMEZONE_NAME: Final = "Europe/Budapest"
 # Disk usage check interval (seconds)
 DISK_CHECK_INTERVAL_SEC: Final = 600  # 10 minutes
 
-# Raw-data retention thresholds (GB). These apply to *tracked retention usage*
-# (data_raw + catalog + meta + state), not to filesystem capacity. See
+# Raw-data retention thresholds (GB). These apply to fresh `data_raw` disk
+# usage only — never to filesystem capacity, and never to the cross-root
+# observability total (data_raw + catalog + meta + state), which may span
+# different filesystems and never drives cleanup decisions. See
 # DISK_FS_FREE_WARN_GB / DISK_FS_FREE_CRITICAL_GB below for filesystem-level
 # free-space thresholds, which are a separate concern.
 DISK_SOFT_LIMIT_GB: Final = int(os.environ.get("CRYPTO_RECORDER_DISK_SOFT_LIMIT_GB", "750"))

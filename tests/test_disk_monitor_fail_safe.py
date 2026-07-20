@@ -517,10 +517,10 @@ def test_growth_uses_real_timestamps_and_excludes_short_spans(tmp_path) -> None:
 
     now = datetime.now(timezone.utc).timestamp()
     monitor._growth_history.append(
-        GrowthSample(epoch=now - 10, timestamp="t0", total_bytes=1_000_000)
+        GrowthSample(epoch=now - 10, timestamp="t0", data_raw_bytes=1_000_000)
     )
     monitor._growth_history.append(
-        GrowthSample(epoch=now, timestamp="t1", total_bytes=2_000_000)
+        GrowthSample(epoch=now, timestamp="t1", data_raw_bytes=2_000_000)
     )
 
     # Span is only 10s, well under MIN_GROWTH_SPAN_SEC -> insufficient evidence.
@@ -534,10 +534,10 @@ def test_growth_computed_from_two_valid_widely_spaced_samples(tmp_path) -> None:
     now = datetime.now(timezone.utc).timestamp()
     one_gb = 1024 ** 3
     monitor._growth_history.append(
-        GrowthSample(epoch=now - 86400, timestamp="t0", total_bytes=10 * one_gb)
+        GrowthSample(epoch=now - 86400, timestamp="t0", data_raw_bytes=10 * one_gb)
     )
     monitor._growth_history.append(
-        GrowthSample(epoch=now, timestamp="t1", total_bytes=20 * one_gb)
+        GrowthSample(epoch=now, timestamp="t1", data_raw_bytes=20 * one_gb)
     )
 
     growth = monitor._compute_growth()
@@ -645,3 +645,119 @@ async def test_lock_released_on_exception_path(tmp_path, monkeypatch) -> None:
         await monitor.check_disk_usage()
 
     assert monitor._scan_lock.locked() is False
+
+
+@pytest.mark.asyncio
+async def test_skipped_duplicate_forces_measurement_untrustworthy_and_degraded(
+    tmp_path, monkeypatch
+) -> None:
+    """A skipped-duplicate report must never inherit a trustworthy flag from
+    the previous cycle, must carry a visible alert, and must not silently
+    remain 'healthy'."""
+    config = FakeConfig(tmp_path)
+    for root in (config.DATA_ROOT, config.NAUTILUS_CATALOG_ROOT, config.META_ROOT):
+        _make_dir(root)
+    monitor = DiskMonitor(config)
+
+    release = asyncio.Event()
+
+    async def slow_measure_all_roots():
+        await release.wait()
+        return await DiskMonitor._measure_all_roots(monitor)
+
+    monkeypatch.setattr(monitor, "_measure_all_roots", slow_measure_all_roots)
+
+    first = asyncio.ensure_future(monitor.check_disk_usage())
+    await asyncio.sleep(0.05)  # let the first call acquire the lock and block
+
+    second = await monitor.check_disk_usage()
+    assert second["skipped_duplicate"] is True
+    # Even though the previous (in-flight) cycle's last report was
+    # trustworthy, a skipped duplicate is not a fresh measurement and must
+    # fail closed.
+    assert second["retention_measurement_trustworthy"] is False
+    assert second["monitoring_health"] in ("degraded", "unhealthy")
+    assert any("skipped" in alert.lower() for alert in second["alerts"])
+
+    release.set()
+    await first
+
+
+@pytest.mark.asyncio
+async def test_no_rmtree_when_lock_held_and_previous_report_trustworthy(
+    tmp_path, monkeypatch
+) -> None:
+    """Even when the previous cycle's report was trustworthy, cleanup must
+    never delete anything if the current check was skipped due to an
+    overlapping scan (skipped_duplicate=True)."""
+    config = FakeConfig(tmp_path, soft_limit_gb=0.000001, cleanup_target_gb=0)
+    for root in (config.DATA_ROOT, config.NAUTILUS_CATALOG_ROOT, config.META_ROOT):
+        _make_dir(root)
+    monitor = DiskMonitor(config)
+    _run_inline_executor(monkeypatch)
+
+    rmtree_calls = []
+    monkeypatch.setattr(disk_monitor_mod.shutil, "rmtree", lambda p: rmtree_calls.append(p))
+
+    # First cycle: a genuine, trustworthy measurement.
+    first_usage = await monitor.check_disk_usage()
+    assert first_usage["retention_measurement_trustworthy"] is True
+
+    # Simulate an overlapping scan: acquire the lock manually so the next
+    # check_disk_usage() call takes the skipped_duplicate path.
+    await monitor._scan_lock.acquire()
+    try:
+        usage = await monitor.check_disk_usage()
+        assert usage["skipped_duplicate"] is True
+        assert usage["retention_measurement_trustworthy"] is False
+
+        cleaned = await monitor.cleanup_old_data()
+    finally:
+        monitor._scan_lock.release()
+
+    assert cleaned is False
+    assert rmtree_calls == []
+
+
+@pytest.mark.asyncio
+async def test_stale_last_known_good_nulls_all_derived_fields(
+    tmp_path, monkeypatch
+) -> None:
+    """When the current data_raw measurement failed/is stale, retention
+    percentages, growth rate, and days-to-full must all be null — never a
+    current-looking estimate silently computed from the stale fallback."""
+    config = FakeConfig(tmp_path, soft_limit_gb=1, hard_limit_gb=2)
+    for root in (config.DATA_ROOT, config.NAUTILUS_CATALOG_ROOT, config.META_ROOT):
+        _make_dir(root)
+    monitor = DiskMonitor(config)
+    _run_inline_executor(monkeypatch)
+
+    # First cycle: genuine successful measurement, establishes last-known-good
+    # and a growth-history sample.
+    await monitor.check_disk_usage()
+
+    # Second cycle: data_raw measurement fails -> falls back to stale LKG.
+    def fake_measure(path, timeout_sec):
+        if path == config.DATA_ROOT:
+            return DirectoryMeasurement(
+                path=path,
+                value_bytes=None,
+                ok=False,
+                status="timeout",
+                error="simulated timeout",
+                measured_at=datetime.now(timezone.utc),
+                duration_seconds=timeout_sec,
+            )
+        return measure_directory(path, timeout_sec)
+
+    monkeypatch.setattr(disk_monitor_mod, "measure_directory", fake_measure)
+    usage = await monitor.check_disk_usage()
+
+    assert usage["components"]["data_raw"]["stale"] is True
+    assert usage["retention_measurement_trustworthy"] is False
+    # All derived fields based on data_raw must be null, not a stale-looking
+    # current estimate.
+    assert usage["percent_of_soft_limit"] is None
+    assert usage["percent_of_hard_limit"] is None
+    assert usage["growth_rate_gb_day"] is None
+    assert usage["days_to_full"] is None

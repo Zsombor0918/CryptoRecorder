@@ -189,6 +189,158 @@ status claims are honest.
 ## Audit entries (newest first)
 
 ---
+## 2026-07-20 — PR #18 second review round: fail-closed disk monitor, data_raw-only retention accounting, daily_build failed status, deploy-script legacy cleanup + honest flags, stale doc references (issues #17, #19)
+
+### Change summary
+- `disk_monitor.py` — `check_disk_usage()` now forces
+  `retention_measurement_trustworthy=False` whenever a scan is skipped due to
+  an overlapping scan already in progress (`skipped_duplicate=True`), even if
+  the previous cycle's own report was trustworthy; adds a `WARNING`/`ERROR`
+  alert and downgrades `monitoring_health` to at least `degraded`.
+  `cleanup_old_data()` now explicitly refuses to act (`return False`)
+  whenever the current cycle's report has `skipped_duplicate=True`.
+- `disk_monitor.py` — `percent_of_soft_limit`, `percent_of_hard_limit`,
+  `growth_rate_gb_day`, and `days_to_full` are now all `null` whenever the
+  current cycle's `data_raw` measurement is not itself fresh and successful
+  (never derived from the persisted last-known-good fallback).
+- `disk_monitor.py` — soft/hard-limit and cleanup-target comparisons,
+  `percent_of_soft_limit`/`percent_of_hard_limit`, and growth-rate/
+  `days_to_full` are now derived exclusively from fresh `data_raw` usage
+  (`data_raw_gb_for_retention`), never from `total_gb` (the cross-root
+  `data_raw + catalog + meta + state` observability sum, which may span
+  different filesystems). `GrowthSample.total_bytes` renamed to
+  `GrowthSample.data_raw_bytes` throughout the module and its tests.
+- `pipeline/daily_build.py` — `run_build_replay_store()` now reports
+  `"failed"` (distinct from `"partial"` and `"no_data"`) when one or more
+  venue/symbol partitions were attempted and *none* succeeded.
+  `generate_daily_report()` propagates `"failed"` distinctly rather than
+  collapsing it into `"partial"`.
+- `scripts/deploy_linux_server.sh` — `cleanup_stale_units()` now removes
+  every legacy/renamed unit name this repo has ever shipped
+  (`crypto-recorder.service`, `nautilus-convert.{service,timer}`,
+  `cryptorecorder-daily-build.{service,timer}`, in addition to the existing
+  `cryptorecorder-feature-build.{service,timer}`), runs for every `--target`,
+  and now runs before `install_units`. `--user`/`--app-dir`/`--env-file` are
+  now rendered into each installed unit file via `sed`
+  (`User=`/`Group=`/`WorkingDirectory=`/`ExecStart=`/`EnvironmentFile=`), and
+  `--data-root` is rendered into a newly created env file's
+  `CRYPTO_RECORDER_*_ROOT` values (an existing env file is still never
+  overwritten).
+- Corrected stale systemd unit name references: `docs/DAILY_BUILD_PIPELINE.md`
+  (11 occurrences of `cryptorecorder-daily-build.{service,timer}` -> the real
+  `cryptorecorder-replay-build.{service,timer}`), `docs/ARCHITECTURE.md` (2
+  occurrences, same rename), `INSTALL.md` (`nautilus-convert.{service,timer}`
+  -> the real `cryptorecorder-convert.{service,timer}` in Troubleshooting).
+- Corrected stale "tracked retention usage (data_raw + catalog + meta +
+  state)" comments to reflect data_raw-only retention semantics in
+  `config.py`, `systemd/cryptorecorder.env.example`, `docs/OPERATIONS.md`,
+  and `INSTALL.md`.
+- `docs/ARCHITECTURE.md` and `docs/DAILY_BUILD_PIPELINE.md` now document all
+  four `daily_build` report statuses (`success`/`partial`/`failed`/`no_data`).
+- `docs/OPERATIONS.md`'s Deployment Script Reference updated to describe the
+  rendering behavior of `--user`/`--app-dir`/`--data-root`/`--env-file` and
+  the expanded stale-unit cleanup list.
+
+### Files/packages touched
+- disk_monitor.py
+- tests/test_disk_monitor_fail_safe.py
+- pipeline/daily_build.py
+- tests/test_daily_build.py
+- scripts/deploy_linux_server.sh
+- tests/test_agent_infrastructure.py
+- config.py
+- systemd/cryptorecorder.env.example
+- docs/OPERATIONS.md
+- docs/ARCHITECTURE.md
+- docs/DAILY_BUILD_PIPELINE.md
+- INSTALL.md
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] docs/REPO_STRUCTURE.md
+- [x] docs/PROJECT_STATUS.md
+- [x] docs/IMPLEMENTATION_AUDIT.md
+- [x] relevant feature docs:
+  - docs/OPERATIONS.md, docs/ARCHITECTURE.md, docs/DAILY_BUILD_PIPELINE.md,
+    INSTALL.md
+
+### Docs updated
+- [x] CHANGELOG.md
+- [ ] README.md — no change needed; no stale references found in this file
+- [ ] docs/PROJECT_STATUS.md — no status/claim change; full_l2 top50/multi-day
+  validation remains pending as before
+- [ ] docs/REPO_STRUCTURE.md — no structural change (no files added/removed)
+- [x] relevant feature docs:
+  - docs/OPERATIONS.md, docs/ARCHITECTURE.md, docs/DAILY_BUILD_PIPELINE.md,
+    INSTALL.md, systemd/cryptorecorder.env.example
+
+### Status / validation impact
+- Validated status changed: no
+- Deferred status changed: no
+- New claims added: no — this entry fixes fail-open/fail-closed edge cases,
+  accounting scope, deployment honesty, and stale references; it does not
+  change what is validated vs deferred (full_l2 top50/multi-day validation
+  remains pending, as before)
+- Evidence for any new validation claim:
+  - n/a
+
+### Tests run
+```bash
+pytest -q
+# 274 passed, 3 skipped
+
+pytest tests/test_disk_monitor_fail_safe.py tests/test_disk_monitor_cleanup.py -q
+# 33 passed
+
+pytest tests/test_daily_build.py -q
+# 5 passed
+
+pytest tests/test_agent_infrastructure.py -q
+# 26 passed
+```
+
+### Validation CLIs run
+```bash
+python -m validation.audit_change_compliance --base main
+# RESULT: PASS (64 changed files vs main)
+
+python -m pipeline.build_replay_store --date 2026-06-12 --symbols ADAUSDT \
+  --data-root ./data_raw --replay-root /tmp/cr_smoke_replay
+# Built replay: BINANCE_SPOT/ADAUSDT/2026-06-12 (412336 depth, 124457 trades)
+# Built replay: BINANCE_USDTF/ADAUSDT/2026-06-12 (442834 depth, 401883 trades)
+# Replay build complete: 2 successful, 0 failed, 855170 depth, 526340 trades
+
+python -m validation.audit_replay_store --date 2026-06-12 --symbols ADAUSDT \
+  --venues BINANCE_SPOT,BINANCE_USDTF --replay-root /tmp/cr_smoke_replay
+# depth/trades parquet for both venues: sorted=true, 0 duplicate sequence
+# keys, schema OK, no errors
+
+python -m pipeline.daily_build --date 2026-06-12 --symbols ADAUSDT \
+  --data-root ./data_raw --replay-root /tmp/cr_smoke_replay \
+  --report-root /tmp/cr_daily_reports
+# status=success, runtime=38.7s, 2/2 symbols, 855170 depth, 526340 trades
+
+bash scripts/deploy_linux_server.sh --target all --dry-run --user customuser \
+  --app-dir /opt/customdir --data-root /srv/customdata \
+  --env-file /etc/customenv/cr.env
+# confirmed all 4 custom values appear in the rendered dry-run plan and none
+# of the hardcoded defaults leak through
+```
+All commands ran against temporary roots (`/tmp/...`) using the existing
+local `./data_raw` fixture; no production data, `/etc` files, or running
+services were touched. Temp directories were removed after the run.
+
+### Known limitations / out of scope
+- Broader top50/multi-day `full_l2` equivalence validation remains pending
+  (unchanged from before this entry); the `v2.0.0` gate is still not declared.
+- No live systemd install/enable/start was performed (out of scope — dry-run
+  only, no root/sudo access in this environment).
+- The migration/cleanup test for the deploy script's `cleanup_stale_units()`
+  verifies the unit-name list and rendered-flag behavior via source
+  inspection and `--dry-run` output, not a live `/etc/systemd/system`
+  install, since this environment has no sudo/systemd access.
+
+---
 ## 2026-07-20 — complete PR #18 remaining work: strip feature-store residue, harden structure tests, fix daily_build false-success, correct systemd/doc references (issues #17, #19)
 
 ### Change summary

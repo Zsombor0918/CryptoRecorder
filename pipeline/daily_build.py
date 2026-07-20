@@ -83,6 +83,9 @@ def run_build_replay_store(
     total_trades = sum(r.get("trade_count", 0) for r in results)
     
     if not results:
+        # Zero eligible venue/symbol partitions for this date (empty/missing
+        # raw data). Never report this as "success" — 0 successful == 0
+        # attempted is not a real successful build.
         status = "no_data"
         logger.warning(
             "Replay build found no eligible venue/symbol partitions for "
@@ -90,6 +93,15 @@ def run_build_replay_store(
         )
     elif successful == len(results):
         status = "success"
+    elif successful == 0:
+        # Partitions were attempted but every single one failed — distinct
+        # from both "no_data" (nothing was eligible) and "partial" (a mix
+        # of success/failure).
+        status = "failed"
+        logger.error(
+            f"Replay build attempted {len(results)} partition(s) for "
+            f"{date_str} but none succeeded — reporting failed."
+        )
     else:
         status = "partial"
     
@@ -149,12 +161,13 @@ def generate_daily_report(
     }
     
     # Check overall status. Distinguish "no_data" (no raw partitions were
-    # eligible to build — not a success) from "partial" (some symbols failed)
-    # from "success" (all eligible symbols built). Both no_data and partial
-    # are non-success and must produce a nonzero process exit code.
+    # eligible to build — not a success), "failed" (partitions were
+    # attempted but every single one failed), "partial" (some symbols
+    # succeeded and some failed), and "success" (all eligible symbols
+    # built). Only "success" produces a zero process exit code.
     replay_status = replay_result.get("status")
-    if replay_status == "no_data":
-        report["status"] = "no_data"
+    if replay_status in ("no_data", "failed", "partial"):
+        report["status"] = replay_status
     elif replay_status != "success":
         report["status"] = "partial"
     

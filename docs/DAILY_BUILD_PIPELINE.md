@@ -77,8 +77,8 @@ step to select.
 The systemd timer automatically runs at 01:00 UTC:
 
 ```bash
-systemctl start cryptorecorder-daily-build.timer
-systemctl status cryptorecorder-daily-build.timer
+systemctl start cryptorecorder-replay-build.timer
+systemctl status cryptorecorder-replay-build.timer
 ```
 
 This executes:
@@ -88,7 +88,7 @@ python -m pipeline.daily_build --date yesterday
 
 View logs:
 ```bash
-journalctl -u cryptorecorder-daily-build.service -f
+journalctl -u cryptorecorder-replay-build.service -f
 ```
 
 ### Development: Run specific date with symbols
@@ -220,8 +220,15 @@ Aggregates results from the previous steps into `daily_build_{date}.json`:
   failures — `0 successful == 0 eligible` is explicitly distinguished from a
   genuine all-success build. The CLI exits with a nonzero status code for
   `no_data` (as it does for `partial`), so scheduler/monitoring alerts fire.
-- `failed` — an unhandled exception aborted the run before a report could be
-  generated normally (see the `except` branch in `pipeline/daily_build.py`).
+- `failed` — either (a) every venue/symbol partition that was eligible for
+  the date was attempted and none of them succeeded (zero successful, one or
+  more attempted — a `daily_build_{date}.json` report is written normally
+  with this status), or (b) an unhandled exception aborted the run before a
+  report could be generated at all (see the top-level `except` branch in
+  `pipeline/daily_build.py`'s `main()`, which logs the error and exits
+  nonzero without writing a report file). Case (a) is distinct from
+  `partial` (which requires at least one success) and from `no_data` (which
+  requires zero eligible partitions).
 
 Only `status == "success"` results in a `0` process exit code from
 `python -m pipeline.daily_build`; `partial`, `no_data`, and unhandled
@@ -400,33 +407,33 @@ python -m pipeline.build_replay_store --date 2026-06-15
 ### View service status
 
 ```bash
-systemctl status cryptorecorder-daily-build.service
-systemctl status cryptorecorder-daily-build.timer
+systemctl status cryptorecorder-replay-build.service
+systemctl status cryptorecorder-replay-build.timer
 ```
 
 ### View recent runs
 
 ```bash
-journalctl -u cryptorecorder-daily-build.service -n 100
+journalctl -u cryptorecorder-replay-build.service -n 100
 ```
 
 ### View full log for latest run
 
 ```bash
-journalctl -u cryptorecorder-daily-build.service --since "2 hours ago" -f
+journalctl -u cryptorecorder-replay-build.service --since "2 hours ago" -f
 ```
 
 ### Manually trigger service (for testing)
 
 ```bash
-systemctl start cryptorecorder-daily-build.service
-journalctl -u cryptorecorder-daily-build.service -f
+systemctl start cryptorecorder-replay-build.service
+journalctl -u cryptorecorder-replay-build.service -f
 ```
 
 ### Check timer schedule
 
 ```bash
-systemctl list-timers cryptorecorder-daily-build.timer
+systemctl list-timers cryptorecorder-replay-build.timer
 ```
 
 ### Edit environment variables
@@ -435,7 +442,7 @@ systemctl list-timers cryptorecorder-daily-build.timer
 sudo nano /etc/cryptorecorder/cryptorecorder.env
 # Then reload:
 sudo systemctl daemon-reload
-sudo systemctl restart cryptorecorder-daily-build.timer
+sudo systemctl restart cryptorecorder-replay-build.timer
 ```
 
 ## See Also

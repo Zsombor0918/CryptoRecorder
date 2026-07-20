@@ -197,6 +197,70 @@ passes.** Until then, broader full-L2 equivalence stays **deferred** (see
   `native_trades.py`, `phase2_depth.py`, `storage.py`, `time_utils.py`,
   `debug_futures_trade_ws.py`) that was previously missing from the doc.
 
+### Fixed (PR #18 second review round)
+- **Disk monitor fail-closed on overlapping scans** — `disk_monitor.py`'s
+  `check_disk_usage()` now forces `retention_measurement_trustworthy=False`
+  whenever a scan is skipped due to an overlapping scan already in progress
+  (`skipped_duplicate=True`), even if the previous cycle's own report was
+  trustworthy; adds a `WARNING`/`ERROR` alert and downgrades
+  `monitoring_health` to at least `degraded`. `cleanup_old_data()` now
+  explicitly refuses to act (`return False`) whenever the current cycle's
+  report has `skipped_duplicate=True`, rather than only checking
+  trustworthiness. New test
+  `test_no_rmtree_when_lock_held_and_previous_report_trustworthy` proves no
+  `shutil.rmtree` call occurs in that case.
+- **No current-looking derived metrics from a stale fallback** —
+  `percent_of_soft_limit`, `percent_of_hard_limit`, `growth_rate_gb_day`, and
+  `days_to_full` are now all `null` (not computed from the persisted
+  last-known-good value) whenever the current cycle's `data_raw` measurement
+  itself is not fresh and successful. New test
+  `test_stale_last_known_good_nulls_all_derived_fields` covers all four
+  fields.
+- **Retention accounting scoped to `data_raw` only** — soft/hard-limit and
+  cleanup-target comparisons, `percent_of_soft_limit`/`percent_of_hard_limit`,
+  and growth-rate/`days_to_full` are now derived exclusively from fresh
+  `data_raw` usage (`data_raw_gb_for_retention`), never from `total_gb` (the
+  cross-root `data_raw + catalog + meta + state` sum, which may span
+  different filesystems and is retained purely as an observability field).
+  `GrowthSample.total_bytes` renamed to `GrowthSample.data_raw_bytes`
+  throughout `disk_monitor.py` and its tests. `docs/OPERATIONS.md`,
+  `config.py`, and `systemd/cryptorecorder.env.example` comments updated to
+  match.
+- **`pipeline/daily_build.py` — explicit `"failed"` status** —
+  `run_build_replay_store()` now reports `"failed"` (distinct from `"partial"`
+  and `"no_data"`) when one or more venue/symbol partitions were attempted
+  for the date and *none* of them succeeded (zero successful, nonzero
+  attempted). `generate_daily_report()` propagates `"failed"` distinctly
+  rather than collapsing it into `"partial"`. New test
+  `test_all_partitions_failed_reports_failed_status` in
+  `tests/test_daily_build.py`. `docs/ARCHITECTURE.md` and
+  `docs/DAILY_BUILD_PIPELINE.md` document all four status values
+  (`success`/`partial`/`failed`/`no_data`).
+- **`scripts/deploy_linux_server.sh` — complete legacy-unit cleanup and honest
+  flags** — `cleanup_stale_units()` now removes every legacy/renamed unit
+  name this repo has ever shipped (`crypto-recorder.service`,
+  `nautilus-convert.{service,timer}`,
+  `cryptorecorder-daily-build.{service,timer}`, in addition to the existing
+  `cryptorecorder-feature-build.{service,timer}`), runs for every `--target`
+  (not just `all`/`replay-build`), and now runs *before* `install_units`
+  installs the canonical replacements. `--user`/`--app-dir`/`--env-file` are
+  now actually rendered into each installed unit file's
+  `User=`/`Group=`/`WorkingDirectory=`/`ExecStart=`/`EnvironmentFile=` lines
+  via `sed`, and `--data-root` is rendered into a newly created env file's
+  `CRYPTO_RECORDER_*_ROOT` values (an existing env file is still never
+  overwritten). New tests in `tests/test_agent_infrastructure.py`:
+  `test_deploy_script_cleans_up_every_legacy_unit_name`,
+  `test_deploy_script_renders_user_app_dir_and_env_file_flags`,
+  `test_deploy_script_never_overwrites_existing_env_file`. `INSTALL.md` and
+  `docs/OPERATIONS.md` updated to describe the rendering behavior.
+- Stale systemd unit name references in docs corrected to the real,
+  currently-shipped names: `docs/DAILY_BUILD_PIPELINE.md` (11 occurrences of
+  `cryptorecorder-daily-build.{service,timer}` -> the real
+  `cryptorecorder-replay-build.{service,timer}`), `docs/ARCHITECTURE.md` (2
+  occurrences, same rename), `INSTALL.md` (`nautilus-convert.{service,timer}`
+  -> the real `cryptorecorder-convert.{service,timer}` in the Troubleshooting
+  section).
+
 ### Added (previous entry, retained)
 
   whose message does not match `<type>(<scope>): <subject>` where type is one of
