@@ -20,7 +20,7 @@ DOCS = ROOT / "docs"
 GITHUB = ROOT / ".github"
 DEPLOY_SCRIPT = ROOT / "scripts" / "deploy_linux_server.sh"
 
-DEPLOY_TARGETS = ["all", "recorder", "legacy-converter", "replay-build"]
+DEPLOY_TARGETS = ["all", "recorder", "replay-build"]
 
 
 # ---------------------------------------------------------------------------
@@ -288,6 +288,37 @@ def test_deploy_script_rejects_invalid_target() -> None:
     assert result.returncode != 0, "deploy script must reject unknown targets"
 
 
+def test_deploy_script_rejects_legacy_converter_target() -> None:
+    """The converter is no longer a deployable target: production only runs
+    recorder + replay-build automatically, so 'legacy-converter' must be
+    rejected exactly like any other unknown --target value."""
+    result = subprocess.run(
+        ["bash", str(DEPLOY_SCRIPT), "--target", "legacy-converter", "--dry-run", "--no-systemd"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode != 0, "deploy script must reject the retired 'legacy-converter' target"
+
+
+def test_deploy_script_all_target_never_installs_converter() -> None:
+    """--target all must only ever plan cryptorecorder-recorder.service and
+    cryptorecorder-replay-build.{service,timer}; the converter must never be
+    installed/enabled/started automatically."""
+    result = subprocess.run(
+        ["bash", str(DEPLOY_SCRIPT), "--target", "all", "--dry-run", "--no-systemd"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "cryptorecorder-convert" not in result.stdout, (
+        "--target all must not plan to install the legacy converter service/timer"
+    )
+
+
 # Every legacy/renamed systemd unit that predates the current canonical
 # names and must be stopped/disabled/removed on upgrade so it can't keep
 # firing its old (removed or renamed) command on a stale schedule.
@@ -299,6 +330,8 @@ LEGACY_STALE_UNITS = [
     "nautilus-convert.service",
     "cryptorecorder-daily-build.timer",
     "cryptorecorder-daily-build.service",
+    "cryptorecorder-convert.timer",
+    "cryptorecorder-convert.service",
 ]
 
 

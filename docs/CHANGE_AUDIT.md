@@ -188,6 +188,109 @@ status claims are honest.
 
 ## Audit entries (newest first)
 
+## 2026-07-21 — Deployment boundary: converter removed from automated production systemd path (issue #17 follow-up)
+
+### Change summary
+- `scripts/deploy_linux_server.sh`: removed `legacy-converter` from
+  `VALID_TARGETS` (it is no longer a deployable `--target`); `--target all`
+  now only installs/controls `cryptorecorder-recorder.service` and
+  `cryptorecorder-replay-build.{service,timer}`. Removed the now-dead
+  `legacy-converter)` cases from `units_for_target()`/`control_for_target()`,
+  and dropped it from `selected_targets()`'s `all` expansion.
+- Added `cryptorecorder-convert.service` and `cryptorecorder-convert.timer`
+  to the `cleanup_stale_units()` `STALE_UNITS` list, so any copy already
+  installed on an existing server is stopped/disabled/removed automatically
+  on the next deploy, matching how the pre-issue-#17 feature-build units are
+  already handled.
+- Marked `systemd/cryptorecorder-convert.service` and `.timer` as
+  manual/reference-only templates via an in-file comment (not rendered or
+  installed by the deploy script for any target); the files themselves were
+  **not** deleted.
+- `docs/OPERATIONS.md`: updated the "Targets" table, "Safety notes" stale-unit
+  list, and "Service groups"/ordering text in the Linux Server Layout section
+  to remove `legacy-converter` and correct the "daily chain runs convert →
+  replay" claim (`replay-build` reads directly from `data_raw` via
+  `pipeline.raw_manifest` and never depended on converter output — there was
+  no real ordering dependency to begin with).
+- `docs/IMPLEMENTATION_AUDIT.md`: added a new "Completed Cleanup Items
+  (2026-07-21 — deployment boundary...)" entry documenting this change.
+- `CHANGELOG.md`: added a new `[Unreleased]` `### Changed (PR #18 —
+  deployment boundary...)` section.
+- `tests/test_agent_infrastructure.py`: removed `legacy-converter` from
+  `DEPLOY_TARGETS`; added `cryptorecorder-convert.timer`/`.service` to
+  `LEGACY_STALE_UNITS`; added two new regression tests —
+  `test_deploy_script_rejects_legacy_converter_target` (asserts
+  `--target legacy-converter` now fails like any unknown target) and
+  `test_deploy_script_all_target_never_installs_converter` (asserts
+  `--target all --dry-run` output never mentions `cryptorecorder-convert`).
+
+### Files/packages touched
+- scripts/deploy_linux_server.sh
+- systemd/cryptorecorder-convert.service
+- systemd/cryptorecorder-convert.timer
+- docs/OPERATIONS.md
+- docs/IMPLEMENTATION_AUDIT.md
+- CHANGELOG.md
+- tests/test_agent_infrastructure.py
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] docs/REPO_STRUCTURE.md
+- [x] docs/PROJECT_STATUS.md
+- [x] docs/IMPLEMENTATION_AUDIT.md
+- [x] relevant feature docs:
+  - docs/OPERATIONS.md (Deployment Script Reference, Linux Server Layout)
+
+### Docs updated
+- [x] CHANGELOG.md
+- [ ] README.md — no change needed; deployment-path detail, not a user-facing feature description
+- [ ] docs/PROJECT_STATUS.md — no change needed; this is a deployment-boundary change, not a validated/deferred data-path status change
+- [ ] docs/REPO_STRUCTURE.md — no change needed; no top-level folder added/removed, `systemd/` package purpose text is unchanged
+- [x] relevant feature docs:
+  - docs/OPERATIONS.md
+  - docs/IMPLEMENTATION_AUDIT.md
+
+### Status / validation impact
+- Validated status changed: no
+- Deferred status changed: no
+- New claims added: no — this narrows the automated production deployment surface; it does not change the validated/deferred status of `convert_day.py`, the full_l2 replay path, or any data artifact
+- Evidence for any new validation claim: n/a
+
+### Tests run
+```bash
+source .venv/bin/activate
+pytest tests/test_agent_infrastructure.py -q   # 28 passed
+pytest -q                                       # 283 passed, 3 skipped
+```
+
+### Validation CLIs run
+```bash
+bash scripts/deploy_linux_server.sh --target all --dry-run --no-systemd
+# confirms units: cryptorecorder-recorder.service cryptorecorder-replay-build.service cryptorecorder-replay-build.timer
+bash scripts/deploy_linux_server.sh --target legacy-converter --dry-run --no-systemd
+# confirms exit 1: invalid --target 'legacy-converter' (expected: all recorder replay-build)
+python -m validation.audit_change_compliance --base main
+```
+
+### Known limitations / out of scope
+- No converter/reconstruction Python code was removed or modified:
+  `convert_day.py`, `converter/`, and `validation/replay_catalog_reconstruct.py`
+  remain fully in place and required for replay building, validation, and
+  local test-computer catalog reconstruction.
+- The `systemd/cryptorecorder-convert.{service,timer}` unit-file templates
+  were kept in the repo (marked manual/reference-only) rather than deleted;
+  deleting them was judged out of scope since the task only required removing
+  the converter from the *active* deployment path, not the reference templates.
+- This change was not tested against a real production server (no `sudo`/
+  real systemd actions were run); only `--dry-run --no-systemd` was exercised,
+  consistent with this being a WSL/dev sandbox, not the production host.
+- Full_l2 broader top50/multi-day validation remains deferred, unaffected by
+  this change (no data-path code was touched).
+- Merge remains deferred; this change is pushed to
+  `refactor/recorder-replay-only` only, per explicit instruction.
+
+---
+
 ---
 ## 2026-07-21 — PR #18 third review round: exchangeinfo-only no_data classification, disk-report timestamp consistency, stale changelog claims (issues #17, #19)
 

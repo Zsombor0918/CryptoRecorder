@@ -490,6 +490,29 @@ Manual scripts remain in:
 - Superseded issue #15 (a `generate_catalog` product-CLI proposal) in favor of
   the narrower recorder + replay-store ownership boundary.
 
+## Completed Cleanup Items (2026-07-21 — deployment boundary: converter removed from production systemd path)
+
+- `scripts/deploy_linux_server.sh`: removed `legacy-converter` as a deployable
+  `--target` (it is no longer in `VALID_TARGETS`); `--target all` now installs
+  only `cryptorecorder-recorder.service` and
+  `cryptorecorder-replay-build.{service,timer}`.
+- `cryptorecorder-convert.service` and `cryptorecorder-convert.timer` were
+  added to the `cleanup_stale_units()` list, so any already-installed copy on
+  an existing server is stopped, disabled, and removed the next time the
+  deploy script runs, exactly like the pre-issue-#17 feature-build units.
+- `convert_day.py`, `converter/`, and `validation/replay_catalog_reconstruct.py`
+  are **not** removed and remain required implementation/reference code — for
+  replay building, validation, and local test-computer catalog
+  reconstruction. Only their presence in the automated production
+  systemd/deployment path changed.
+- `docs/OPERATIONS.md` updated: the "Targets" and "Service groups" tables no
+  longer list `legacy-converter`; the "daily chain runs convert → replay"
+  ordering claim was corrected (`replay-build` already reads directly from
+  `data_raw` and never depended on converter output).
+- `systemd/cryptorecorder-convert.service` and `.timer` are kept in the repo
+  as manual/reference templates (marked as such in-file); they are not
+  rendered or installed by the deploy script for any target.
+
 See `CHANGELOG.md` `[Unreleased]` for the full change list.
 
 ---

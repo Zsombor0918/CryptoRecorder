@@ -66,6 +66,40 @@ passes.** Until then, broader full-L2 equivalence stays **deferred** (see
 
 ## [Unreleased]
 
+### Changed (PR #18 — deployment boundary: converter removed from automated production path)
+- **`scripts/deploy_linux_server.sh`** — `legacy-converter` is no longer a
+  deployable `--target`; it was removed from `VALID_TARGETS`, so
+  `--target legacy-converter` is now rejected exactly like any other unknown
+  target. `--target all` now installs/controls only
+  `cryptorecorder-recorder.service` and `cryptorecorder-replay-build.{service,timer}`
+  — production automatically runs **only** those two units. This closes the
+  gap where `--target all` still silently installed the legacy converter
+  service/timer.
+- `cryptorecorder-convert.service` and `cryptorecorder-convert.timer` were
+  added to `cleanup_stale_units()`'s stale-unit list, so any copy already
+  installed on an existing server (from before this change) is stopped,
+  disabled, and removed automatically the next time the deploy script runs,
+  the same way the pre-issue-#17 feature-build units are handled.
+- **No converter/reconstruction code was removed.** `convert_day.py`,
+  `converter/`, and `validation/replay_catalog_reconstruct.py` remain in
+  place and required — for replay building, validation, and local
+  test-computer catalog reconstruction. Replay stores continue to be synced
+  separately by the operator; on the test computer, the synced replay stores
+  may still be reconstructed into temporary Nautilus catalogs by symbol (e.g.
+  for KovacsTrader) via `validation.replay_catalog_reconstruct`, run
+  manually — this is unaffected by the deployment-path change.
+  `systemd/cryptorecorder-convert.{service,timer}` remain in the repo as
+  manual/reference templates (marked as such in-file) but are not rendered
+  or installed by the deploy script for any target.
+- `docs/OPERATIONS.md` updated: the "Targets" and "Service groups" tables no
+  longer list `legacy-converter`; the stale "daily chain runs convert →
+  replay" ordering claim is corrected (`replay-build` reads directly from
+  `data_raw` and never depended on converter output). `docs/IMPLEMENTATION_AUDIT.md`
+  gained a matching completed-cleanup-items entry. New/updated tests in
+  `tests/test_agent_infrastructure.py` (`DEPLOY_TARGETS`, `LEGACY_STALE_UNITS`,
+  and new `test_deploy_script_rejects_legacy_converter_target` /
+  `test_deploy_script_all_target_never_installs_converter`).
+
 ### Fixed (PR #18 third review round)
 - **`pipeline/daily_build.py` — exchange-info-only dates report `no_data`,
   never `failed`** — `run_build_replay_store()` now derives eligible

@@ -30,7 +30,7 @@ ENV_FILE="/etc/cryptorecorder/cryptorecorder.env"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-VALID_TARGETS=("all" "recorder" "legacy-converter" "replay-build")
+VALID_TARGETS=("all" "recorder" "replay-build")
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -53,7 +53,7 @@ usage() {
 Usage: scripts/deploy_linux_server.sh [flags]
 
 Flags:
-  --target <name>     all | recorder | legacy-converter | replay-build  (default: all)
+  --target <name>     all | recorder | replay-build  (default: all)
   --dry-run           Print every action; change nothing.
   --no-systemd        Skip all systemd / /etc actions (safe in WSL).
   --install-only      Prepare env + install units; do not enable/start.
@@ -117,7 +117,6 @@ done
 units_for_target() {
   case "$1" in
     recorder)         echo "cryptorecorder-recorder.service" ;;
-    legacy-converter) echo "cryptorecorder-convert.service cryptorecorder-convert.timer" ;;
     replay-build)     echo "cryptorecorder-replay-build.service cryptorecorder-replay-build.timer" ;;
   esac
 }
@@ -125,14 +124,13 @@ units_for_target() {
 control_for_target() {
   case "$1" in
     recorder)         echo "cryptorecorder-recorder.service" ;;
-    legacy-converter) echo "cryptorecorder-convert.timer" ;;
     replay-build)     echo "cryptorecorder-replay-build.timer" ;;
   esac
 }
 
 selected_targets() {
   if [[ "$TARGET" == "all" ]]; then
-    echo "recorder legacy-converter replay-build"
+    echo "recorder replay-build"
   else
     echo "$TARGET"
   fi
@@ -277,17 +275,24 @@ control_units() {
 }
 
 # Stop/disable/remove systemd units that this repo used to install but no
-# longer ships: the pre-issue-#17 feature-build service group, and every
+# longer ships: the pre-issue-#17 feature-build service group, every
 # obsolete/renamed unit superseded by the current canonical names
 # (crypto-recorder.service -> cryptorecorder-recorder.service,
 # nautilus-convert.{service,timer} -> cryptorecorder-convert.{service,timer},
-# cryptorecorder-daily-build.{service,timer} -> cryptorecorder-replay-build.{service,timer}).
-# On servers deployed before these renames, the stale unit files may still be
+# cryptorecorder-daily-build.{service,timer} -> cryptorecorder-replay-build.{service,timer}),
+# and cryptorecorder-convert.{service,timer} itself: the legacy converter
+# (convert_day.py) is deployment-boundary work only now -- it remains
+# required implementation/reference code for replay building, validation,
+# and local test-computer catalog reconstruction (see docs/OPERATIONS.md),
+# but production no longer runs it automatically. Only
+# cryptorecorder-recorder.service and cryptorecorder-replay-build.timer are
+# installed/enabled/started by this script.
+# On servers deployed before these changes, the stale unit files may still be
 # present under /etc/systemd/system and would otherwise keep firing the
-# removed/renamed command on their old schedule after this repo is upgraded.
-# This step always runs (regardless of --target) so an upgrade to any target
-# still cleans up every stale unit, and it always runs before install_units
-# installs the canonical replacements.
+# removed/renamed/retired command on their old schedule after this repo is
+# upgraded. This step always runs (regardless of --target) so an upgrade to
+# any target still cleans up every stale unit, and it always runs before
+# install_units installs the canonical replacements.
 STALE_UNITS=(
   cryptorecorder-feature-build.timer
   cryptorecorder-feature-build.service
@@ -296,6 +301,8 @@ STALE_UNITS=(
   nautilus-convert.service
   cryptorecorder-daily-build.timer
   cryptorecorder-daily-build.service
+  cryptorecorder-convert.timer
+  cryptorecorder-convert.service
 )
 
 cleanup_stale_units() {

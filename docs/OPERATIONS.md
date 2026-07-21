@@ -225,8 +225,16 @@ The canonical paths and service groups it uses are defined below in the
 |--------|---------------|
 | `all` | every group below (default) |
 | `recorder` | `cryptorecorder-recorder.service` |
-| `legacy-converter` | `cryptorecorder-convert.service` + `.timer` |
 | `replay-build` | `cryptorecorder-replay-build.service` + `.timer` |
+
+`legacy-converter` is **not** a deployable target. Production automatically runs
+only `cryptorecorder-recorder.service` and `cryptorecorder-replay-build.timer`;
+the converter (`convert_day.py`) is never installed, enabled, or started as a
+systemd unit by this script. It remains required implementation/reference code
+for replay building, validation, and local test-computer catalog
+reconstruction (see [Linux Server Layout](#linux-server-layout) below), and can
+still be run manually (`python convert_day.py --staging`) when needed — it is
+just not part of the automated deployment path.
 
 ## Flags
 
@@ -295,9 +303,11 @@ still prepares the venv, dependencies, and data dirs (or prints them under `--dr
   the current unit set: `cryptorecorder-feature-build.{service,timer}` (pre-issue-#17
   feature-build group), `crypto-recorder.service` (renamed to
   `cryptorecorder-recorder.service`), `nautilus-convert.{service,timer}` (renamed to
-  `cryptorecorder-convert.{service,timer}`), and `cryptorecorder-daily-build.{service,timer}`
-  (renamed to `cryptorecorder-replay-build.{service,timer}`). This cleanup step is skipped
-  under `--no-systemd`.
+  `cryptorecorder-convert.{service,timer}`), `cryptorecorder-daily-build.{service,timer}`
+  (renamed to `cryptorecorder-replay-build.{service,timer}`), and
+  `cryptorecorder-convert.{service,timer}` itself (the legacy converter is no longer part
+  of the automated production deployment path; any copy installed by an older deploy is
+  stopped/disabled/removed). This cleanup step is skipped under `--no-systemd`.
 
 ---
 
@@ -346,20 +356,33 @@ Generated data roots under `DATA_BASE` (see `config.py` and the env template):
 
 ## Service groups
 
-Production work is split into three service groups plus a meta target `all`.
+Production work is split into two service groups plus a meta target `all`.
+Production automatically runs **only** `cryptorecorder-recorder.service` and
+`cryptorecorder-replay-build.timer`.
 
 | Group | systemd unit(s) | Kind | Schedule | Command (in `.venv`) |
 |-------|-----------------|------|----------|----------------------|
 | `recorder` | `cryptorecorder-recorder.service` | long-running | always on | `python recorder.py` |
-| `legacy-converter` | `cryptorecorder-convert.service` + `.timer` | oneshot | ~00:10 UTC | `python convert_day.py --staging` (defaults to yesterday UTC) |
 | `replay-build` | `cryptorecorder-replay-build.service` + `.timer` | oneshot | ~01:00 UTC | `python -m pipeline.daily_build --date yesterday` |
 
-Meta target **`all`** installs/controls all three groups together.
+Meta target **`all`** installs/controls both groups together.
 
-Ordering: the daily chain runs **convert → replay** (each after the previous
-day has closed and the prior step has produced output). There is no
-feature-build step; CryptoRecorder's scope ends at `replay_store` (removed,
-issue #17).
+`replay-build` reads directly from `data_raw` (via `pipeline.raw_manifest`); it
+does not depend on `convert_day.py` or any converter output, so there is no
+ordering dependency between them. The legacy converter
+(`cryptorecorder-convert.service` + `.timer`) is **not** installed, enabled, or
+started by `scripts/deploy_linux_server.sh` — it is deployment-boundary work
+only. `convert_day.py`, `converter/`, and `validation/replay_catalog_reconstruct.py`
+remain required implementation/reference code for replay building, validation,
+and local test-computer catalog reconstruction: replay stores are synced
+separately by the operator, and on the test computer the synced replay stores
+may be reconstructed into temporary Nautilus catalogs by symbol (e.g. for
+KovacsTrader) using `validation.replay_catalog_reconstruct` — run manually, not
+via systemd. Any `cryptorecorder-convert.{service,timer}` already installed on
+an existing server (from before this change) is stopped, disabled, and removed
+automatically the next time the deploy script runs (see "Safety notes" above).
+There is no feature-build step; CryptoRecorder's scope ends at `replay_store`
+(removed, issue #17).
 
 > The replay-build service invokes `pipeline.daily_build` because
 > `pipeline.build_replay_store` requires an explicit `YYYY-MM-DD` date and does
