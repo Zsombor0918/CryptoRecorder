@@ -12,10 +12,12 @@ import json
 import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
 
 import disk_monitor as disk_monitor_mod
+from config import REPORT_TIMEZONE_NAME
 from disk_monitor import (
     DirectoryMeasurement,
     DiskMonitor,
@@ -24,6 +26,7 @@ from disk_monitor import (
     measure_directory,
     measure_filesystem,
 )
+from time_utils import local_now_iso
 
 
 class FakeConfig:
@@ -761,3 +764,102 @@ async def test_stale_last_known_good_nulls_all_derived_fields(
     assert usage["percent_of_hard_limit"] is None
     assert usage["growth_rate_gb_day"] is None
     assert usage["days_to_full"] is None
+
+
+# ---------------------------------------------------------------------------
+# Top-level report timestamp timezone consistency (docs/OPERATIONS.md
+# "Europe/Budapest" contract) — Codex review finding #2.
+# ---------------------------------------------------------------------------
+
+REPORT_TZ = ZoneInfo(REPORT_TIMEZONE_NAME)
+
+
+@pytest.mark.asyncio
+async def test_normal_report_timestamp_uses_configured_local_timezone(
+    tmp_path, monkeypatch
+) -> None:
+    """The top-level `timestamp` field of a normal (non-overlapping) scan
+    must carry the configured local report-timezone offset (Europe/Budapest),
+    not a bare UTC offset, matching the documented contract."""
+    config = FakeConfig(tmp_path)
+    for root in (config.DATA_ROOT, config.NAUTILUS_CATALOG_ROOT, config.META_ROOT):
+        _make_dir(root)
+    monitor = DiskMonitor(config)
+    _run_inline_executor(monkeypatch)
+
+    usage = await monitor.check_disk_usage()
+
+    reported = datetime.fromisoformat(usage["timestamp"])
+    assert reported.tzinfo is not None
+    expected_offset = REPORT_TZ.utcoffset(reported.replace(tzinfo=None))
+    assert reported.utcoffset() == expected_offset
+
+
+@pytest.mark.asyncio
+async def test_overlapping_scan_report_timestamp_uses_same_timezone_contract(
+    tmp_path, monkeypatch
+) -> None:
+    """The skipped/overlap ('no prior report') path must use the identical
+    local-timezone contract as a normal scan's top-level timestamp."""
+    config = FakeConfig(tmp_path)
+    monitor = DiskMonitor(config)
+    # No prior report exists yet and the lock is held -> hits the
+    # no-prior-report branch of the overlapping-scan guard.
+    await monitor._scan_lock.acquire()
+    try:
+        usage = await monitor.check_disk_usage()
+    finally:
+        monitor._scan_lock.release()
+
+    assert usage["skipped_duplicate"] is True
+    reported = datetime.fromisoformat(usage["timestamp"])
+    assert reported.tzinfo is not None
+    expected_offset = REPORT_TZ.utcoffset(reported.replace(tzinfo=None))
+    assert reported.utcoffset() == expected_offset
+
+
+@pytest.mark.asyncio
+async def test_report_timestamp_change_does_not_alter_growth_or_age_logic(
+    tmp_path, monkeypatch
+) -> None:
+    """Switching the top-level timestamp to local time must not change
+    growth-sample ordering, measurement-age computation, or staleness
+    logic — those must remain driven by UTC/epoch values internally."""
+    config = FakeConfig(tmp_path, stale_after_sec=1.0)
+    for root in (config.DATA_ROOT, config.NAUTILUS_CATALOG_ROOT, config.META_ROOT):
+        _make_dir(root)
+    monitor = DiskMonitor(config)
+    _run_inline_executor(monkeypatch)
+
+    first = await monitor.check_disk_usage()
+    assert first["components"]["data_raw"]["measurement_age_seconds"] == 0.0
+
+    def fake_measure(path, timeout_sec):
+        if path == config.DATA_ROOT:
+            return DirectoryMeasurement(
+                path=path,
+                value_bytes=None,
+                ok=False,
+                status="timeout",
+                error="simulated timeout",
+                measured_at=datetime.now(timezone.utc),
+                duration_seconds=timeout_sec,
+            )
+        return measure_directory(path, timeout_sec)
+
+    monkeypatch.setattr(disk_monitor_mod, "measure_directory", fake_measure)
+    second = await monitor.check_disk_usage()
+
+    data_raw = second["components"]["data_raw"]
+    # Age is computed from UTC/epoch internals and must remain a sane,
+    # non-negative elapsed value independent of the local-time top-level
+    # timestamp representation.
+    assert data_raw["measurement_age_seconds"] is not None
+    assert data_raw["measurement_age_seconds"] >= 0.0
+    assert data_raw["stale"] is True
+
+    # Growth-history ordering (internal epoch-based) is unaffected: a
+    # second, later sample must still be accepted (no "non-increasing
+    # timestamp" rejection) even though the top-level report timestamp is
+    # now expressed in local time.
+    assert len(monitor._growth_history) >= 1

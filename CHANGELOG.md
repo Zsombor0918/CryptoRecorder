@@ -66,6 +66,40 @@ passes.** Until then, broader full-L2 equivalence stays **deferred** (see
 
 ## [Unreleased]
 
+### Fixed (PR #18 third review round)
+- **`pipeline/daily_build.py` — exchange-info-only dates report `no_data`,
+  never `failed`** — `run_build_replay_store()` now derives eligible
+  venue/symbol replay-build attempts from actual raw channel coverage
+  (`depth_v2`/`trade_v2`) instead of treating every raw-manifest "symbol"
+  entry (including `EXCHANGEINFO`, from `data_raw/<venue>/exchangeinfo/
+  EXCHANGEINFO/<date>/`) as a market symbol. A date containing only an
+  exchange-info partition now attempts zero replay partitions and reports
+  `no_data` (nonzero exit code), matching the existing "zero eligible
+  partitions" contract. `EXCHANGEINFO` can never be attempted even via
+  explicit `--symbols EXCHANGEINFO`, because eligibility is computed from
+  channel coverage rather than a literal symbol-name exclusion — protecting
+  against future non-market metadata channels too. `success`/`partial`/
+  `failed`/`no_data` semantics for genuinely eligible depth/trade symbols are
+  unchanged. New tests in `tests/test_daily_build.py`.
+- **`disk_monitor.py` — consistent report-timestamp timezone contract** — the
+  top-level `"timestamp"` field of a normal disk-usage scan now uses
+  `time_utils.local_now_iso()` (Europe/Budapest), matching the
+  already-local-time skipped/overlapping-scan path and the documented
+  `docs/OPERATIONS.md` contract, instead of a bare UTC `now.isoformat()`.
+  Internal `measured_at` fields, growth-history epoch ordering, and
+  measurement-age/staleness calculations remain UTC/epoch-based and are
+  unaffected. `docs/OPERATIONS.md` gains an explicit `timestamp` field row
+  documenting this. New tests in `tests/test_disk_monitor_fail_safe.py`.
+- **`CHANGELOG.md` — corrected stale active-state framing** — the two
+  pre-issue-#17 `[Unreleased]` "Changed" entries describing
+  `pipeline.generate_catalog --profile full_l2` and `docs/GENERATE_CATALOG.md`/
+  `docs/FEATURE_STORE.md` are now explicitly marked historical/superseded,
+  with an inline note that the CLI and both doc files were later removed
+  by issue #17 and are not available/do not exist today. History is
+  preserved; only the current-state framing was corrected. New guard test
+  `test_changelog_unreleased_has_no_active_stale_feature_catalog_claims` in
+  `tests/test_agent_infrastructure.py`.
+
 ### Removed (issue #17 — recorder + replay-store ownership refactor)
 - The entire **feature-store subsystem**: `stores/feature_schema.py`,
   `stores/feature_calc.py`, `stores/feature_writer.py`,
@@ -288,7 +322,13 @@ passes.** Until then, broader full-L2 equivalence stays **deferred** (see
   before every commit and blocks if compliance fails. Activate per-clone with
   `git config core.hooksPath .githooks` (see `INSTALL.md`).
 
-### Changed
+### Changed (historical — pre-issue #17 full_l2 rollout; superseded, see "Removed (issue #17...)" above)
+> The `pipeline.generate_catalog` CLI and `docs/GENERATE_CATALOG.md`/
+> `docs/FEATURE_STORE.md` referenced below were later **removed** by the
+> issue #17 refactor (see the "Removed" sections earlier in this
+> `[Unreleased]` block). They are recorded here only as history of when
+> `full_l2` support was first added; `pipeline.generate_catalog` is **not**
+> an available production CLI today, and neither doc file currently exists.
 - `generate_catalog --profile full_l2` (and `depth_only`, `depth10`): replay-based
   full order-book catalog generation reusing the shared depth engine in
   `converter/depth_phase2.py` via `stores/replay_depth_adapter.py` (no second
@@ -299,25 +339,33 @@ passes.** Until then, broader full-L2 equivalence stays **deferred** (see
 - `validation/validate_catalog_equivalence.py` extended to compare the `full_l2`
   profile (trades + deltas + depth10 + checkpoints) and emit a per-instrument
   report under `validation_reports/`.
-- New flags on `pipeline.generate_catalog`: `--emit-depth10/--no-emit-depth10`,
+- New flags on the then-existing `pipeline.generate_catalog`: `--emit-depth10/--no-emit-depth10`,
   `--depth10-interval-sec`, `--derived-depth-snapshot-levels`, `--time-filter`.
 - `validation/audit_storage_size.py` — audit-only CLI measuring on-disk size of
-  replay/feature/catalog artifacts.
+  replay/feature/catalog artifacts (the `feature` artifact measurement was
+  itself later removed along with the feature-store subsystem; see "Removed
+  (issue #17 completion)" above).
 - Docs: `docs/IMPLEMENTATION_AUDIT.md`, `docs/IMPLEMENTATION_AUDIT.md`.
 - Tests: `tests/test_replay_depth_adapter.py`, `tests/test_generate_catalog_full_l2.py`,
   `tests/test_catalog_equivalence_full_l2.py`, `tests/test_full_l2_realdata_gate.py`,
   plus a synthetic full-L2 convert_day-vs-replay equivalence test in
   `tests/test_catalog_equivalence.py`.
 
-### Changed
+### Changed (historical — pre-issue #17; generate_catalog since removed)
 - `replay_store → generate_catalog --profile full_l2` moved from **deferred** to
   **implemented, semantically validated on the ADAUSDT single-day smoke** against
   `convert_day.py` (trades, OrderBookDeltas, OrderBookDepth10, and book
   checkpoints all match). `convert_day.py` remains the production reference.
-- Docs updated to reflect full_l2 support: `docs/REPO_STRUCTURE.md`,
+  This ADAUSDT-smoke validation result still holds today, but the
+  reconstruction now lives in the validation-only
+  `validation/replay_catalog_reconstruct.py` helper, not the (since removed)
+  `pipeline.generate_catalog` CLI — see `docs/FULL_L2_REPLAY_CATALOG_PLAN.md`
+  for the current gate status.
+- Docs updated at the time to reflect full_l2 support: `docs/REPO_STRUCTURE.md`,
   `docs/PROJECT_STATUS.md`, `docs/FULL_L2_REPLAY_CATALOG_PLAN.md`,
   `docs/GENERATE_CATALOG.md`, `docs/FEATURE_STORE.md`, `docs/README.md`,
-  `README.md`.
+  `README.md`. The latter two doc files were subsequently deleted by the
+  issue #17 refactor and no longer exist.
 
 ### Deferred
 - Broader `full_l2` validation across the top50 universe and multiple days. This

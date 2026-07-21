@@ -752,7 +752,15 @@ class DiskMonitor:
             monitoring_health = "healthy"
 
         report = {
-            "timestamp": now.isoformat(),
+            # Operator-facing top-level report timestamp: always the
+            # configured local report timezone (Europe/Budapest), matching
+            # every other top-level report timestamp (heartbeat, startup
+            # coverage, and the skipped/overlap path below) — see
+            # docs/OPERATIONS.md "State File Schemas". `now` (UTC) remains
+            # the basis for every internal/derived calculation below
+            # (measured_at, growth-history epoch ordering, measurement age,
+            # staleness) and must not be replaced by this local timestamp.
+            "timestamp": local_now_iso(),
             "components": components,
             # Backward-compatible top-level fields. `None` (never `0`) when
             # the underlying measurement and every fallback are unavailable.

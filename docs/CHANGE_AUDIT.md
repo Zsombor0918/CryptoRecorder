@@ -189,6 +189,106 @@ status claims are honest.
 ## Audit entries (newest first)
 
 ---
+## 2026-07-21 — PR #18 third review round: exchangeinfo-only no_data classification, disk-report timestamp consistency, stale changelog claims (issues #17, #19)
+
+### Change summary
+- `pipeline/daily_build.py` — `run_build_replay_store()` now filters eligible
+  venue/symbol partitions by actual raw channel coverage (`depth_v2`/`trade_v2`
+  in `ELIGIBLE_REPLAY_CHANNELS`) instead of assuming every raw-manifest
+  "symbol" entry is a market symbol. A date containing only an `exchangeinfo`
+  partition (e.g. `data_raw/<venue>/exchangeinfo/EXCHANGEINFO/<date>/`) now
+  attempts zero replay partitions and reports `no_data`, never `failed`.
+  `EXCHANGEINFO` can never become an attempted replay symbol even if a caller
+  explicitly passes `--symbols EXCHANGEINFO`, because filtering is based on
+  channel coverage, not a literal symbol-name exclusion — so other future
+  non-market metadata channels are protected the same way.
+- `disk_monitor.py` — `_check_disk_usage_locked()`'s top-level `"timestamp"`
+  field now uses `time_utils.local_now_iso()` (Europe/Budapest) instead of a
+  bare UTC `now.isoformat()`, matching the already-local-time skipped/overlap
+  path and the documented `docs/OPERATIONS.md` contract. Internal
+  `measured_at`, growth-history epoch ordering, and measurement-age/staleness
+  calculations are untouched and remain UTC/epoch-based.
+- `docs/OPERATIONS.md` — added an explicit `timestamp` row to the
+  `disk_usage.json` fields table clarifying the Europe/Budapest top-level
+  contract and that internal growth calculations stay UTC/epoch-based.
+- `CHANGELOG.md` — the two pre-issue-#17 `[Unreleased]` "Changed" blocks that
+  described `pipeline/generate_catalog.py --profile full_l2` and
+  `docs/GENERATE_CATALOG.md`/`docs/FEATURE_STORE.md` as if still active are
+  now explicitly headed "(historical — ... superseded)" with an inline note
+  stating the CLI and both doc files were later removed by issue #17 and do
+  not exist today. No history was deleted; only the currently-active-state
+  framing was corrected.
+- Tests: `tests/test_daily_build.py` (4 new: exchangeinfo-only → `no_data`,
+  exchangeinfo + one valid symbol → only the valid symbol attempted, explicit
+  `--symbols EXCHANGEINFO` filtering still yields `no_data`, main() exits
+  nonzero); `tests/test_disk_monitor_fail_safe.py` (3 new: normal report
+  timestamp carries the Europe/Budapest offset, the overlapping/no-prior path
+  carries the same offset, the timestamp change does not alter
+  growth/measurement-age logic); `tests/test_agent_infrastructure.py` (1 new:
+  `[Unreleased]` may not present the removed `generate_catalog` CLI or the
+  deleted feature/catalog docs as currently available outside a
+  historical/removed context).
+
+### Files/packages touched
+- pipeline/daily_build.py
+- disk_monitor.py
+- docs/OPERATIONS.md
+- CHANGELOG.md
+- tests/test_daily_build.py
+- tests/test_disk_monitor_fail_safe.py
+- tests/test_agent_infrastructure.py
+- docs/CHANGE_AUDIT.md (this entry)
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] docs/REPO_STRUCTURE.md
+- [x] docs/PROJECT_STATUS.md
+- [x] docs/IMPLEMENTATION_AUDIT.md
+- [x] relevant feature docs:
+  - docs/OPERATIONS.md, docs/DAILY_BUILD_PIPELINE.md, docs/FULL_L2_REPLAY_CATALOG_PLAN.md
+
+### Docs updated
+- [x] CHANGELOG.md
+- [ ] README.md — no change needed; no user-facing behavior/API change
+- [ ] docs/PROJECT_STATUS.md — no validated/deferred status change; these are
+  bugfixes to already-documented statuses (`no_data` classification,
+  timestamp contract), not new capability claims
+- [ ] docs/REPO_STRUCTURE.md — no structural change
+- [x] relevant feature docs:
+  - docs/OPERATIONS.md (added `timestamp` field row to the `disk_usage.json` table)
+
+### Status / validation impact
+- Validated status changed: no
+- Deferred status changed: no
+- New claims added: no — this entry corrects a stale-claim framing bug in
+  `CHANGELOG.md`, it does not add or remove any validated/deferred capability
+- Evidence for any new validation claim:
+  - n/a
+
+### Tests run
+```bash
+pytest tests/test_daily_build.py -q                                    # 9 passed
+pytest tests/test_disk_monitor_fail_safe.py tests/test_disk_monitor_cleanup.py -q  # 36 passed
+pytest tests/test_repo_structure.py tests/test_agent_infrastructure.py -q  # 49 passed
+pytest -q                                                               # 282 passed, 3 skipped
+```
+
+### Validation CLIs run
+```bash
+python -m validation.audit_change_compliance --base main   # RESULT: PASS
+```
+
+### Known limitations / out of scope
+- Broader top50/multi-day `full_l2` equivalence remains deferred (unchanged
+  by this entry).
+- No production data, services, or `/etc/cryptorecorder/cryptorecorder.env`
+  were touched; all tests use `tmp_path`-scoped temporary roots.
+- The ADAUSDT replay-equivalence smoke was not re-run as part of this change
+  (no code path it depends on — `convert_day.py`, replay writer/reader
+  schemas, catalog reconstruction — was touched); see final report for the
+  smoke-availability statement.
+
+---
 ## 2026-07-20 — PR #18 second review round: fail-closed disk monitor, data_raw-only retention accounting, daily_build failed status, deploy-script legacy cleanup + honest flags, stale doc references (issues #17, #19)
 
 ### Change summary

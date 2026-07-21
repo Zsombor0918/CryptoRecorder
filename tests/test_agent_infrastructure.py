@@ -178,6 +178,62 @@ def test_no_doc_claims_syncthing_done() -> None:
             )
 
 
+# Tokens that identify the removed `pipeline.generate_catalog` product CLI and
+# the two docs files deleted alongside it (issue #17). A paragraph mentioning
+# any of these in the *active* `[Unreleased]` state must clearly mark that
+# context as historical/removed — otherwise it misrepresents current status.
+_STALE_FEATURE_CATALOG_TOKENS = [
+    "docs/generate_catalog.md",
+    "docs/feature_store.md",
+    "pipeline.generate_catalog",
+    "generate_catalog --profile",
+]
+_STALE_CLAIM_SAFE_WORDS = (
+    "removed", "deleted", "no longer", "historical", "superseded", "moved to",
+)
+
+
+def _unreleased_section(changelog_text: str) -> str:
+    match = re.search(
+        r"^## \[Unreleased\]\s*$(.*?)(?=^## \[)", changelog_text,
+        flags=re.MULTILINE | re.DOTALL,
+    )
+    assert match, "CHANGELOG.md must have an '## [Unreleased]' section"
+    return match.group(1)
+
+
+def _iter_unreleased_blocks(unreleased_text: str) -> list[tuple[str, str]]:
+    """Split the Unreleased section into (header, body) pairs by '### ' headers."""
+    parts = re.split(r"^(### .+)$", unreleased_text, flags=re.MULTILINE)
+    return [(parts[i].strip(), parts[i + 1]) for i in range(1, len(parts), 2)]
+
+
+def test_changelog_unreleased_has_no_active_stale_feature_catalog_claims() -> None:
+    """The active `[Unreleased]` state must not present the removed
+    `pipeline.generate_catalog` CLI, or the deleted `docs/GENERATE_CATALOG.md`/
+    `docs/FEATURE_STORE.md`, as currently available — except inside a
+    paragraph or subsection clearly marked historical/removed/superseded."""
+    changelog = (ROOT / "CHANGELOG.md").read_text()
+    unreleased = _unreleased_section(changelog)
+
+    for header, body in _iter_unreleased_blocks(unreleased):
+        header_is_historical = any(
+            word in header.lower() for word in ("historical", "removed")
+        )
+        for paragraph in re.split(r"\n(?=- )", body):
+            normalized = _normalize(paragraph)
+            if not any(tok in normalized for tok in _STALE_FEATURE_CATALOG_TOKENS):
+                continue
+            assert header_is_historical or any(
+                word in normalized for word in _STALE_CLAIM_SAFE_WORDS
+            ), (
+                "CHANGELOG.md [Unreleased] references the removed "
+                "pipeline.generate_catalog CLI or a deleted feature/catalog doc "
+                f"without marking it historical/removed (under '### {header}'): "
+                f"{paragraph.strip()[:200]!r}"
+            )
+
+
 # ---------------------------------------------------------------------------
 # Deploy script
 # ---------------------------------------------------------------------------

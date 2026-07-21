@@ -74,6 +74,15 @@ def _write_symbol_raw_data(root: Path, venue: str, symbol: str, date: str) -> No
     )
 
 
+def _write_exchangeinfo_raw_data(root: Path, venue: str, date: str) -> None:
+    """Write a raw exchangeinfo partition: data_raw/<venue>/exchangeinfo/
+    EXCHANGEINFO/<date>/... — metadata only, never a market symbol."""
+    _write_jsonl(
+        root / venue / "exchangeinfo" / "EXCHANGEINFO" / date / f"{date}T00.jsonl",
+        [{"record_type": "exchangeinfo_snapshot", "venue": venue, "symbols": []}],
+    )
+
+
 DATE = "2026-06-12"
 VENUE = "BINANCE_SPOT"
 
@@ -234,3 +243,122 @@ def test_all_partitions_failed_reports_failed_status(
     assert report["status"] == "failed"
     assert report["status"] not in ("partial", "no_data", "success")
     assert len(report["errors"]) == 2
+
+
+# ---------------------------------------------------------------------------
+# exchangeinfo-only dates must never be treated as market-symbol replay work
+# (Codex review finding #1).
+# ---------------------------------------------------------------------------
+
+def test_exchangeinfo_only_date_reports_no_data(tmp_path: Path) -> None:
+    """A date with only a raw exchangeinfo partition (no depth_v2/trade_v2)
+    must report 'no_data' and attempt zero replay partitions — EXCHANGEINFO
+    must never be derived/attempted as a market symbol."""
+    data_root = tmp_path / "raw"
+    replay_root = tmp_path / "replay"
+    report_root = tmp_path / "reports"
+    _write_exchangeinfo_raw_data(data_root, VENUE, DATE)
+
+    raw_result = daily_build.run_raw_manifest(DATE, data_root)
+    assert "EXCHANGEINFO" in raw_result["data"][VENUE]
+
+    all_symbols = sorted(
+        {s for venue_data in raw_result["data"].values() for s in venue_data}
+    )
+    replay_result = daily_build.run_build_replay_store(
+        DATE, all_symbols, data_root, replay_root
+    )
+
+    assert replay_result["status"] == "no_data"
+    assert replay_result["symbols_total"] == 0
+    assert replay_result["results"] == []
+
+    report = daily_build.generate_daily_report(
+        DATE, data_root, replay_root, report_root, raw_result, replay_result, 1.0
+    )
+    assert report["status"] == "no_data"
+
+
+def test_exchangeinfo_main_exits_nonzero_with_no_data(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data_root = tmp_path / "raw"
+    replay_root = tmp_path / "replay"
+    report_root = tmp_path / "reports"
+    _write_exchangeinfo_raw_data(data_root, VENUE, DATE)
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "daily_build.py",
+            "--date", DATE,
+            "--data-root", str(data_root),
+            "--replay-root", str(replay_root),
+            "--report-root", str(report_root),
+        ],
+    )
+    exit_code = daily_build.main()
+    assert exit_code != 0
+
+    report_path = report_root / f"daily_build_{DATE}.json"
+    report = json.loads(report_path.read_text())
+    assert report["status"] == "no_data"
+
+
+def test_exchangeinfo_plus_one_valid_symbol_only_attempts_valid_symbol(
+    tmp_path: Path,
+) -> None:
+    """A date with both an exchangeinfo partition and one valid depth/trade
+    symbol must attempt only the valid symbol; EXCHANGEINFO must never be
+    attempted, and the eligible symbol's success must still be reported."""
+    data_root = tmp_path / "raw"
+    replay_root = tmp_path / "replay"
+    report_root = tmp_path / "reports"
+    _write_exchangeinfo_raw_data(data_root, VENUE, DATE)
+    _write_symbol_raw_data(data_root, VENUE, "ADAUSDT", DATE)
+
+    raw_result = daily_build.run_raw_manifest(DATE, data_root)
+    all_symbols = sorted(
+        {s for venue_data in raw_result["data"].values() for s in venue_data}
+    )
+    assert "EXCHANGEINFO" in all_symbols
+    assert "ADAUSDT" in all_symbols
+
+    replay_result = daily_build.run_build_replay_store(
+        DATE, all_symbols, data_root, replay_root
+    )
+
+    assert replay_result["status"] == "success"
+    assert replay_result["symbols_total"] == 1
+    assert replay_result["symbols_processed"] == 1
+    assert [r["symbol"] for r in replay_result["results"]] == ["ADAUSDT"]
+
+    report = daily_build.generate_daily_report(
+        DATE, data_root, replay_root, report_root, raw_result, replay_result, 1.0
+    )
+    assert report["status"] == "success"
+
+
+def test_explicit_symbol_filtering_cannot_build_exchangeinfo(tmp_path: Path) -> None:
+    """Even if a caller explicitly requests --symbols EXCHANGEINFO, it must
+    never be attempted as a replay build, because it has no depth_v2/trade_v2
+    channel coverage."""
+    data_root = tmp_path / "raw"
+    replay_root = tmp_path / "replay"
+    report_root = tmp_path / "reports"
+    _write_exchangeinfo_raw_data(data_root, VENUE, DATE)
+    _write_symbol_raw_data(data_root, VENUE, "ADAUSDT", DATE)
+
+    raw_result = daily_build.run_raw_manifest(DATE, data_root)
+
+    replay_result = daily_build.run_build_replay_store(
+        DATE, ["EXCHANGEINFO"], data_root, replay_root
+    )
+    assert replay_result["status"] == "no_data"
+    assert replay_result["symbols_total"] == 0
+    assert replay_result["results"] == []
+
+    report = daily_build.generate_daily_report(
+        DATE, data_root, replay_root, report_root, raw_result, replay_result, 1.0
+    )
+    assert report["status"] == "no_data"

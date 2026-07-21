@@ -51,6 +51,7 @@ measurement is never reported as zero — see the safety invariant in
 
 | Field | Meaning |
 |-------|---------|
+| `timestamp` | Top-level, operator-facing report timestamp — always Hungary local time (`Europe/Budapest`, ISO-8601 with offset), for both a normal scan and the skipped/overlapping-scan path. Internal growth-rate/days-to-full calculations are computed from separate, UTC-based epoch values and are unaffected by this field's timezone. |
 | `components.<data_raw\|catalog\|meta\|state>.value_gb` | Current or last-known-good size in GB, or `null` if never measured |
 | `components.<name>.measurement_ok` | `true` only if *this cycle's* scan succeeded |
 | `components.<name>.measurement_status` | `ok` / `missing` / `timeout` / `command_error` / `malformed_output` / `error` |

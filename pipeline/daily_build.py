@@ -19,6 +19,11 @@ from config import DATA_ROOT, REPLAY_ROOT, DAILY_REPORT_ROOT
 
 logger = logging.getLogger(__name__)
 
+# Raw channels that make a symbol eligible for replay construction. Metadata
+# channels (e.g. "exchangeinfo") are never eligible — a symbol/date must have
+# at least one depth or trade partition before a replay build is attempted.
+ELIGIBLE_REPLAY_CHANNELS = frozenset({"depth_v2", "trade_v2"})
+
 
 def _parse_date_arg(date_str: str) -> str:
     """
@@ -72,11 +77,26 @@ def run_build_replay_store(
     results = []
     for venue in coverage.get("venues", []):
         for symbol in symbols:
-            if symbol in coverage.get("data", {}).get(venue, {}):
-                result = build_replay_for_symbol(
-                    venue, symbol, date_str, data_root, replay_root
+            channels = coverage.get("data", {}).get(venue, {}).get(symbol)
+            if not channels:
+                continue
+            if not (set(channels) & ELIGIBLE_REPLAY_CHANNELS):
+                # Metadata-only partitions (e.g. exchangeinfo) are never
+                # eligible for replay construction, regardless of whether
+                # the symbol was auto-detected or explicitly requested via
+                # --symbols. Filtering on actual channel coverage (rather
+                # than excluding a literal "EXCHANGEINFO" symbol string)
+                # also protects against future non-market metadata channels.
+                logger.debug(
+                    f"Skipping {venue}/{symbol} for {date_str}: no depth_v2/"
+                    "trade_v2 partitions (metadata-only channel coverage: "
+                    f"{sorted(channels)})."
                 )
-                results.append(result)
+                continue
+            result = build_replay_for_symbol(
+                venue, symbol, date_str, data_root, replay_root
+            )
+            results.append(result)
     
     successful = sum(1 for r in results if r["status"] == "success")
     total_depth = sum(r.get("depth_count", 0) for r in results)
