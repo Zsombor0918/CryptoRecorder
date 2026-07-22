@@ -390,6 +390,47 @@ def test_docs_do_not_reference_pipeline_audit_modules() -> None:
             )
 
 
+def test_docs_do_not_claim_deleted_converter_systemd_files_exist() -> None:
+    """
+    systemd/cryptorecorder-convert.service and .timer were deleted in PR #18
+    finalization. Current-state documentation must never claim they still
+    exist in the repo as manual/reference templates -- that sends operators
+    looking for files that are gone. docs/CHANGE_AUDIT.md is an append-only
+    historical log and is exempt: past dated entries may describe a
+    superseded decision as long as they are not the file being checked here.
+    """
+    assert not (ROOT / "systemd" / "cryptorecorder-convert.service").exists(), (
+        "systemd/cryptorecorder-convert.service must stay deleted (PR #18)."
+    )
+    assert not (ROOT / "systemd" / "cryptorecorder-convert.timer").exists(), (
+        "systemd/cryptorecorder-convert.timer must stay deleted (PR #18)."
+    )
+
+    forbidden_normalized_phrases = [
+        "kept in the repo as manual-only reference templates",
+        "kept in the repo as manual/reference templates",
+        "kept in the repo as manual",
+        "converter systemd templates remain",
+    ]
+
+    current_state_docs = [
+        ROOT / "CHANGELOG.md",
+        ROOT / "INSTALL.md",
+        ROOT / "AGENTS.md",
+        *[p for p in DOCS.glob("*.md") if p.name != "CHANGE_AUDIT.md"],
+    ]
+    for doc_path in current_state_docs:
+        if not doc_path.exists():
+            continue
+        normalized = re.sub(r"\s+", " ", doc_path.read_text())
+        for phrase in forbidden_normalized_phrases:
+            assert phrase not in normalized, (
+                f"{doc_path.relative_to(ROOT)} still claims deleted converter "
+                f"systemd templates remain in the repo (found: {phrase!r}). "
+                "Update to state they were deleted in PR #18."
+            )
+
+
 def test_docs_do_not_reference_validators_package() -> None:
     """After removal, no docs should reference the old validators/ package as an active path."""
     # These are patterns that would indicate a live import or command reference.

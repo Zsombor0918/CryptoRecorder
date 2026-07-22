@@ -92,9 +92,10 @@ passes.** Until then, broader full-L2 equivalence stays **deferred** (see
   architecture. Stale installed converter units are still removed by
   `scripts/deploy_linux_server.sh` cleanup (no change to the deploy script).
   `convert_day.py` and `converter/` are unchanged and required.
-- **`INSTALL.md` note updated** — the `> **Note:**` that previously said converter
-  templates are "kept in the repo as manual-only reference templates" now correctly
-  states they were deleted in PR #18 and references the manual CLI command instead.
+- **`INSTALL.md` note updated** — the `> **Note:**` that previously claimed the
+  converter templates were still present in the repo for manual use now
+  correctly states they were deleted in PR #18 and references the manual CLI
+  command instead.
 - **`docs/OPERATIONS.md` updated** — references to converter units corrected to
   say "deleted from the repository in PR #18".
 

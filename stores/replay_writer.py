@@ -53,6 +53,37 @@ def _compute_sha256(file_path: Path) -> str:
     return sha256_hash.hexdigest()
 
 
+def validate_partition(partition_dir: Path) -> bool:
+    """Return True only if partition_dir is a complete, checksum-valid replay partition.
+
+    This is the single source of truth for partition validity, shared by
+    ReplayWriter.publish() (post-publication validation) and
+    pipeline.build_replay_store (skip-if-valid / crash-recovery checks) so
+    that both call sites can never disagree about what "valid" means.
+    """
+    manifest_path = partition_dir / "manifest.json"
+    depth_path = partition_dir / "depth.parquet"
+    trades_path = partition_dir / "trades.parquet"
+    if not (manifest_path.exists() and depth_path.exists() and trades_path.exists()):
+        return False
+    try:
+        with open(manifest_path) as f:
+            manifest = json.load(f)
+        if manifest.get("status") != "complete":
+            return False
+        for key, path in (("depth_checksum", depth_path), ("trades_checksum", trades_path)):
+            expected = manifest.get(key)
+            if not expected:
+                return False
+            if _compute_sha256(path) != expected:
+                logger.warning(f"Checksum mismatch for {partition_dir} ({key})")
+                return False
+        return True
+    except Exception as e:
+        logger.warning(f"Partition validation failed for {partition_dir}: {e}")
+        return False
+
+
 def _write_channel_incremental(
     spool: RawRecordSpool,
     out_path: Path,
@@ -359,18 +390,50 @@ class ReplayWriter:
                     )
             raise
 
-        # Step 3: canonical publication succeeded — verify new output exists.
-        if not self.output_dir.exists():
+        # Step 3: canonical publication succeeded on the filesystem — but that
+        # does not guarantee the published directory is a complete, valid
+        # partition (missing/corrupt output under a non-standard filesystem
+        # replace, truncated write, etc.). Validate before ever deleting the
+        # last known-good backup.
+        if not validate_partition(self.output_dir):
             logger.error(
-                f"Post-publish check: output_dir {self.output_dir} does not exist "
-                "after os.replace(). Leaving backup in place."
+                f"Post-publish validation failed for {self.output_dir}: "
+                "missing/corrupt manifest, parquet files, or checksum mismatch. "
+                "Quarantining invalid output and restoring backup if available."
             )
-            # Do NOT raise here — the replace did not raise, which is unexpected.
-            # Preserve backup and let the caller detect corruption via validation.
-            return self.output_dir
+            quarantine_dir = self.output_dir.parent / f".quarantine_{self.date}_{self.symbol}"
+            try:
+                if quarantine_dir.exists():
+                    shutil.rmtree(quarantine_dir)
+                if self.output_dir.exists():
+                    os.replace(self.output_dir, quarantine_dir)
+            except Exception as qe:
+                logger.error(
+                    f"Could not quarantine invalid output {self.output_dir}: {qe}"
+                )
+            if backup_dir.exists() and not self.output_dir.exists():
+                try:
+                    os.replace(backup_dir, self.output_dir)
+                    logger.warning(
+                        f"Restored previous valid partition after invalid publish: "
+                        f"{self.output_dir}"
+                    )
+                except Exception as restore_err:
+                    logger.error(
+                        f"Could not restore backup partition {backup_dir} after "
+                        f"invalid publish: {restore_err}"
+                    )
+            raise RuntimeError(
+                f"Post-publish validation failed for {self.output_dir}; refusing "
+                "to report success. Previous valid partition preserved/restored "
+                "where possible; invalid output quarantined at "
+                f"{quarantine_dir}."
+            )
 
-        # Step 4: delete obsolete backup on a best-effort basis.
-        # A failure here must NOT cause publish() to raise or the build to fail.
+        # Step 4: new canonical partition is valid — delete the obsolete
+        # backup on a best-effort basis. A failure here must NOT cause
+        # publish() to raise or the build to fail, since the new partition is
+        # already confirmed valid.
         if backup_dir.exists():
             try:
                 shutil.rmtree(backup_dir)

@@ -93,6 +93,123 @@ An entry may be skipped **only** for:
 - <or "none — task fully completed">
 ```
 
+## 2026-07-22 — PR #18 final Codex findings: post-publish validation, cleanup-failure preservation, force-rebuild backup safety, converter doc consistency
+
+### Change summary
+- `stores/replay_writer.py`: extracted `validate_partition(partition_dir)` as a
+  single shared source of truth for partition validity (manifest exists,
+  parses, `status == "complete"`, both parquet files exist, checksums match).
+  `publish()` now calls it immediately after `os.replace(staging, output)`
+  succeeds. If validation fails, the invalid new output is quarantined to
+  `.quarantine_{date}_{symbol}`, the previous valid backup (if any) is
+  restored to canonical, and `publish()` raises `RuntimeError` instead of
+  returning normally — closing the P1 gap where a missing/corrupt post-replace
+  destination could still report `status="success"`. The obsolete backup is
+  now deleted only *after* the new canonical partition validates (never
+  before).
+- `pipeline/build_replay_store.py`: `_partition_is_valid()` now delegates to
+  `stores.replay_writer.validate_partition()` instead of duplicating checksum
+  logic, so ReplayWriter's post-publish check and the skip-if-valid/crash-
+  recovery check can never disagree about what "valid" means.
+- `pipeline/build_replay_store.py`: the primary-failure exception handler in
+  `build_replay_for_symbol()` now wraps `writer.cleanup_staging()` in its own
+  `try/except`. A secondary cleanup failure is appended to `status["errors"]`
+  alongside the primary failure instead of escaping and replacing the handled
+  per-symbol result — closing the P1 gap where `run_build_replay_store()`
+  could stop mid-loop on a cleanup exception.
+- `pipeline/build_replay_store.py`: removed the `force=True` pre-build block
+  that blindly deleted `.backup_*` before any replacement had been built or
+  validated. `recover_partition_state()` now runs unconditionally (even under
+  `force=True`); a `fail` action (ambiguous/invalid states) still fails
+  closed under `--force`, and a `skip` action under `force=True` falls through
+  to rebuild instead of returning `skipped` — but no longer deletes the
+  backup pre-emptively. The existing `publish()` backup<-canonical<-staging
+  rotation now naturally protects the last known-good copy through forced
+  rebuild failures.
+- `docs/IMPLEMENTATION_AUDIT.md`: corrected the current-state claim that
+  `systemd/cryptorecorder-convert.service`/`.timer` "are kept in the repo as
+  manual/reference templates" — they were deleted in PR #18 finalization.
+- `CHANGELOG.md`: reworded a quoted description of the old INSTALL.md note so
+  it no longer contains the literal stale-claim phrase itself.
+- `tests/test_repo_structure.py`: added
+  `test_docs_do_not_claim_deleted_converter_systemd_files_exist()` — a guard
+  test asserting both converter unit files stay deleted and that no
+  current-state doc (excluding the append-only `docs/CHANGE_AUDIT.md` log)
+  claims they still exist as manual/reference templates.
+- `tests/test_replay_memory_bounded.py`: 13 new tests covering post-publish
+  validation (normal success, fault-injected missing output, corrupt
+  manifest, checksum mismatch, backup-not-deleted-until-validated, backup
+  still deleted on validated success), cleanup-failure preservation (single
+  symbol + multi-symbol continuation), and all 5 required `--force` rebuild
+  scenarios (valid/no-backup success and failure, missing-canonical/valid-
+  backup success and failure, invalid-canonical/valid-backup preserved).
+
+### Files/packages touched
+- `stores/replay_writer.py`
+- `pipeline/build_replay_store.py`
+- `tests/test_replay_memory_bounded.py`
+- `tests/test_repo_structure.py`
+- `docs/IMPLEMENTATION_AUDIT.md`
+- `CHANGELOG.md`
+- `docs/CHANGE_AUDIT.md`
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] docs/REPO_STRUCTURE.md
+- [x] docs/PROJECT_STATUS.md
+- [x] docs/IMPLEMENTATION_AUDIT.md
+- [x] relevant feature docs: docs/REPLAY_STORE.md, docs/DAILY_BUILD_PIPELINE.md
+
+### Docs updated
+- [x] CHANGELOG.md
+- [x] docs/IMPLEMENTATION_AUDIT.md
+- No docs/PROJECT_STATUS.md update required: validated/deferred status unchanged
+- No docs/REPO_STRUCTURE.md update required: no folder/file contract change
+  (no files added or removed in this pass — the converter systemd files were
+  already deleted in the prior commit)
+
+### Status / validation impact
+- Validated status changed: no
+- Deferred status changed: no
+- New claims added: no
+- Evidence: n/a — correctness/safety fixes with no new validation paths
+
+### Tests run
+```bash
+pytest tests/test_replay_memory_bounded.py -q     # 47 passed
+pytest tests/test_daily_build.py -q                # 9 passed
+pytest tests/test_replay_store.py -q               # 3 passed
+pytest tests/test_replay_catalog_reconstruct.py -q # 4 passed
+pytest tests/test_catalog_equivalence_full_l2.py -q # 2 passed
+pytest tests/test_agent_infrastructure.py -q        # 28 passed
+pytest tests/test_repo_structure.py -q              # 23 passed
+pytest -q                                           # 331 passed, 3 skipped
+```
+
+### Validation CLIs run
+```bash
+python -m validation.audit_change_compliance --base main   # PASS
+bash -n scripts/deploy_linux_server.sh                       # OK (no output = valid syntax)
+systemd-analyze verify systemd/cryptorecorder-replay-build.service
+  # Fails on this dev machine: references production path
+  # /home/zsom/services/CryptoRecorder/.venv/bin/python, which does not exist
+  # here. Pre-existing condition unrelated to this change; not a regression.
+./scripts/deploy_linux_server.sh --target all --dry-run
+  # Confirms only cryptorecorder-recorder.service,
+  # cryptorecorder-replay-build.service, cryptorecorder-replay-build.timer are
+  # targeted; no converter unit referenced.
+```
+
+### Known limitations / out of scope
+- Real Linux production service validation (actual systemd start/enable on
+  the production host) was not performed and is out of scope for a dev-machine
+  change; noted as pending in the PR comment.
+- No changes to recorder.py, raw schema, replay schema, replay ordering,
+  Nautilus reconstruction, Syncthing, KovacsTrader integration, or the uv
+  migration (issue #20).
+- Merge remains deferred; this change is pushed to
+  `refactor/recorder-replay-only` only.
+
 ## 2026-07-22 — PR #18 finalization: fail-closed crash-recovery state machine, best-effort backup deletion, converter systemd files deleted
 
 ### Change summary

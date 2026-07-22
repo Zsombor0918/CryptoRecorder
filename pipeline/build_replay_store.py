@@ -17,7 +17,7 @@ from typing import Optional
 
 from config import DATA_ROOT, REPLAY_ROOT
 from converter.readers import stream_raw_records
-from stores.replay_writer import ReplayWriter
+from stores.replay_writer import ReplayWriter, validate_partition
 
 logger = logging.getLogger(__name__)
 
@@ -241,38 +241,12 @@ def _partition_is_valid(
     """Return True only if the partition is complete with a valid manifest and files.
 
     Pass _candidate to validate an alternate directory (e.g. a backup) instead
-    of the canonical output location.
+    of the canonical output location. Delegates to
+    stores.replay_writer.validate_partition() so ReplayWriter's post-publish
+    check and this skip-if-valid/crash-recovery check share one definition.
     """
     out_dir = _candidate or replay_root / f"venue={venue}" / f"symbol={symbol}" / f"date={date}"
-    manifest_path = out_dir / "manifest.json"
-    depth_path = out_dir / "depth.parquet"
-    trades_path = out_dir / "trades.parquet"
-    if not (manifest_path.exists() and depth_path.exists() and trades_path.exists()):
-        return False
-    try:
-        with open(manifest_path) as f:
-            manifest = json.load(f)
-        if manifest.get("status") != "complete":
-            return False
-        # Verify checksums
-        import hashlib
-        for key, path in (("depth_checksum", depth_path), ("trades_checksum", trades_path)):
-            expected = manifest.get(key)
-            if not expected:
-                return False
-            h = hashlib.sha256()
-            with open(path, "rb") as f:
-                for chunk in iter(lambda: f.read(65536), b""):
-                    h.update(chunk)
-            if h.hexdigest() != expected:
-                logger.warning(
-                    f"Checksum mismatch for {venue}/{symbol}/{date} ({key}): skipping"
-                )
-                return False
-        return True
-    except Exception as e:
-        logger.warning(f"Partition validation failed for {venue}/{symbol}/{date}: {e}")
-        return False
+    return validate_partition(out_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -501,36 +475,33 @@ def build_replay_for_symbol(
 
     # ---------------------------------------------------------------
     # Crash-recovery: handle all possible backup/output state combinations
-    # before doing anything else.
+    # before doing anything else. This runs even when force=True: --force
+    # means "rebuild even when a valid canonical partition exists", not
+    # "delete recovery copies before a replacement is valid". Invalid or
+    # ambiguous states (recovery.action == "fail") must still fail closed
+    # under --force so a valid backup/canonical copy is never silently
+    # destroyed. The normal publish() flow (backup <- canonical <- staging)
+    # protects the current valid partition through the forced rebuild
+    # without any separate pre-build backup deletion.
     # ---------------------------------------------------------------
-    if not force:
-        recovery = recover_partition_state(replay_root, venue, symbol, date)
-        if recovery.action == "fail":
-            status["status"] = "failed"
-            status["errors"].append(recovery.message)
-            logger.error(recovery.message)
-            return status
-        if recovery.action == "skip":
-            # Partition is valid (possibly just restored from backup).
-            logger.info(
-                f"⏭ Skipping already-complete partition: {venue}/{symbol}/{date}"
-            )
-            status["status"] = "skipped"
-            return status
-        # action == "rebuild" — fall through to build.
-
-    # When force=True, skip crash-recovery and proceed directly to rebuild.
-    # Remove any leftover backup dir so publish() does not get confused.
-    if force:
-        backup_dir = (
-            replay_root / f"venue={venue}" / f"symbol={symbol}"
-            / f".backup_{date}_{symbol}"
+    recovery = recover_partition_state(replay_root, venue, symbol, date)
+    if recovery.action == "fail":
+        status["status"] = "failed"
+        status["errors"].append(recovery.message)
+        logger.error(recovery.message)
+        return status
+    if recovery.action == "skip" and not force:
+        # Partition is valid (possibly just restored from backup).
+        logger.info(
+            f"Skipping already-complete partition: {venue}/{symbol}/{date}"
         )
-        if backup_dir.exists():
-            try:
-                _shutil.rmtree(backup_dir)
-            except Exception as e:
-                logger.warning(f"--force: could not remove backup {backup_dir}: {e}")
+        status["status"] = "skipped"
+        return status
+    # action == "rebuild", or (action == "skip" and force) -- fall through to
+    # build. In the force+skip case, recover_partition_state has already
+    # resolved any crash-left backup/canonical ambiguity, and the current
+    # valid canonical output (if any) will be moved into the backup slot by
+    # publish() itself, then deleted only after the replacement validates.
 
     # Remove stale staging directory from a previous SIGKILL so it cannot be
     # confused with a successful previous build.
@@ -633,11 +604,20 @@ def build_replay_for_symbol(
             f"({writer.depth_count} depth, {writer.trade_count} trades)"
         )
 
-    except Exception as e:
+    except Exception as primary_error:
         status["status"] = "failed"
-        status["errors"].append(str(e))
-        logger.error(f"✗ Failed to build replay for {venue}/{symbol}/{date}: {e}")
-        writer.cleanup_staging()
+        status["errors"].append(str(primary_error))
+        logger.error(
+            f"Failed to build replay for {venue}/{symbol}/{date}: {primary_error}"
+        )
+        try:
+            writer.cleanup_staging()
+        except Exception as cleanup_error:
+            status["errors"].append(f"Staging cleanup also failed: {cleanup_error}")
+            logger.error(
+                f"Staging cleanup also failed for {venue}/{symbol}/{date}: "
+                f"{cleanup_error}"
+            )
 
     return status
 

@@ -490,9 +490,13 @@ Manual scripts remain in:
   longer list `legacy-converter`; the "daily chain runs convert → replay"
   ordering claim was corrected (`replay-build` already reads directly from
   `data_raw` and never depended on converter output).
-- `systemd/cryptorecorder-convert.service` and `.timer` are kept in the repo
-  as manual/reference templates (marked as such in-file); they are not
-  rendered or installed by the deploy script for any target.
+- `systemd/cryptorecorder-convert.service` and `.timer` were deleted from the
+  repository in PR #18 finalization (2026-07-22) — converter systemd
+  automation is not part of the supported production architecture. Manual
+  reconstruction uses documented CLI commands (e.g.
+  `python convert_day.py --date YYYY-MM-DD --staging`), not systemd templates.
+  Stale installed converter units are still removed by
+  `scripts/deploy_linux_server.sh` cleanup (unchanged).
 
 See `CHANGELOG.md` `[Unreleased]` for the full change list.
 

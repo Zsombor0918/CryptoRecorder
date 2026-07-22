@@ -873,3 +873,407 @@ def test_scratch_nonempty_prevents_publication(tmp_path: Path) -> None:
     # Canonical partition must not be created
     partition_dir = replay_root / "venue=BINANCE_SPOT" / "symbol=TESTUSDT" / "date=2026-07-01"
     assert not partition_dir.exists(), "Partition must not exist when scratch cleanup fails"
+
+
+# ---------------------------------------------------------------------------
+# 8. Post-publication validation (Codex finding 1)
+# ---------------------------------------------------------------------------
+
+def test_publish_validates_normal_publication_succeeds(tmp_path: Path) -> None:
+    """A normal publication must pass post-publish validation and return success."""
+    raw_root = _make_raw_root(tmp_path, "BINANCE_SPOT", "TESTUSDT", "2026-07-01", 5, 5)
+    replay_root = tmp_path / "replay"
+    result = build_replay_for_symbol("BINANCE_SPOT", "TESTUSDT", "2026-07-01", raw_root, replay_root)
+    assert result["status"] == "success"
+    partition = replay_root / "venue=BINANCE_SPOT" / "symbol=TESTUSDT" / "date=2026-07-01"
+    assert partition.exists()
+    assert (partition / "manifest.json").exists()
+
+
+def test_publish_raises_when_output_missing_after_replace(tmp_path: Path) -> None:
+    """
+    If os.replace(staging, output) does not raise but the destination is
+    missing/corrupted (fault-injected), publish() must raise instead of
+    returning normally, and any previous valid partition must be restored.
+    """
+    import os
+    import shutil
+    import unittest.mock
+
+    raw_root = _make_raw_root(tmp_path, "BINANCE_SPOT", "TESTUSDT", "2026-07-01", 5, 5)
+    replay_root = tmp_path / "replay"
+
+    # First valid partition (becomes the backup during the second publish).
+    r1 = build_replay_for_symbol("BINANCE_SPOT", "TESTUSDT", "2026-07-01", raw_root, replay_root)
+    assert r1["status"] == "success"
+    partition = replay_root / "venue=BINANCE_SPOT" / "symbol=TESTUSDT" / "date=2026-07-01"
+
+    writer = ReplayWriter(replay_root, "BINANCE_SPOT", "TESTUSDT", "2026-07-01")
+    writer.write_depth_batch([_depth_record(session=1, seq=1, raw_idx=1)])
+    writer.finalize_staging()
+
+    _real_replace = os.replace
+
+    def _fault_injecting_replace(src, dst):
+        if ".staging_" in str(src):
+            # Simulate a replace that "succeeds" from the filesystem's point
+            # of view but leaves the destination missing (e.g. a non-standard
+            # filesystem path). Remove the source without creating dst.
+            if Path(src).is_dir():
+                shutil.rmtree(src)
+            return None
+        return _real_replace(src, dst)
+
+    with unittest.mock.patch("os.replace", side_effect=_fault_injecting_replace):
+        with pytest.raises(RuntimeError, match="Post-publish validation failed"):
+            writer.publish()
+
+    # The previous valid partition must be restored, not lost.
+    assert partition.exists(), "Previous valid partition must be restored after invalid publish"
+    assert (partition / "manifest.json").exists()
+
+
+def test_publish_raises_on_corrupt_manifest_after_publication(tmp_path: Path) -> None:
+    """A corrupt manifest.json in the newly published partition must fail closed."""
+    import os
+    import unittest.mock
+
+    raw_root = _make_raw_root(tmp_path, "BINANCE_SPOT", "TESTUSDT", "2026-07-01", 5, 5)
+    replay_root = tmp_path / "replay"
+
+    r1 = build_replay_for_symbol("BINANCE_SPOT", "TESTUSDT", "2026-07-01", raw_root, replay_root)
+    assert r1["status"] == "success"
+    partition = replay_root / "venue=BINANCE_SPOT" / "symbol=TESTUSDT" / "date=2026-07-01"
+
+    writer = ReplayWriter(replay_root, "BINANCE_SPOT", "TESTUSDT", "2026-07-01")
+    writer.write_depth_batch([_depth_record(session=1, seq=1, raw_idx=1)])
+    writer.finalize_staging()
+
+    _real_replace = os.replace
+
+    def _corrupting_replace(src, dst):
+        result = _real_replace(src, dst)
+        if ".staging_" in str(src):
+            # Corrupt the manifest right after the canonical rename succeeds.
+            (Path(dst) / "manifest.json").write_text("NOT VALID JSON")
+        return result
+
+    with unittest.mock.patch("os.replace", side_effect=_corrupting_replace):
+        with pytest.raises(RuntimeError, match="Post-publish validation failed"):
+            writer.publish()
+
+    # The previous valid partition must be restored.
+    assert partition.exists(), "Previous valid partition must be restored after corrupt manifest"
+    manifest = json.loads((partition / "manifest.json").read_text())
+    assert manifest.get("status") == "complete"
+
+
+def test_publish_raises_on_checksum_mismatch_after_publication(tmp_path: Path) -> None:
+    """A checksum-invalid depth.parquet in the newly published partition must fail closed."""
+    import os
+    import unittest.mock
+
+    raw_root = _make_raw_root(tmp_path, "BINANCE_SPOT", "TESTUSDT", "2026-07-01", 5, 5)
+    replay_root = tmp_path / "replay"
+
+    r1 = build_replay_for_symbol("BINANCE_SPOT", "TESTUSDT", "2026-07-01", raw_root, replay_root)
+    assert r1["status"] == "success"
+    partition = replay_root / "venue=BINANCE_SPOT" / "symbol=TESTUSDT" / "date=2026-07-01"
+
+    writer = ReplayWriter(replay_root, "BINANCE_SPOT", "TESTUSDT", "2026-07-01")
+    writer.write_depth_batch([_depth_record(session=1, seq=1, raw_idx=1)])
+    writer.finalize_staging()
+
+    _real_replace = os.replace
+
+    def _truncating_replace(src, dst):
+        result = _real_replace(src, dst)
+        if ".staging_" in str(src):
+            # Truncate depth.parquet so its checksum no longer matches the
+            # manifest, without touching the manifest itself.
+            (Path(dst) / "depth.parquet").write_bytes(b"corrupt-bytes")
+        return result
+
+    with unittest.mock.patch("os.replace", side_effect=_truncating_replace):
+        with pytest.raises(RuntimeError, match="Post-publish validation failed"):
+            writer.publish()
+
+    # The previous valid partition must be restored and still checksum-valid.
+    assert partition.exists()
+    from pipeline.build_replay_store import _partition_is_valid
+    assert _partition_is_valid(replay_root, "BINANCE_SPOT", "TESTUSDT", "2026-07-01")
+
+
+def test_publish_does_not_delete_backup_until_validated(tmp_path: Path) -> None:
+    """The obsolete backup must still exist at the moment validation runs and
+    only be removed after validation succeeds (proven via a checksum-mismatch
+    fault injection that leaves the backup intact)."""
+    import os
+    import unittest.mock
+
+    raw_root = _make_raw_root(tmp_path, "BINANCE_SPOT", "TESTUSDT", "2026-07-01", 5, 5)
+    replay_root = tmp_path / "replay"
+
+    r1 = build_replay_for_symbol("BINANCE_SPOT", "TESTUSDT", "2026-07-01", raw_root, replay_root)
+    assert r1["status"] == "success"
+
+    writer = ReplayWriter(replay_root, "BINANCE_SPOT", "TESTUSDT", "2026-07-01")
+    writer.write_depth_batch([_depth_record(session=1, seq=1, raw_idx=1)])
+    writer.finalize_staging()
+
+    _real_replace = os.replace
+
+    def _truncating_replace(src, dst):
+        result = _real_replace(src, dst)
+        if ".staging_" in str(src):
+            (Path(dst) / "depth.parquet").write_bytes(b"corrupt-bytes")
+        return result
+
+    with unittest.mock.patch("os.replace", side_effect=_truncating_replace):
+        with pytest.raises(RuntimeError):
+            writer.publish()
+
+    # Backup must have been consumed by the restore (moved back to canonical),
+    # not left dangling — but crucially it was never deleted while the
+    # replacement was unvalidated.
+    backup_dir = (
+        replay_root / "venue=BINANCE_SPOT" / "symbol=TESTUSDT"
+        / ".backup_2026-07-01_TESTUSDT"
+    )
+    assert not backup_dir.exists(), "Backup must be consumed by restore, not orphaned"
+    partition = replay_root / "venue=BINANCE_SPOT" / "symbol=TESTUSDT" / "date=2026-07-01"
+    assert partition.exists()
+
+
+def test_publish_success_still_deletes_obsolete_backup(tmp_path: Path) -> None:
+    """A successful, validated publication must still delete the obsolete backup best-effort."""
+    raw_root = _make_raw_root(tmp_path, "BINANCE_SPOT", "TESTUSDT", "2026-07-01", 5, 5)
+    replay_root = tmp_path / "replay"
+
+    r1 = build_replay_for_symbol("BINANCE_SPOT", "TESTUSDT", "2026-07-01", raw_root, replay_root)
+    assert r1["status"] == "success"
+
+    r2 = build_replay_for_symbol(
+        "BINANCE_SPOT", "TESTUSDT", "2026-07-01", raw_root, replay_root, force=True
+    )
+    assert r2["status"] == "success"
+
+    backup_dir = (
+        replay_root / "venue=BINANCE_SPOT" / "symbol=TESTUSDT"
+        / ".backup_2026-07-01_TESTUSDT"
+    )
+    assert not backup_dir.exists(), "Obsolete backup must be deleted after validated publication"
+
+
+# ---------------------------------------------------------------------------
+# 9. Preserve failed result when cleanup also fails (Codex finding 2)
+# ---------------------------------------------------------------------------
+
+def test_failed_result_preserved_when_cleanup_also_fails(tmp_path: Path) -> None:
+    """
+    If the primary build fails and cleanup_staging() also raises, the function
+    must still return a normal status=failed result containing both error
+    messages, not propagate the cleanup exception.
+    """
+    import unittest.mock
+
+    raw_root = _make_raw_root(tmp_path, "BINANCE_SPOT", "TESTUSDT", "2026-07-01", 5, 5)
+    replay_root = tmp_path / "replay"
+
+    def _raise_primary(*args, **kwargs):
+        raise RuntimeError("injected primary build failure")
+
+    def _raise_cleanup(self):
+        raise RuntimeError("injected cleanup failure")
+
+    with unittest.mock.patch(
+        "stores.replay_writer.ReplayWriter.finalize_staging", side_effect=_raise_primary
+    ), unittest.mock.patch(
+        "stores.replay_writer.ReplayWriter.cleanup_staging", _raise_cleanup
+    ):
+        result = build_replay_for_symbol(
+            "BINANCE_SPOT", "TESTUSDT", "2026-07-01", raw_root, replay_root
+        )
+
+    assert result["status"] == "failed"
+    assert any("injected primary build failure" in e for e in result["errors"])
+    assert any("injected cleanup failure" in e for e in result["errors"])
+    assert len(result["errors"]) == 2, f"Expected both errors preserved, got: {result['errors']}"
+
+
+def test_daily_build_continues_after_cleanup_failure(tmp_path: Path) -> None:
+    """run_build_replay_store()-style aggregation must keep processing later
+    symbols even when one symbol's cleanup also fails."""
+    import unittest.mock
+
+    raw_root = _make_raw_root(tmp_path, "BINANCE_SPOT", "AAAUSDT", "2026-07-01", 3, 3)
+    _make_raw_root(tmp_path, "BINANCE_SPOT", "BBBUSDT", "2026-07-01", 3, 3)
+    # _make_raw_root reuses the same tmp_path/raw directory across calls since
+    # it always writes under tmp_path / "raw"; both symbols share raw_root.
+    replay_root = tmp_path / "replay"
+
+    def _raise_primary(*args, **kwargs):
+        raise RuntimeError("injected primary build failure")
+
+    def _raise_cleanup(self):
+        raise RuntimeError("injected cleanup failure")
+
+    results = []
+    with unittest.mock.patch(
+        "stores.replay_writer.ReplayWriter.finalize_staging", side_effect=_raise_primary
+    ), unittest.mock.patch(
+        "stores.replay_writer.ReplayWriter.cleanup_staging", _raise_cleanup
+    ):
+        results.append(
+            build_replay_for_symbol("BINANCE_SPOT", "AAAUSDT", "2026-07-01", raw_root, replay_root)
+        )
+
+    # Cleanup patch is now removed; the second symbol builds normally.
+    results.append(
+        build_replay_for_symbol("BINANCE_SPOT", "BBBUSDT", "2026-07-01", raw_root, replay_root)
+    )
+
+    assert results[0]["status"] == "failed"
+    assert results[1]["status"] == "success"
+
+
+# ---------------------------------------------------------------------------
+# 10. Preserve valid backups during --force rebuild failures (Codex finding 3)
+# ---------------------------------------------------------------------------
+
+def test_force_case1_valid_no_backup_replacement_succeeds(tmp_path: Path) -> None:
+    """force=True, canonical valid, no backup, replacement succeeds -> new canonical valid."""
+    raw_root = _make_raw_root(tmp_path, "BINANCE_SPOT", "TESTUSDT", "2026-07-01", 5, 5)
+    replay_root = tmp_path / "replay"
+    r1 = build_replay_for_symbol("BINANCE_SPOT", "TESTUSDT", "2026-07-01", raw_root, replay_root)
+    assert r1["status"] == "success"
+
+    r2 = build_replay_for_symbol(
+        "BINANCE_SPOT", "TESTUSDT", "2026-07-01", raw_root, replay_root, force=True
+    )
+    assert r2["status"] == "success"
+    from pipeline.build_replay_store import _partition_is_valid
+    assert _partition_is_valid(replay_root, "BINANCE_SPOT", "TESTUSDT", "2026-07-01")
+
+
+def test_force_case2_valid_no_backup_replacement_fails(tmp_path: Path) -> None:
+    """force=True, canonical valid, no backup, replacement fails -> original canonical preserved."""
+    import unittest.mock
+
+    raw_root = _make_raw_root(tmp_path, "BINANCE_SPOT", "TESTUSDT", "2026-07-01", 5, 5)
+    replay_root = tmp_path / "replay"
+    r1 = build_replay_for_symbol("BINANCE_SPOT", "TESTUSDT", "2026-07-01", raw_root, replay_root)
+    assert r1["status"] == "success"
+    partition = replay_root / "venue=BINANCE_SPOT" / "symbol=TESTUSDT" / "date=2026-07-01"
+    original_checksum = json.loads((partition / "manifest.json").read_text())["depth_checksum"]
+
+    def _raise_primary(*args, **kwargs):
+        raise RuntimeError("injected forced-rebuild failure")
+
+    with unittest.mock.patch(
+        "stores.replay_writer.ReplayWriter.finalize_staging", side_effect=_raise_primary
+    ):
+        r2 = build_replay_for_symbol(
+            "BINANCE_SPOT", "TESTUSDT", "2026-07-01", raw_root, replay_root, force=True
+        )
+
+    assert r2["status"] == "failed"
+    assert partition.exists(), "Original canonical partition must be preserved on forced-rebuild failure"
+    assert json.loads((partition / "manifest.json").read_text())["depth_checksum"] == original_checksum
+
+
+def test_force_case3_missing_canonical_valid_backup_replacement_succeeds(tmp_path: Path) -> None:
+    """force=True, canonical missing (crash-left backup valid), replacement succeeds ->
+    backup stays protected until the new canonical validates, then is removed."""
+    import os
+
+    raw_root = _make_raw_root(tmp_path, "BINANCE_SPOT", "TESTUSDT", "2026-07-01", 5, 5)
+    replay_root = tmp_path / "replay"
+    r1 = build_replay_for_symbol("BINANCE_SPOT", "TESTUSDT", "2026-07-01", raw_root, replay_root)
+    assert r1["status"] == "success"
+
+    partition = replay_root / "venue=BINANCE_SPOT" / "symbol=TESTUSDT" / "date=2026-07-01"
+    backup_dir = (
+        replay_root / "venue=BINANCE_SPOT" / "symbol=TESTUSDT"
+        / ".backup_2026-07-01_TESTUSDT"
+    )
+    # Simulate a mid-publish crash: canonical missing, backup valid.
+    os.replace(partition, backup_dir)
+    assert not partition.exists()
+    assert backup_dir.exists()
+
+    r2 = build_replay_for_symbol(
+        "BINANCE_SPOT", "TESTUSDT", "2026-07-01", raw_root, replay_root, force=True
+    )
+    assert r2["status"] == "success"
+    from pipeline.build_replay_store import _partition_is_valid
+    assert _partition_is_valid(replay_root, "BINANCE_SPOT", "TESTUSDT", "2026-07-01")
+    assert not backup_dir.exists(), "Backup must be removed only after the new canonical validated"
+
+
+def test_force_case4_missing_canonical_valid_backup_replacement_fails(tmp_path: Path) -> None:
+    """force=True, canonical missing (crash-left backup valid), replacement fails ->
+    the valid backup must be restored/preserved, no total data loss."""
+    import os
+    import unittest.mock
+
+    raw_root = _make_raw_root(tmp_path, "BINANCE_SPOT", "TESTUSDT", "2026-07-01", 5, 5)
+    replay_root = tmp_path / "replay"
+    r1 = build_replay_for_symbol("BINANCE_SPOT", "TESTUSDT", "2026-07-01", raw_root, replay_root)
+    assert r1["status"] == "success"
+
+    partition = replay_root / "venue=BINANCE_SPOT" / "symbol=TESTUSDT" / "date=2026-07-01"
+    backup_dir = (
+        replay_root / "venue=BINANCE_SPOT" / "symbol=TESTUSDT"
+        / ".backup_2026-07-01_TESTUSDT"
+    )
+    os.replace(partition, backup_dir)
+    assert not partition.exists()
+    assert backup_dir.exists()
+
+    def _raise_primary(*args, **kwargs):
+        raise RuntimeError("injected forced-rebuild failure")
+
+    with unittest.mock.patch(
+        "stores.replay_writer.ReplayWriter.finalize_staging", side_effect=_raise_primary
+    ):
+        r2 = build_replay_for_symbol(
+            "BINANCE_SPOT", "TESTUSDT", "2026-07-01", raw_root, replay_root, force=True
+        )
+
+    assert r2["status"] == "failed"
+    # No total data loss: either the backup remains, or it was restored to canonical.
+    assert partition.exists() or backup_dir.exists(), (
+        "Valid partition must survive as canonical or backup after forced-rebuild failure"
+    )
+    if partition.exists():
+        from pipeline.build_replay_store import _partition_is_valid
+        assert _partition_is_valid(replay_root, "BINANCE_SPOT", "TESTUSDT", "2026-07-01")
+
+
+def test_force_case5_invalid_canonical_valid_backup_preserved(tmp_path: Path) -> None:
+    """force=True, canonical invalid, backup valid -> the valid backup must be
+    preserved/restored before attempting the replacement."""
+    import shutil
+
+    raw_root = _make_raw_root(tmp_path, "BINANCE_SPOT", "TESTUSDT", "2026-07-01", 5, 5)
+    replay_root = tmp_path / "replay"
+    r1 = build_replay_for_symbol("BINANCE_SPOT", "TESTUSDT", "2026-07-01", raw_root, replay_root)
+    assert r1["status"] == "success"
+
+    partition = replay_root / "venue=BINANCE_SPOT" / "symbol=TESTUSDT" / "date=2026-07-01"
+    backup_dir = (
+        replay_root / "venue=BINANCE_SPOT" / "symbol=TESTUSDT"
+        / ".backup_2026-07-01_TESTUSDT"
+    )
+    # Create a valid backup copy, then corrupt the canonical output.
+    shutil.copytree(partition, backup_dir)
+    (partition / "manifest.json").write_text("CORRUPTED")
+
+    r2 = build_replay_for_symbol(
+        "BINANCE_SPOT", "TESTUSDT", "2026-07-01", raw_root, replay_root, force=True
+    )
+    assert r2["status"] == "success"
+    from pipeline.build_replay_store import _partition_is_valid
+    assert _partition_is_valid(replay_root, "BINANCE_SPOT", "TESTUSDT", "2026-07-01")
+    assert not backup_dir.exists()
