@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from config import DATA_ROOT, REPLAY_ROOT, REPLAY_SPOOL_TEMP_DIR
+from config import DATA_ROOT, REPLAY_ROOT
 from converter.readers import stream_raw_records
 from stores.replay_writer import ReplayWriter
 
@@ -269,12 +269,16 @@ def build_replay_for_symbol(
     date: str,
     data_root: Path,
     replay_root: Path,
+    *,
+    force: bool = False,
 ) -> dict:
     """
     Build replay store for a single venue/symbol/date.
 
     Skips partitions that already have a complete, checksum-valid manifest so
     that restarted runs make durable progress without rebuilding earlier work.
+    Pass force=True to rebuild even when a valid partition already exists (use
+    after raw data has been repaired or backfilled).
 
     Returns:
         Status dict with counts and errors.
@@ -289,8 +293,8 @@ def build_replay_for_symbol(
         "errors": [],
     }
 
-    # Skip already-complete valid partitions
-    if _partition_is_valid(replay_root, venue, symbol, date):
+    # Skip already-complete valid partitions (unless force rebuild requested).
+    if not force and _partition_is_valid(replay_root, venue, symbol, date):
         logger.info(
             f"⏭ Skipping already-complete partition: {venue}/{symbol}/{date}"
         )
@@ -310,7 +314,6 @@ def build_replay_for_symbol(
 
     writer = ReplayWriter(
         replay_root, venue, symbol, date,
-        spool_temp_dir=REPLAY_SPOOL_TEMP_DIR,
     )
 
     try:
@@ -427,6 +430,13 @@ Examples:
         default=None,
         help=f"Replay root (default: {REPLAY_ROOT})",
     )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        default=False,
+        help="Rebuild partition even if it already has a valid complete manifest "
+             "(use after raw data has been repaired or backfilled)",
+    )
     args = parser.parse_args()
 
     data_root = args.data_root or DATA_ROOT
@@ -459,7 +469,10 @@ Examples:
     for venue in venues:
         for symbol in symbols_to_build:
             if symbol in coverage["data"].get(venue, {}):
-                result = build_replay_for_symbol(venue, symbol, date_str, data_root, replay_root)
+                result = build_replay_for_symbol(
+                    venue, symbol, date_str, data_root, replay_root,
+                    force=args.force,
+                )
                 results.append(result)
 
     # Summary

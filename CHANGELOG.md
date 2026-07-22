@@ -66,7 +66,65 @@ passes.** Until then, broader full-L2 equivalence stays **deferred** (see
 
 ## [Unreleased]
 
-### Fixed (PR #18 — memory-bounded replay-store building)
+### Fixed (PR #18 — spool lifetime, atomic publication, force-rebuild)
+- **`stores/replay_writer.py` — spool files now live inside `staging_dir/scratch/`**
+  — previously spool files were created in the system temp directory
+  (`/tmp` or `CRYPTO_RECORDER_REPLAY_SPOOL_TEMP_DIR`). On a SIGKILL/OOM,
+  Python cleanup cannot run so orphaned multi-GiB SQLite files remained on
+  disk indefinitely. Spools are now created under
+  `staging_dir/scratch/` so that the existing stale-staging cleanup
+  (`shutil.rmtree(.staging_*)`) removes both the partial Parquet output and
+  all spool files in one step. The spool temp dir config is removed from the
+  construction path (spools are always co-located with staging).
+- **`stores/replay_writer.py` — `publish()` backup/restore for atomic
+  publication** — the previous implementation called
+  `shutil.rmtree(output_dir)` before `os.replace(staging, output)`. If
+  `os.replace()` failed (I/O error, permissions, filesystem issue), the
+  previously valid partition was already deleted. The fixed implementation:
+  renames the existing valid partition to `.backup_{date}_{symbol}`, then
+  calls `os.replace(staging, output)`, removes the backup on success, and
+  restores the backup on failure. The valid published store is never lost.
+- **`pipeline/build_replay_store.py` — `--force` flag and `force` parameter**
+  — skip-if-valid only checks output integrity, not whether the raw inputs
+  have changed or been backfilled. `--force` / `force=True` rebuilds even
+  a fully valid partition. Documents the provenance contract: without
+  `--force`, a complete checksum-valid partition is always skipped.
+
+### Added (PR #18 — spool/publication regression tests)
+- `test_spool_files_live_inside_staging_dir` — verifies spool files are under
+  `staging_dir/scratch`, not in `/tmp`.
+- `test_stale_staging_cleanup_removes_spools` — simulates a SIGKILL by
+  creating a stale staging+scratch+fake-spool, confirms the next build
+  removes them and succeeds.
+- `test_publish_preserves_existing_partition_on_replace_error` — injects a
+  failure at `os.replace(staging→output)` and confirms the original
+  partition is restored intact.
+- `test_force_rebuild_overrides_valid_partition` — confirms `force=True`
+  rebuilds a partition that would otherwise be skipped.
+
+### Real-data memory evidence (BTCUSDT 2026-06-12, local development machine)
+
+```
+Symbol:       BTCUSDT (heaviest locally available: 509 MB raw)
+Venues:       BINANCE_SPOT + BINANCE_USDTF
+Records:      835,403 depth + 3,112,086 trades (SPOT)
+              563,875 depth + 3,200,399 trades (USDTF)
+Exit status:  0 (success)
+Elapsed:      10:30 wall-clock
+Maximum RSS:  855,432 kB (~835 MiB)
+Limit:        12,288,000 kB (12 GiB systemd MemoryMax)
+Headroom:     ~93% free (835 MiB of 12 GiB)
+```
+
+Command used:
+```
+/usr/bin/time -v python -m pipeline.build_replay_store \
+  --date 2026-06-12 --symbols BTCUSDT \
+  --data-root data_raw \
+  --replay-root /tmp/test_replay_btcusdt_<ts>
+```
+
+
 - **`stores/replay_writer.py` — replace unbounded Python-list accumulation with
   disk-backed SQLite spooling** — the previous implementation retained all
   depth and trade records for an entire symbol/day in `depth_batches` and

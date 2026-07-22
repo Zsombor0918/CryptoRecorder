@@ -131,25 +131,6 @@ book checkpoints    7/7 match, no crossed books
 Report: `validation_reports/full_l2_equivalence_2026-06-12_ADAUSDT.json` (local,
 gitignored). This is a single-symbol, single-day smoke — not a universe benchmark.
 
-Feature audit for `2026-06-12`, `BINANCE_SPOT/ADAUSDT`, `1m`:
-
-```text
-actual_row_count: 1428
-expected_dense_row_count: 1440
-outside_date_rows: 0
-duplicate_timestamp_count: 0
-missing_windows_count_if_dense: 12
-all-null examples: return_1s, return_5s, return_10s, return_30s, return_1m
-```
-
-This confirms the feature store is UTC-day clamped and sparse. It does not force a dense full-day grid.
-
-Report path from the local run:
-
-```text
-/tmp/cryptorecorder-equivalence-smoke-20260616/catalog_equivalence_2026-06-12.json
-```
-
 ## Deferred
 
 Broader `full_l2` validation across the top50 universe and multiple days is not

@@ -49,16 +49,6 @@ REPLAY_ROOT: Final = Path(
     os.environ.get("CRYPTO_RECORDER_REPLAY_ROOT", "/data/cryptorecorder/replay_store")
 ).expanduser()
 
-# Temporary spool directory for bounded replay-store building.
-# Defaults to a subdirectory of the replay root on the same data filesystem
-# so that large SQLite spools do not land on a small root filesystem under
-# /tmp.  Override with CRYPTO_RECORDER_REPLAY_SPOOL_TEMP_DIR if desired.
-REPLAY_SPOOL_TEMP_DIR: Final[Path | None] = (
-    Path(os.environ["CRYPTO_RECORDER_REPLAY_SPOOL_TEMP_DIR"]).expanduser()
-    if os.environ.get("CRYPTO_RECORDER_REPLAY_SPOOL_TEMP_DIR")
-    else None
-)
-
 # Daily build reports
 DAILY_REPORT_ROOT: Final = Path(
     os.environ.get("CRYPTO_RECORDER_DAILY_REPORT_ROOT", str(STATE_ROOT / "daily_build_reports"))

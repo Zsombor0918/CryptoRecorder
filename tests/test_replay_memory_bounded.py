@@ -463,3 +463,101 @@ def test_cross_batch_ordering_is_deterministic(tmp_path: Path) -> None:
     seqs = tbl.column("session_seq").to_pylist()
     assert seqs == sorted(seqs), f"Not sorted: {seqs}"
     assert len(seqs) == 12
+
+
+# ---------------------------------------------------------------------------
+# Spool lifetime — spools live inside staging dir
+# ---------------------------------------------------------------------------
+
+def test_spool_files_live_inside_staging_dir(tmp_path: Path) -> None:
+    """SQLite spool files must be created inside staging_dir/scratch so that
+    stale-staging cleanup removes them even after a SIGKILL."""
+    replay_root = tmp_path / "replay"
+    writer = ReplayWriter(replay_root, "BINANCE_SPOT", "TESTUSDT", "2026-07-01")
+    # Trigger spool creation
+    writer.write_depth_batch([_depth_record(session=1, seq=1, raw_idx=1)])
+    scratch = writer.staging_dir / "scratch"
+    assert scratch.exists(), "scratch directory must exist under staging_dir"
+    all_files = list(scratch.iterdir())
+    assert all_files, "spool file must be inside staging_dir/scratch"
+    # Simulate stale-staging cleanup: rmtree staging_dir removes everything
+    import shutil
+    shutil.rmtree(writer.staging_dir)
+    assert not scratch.exists(), "scratch must be gone after staging cleanup"
+
+
+def test_stale_staging_cleanup_removes_spools(tmp_path: Path) -> None:
+    """After a SIGKILL the .staging_* dir is removed by the next build.
+    Confirm that removes spool files too (no orphaned SQLite on data disk)."""
+    raw_root = _make_raw_root(tmp_path, "BINANCE_SPOT", "TESTUSDT", "2026-07-01", 10, 10)
+    replay_root = tmp_path / "replay"
+    # Simulate a SIGKILL mid-run: create staging + scratch + a fake spool file
+    staging = replay_root / "venue=BINANCE_SPOT" / "symbol=TESTUSDT" / ".staging_2026-07-01_TESTUSDT"
+    scratch = staging / "scratch"
+    scratch.mkdir(parents=True)
+    fake_spool = scratch / "replay-depth-orphan"
+    fake_spool.write_bytes(b"fake sqlite")
+    assert fake_spool.exists()
+
+    # Running the build should remove the stale staging (incl. scratch) and rebuild
+    result = build_replay_for_symbol(
+        "BINANCE_SPOT", "TESTUSDT", "2026-07-01", raw_root, replay_root
+    )
+    assert result["status"] == "success"
+    assert not staging.exists(), "stale staging (incl. spool) must be removed"
+
+
+# ---------------------------------------------------------------------------
+# Atomic publication — backup/restore
+# ---------------------------------------------------------------------------
+
+def test_publish_preserves_existing_partition_on_replace_error(tmp_path: Path) -> None:
+    """If os.replace(staging->output) fails, the pre-existing valid partition
+    must be restored so the published store is never left empty."""
+    import os
+    import unittest.mock
+    raw_root = _make_raw_root(tmp_path, "BINANCE_SPOT", "TESTUSDT", "2026-07-01", 5, 5)
+    replay_root = tmp_path / "replay"
+
+    # Build a first valid partition
+    r1 = build_replay_for_symbol("BINANCE_SPOT", "TESTUSDT", "2026-07-01", raw_root, replay_root)
+    assert r1["status"] == "success"
+    partition = replay_root / "venue=BINANCE_SPOT" / "symbol=TESTUSDT" / "date=2026-07-01"
+    original_depth_size = (partition / "depth.parquet").stat().st_size
+
+    # Start a second writer, finalize staging, then make os.replace fail
+    writer = ReplayWriter(replay_root, "BINANCE_SPOT", "TESTUSDT", "2026-07-01")
+    writer.write_depth_batch([_depth_record(session=1, seq=1, raw_idx=1)])
+    writer.finalize_staging()
+
+    _real_replace = os.replace
+    def _failing_replace(src, dst):
+        # Only fail the staging->output rename
+        if ".staging_" in str(src):
+            raise OSError("injected failure")
+        return _real_replace(src, dst)
+
+    with unittest.mock.patch("os.replace", side_effect=_failing_replace):
+        with pytest.raises(OSError, match="injected failure"):
+            writer.publish()
+
+    # The original partition must still exist and be intact
+    assert partition.exists(), "original partition must still exist after failed publish"
+    assert (partition / "manifest.json").exists()
+    assert (partition / "depth.parquet").stat().st_size == original_depth_size
+
+
+def test_force_rebuild_overrides_valid_partition(tmp_path: Path) -> None:
+    """force=True must rebuild even when the partition is already valid."""
+    raw_root = _make_raw_root(tmp_path, "BINANCE_SPOT", "TESTUSDT", "2026-07-01", 5, 5)
+    replay_root = tmp_path / "replay"
+    r1 = build_replay_for_symbol("BINANCE_SPOT", "TESTUSDT", "2026-07-01", raw_root, replay_root)
+    assert r1["status"] == "success"
+    # Without force -> skipped
+    r2 = build_replay_for_symbol("BINANCE_SPOT", "TESTUSDT", "2026-07-01", raw_root, replay_root)
+    assert r2["status"] == "skipped"
+    # With force -> success (rebuilt)
+    r3 = build_replay_for_symbol(
+        "BINANCE_SPOT", "TESTUSDT", "2026-07-01", raw_root, replay_root, force=True
+    )
+    assert r3["status"] == "success"

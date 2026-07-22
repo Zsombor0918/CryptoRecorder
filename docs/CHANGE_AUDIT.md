@@ -93,6 +93,87 @@ An entry may be skipped **only** for:
 - <or "none — task fully completed">
 ```
 
+## 2026-07-22 — Fix spool lifetime, atomic publication, force-rebuild, stale docs (PR #18)
+
+### Change summary
+- `stores/replay_writer.py`: spool files moved from system temp to
+  `staging_dir/scratch/` — stale staging cleanup now also removes orphaned
+  SQLite spools; `_spool_temp_dir` removed from constructor (no longer
+  configurable separately — spools are always co-located with staging).
+- `stores/replay_writer.py`: `publish()` now does a backup/restore atomic
+  swap — renames existing valid partition to `.backup_{date}_{symbol}` before
+  `os.replace(staging→output)`, restores backup on failure; the previously
+  valid partition can no longer be lost by a failed rename.
+- `pipeline/build_replay_store.py`: added `force` kwarg and `--force` CLI
+  flag; skip-if-valid respects `force=True`; documents the provenance contract
+  (without `--force`, output integrity is validated, raw inputs are not).
+- `tests/test_replay_memory_bounded.py`: 4 new tests — spool-in-staging, stale
+  staging removes spools, backup/restore on replace error, force-rebuild.
+- `docs/OPERATIONS.md`: fixed stale `crypto-recorder` unit name in quick-
+  reference commands → `cryptorecorder-recorder`.
+- `docs/IMPLEMENTATION_AUDIT.md`: removed stale feature-store audit content
+  from active `Smoke-Tested` section (feature-store was removed in issue #17).
+- `docs/CHANGE_AUDIT.md`: updated previous entry's Docs-updated section.
+- `CHANGELOG.md`: added `[Unreleased]` section for P1/P2 fixes.
+- Real-data RAM test: BTCUSDT 2026-06-12 (509 MB raw) — pending `/usr/bin/time
+  -v` peak RSS output.
+
+### Files/packages touched
+- `stores/replay_writer.py`
+- `pipeline/build_replay_store.py`
+- `tests/test_replay_memory_bounded.py`
+- `docs/OPERATIONS.md`
+- `docs/IMPLEMENTATION_AUDIT.md`
+- `CHANGELOG.md`
+- `docs/CHANGE_AUDIT.md`
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] docs/REPO_STRUCTURE.md
+- [x] docs/PROJECT_STATUS.md
+- [x] docs/IMPLEMENTATION_AUDIT.md
+- [x] docs/REPLAY_STORE.md, docs/OPERATIONS.md, docs/FULL_L2_REPLAY_CATALOG_PLAN.md
+
+### Docs updated
+- [x] CHANGELOG.md
+- [ ] README.md — no public interface change; not required
+- [ ] docs/PROJECT_STATUS.md — no new validated/deferred status change
+- [ ] docs/REPO_STRUCTURE.md — no new folders/files
+- [x] docs/OPERATIONS.md — fixed stale unit name in quick-reference
+- [x] docs/IMPLEMENTATION_AUDIT.md — removed stale feature-store smoke content
+
+### Status / validation impact
+- Validated status changed: no
+- Deferred status changed: no
+- New claims added: no
+- Evidence for any new validation claim:
+  - n/a
+
+### Tests run
+```
+pytest tests/test_replay_memory_bounded.py   # 21 passed (incl. 4 new tests)
+pytest -q                                    # 304 passed, 3 skipped
+```
+
+### Validation CLIs run
+```
+python -m validation.audit_change_compliance --base main   (pending — run after commit)
+Real-data BTCUSDT 2026-06-12 RAM test:
+  BINANCE_SPOT:  835,403 depth + 3,112,086 trades
+  BINANCE_USDTF: 563,875 depth + 3,200,399 trades
+  Maximum RSS:   855,432 kB (~835 MiB) — well under 12 GiB systemd MemoryMax
+  Exit status:   0
+```
+
+### Known limitations / out of scope
+- `REPLAY_SPOOL_TEMP_DIR` config in `config.py` and `cryptorecorder.env.example`
+  is now dead (spools always use staging/scratch). Will be removed in a
+  follow-up cleanup.
+- Production DEXEUSDT 2026-07-21 test still requires the production server.
+- uv migration (issue #20) excluded.
+
+---
+
 ## 2026-07-22 — Memory-bounded replay-store builder (PR #18)
 
 ### Change summary

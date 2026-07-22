@@ -45,19 +45,6 @@ _DEFAULT_PARQUET_BATCH = int(
 )
 
 
-def _resolve_spool_temp_dir(override: "Path | str | None") -> "str | None":
-    if override is not None:
-        p = Path(override).expanduser()
-        p.mkdir(parents=True, exist_ok=True)
-        return str(p)
-    env = os.environ.get("CRYPTO_RECORDER_REPLAY_SPOOL_TEMP_DIR")
-    if env:
-        p = Path(env).expanduser()
-        p.mkdir(parents=True, exist_ok=True)
-        return str(p)
-    return None
-
-
 def _compute_sha256(file_path: Path) -> str:
     sha256_hash = hashlib.sha256()
     with open(file_path, "rb") as f:
@@ -149,7 +136,6 @@ class ReplayWriter:
         symbol: str,
         date: str,
         *,
-        spool_temp_dir: "Path | str | None" = None,
         parquet_batch_size: int = _DEFAULT_PARQUET_BATCH,
     ):
         self.replay_root = Path(replay_root)
@@ -171,8 +157,11 @@ class ReplayWriter:
         self.trade_count = 0
         self._manifest: "dict[str, Any] | None" = None
 
-        self._spool_temp_dir = _resolve_spool_temp_dir(spool_temp_dir)
-        self.staging_dir.mkdir(parents=True, exist_ok=True)
+        # Spool files live inside the staging directory so that a stale-staging
+        # cleanup (shutil.rmtree on .staging_*) also removes orphaned SQLite
+        # spools even when a previous SIGKILL/OOM prevented normal cleanup.
+        self._spool_scratch_dir = self.staging_dir / "scratch"
+        self._spool_scratch_dir.mkdir(parents=True, exist_ok=True)
 
         self._depth_spool: "RawRecordSpool | None" = None
         self._trade_spool: "RawRecordSpool | None" = None
@@ -184,7 +173,7 @@ class ReplayWriter:
     def _get_depth_spool(self) -> RawRecordSpool:
         if self._depth_spool is None:
             self._depth_spool = RawRecordSpool(
-                temp_dir=self._spool_temp_dir,
+                temp_dir=self._spool_scratch_dir,
                 prefix="replay-depth-",
             )
         return self._depth_spool
@@ -192,7 +181,7 @@ class ReplayWriter:
     def _get_trade_spool(self) -> RawRecordSpool:
         if self._trade_spool is None:
             self._trade_spool = RawRecordSpool(
-                temp_dir=self._spool_temp_dir,
+                temp_dir=self._spool_scratch_dir,
                 prefix="replay-trade-",
             )
         return self._trade_spool
@@ -314,10 +303,33 @@ class ReplayWriter:
             json.dump(manifest, f, indent=2)
         logger.info(f"Wrote manifest: {manifest_path}")
 
-        if self.output_dir.exists():
-            shutil.rmtree(self.output_dir)
+        # Atomic publication with backup/restore so the existing valid partition
+        # is never lost if the replacement fails (I/O error, permissions, etc.).
+        backup_dir = self.output_dir.parent / f".backup_{self.date}_{self.symbol}"
         self.output_dir.parent.mkdir(parents=True, exist_ok=True)
-        os.replace(self.staging_dir, self.output_dir)
+        try:
+            if self.output_dir.exists():
+                # Rename existing valid partition to backup; restore if replace fails.
+                if backup_dir.exists():
+                    shutil.rmtree(backup_dir)
+                os.replace(self.output_dir, backup_dir)
+            os.replace(self.staging_dir, self.output_dir)
+            # Success — discard backup.
+            if backup_dir.exists():
+                shutil.rmtree(backup_dir)
+        except Exception:
+            # Restore backup so the last-known-good partition is not lost.
+            if backup_dir.exists() and not self.output_dir.exists():
+                try:
+                    os.replace(backup_dir, self.output_dir)
+                    logger.warning(
+                        f"Publication failed; restored previous partition: {self.output_dir}"
+                    )
+                except Exception as restore_err:
+                    logger.error(
+                        f"Could not restore backup partition {backup_dir}: {restore_err}"
+                    )
+            raise
 
         logger.info(f"Published replay data to: {self.output_dir}")
         return self.output_dir

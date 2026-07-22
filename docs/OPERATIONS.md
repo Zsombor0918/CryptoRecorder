@@ -17,13 +17,13 @@ Systemd units are in `systemd/`.
 
 ```bash
 # Control recorder service
-sudo systemctl start crypto-recorder
-sudo systemctl stop crypto-recorder
-sudo systemctl restart crypto-recorder
-sudo systemctl status crypto-recorder
+sudo systemctl start cryptorecorder-recorder
+sudo systemctl stop cryptorecorder-recorder
+sudo systemctl restart cryptorecorder-recorder
+sudo systemctl status cryptorecorder-recorder
 
 # View logs
-journalctl -u crypto-recorder -f
+journalctl -u cryptorecorder-recorder -f
 ```
 
 ## Important Runtime Files
@@ -391,20 +391,16 @@ There is no feature-build step; CryptoRecorder's scope ends at `replay_store`
 
 ### Replay-build memory and restart behaviour
 
-**Memory-bounded writes**: `ReplayWriter` spools each symbol/day to a temporary
-SQLite file (via `converter.spool.RawRecordSpool`) and writes Parquet
-incrementally in bounded batches. Peak RSS is O(batch), not O(symbol/day). The
-batch size is controlled by `CRYPTO_RECORDER_REPLAY_PARQUET_BATCH` (default
-5 000 rows). Spool files are deleted on both success and error.
-
-**Spool temp directory**: Spool files may be several GiB for high-volume
-symbols. By default they land in the system temp directory (usually `/tmp`,
-governed by `$TMPDIR`). Set `CRYPTO_RECORDER_REPLAY_SPOOL_TEMP_DIR` in the
-env file to place them on the data filesystem instead:
-
-```ini
-CRYPTO_RECORDER_REPLAY_SPOOL_TEMP_DIR=/data/cryptorecorder/replay_spool_tmp
-```
+**Memory-bounded writes**: `ReplayWriter` spools each symbol/day to a SQLite
+file inside the staging directory (`staging_dir/scratch/`) via
+`converter.spool.RawRecordSpool`, and writes Parquet incrementally in bounded
+batches through `pyarrow.parquet.ParquetWriter`. Peak RSS is O(batch), not
+O(symbol/day). Batch size is controlled by `CRYPTO_RECORDER_REPLAY_PARQUET_BATCH`
+(default 5 000 rows). Because spool files live inside the staging directory,
+a stale-staging cleanup (triggered by the next run after a SIGKILL/OOM) removes
+both the partial Parquet output and all orphaned spool files in one
+`shutil.rmtree(.staging_*)` call — no multi-GiB orphaned SQLite files remain on
+the data filesystem.
 
 **Restart policy**: The service uses `Restart=no`. A deterministic failure
 (e.g. bad raw data) will not trigger an automatic retry loop.
@@ -416,6 +412,8 @@ root cause: `sudo systemctl start cryptorecorder-replay-build.service`.
 partitions (manifest exists, `status=complete`, checksums match) are skipped.
 Only genuinely incomplete or missing partitions are rebuilt. A stale staging
 directory from a previous SIGKILL is removed before starting a fresh build.
+Use `--force` to rebuild a complete partition after raw data has been repaired
+or backfilled.
 
 **Recovery command** (after a confirmed OOM or failure):
 ```bash

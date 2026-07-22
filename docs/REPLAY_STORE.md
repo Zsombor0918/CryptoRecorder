@@ -17,7 +17,7 @@ label-store, or general-purpose consumer catalog from replay_store.
 - **Columnar format** — Efficient for time-series queries and feature calculations
 - **Streaming access** — Load via [ReplayReader](#replayreader-api) without materializing full days in memory
 - **Exact decimals preserved** — Float fields exist for feature convenience, and string fields preserve source price/size values for Nautilus reconstruction
-- **Memory-bounded writes** — `ReplayWriter` spools records to a temporary SQLite file on disk and writes Parquet incrementally in bounded batches; peak RSS is O(batch), not O(symbol/day)
+- **Memory-bounded writes** — `ReplayWriter` spools records to a SQLite file inside the staging directory (`staging_dir/scratch/`) and writes Parquet incrementally in bounded batches; peak RSS is O(batch), not O(symbol/day)
 
 ## Structure
 
@@ -297,7 +297,7 @@ For each symbol/date:
 6. **Write manifest**: Store metadata and checksums
 7. **Atomic move**: Move from staging to published directory
 
-Temporary spool files are deleted on both success and failure. A stale staging directory from a previous SIGKILL is removed before starting a new build for the same partition. The spool directory defaults to the system temp directory (`/tmp`); set `CRYPTO_RECORDER_REPLAY_SPOOL_TEMP_DIR` to place spools on the data filesystem instead.
+Temporary spool files live inside `staging_dir/scratch/` and are removed automatically when the staging directory is cleaned up (on both success and on the next build after a SIGKILL/OOM). A stale staging directory from a previous SIGKILL is removed before starting a new build for the same partition.
 
 ## Auditing Replay Store
 
