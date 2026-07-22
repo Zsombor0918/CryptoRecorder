@@ -389,6 +389,41 @@ There is no feature-build step; CryptoRecorder's scope ends at `replay_store`
 > not understand the literal `yesterday`. `daily_build` resolves `yesterday` to
 > the previous completed UTC date.
 
+### Replay-build memory and restart behaviour
+
+**Memory-bounded writes**: `ReplayWriter` spools each symbol/day to a temporary
+SQLite file (via `converter.spool.RawRecordSpool`) and writes Parquet
+incrementally in bounded batches. Peak RSS is O(batch), not O(symbol/day). The
+batch size is controlled by `CRYPTO_RECORDER_REPLAY_PARQUET_BATCH` (default
+5 000 rows). Spool files are deleted on both success and error.
+
+**Spool temp directory**: Spool files may be several GiB for high-volume
+symbols. By default they land in the system temp directory (usually `/tmp`,
+governed by `$TMPDIR`). Set `CRYPTO_RECORDER_REPLAY_SPOOL_TEMP_DIR` in the
+env file to place them on the data filesystem instead:
+
+```ini
+CRYPTO_RECORDER_REPLAY_SPOOL_TEMP_DIR=/data/cryptorecorder/replay_spool_tmp
+```
+
+**Restart policy**: The service uses `Restart=no`. A deterministic failure
+(e.g. bad raw data) will not trigger an automatic retry loop.
+`StartLimitIntervalSec=86400` / `StartLimitBurst=3` in `[Unit]` cap restarts
+if the policy is ever re-enabled. To re-run the build manually after fixing the
+root cause: `sudo systemctl start cryptorecorder-replay-build.service`.
+
+**Durable progress on restart**: When a build is re-run, already-complete
+partitions (manifest exists, `status=complete`, checksums match) are skipped.
+Only genuinely incomplete or missing partitions are rebuilt. A stale staging
+directory from a previous SIGKILL is removed before starting a fresh build.
+
+**Recovery command** (after a confirmed OOM or failure):
+```bash
+sudo systemctl start cryptorecorder-replay-build.service
+# Then inspect:
+journalctl -u cryptorecorder-replay-build.service -n 100
+```
+
 ## Explicitly out of scope
 
 The following are **not** part of the deployment and have **no** services here:

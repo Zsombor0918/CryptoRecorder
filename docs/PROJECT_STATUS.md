@@ -30,7 +30,10 @@ validated without recorded evidence.
   (`stores/replay_*`, `pipeline/build_replay_store.py`). This is the stable
   external contract consumed by downstream repositories (e.g. KovacsTrader).
   CryptoRecorder does not build a feature/label layer or a general-purpose
-  consumer catalog from it.
+  consumer catalog from it. `ReplayWriter` is memory-bounded (SQLite spool +
+  incremental Parquet write); the service restart loop has been fixed
+  (`Restart=no`); production RAM measurement against the DEXEUSDT partition is
+  still pending on the production server.
 - **`replay_store → validation.replay_catalog_reconstruct`** (validation-only,
   no CLI) — internal helper used only by
   `validation.validate_catalog_equivalence` to reconstruct a temporary Nautilus

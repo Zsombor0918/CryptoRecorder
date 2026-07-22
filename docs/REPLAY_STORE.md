@@ -17,7 +17,7 @@ label-store, or general-purpose consumer catalog from replay_store.
 - **Columnar format** — Efficient for time-series queries and feature calculations
 - **Streaming access** — Load via [ReplayReader](#replayreader-api) without materializing full days in memory
 - **Exact decimals preserved** — Float fields exist for feature convenience, and string fields preserve source price/size values for Nautilus reconstruction
-- **v0 write limitation** — `ReplayWriter` currently accumulates one symbol/date in memory before writing; use RSS benchmarks before large production runs
+- **Memory-bounded writes** — `ReplayWriter` spools records to a temporary SQLite file on disk and writes Parquet incrementally in bounded batches; peak RSS is O(batch), not O(symbol/day)
 
 ## Structure
 
@@ -290,14 +290,14 @@ python -m pipeline.build_replay_store \
 For each symbol/date:
 
 1. **Stream raw data**: Read from `data_raw/{VENUE}/{channel}/{SYMBOL}/{YYYY-MM-DD}/{YYYY-MM-DDTHH}.jsonl(.zst)`
-2. **Accumulate symbol/date records**: v0 accumulates one symbol/date before sorting and writing
-3. **Deterministic sort**: Sort by the depth/trade composite keys to ensure reproducibility
-4. **Convert to Parquet**: Transform raw records to columnar schema
+2. **Spool to disk**: Each batch of converted records is written immediately to a temporary SQLite spool (`converter.spool.RawRecordSpool`) — no full-day Python list is retained
+3. **Deterministic sort**: SQLite index enforces sort order `(stream_session_id, session_seq, raw_index)` for depth and `(trade_stream_session_id, trade_session_seq, raw_index)` for trades
+4. **Incremental Parquet write**: Spool is read back in bounded batches (default 5 000 rows) through `pyarrow.parquet.ParquetWriter`; depth channel is fully written and closed before the trade channel begins
 5. **Compute checksums**: SHA256 hash of each Parquet file for integrity
 6. **Write manifest**: Store metadata and checksums
 7. **Atomic move**: Move from staging to published directory
 
-Future optimization: replace symbol/date accumulation with a streaming external sort or SQLite-backed spool before claiming memory-bounded production replay writes.
+Temporary spool files are deleted on both success and failure. A stale staging directory from a previous SIGKILL is removed before starting a new build for the same partition. The spool directory defaults to the system temp directory (`/tmp`); set `CRYPTO_RECORDER_REPLAY_SPOOL_TEMP_DIR` to place spools on the data filesystem instead.
 
 ## Auditing Replay Store
 

@@ -320,7 +320,7 @@ cd "$APP_DIR"
 ```
 
 Drop `--dry-run` once the printed actions look correct. Valid `--target`
-values are `all`, `recorder`, `legacy-converter`, and `replay-build`
+values are `all`, `recorder`, and `replay-build`
 (`scripts/deploy_linux_server.sh --help` documents every flag).
 
 If you prefer manual installation, generate host-specific units with the same

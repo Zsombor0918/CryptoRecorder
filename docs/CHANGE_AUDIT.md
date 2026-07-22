@@ -123,6 +123,10 @@ An entry may be skipped **only** for:
 - `tests/test_replay_memory_bounded.py`
 - `CHANGELOG.md`
 - `docs/CHANGE_AUDIT.md`
+- `docs/REPLAY_STORE.md`
+- `docs/OPERATIONS.md`
+- `docs/PROJECT_STATUS.md`
+- `INSTALL.md`
 
 ### Docs reviewed
 - [x] AGENTS.md
@@ -134,16 +138,12 @@ An entry may be skipped **only** for:
 
 ### Docs updated
 - [x] CHANGELOG.md
-- [ ] README.md — No docs update required because: no public interface change
-- [ ] docs/PROJECT_STATUS.md — No docs update required because: no
-      validated/deferred status changed; ADAUSDT smoke remains the validated
-      baseline; DEXEUSDT production test requires production raw data not
-      available on this development machine
-- [ ] docs/REPLAY_STORE.md — No docs update required because: schema, filenames,
-      manifest fields, checksums, and reconstruction path are unchanged; only
-      internal memory management changed
-- [ ] docs/OPERATIONS.md — No docs update required because: operational command
-      reference remains accurate; restart-policy change documented in CHANGELOG
+- [ ] README.md — no public interface change; not required
+- [x] docs/PROJECT_STATUS.md — updated replay_store v0 bullet to reflect memory-bounded writer and fixed restart policy; noted production RAM measurement still pending
+- [ ] docs/REPO_STRUCTURE.md — no new folders/files; not required
+- [x] docs/REPLAY_STORE.md — removed stale "v0 write limitation" bullet; replaced "Future optimization" note with implemented-solution description; updated Processing Details section
+- [x] docs/OPERATIONS.md — added "Replay-build memory and restart behaviour" section documenting bounded writes, spool temp dir, `Restart=no`, durable forward progress, and recovery commands
+- [x] INSTALL.md — removed stale `legacy-converter` target from deploy command reference
 
 ### Status / validation impact
 - Validated status changed: no
