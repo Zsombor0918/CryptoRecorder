@@ -9,6 +9,7 @@ import argparse
 import hashlib
 import json
 import logging
+import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -229,9 +230,20 @@ def _convert_trade_record(raw_record: dict, venue: str, symbol: str, date: str) 
         return None
 
 
-def _partition_is_valid(replay_root: Path, venue: str, symbol: str, date: str) -> bool:
-    """Return True only if the partition is complete with a valid manifest and files."""
-    out_dir = replay_root / f"venue={venue}" / f"symbol={symbol}" / f"date={date}"
+def _partition_is_valid(
+    replay_root: Path,
+    venue: str,
+    symbol: str,
+    date: str,
+    *,
+    _candidate: "Path | None" = None,
+) -> bool:
+    """Return True only if the partition is complete with a valid manifest and files.
+
+    Pass _candidate to validate an alternate directory (e.g. a backup) instead
+    of the canonical output location.
+    """
+    out_dir = _candidate or replay_root / f"venue={venue}" / f"symbol={symbol}" / f"date={date}"
     manifest_path = out_dir / "manifest.json"
     depth_path = out_dir / "depth.parquet"
     trades_path = out_dir / "trades.parquet"
@@ -293,6 +305,66 @@ def build_replay_for_symbol(
         "errors": [],
     }
 
+    import shutil as _shutil
+
+    partition_dir = (
+        replay_root / f"venue={venue}" / f"symbol={symbol}" / f"date={date}"
+    )
+    backup_dir = (
+        replay_root / f"venue={venue}" / f"symbol={symbol}"
+        / f".backup_{date}_{symbol}"
+    )
+    staging_dir = (
+        replay_root / f"venue={venue}" / f"symbol={symbol}"
+        / f".staging_{date}_{symbol}"
+    )
+
+    # ---------------------------------------------------------------
+    # Crash-recovery: a previous SIGKILL may have occurred between the
+    # two os.replace() calls inside publish(), leaving output_dir gone
+    # and backup_dir present.  Restore the backup before doing anything
+    # else so no valid data is permanently lost.
+    # ---------------------------------------------------------------
+    if backup_dir.exists() and not partition_dir.exists():
+        if _partition_is_valid(replay_root, venue, symbol, date, _candidate=backup_dir):
+            logger.warning(
+                f"Crash-recovery: restoring backup partition {backup_dir} -> {partition_dir}"
+            )
+            partition_dir.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                os.replace(backup_dir, partition_dir)
+            except Exception as restore_err:
+                status["status"] = "error"
+                status["errors"].append(
+                    f"Crash-recovery restore failed: {restore_err}"
+                )
+                logger.error(
+                    f"Cannot restore backup {backup_dir}: {restore_err}. "
+                    "Manual intervention required."
+                )
+                return status
+            logger.info(f"Crash-recovery complete: {partition_dir}")
+        else:
+            logger.warning(
+                f"Crash-recovery: backup {backup_dir} is invalid/incomplete; "
+                "removing and rebuilding."
+            )
+            _shutil.rmtree(backup_dir, ignore_errors=True)
+    elif backup_dir.exists() and partition_dir.exists():
+        # Both exist: canonical output is complete → remove stale backup.
+        if _partition_is_valid(replay_root, venue, symbol, date):
+            logger.info(f"Removing stale backup (canonical partition is valid): {backup_dir}")
+            _shutil.rmtree(backup_dir, ignore_errors=True)
+        else:
+            # Canonical output is corrupt; backup may be newer.  Treat as
+            # corrupt partition — fall through to rebuild (backup removed by
+            # existing stale-staging cleanup below if it has staging_dir too,
+            # otherwise it stays harmlessly until publish() overwrites it).
+            logger.warning(
+                f"Both {partition_dir} and {backup_dir} exist but canonical is invalid; "
+                "will rebuild."
+            )
+
     # Skip already-complete valid partitions (unless force rebuild requested).
     if not force and _partition_is_valid(replay_root, venue, symbol, date):
         logger.info(
@@ -303,14 +375,25 @@ def build_replay_for_symbol(
 
     # Remove stale staging directory from a previous SIGKILL so it cannot be
     # confused with a successful previous build.
-    staging_dir = (
-        replay_root / f"venue={venue}" / f"symbol={symbol}"
-        / f".staging_{date}_{symbol}"
-    )
     if staging_dir.exists():
         logger.info(f"Removing stale staging dir: {staging_dir}")
-        import shutil as _shutil
-        _shutil.rmtree(staging_dir, ignore_errors=True)
+        try:
+            _shutil.rmtree(staging_dir)
+        except Exception as exc:
+            status["status"] = "error"
+            status["errors"].append(
+                f"Failed to remove stale staging dir {staging_dir}: {exc}"
+            )
+            logger.error(status["errors"][-1])
+            return status
+        if staging_dir.exists():
+            status["status"] = "error"
+            status["errors"].append(
+                f"Failed to remove stale staging dir {staging_dir}; "
+                "refusing to build on top of stale files."
+            )
+            logger.error(status["errors"][-1])
+            return status
 
     writer = ReplayWriter(
         replay_root, venue, symbol, date,

@@ -93,6 +93,73 @@ An entry may be skipped **only** for:
 - <or "none — task fully completed">
 ```
 
+## 2026-07-22 — Crash-recovery, fail-closed cleanup, partition layout, INSTALL.md (PR #18)
+
+### Change summary
+- `pipeline/build_replay_store.py`: startup crash-recovery — if `output_dir`
+  is missing and `.backup_{date}_{symbol}` exists (mid-publish SIGKILL state),
+  validates and restores the backup before proceeding; fails closed if restore
+  fails; removes invalid backups. Handles both missing-output and
+  both-exist cases.
+- `pipeline/build_replay_store.py`: stale-staging cleanup now catches rmtree
+  exceptions and verifies the directory is gone; returns `status=error` if
+  cleanup fails, refusing to build on stale state (`ignore_errors` removed).
+- `stores/replay_writer.py`: `finalize_staging()` removes the empty
+  `scratch/` subdirectory after spools are closed, so published partitions
+  contain only supported files and no subdirectories.
+- `stores/replay_writer.py`: `cleanup_staging()` now raises `RuntimeError`
+  if `shutil.rmtree` fails (instead of logging a warning and continuing), 
+  so callers see the failure.
+- `INSTALL.md`: manual installation loop, `systemd-analyze verify` command,
+  enable/start/stop/status blocks, and troubleshooting section all updated to
+  remove `cryptorecorder-convert.service`/`.timer` as active production units.
+  Removed the "converter timer date seems wrong" troubleshooting section. Added
+  `> **Note:**` clarifying converter templates remain for manual local use only.
+- `tests/test_replay_memory_bounded.py`: 3 new regression tests:
+  `test_published_partition_layout_is_clean`,
+  `test_crash_recovery_restores_backup_on_startup`,
+  `test_stale_staging_cleanup_fails_closed`.
+
+### Files/packages touched
+- `pipeline/build_replay_store.py`
+- `stores/replay_writer.py`
+- `tests/test_replay_memory_bounded.py`
+- `INSTALL.md`
+- `CHANGELOG.md`
+- `docs/CHANGE_AUDIT.md`
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] docs/REPO_STRUCTURE.md
+- [x] docs/PROJECT_STATUS.md
+- [x] docs/IMPLEMENTATION_AUDIT.md
+- [x] relevant feature docs: docs/REPLAY_STORE.md, docs/OPERATIONS.md
+
+### Docs updated
+- [x] CHANGELOG.md
+- No other docs update required: code fixes only; status is unchanged
+
+### Status / validation impact
+- Validated status changed: no
+- Deferred status changed: no
+- New claims added: no
+- Evidence: n/a — these are defensive/correctness fixes; no new validation paths
+
+### Tests run
+```
+pytest tests/test_replay_memory_bounded.py -q   → 24 passed
+pytest -q                                       → 307 passed, 3 skipped
+```
+
+### Validation CLIs run
+```
+python -m validation.audit_change_compliance --base main   (run before commit)
+```
+
+### Known limitations / out of scope
+- DEXEUSDT production server test still pending (requires production server).
+- PR description update (item 5 from review) done by the author as a PR comment.
+
 ## 2026-07-22 — Fix spool lifetime, atomic publication, force-rebuild, stale docs (PR #18)
 
 ### Change summary

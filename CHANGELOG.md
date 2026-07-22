@@ -66,6 +66,49 @@ passes.** Until then, broader full-L2 equivalence stays **deferred** (see
 
 ## [Unreleased]
 
+### Fixed (PR #18 — crash-recovery, fail-closed cleanup, partition layout, INSTALL.md)
+- **`pipeline/build_replay_store.py` — crash-recovery for mid-publish SIGKILL**
+  — a SIGKILL between the two `os.replace()` calls in `publish()` left
+  `output_dir` missing and `.backup_{date}_{symbol}` present. The next
+  `build_replay_for_symbol()` call now checks for this state before the
+  stale-staging cleanup: validates the backup manifest/checksums and restores
+  it to the canonical output path; fails closed (status=error) if the restore
+  fails; removes an invalid backup and rebuilds. Both cases (backup+missing
+  output, backup+existing output) are handled explicitly.
+- **`pipeline/build_replay_store.py` — stale-staging cleanup fails closed**
+  — previously used `ignore_errors=True` which silently continued on top of
+  stale files if `rmtree` failed. Now catches `rmtree` exceptions and
+  verifies the directory is gone; returns `status=error` if the staging dir
+  still exists after cleanup, refusing to build on top of stale state.
+- **`stores/replay_writer.py` — remove `scratch/` before publication**
+  — after spools are closed and deleted, `finalize_staging()` now removes the
+  empty `scratch/` subdirectory before writing the manifest. The published
+  partition therefore contains only the supported files (`depth.parquet`,
+  `trades.parquet`, `manifest.json`, `instrument.json`) and no subdirectories.
+- **`INSTALL.md` — remove converter unit from manual installation and
+  start-services sections** — the manual installation loop, `systemd-analyze
+  verify` command, enable/start/stop/restart/status command blocks, and the
+  troubleshooting section all previously referenced `cryptorecorder-convert.
+  service` / `cryptorecorder-convert.timer` as active units to install.
+  These sections now reference only the production units
+  (`cryptorecorder-recorder.service`, `cryptorecorder-replay-build.service`,
+  `cryptorecorder-replay-build.timer`). The stale "converter timer date" 
+  troubleshooting sub-section was removed. A `> **Note:**` clarifies that the
+  converter systemd template files remain in the repo as manual/reference
+  templates only and must not be installed on the production server.
+
+### Added (PR #18 — crash-recovery and layout regression tests)
+- `test_published_partition_layout_is_clean` — verifies that the published
+  partition contains only supported files (`depth.parquet`, `trades.parquet`,
+  `manifest.json`) and no subdirectories (no `scratch/`, SQLite, backups).
+- `test_crash_recovery_restores_backup_on_startup` — simulates mid-publish
+  SIGKILL (renames output to backup, asserts output is gone), then calls
+  `build_replay_for_symbol()` and verifies backup is restored to canonical
+  output without rebuilding.
+- `test_stale_staging_cleanup_fails_closed` — places a non-removable stale
+  staging dir (chmod no-write) and verifies the build returns `status=error`
+  rather than building on top of stale files.
+
 ### Fixed (PR #18 — spool lifetime, atomic publication, force-rebuild)
 - **`stores/replay_writer.py` — spool files now live inside `staging_dir/scratch/`**
   — previously spool files were created in the system temp directory

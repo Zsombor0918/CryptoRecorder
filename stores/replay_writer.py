@@ -263,6 +263,19 @@ class ReplayWriter:
         depth_checksum = _compute_sha256(depth_path)
         trades_checksum = _compute_sha256(trades_path)
 
+        # Remove the scratch directory — spools have been closed and deleted,
+        # so it should now be empty.  An empty scratch/ must not appear in
+        # the final published partition.
+        if self._spool_scratch_dir.exists():
+            try:
+                self._spool_scratch_dir.rmdir()  # fails if non-empty (safety)
+            except OSError:
+                # Non-empty means a spool was not cleaned up; remove anyway and log.
+                logger.warning(
+                    f"scratch dir {self._spool_scratch_dir} was not empty; removing."
+                )
+                shutil.rmtree(self._spool_scratch_dir, ignore_errors=True)
+
         manifest: dict = {
             "venue": self.venue,
             "symbol": self.symbol,
@@ -350,5 +363,12 @@ class ReplayWriter:
         if self.staging_dir.exists():
             try:
                 shutil.rmtree(self.staging_dir)
-            except Exception:
-                logger.warning(f"Could not remove staging dir {self.staging_dir}")
+            except Exception as exc:
+                logger.error(f"Could not remove staging dir {self.staging_dir}: {exc}")
+                raise RuntimeError(
+                    f"cleanup_staging failed: staging dir {self.staging_dir} still exists"
+                ) from exc
+            if self.staging_dir.exists():
+                raise RuntimeError(
+                    f"cleanup_staging failed: staging dir {self.staging_dir} was not removed"
+                )

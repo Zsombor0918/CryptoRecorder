@@ -331,8 +331,6 @@ cd "$APP_DIR"
 
 for unit in \
   cryptorecorder-recorder.service \
-  cryptorecorder-convert.service \
-  cryptorecorder-convert.timer \
   cryptorecorder-replay-build.service \
   cryptorecorder-replay-build.timer
 do
@@ -345,19 +343,19 @@ done
 sudo systemctl daemon-reload
 sudo systemd-analyze verify \
   /etc/systemd/system/cryptorecorder-recorder.service \
-  /etc/systemd/system/cryptorecorder-convert.service \
-  /etc/systemd/system/cryptorecorder-convert.timer \
   /etc/systemd/system/cryptorecorder-replay-build.service \
   /etc/systemd/system/cryptorecorder-replay-build.timer
 ```
 
-Current unit behavior:
+> **Note:** `systemd/cryptorecorder-convert.{service,timer}` are kept in the repo as
+> manual-only reference templates for local catalog reconstruction. They are **not**
+> part of the automated production service set and must not be installed or enabled
+> on the production server. Any previously installed converter units are removed by
+> `scripts/deploy_linux_server.sh` on the next deploy run.
+
+Current production unit behavior:
 
 - `cryptorecorder-recorder.service` runs `recorder.py` (live recording)
-- `cryptorecorder-convert.service` runs `convert_day.py --staging` (legacy
-  full-L2 converter, previous UTC day)
-- `cryptorecorder-convert.timer` schedules the legacy converter once daily at
-  `00:10 UTC`
 - `cryptorecorder-replay-build.service` runs
   `python -m pipeline.daily_build --date yesterday` (builds `replay_store`)
 - `cryptorecorder-replay-build.timer` schedules the replay build once daily
@@ -369,9 +367,6 @@ Inspect the installed units:
 
 ```bash
 systemctl cat cryptorecorder-recorder.service
-systemctl cat cryptorecorder-convert.service
-systemctl cat cryptorecorder-convert.timer
-systemctl list-timers --all cryptorecorder-convert.timer
 systemctl cat cryptorecorder-replay-build.service
 systemctl cat cryptorecorder-replay-build.timer
 systemctl list-timers --all cryptorecorder-replay-build.timer
@@ -385,7 +380,6 @@ Enable automatic startup:
 
 ```bash
 sudo systemctl enable cryptorecorder-recorder.service
-sudo systemctl enable cryptorecorder-convert.timer
 sudo systemctl enable cryptorecorder-replay-build.timer
 ```
 
@@ -393,7 +387,6 @@ Start live operation:
 
 ```bash
 sudo systemctl start cryptorecorder-recorder.service
-sudo systemctl start cryptorecorder-convert.timer
 sudo systemctl start cryptorecorder-replay-build.timer
 ```
 
@@ -402,8 +395,6 @@ Stop/restart later:
 ```bash
 sudo systemctl stop cryptorecorder-recorder.service
 sudo systemctl restart cryptorecorder-recorder.service
-sudo systemctl stop cryptorecorder-convert.timer
-sudo systemctl start cryptorecorder-convert.timer
 sudo systemctl stop cryptorecorder-replay-build.timer
 sudo systemctl start cryptorecorder-replay-build.timer
 ```
@@ -412,13 +403,10 @@ Status and logs:
 
 ```bash
 systemctl status cryptorecorder-recorder.service
-systemctl status cryptorecorder-convert.timer
-systemctl status cryptorecorder-convert.service
 systemctl status cryptorecorder-replay-build.timer
 systemctl status cryptorecorder-replay-build.service
 
 journalctl -u cryptorecorder-recorder.service -f
-journalctl -u cryptorecorder-convert.service -f
 journalctl -u cryptorecorder-replay-build.service -f
 ```
 
@@ -546,25 +534,14 @@ Check path/user substitution first:
 
 ```bash
 systemctl cat cryptorecorder-recorder.service
-systemctl cat cryptorecorder-convert.service
+systemctl cat cryptorecorder-replay-build.service
 ```
 
 Then inspect logs:
 
 ```bash
 journalctl -u cryptorecorder-recorder.service -n 200 --no-pager
-journalctl -u cryptorecorder-convert.service -n 200 --no-pager
-```
-
-### converter timer date seems wrong
-
-The timer is meant to run at `00:10 UTC`, and the converter default date is
-“yesterday UTC.” Confirm the installed timer rather than relying on local wall
-clock intuition:
-
-```bash
-systemctl cat cryptorecorder-convert.timer
-systemctl list-timers --all cryptorecorder-convert.timer
+journalctl -u cryptorecorder-replay-build.service -n 200 --no-pager
 ```
 
 ### converter refuses partial overwrite
