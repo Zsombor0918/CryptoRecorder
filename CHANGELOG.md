@@ -66,6 +66,82 @@ passes.** Until then, broader full-L2 equivalence stays **deferred** (see
 
 ## [Unreleased]
 
+### Fixed (PR #18 — memory-bounded replay-store building)
+- **`stores/replay_writer.py` — replace unbounded Python-list accumulation with
+  disk-backed SQLite spooling** — the previous implementation retained all
+  depth and trade records for an entire symbol/day in `depth_batches` and
+  `trade_batches` Python lists before writing, causing OOM kills on
+  high-volume symbols (observed: `BINANCE_SPOT/DEXEUSDT` on 2026-07-21 with
+  `MemoryPeak=12884901888`, `Result=oom-kill` against a 12 GiB systemd
+  `MemoryMax`). Records are now spooled to a SQLite file on disk immediately
+  via `converter.spool.RawRecordSpool` (the same proven infrastructure used
+  by the converter). Parquet output is written incrementally through
+  `pyarrow.parquet.ParquetWriter` in bounded batches of 5 000 rows (tunable
+  via `CRYPTO_RECORDER_REPLAY_PARQUET_BATCH`). The depth channel is fully
+  written and closed before the trade channel begins, so both channels are
+  never simultaneously in memory. Peak RSS is now O(batch) rather than O(day).
+- **`stores/replay_writer.py` — `cleanup_staging()` method** — safely removes
+  staging directory and closes/deletes open spool files on error paths.
+  `build_replay_for_symbol()` calls `cleanup_staging()` in the `except`
+  branch so a failed build never leaves a stale staging directory.
+- **`pipeline/build_replay_store.py` — skip already-valid partitions** — on
+  restart, a partition is skipped only after strict validation: manifest must
+  exist with `status=complete`, both Parquet files must be present, and their
+  SHA-256 checksums must match the manifest values. An incomplete staging
+  directory is never treated as valid. Stale staging directories from previous
+  SIGKILL are removed before starting a new build.
+- **`pipeline/build_replay_store.py` — `_partition_is_valid()` helper** — the
+  validation logic is now a standalone, testable function.
+- **`pipeline/daily_build.py` — count skipped partitions honestly** — the
+  daily build result now distinguishes `success`, `skipped`, `failed`, and
+  `no_data`. Skipped (already-valid) partitions count toward success; the log
+  and report accurately reflect built vs skipped vs failed counts.
+- **`systemd/cryptorecorder-replay-build.service` — stop endless retry loop**
+  — changed `Restart=on-failure` to `Restart=no`. Added
+  `StartLimitIntervalSec=86400` / `StartLimitBurst=3` in `[Unit]` as a safety
+  net if restart is ever re-enabled. Previously, more than 100 restarts were
+  observed as the service repeatedly rebuilt earlier partitions, reached
+  DEXEUSDT, was OOM-killed, and immediately restarted from scratch. With
+  `Restart=no` and per-partition skip-if-valid, a rerun makes durable forward
+  progress instead of looping.
+- **`config.py` — `REPLAY_SPOOL_TEMP_DIR`** — new optional configuration for
+  the spool temp directory. Defaults to `None` (SQLite spool files are placed
+  via `tempfile.NamedTemporaryFile`, which obeys `TMPDIR` / `/tmp`). Set
+  `CRYPTO_RECORDER_REPLAY_SPOOL_TEMP_DIR` to a path on the data filesystem to
+  avoid landing large spool files on a small root filesystem.
+- **`systemd/cryptorecorder.env.example`** — documents
+  `CRYPTO_RECORDER_REPLAY_SPOOL_TEMP_DIR` and
+  `CRYPTO_RECORDER_REPLAY_PARQUET_BATCH`.
+
+### Added (PR #18 — memory-bounded replay-store building)
+- **`tests/test_replay_memory_bounded.py`** — 17 regression tests verifying:
+  memory boundedness (no Python lists); correct schemas, counts, ordering,
+  checksums, manifests; empty-channel schema preservation; large-record-set
+  spanning many batches; cleanup on success and exception; stale staging
+  handling; skip-if-valid logic; corrupt/incomplete partitions not skipped;
+  cross-batch deterministic ordering.
+
+### Note: real-data production validation
+The DEXEUSDT partition test must be run on the production server with access to
+`/data/cryptorecorder/data_raw` — the development machine does not have
+production raw data. The required command for production validation is:
+
+```
+CRYPTO_RECORDER_DATA_ROOT=/data/cryptorecorder/data_raw \
+CRYPTO_RECORDER_REPLAY_ROOT=/tmp/test_replay_$(date +%s) \
+/usr/bin/time -v python -m pipeline.build_replay_store \
+  --date 2026-07-21 --symbols DEXEUSDT
+```
+
+Or via a transient cgroup with 12 GiB memory limit:
+```
+systemd-run --scope -p MemoryMax=12G \
+  /path/to/.venv/bin/python -m pipeline.build_replay_store \
+  --date 2026-07-21 --symbols DEXEUSDT \
+  --data-root /data/cryptorecorder/data_raw \
+  --replay-root /tmp/test_replay_dexeusdt
+```
+
 ### Changed (PR #18 — deployment boundary: converter removed from automated production path)
 - **`scripts/deploy_linux_server.sh`** — `legacy-converter` is no longer a
   deployable `--target`; it was removed from `VALID_TARGETS`, so

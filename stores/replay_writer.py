@@ -1,7 +1,24 @@
 """
-stores.replay_writer — Deterministic Parquet writing for replay_store.
+stores.replay_writer — Memory-bounded deterministic Parquet writing for replay_store.
 
-Handles sorting, staging, and atomic publish for replay data integrity.
+Uses disk-backed SQLite spools (via converter.spool.RawRecordSpool) to avoid
+retaining a full symbol/day in Python lists.  Records are written to Parquet
+incrementally in bounded batches using pyarrow.parquet.ParquetWriter so that peak
+RSS remains independent of the total record count.
+
+Ordering contracts (unchanged from v0):
+    depth:  (stream_session_id, session_seq, raw_index)
+    trades: (trade_stream_session_id, trade_session_seq, raw_index)
+
+Output format (unchanged from v0):
+    replay_store/
+      venue=<VENUE>/
+        symbol=<SYMBOL>/
+          date=<DATE>/
+            depth.parquet
+            trades.parquet
+            instrument.json   (optional)
+            manifest.json
 """
 from __future__ import annotations
 
@@ -17,16 +34,104 @@ from typing import Any, Optional
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from converter.spool import RawRecordSpool
 from .replay_schema import DEPTH_REPLAY_SCHEMA, TRADE_REPLAY_SCHEMA, MANIFEST_SCHEMA
 
 logger = logging.getLogger(__name__)
 
+# Number of spool rows read per Parquet row-group.
+_DEFAULT_PARQUET_BATCH = int(
+    os.environ.get("CRYPTO_RECORDER_REPLAY_PARQUET_BATCH", "5000")
+)
+
+
+def _resolve_spool_temp_dir(override: "Path | str | None") -> "str | None":
+    if override is not None:
+        p = Path(override).expanduser()
+        p.mkdir(parents=True, exist_ok=True)
+        return str(p)
+    env = os.environ.get("CRYPTO_RECORDER_REPLAY_SPOOL_TEMP_DIR")
+    if env:
+        p = Path(env).expanduser()
+        p.mkdir(parents=True, exist_ok=True)
+        return str(p)
+    return None
+
+
+def _compute_sha256(file_path: Path) -> str:
+    sha256_hash = hashlib.sha256()
+    with open(file_path, "rb") as f:
+        for byte_block in iter(lambda: f.read(65536), b""):
+            sha256_hash.update(byte_block)
+    return sha256_hash.hexdigest()
+
+
+def _write_channel_incremental(
+    spool: RawRecordSpool,
+    out_path: Path,
+    schema: pa.Schema,
+    parquet_batch_size: int,
+) -> "tuple[int, int, int]":
+    """Write all spool records to out_path in bounded batches.
+
+    Returns (record_count, ts_min_ns, ts_max_ns).
+    An empty channel produces a schema-bearing empty Parquet file.
+    """
+    record_count = 0
+    ts_min: "int | None" = None
+    ts_max: "int | None" = None
+    writer: "pq.ParquetWriter | None" = None
+
+    try:
+        batch: list = []
+        for record in spool.iter_records():
+            batch.append(record)
+            ts = int(record.get("ts_exchange_ns") or 0)
+            if ts_min is None or ts < ts_min:
+                ts_min = ts
+            if ts_max is None or ts > ts_max:
+                ts_max = ts
+            record_count += 1
+            if len(batch) >= parquet_batch_size:
+                tbl = pa.Table.from_pylist(batch, schema=schema)
+                if writer is None:
+                    writer = pq.ParquetWriter(
+                        str(out_path),
+                        schema=schema,
+                        compression="zstd",
+                        compression_level=3,
+                    )
+                writer.write_table(tbl)
+                del tbl, batch
+                batch = []
+
+        # Flush remainder (or write empty schema-bearing file)
+        tbl = pa.Table.from_pylist(batch, schema=schema)
+        if writer is None:
+            writer = pq.ParquetWriter(
+                str(out_path),
+                schema=schema,
+                compression="zstd",
+                compression_level=3,
+            )
+        writer.write_table(tbl)
+        del tbl, batch
+    finally:
+        if writer is not None:
+            writer.close()
+
+    return record_count, (ts_min or 0), (ts_max or 0)
+
 
 class ReplayWriter:
     """
-    Writes deterministic normalized Parquet replay data with staging/publish pattern.
-    
-    Output layout (Hive-style partitions):
+    Memory-bounded writer for a single venue/symbol/date replay partition.
+
+    Records are spooled to SQLite on disk immediately and read back in
+    bounded batches during finalization so that peak RSS is proportional to
+    parquet_batch_size, not to the total record count.
+
+    Output layout (Hive-style, unchanged from v0):
         replay_store/
           venue=BINANCE_SPOT/
             symbol=BTCUSDT/
@@ -43,145 +148,139 @@ class ReplayWriter:
         venue: str,
         symbol: str,
         date: str,
+        *,
+        spool_temp_dir: "Path | str | None" = None,
+        parquet_batch_size: int = _DEFAULT_PARQUET_BATCH,
     ):
-        """
-        Initialize writer for a single venue/symbol/date partition.
-
-        Args:
-            replay_root: Base replay_store directory
-            venue: Venue name (e.g., 'BINANCE_SPOT')
-            symbol: Symbol name (e.g., 'BTCUSDT')
-            date: Date string (e.g., '2026-06-15')
-        """
         self.replay_root = Path(replay_root)
         self.venue = venue
         self.symbol = symbol
         self.date = date
+        self._parquet_batch_size = parquet_batch_size
 
-        # Final output directory (Hive-style)
         self.output_dir = (
-            self.replay_root / f"venue={venue}" / f"symbol={symbol}" / f"date={date}"
+            self.replay_root
+            / f"venue={venue}"
+            / f"symbol={symbol}"
+            / f"date={date}"
         )
-
-        # Staging directory (temporary)
         self.staging_dir = self.output_dir.parent / f".staging_{date}_{symbol}"
 
-        # Ensure staging exists
-        self.staging_dir.mkdir(parents=True, exist_ok=True)
-
-        # Data accumulation
-        self.depth_batches: list[dict] = []
-        self.trade_batches: list[dict] = []
+        # Counters (compatible with existing callers)
         self.depth_count = 0
         self.trade_count = 0
-        self._manifest: dict[str, Any] | None = None
+        self._manifest: "dict[str, Any] | None" = None
 
-    def write_depth_batch(self, records: list[dict]) -> None:
-        """
-        Accumulate depth records (will be sorted and written at finalize).
+        self._spool_temp_dir = _resolve_spool_temp_dir(spool_temp_dir)
+        self.staging_dir.mkdir(parents=True, exist_ok=True)
 
-        Args:
-            records: List of depth record dicts
-        """
-        self.depth_batches.extend(records)
+        self._depth_spool: "RawRecordSpool | None" = None
+        self._trade_spool: "RawRecordSpool | None" = None
+
+    # ------------------------------------------------------------------
+    # Lazy spool init
+    # ------------------------------------------------------------------
+
+    def _get_depth_spool(self) -> RawRecordSpool:
+        if self._depth_spool is None:
+            self._depth_spool = RawRecordSpool(
+                temp_dir=self._spool_temp_dir,
+                prefix="replay-depth-",
+            )
+        return self._depth_spool
+
+    def _get_trade_spool(self) -> RawRecordSpool:
+        if self._trade_spool is None:
+            self._trade_spool = RawRecordSpool(
+                temp_dir=self._spool_temp_dir,
+                prefix="replay-trade-",
+            )
+        return self._trade_spool
+
+    # ------------------------------------------------------------------
+    # Public write API (compatible signatures with v0)
+    # ------------------------------------------------------------------
+
+    def write_depth_batch(self, records: list) -> None:
+        """Spool depth records to disk (O(batch) memory, not O(day))."""
+        spool = self._get_depth_spool()
+        for r in records:
+            sort_key = (
+                int(r.get("stream_session_id", 0)),
+                int(r.get("session_seq", 0)),
+                int(r.get("raw_index", 0)),
+            )
+            spool.insert(r, sort_key=sort_key, raw_index=int(r.get("raw_index", 0)))
         self.depth_count += len(records)
 
-    def write_trades_batch(self, records: list[dict]) -> None:
-        """
-        Accumulate trade records (will be sorted and written at finalize).
-
-        Args:
-            records: List of trade record dicts
-        """
-        self.trade_batches.extend(records)
+    def write_trades_batch(self, records: list) -> None:
+        """Spool trade records to disk (O(batch) memory, not O(day))."""
+        spool = self._get_trade_spool()
+        for r in records:
+            sort_key = (
+                int(r.get("trade_stream_session_id", 0)),
+                int(r.get("trade_session_seq", 0)),
+                int(r.get("raw_index", 0)),
+            )
+            spool.insert(r, sort_key=sort_key, raw_index=int(r.get("raw_index", 0)))
         self.trade_count += len(records)
 
-    def _sort_records(self, records: list[dict], is_depth: bool = True) -> list[dict]:
-        """
-        Sort records deterministically by (stream_session_id, session_seq, raw_index).
-        """
-        if is_depth:
-            return sorted(
-                records,
-                key=lambda r: (r["stream_session_id"], r["session_seq"], r["raw_index"]),
-            )
-        else:  # trades
-            return sorted(
-                records,
-                key=lambda r: (r["trade_stream_session_id"], r["trade_session_seq"], r["raw_index"]),
-            )
+    # ------------------------------------------------------------------
+    # Finalization (incremental Parquet, no full-day lists)
+    # ------------------------------------------------------------------
 
-    def _records_to_table(
-        self, records: list[dict], schema: pa.Schema
-    ) -> pa.Table:
-        """Convert list of dicts to PyArrow Table."""
-        if not records:
-            return pa.table({}, schema=schema)
-        return pa.Table.from_pylist(records, schema=schema)
-
-    def _compute_sha256(self, file_path: Path) -> str:
-        """Compute SHA256 checksum of a file."""
-        sha256_hash = hashlib.sha256()
-        with open(file_path, "rb") as f:
-            for byte_block in iter(lambda: f.read(4096), b""):
-                sha256_hash.update(byte_block)
-        return sha256_hash.hexdigest()
-
-    def finalize_staging(self) -> dict[str, Any]:
+    def finalize_staging(self) -> "dict[str, Any]":
         """
-        Write sorted records to staging directory.
+        Write spooled records to staging Parquet files using bounded batches.
+
+        The depth channel is fully written and its Parquet writer closed before
+        the trade channel begins, so both channels are never simultaneously in
+        memory.
 
         Returns:
-            Manifest dict with counts and metadata.
+            Manifest dict with counts, checksums, and timestamp range.
         """
-        # Sort records deterministically
-        sorted_depth = self._sort_records(self.depth_batches, is_depth=True)
-        sorted_trades = self._sort_records(self.trade_batches, is_depth=False)
-
-        # Convert to Parquet tables
-        depth_table = self._records_to_table(sorted_depth, DEPTH_REPLAY_SCHEMA)
-        trades_table = self._records_to_table(sorted_trades, TRADE_REPLAY_SCHEMA)
-
-        # Write to staging with ZSTD compression
         depth_path = self.staging_dir / "depth.parquet"
         trades_path = self.staging_dir / "trades.parquet"
 
-        pq.write_table(
-            depth_table,
-            depth_path,
-            compression="zstd",
-            compression_level=3,
+        # --- Depth ---
+        depth_spool = self._get_depth_spool()
+        depth_spool.commit()
+        depth_count, ts_d_min, ts_d_max = _write_channel_incremental(
+            depth_spool, depth_path, DEPTH_REPLAY_SCHEMA, self._parquet_batch_size
         )
-        pq.write_table(
-            trades_table,
-            trades_path,
-            compression="zstd",
-            compression_level=3,
+        depth_spool.close()
+        self._depth_spool = None
+        logger.info(f"Wrote staging depth: {depth_path} ({depth_count} records)")
+
+        # --- Trades ---
+        trade_spool = self._get_trade_spool()
+        trade_spool.commit()
+        trade_count, ts_t_min, ts_t_max = _write_channel_incremental(
+            trade_spool, trades_path, TRADE_REPLAY_SCHEMA, self._parquet_batch_size
         )
+        trade_spool.close()
+        self._trade_spool = None
+        logger.info(f"Wrote staging trades: {trades_path} ({trade_count} records)")
 
-        logger.info(
-            f"Wrote staging: {depth_path} ({self.depth_count} records), "
-            f"{trades_path} ({self.trade_count} records)"
-        )
+        # Sync authoritative counts
+        self.depth_count = depth_count
+        self.trade_count = trade_count
 
-        # Compute checksums
-        depth_checksum = self._compute_sha256(depth_path)
-        trades_checksum = self._compute_sha256(trades_path)
+        nonzero_ts = [t for t in (ts_d_min, ts_d_max, ts_t_min, ts_t_max) if t != 0]
+        ts_min = min(nonzero_ts) if nonzero_ts else 0
+        ts_max = max(nonzero_ts) if nonzero_ts else 0
 
-        # Get timestamp ranges
-        ts_depth_range = self._get_timestamp_range(sorted_depth, is_depth=True)
-        ts_trades_range = self._get_timestamp_range(sorted_trades, is_depth=False)
-        ts_min = min(ts_depth_range[0], ts_trades_range[0]) if sorted_depth or sorted_trades else 0
-        ts_max = max(ts_depth_range[1], ts_trades_range[1]) if sorted_depth or sorted_trades else 0
+        depth_checksum = _compute_sha256(depth_path)
+        trades_checksum = _compute_sha256(trades_path)
 
-        # Create manifest
-        manifest = {
+        manifest: dict = {
             "venue": self.venue,
             "symbol": self.symbol,
             "date": self.date,
             "status": "complete",
-            "depth_record_count": self.depth_count,
-            "trade_record_count": self.trade_count,
+            "depth_record_count": depth_count,
+            "trade_record_count": trade_count,
             "ts_range_start_ns": ts_min,
             "ts_range_end_ns": ts_max,
             "depth_checksum": depth_checksum,
@@ -189,35 +288,17 @@ class ReplayWriter:
             "created_at_utc": datetime.now(timezone.utc).isoformat(),
             "errors": [],
         }
-
         self._manifest = manifest
         return manifest
 
-    def _get_timestamp_range(
-        self, records: list[dict], is_depth: bool = True
-    ) -> tuple[int, int]:
-        """Get min/max timestamp from records."""
-        if not records:
-            return (0, 0)
-        if is_depth:
-            ts_field = "ts_exchange_ns"
-        else:
-            ts_field = "ts_exchange_ns"
-        timestamps = [r.get(ts_field, 0) for r in records]
-        return (min(timestamps), max(timestamps))
-
-    def publish(self, instrument_metadata: Optional[dict] = None) -> Path:
+    def publish(self, instrument_metadata: "Optional[dict]" = None) -> Path:
         """
         Atomically move staging to final output directory.
-        Write instrument.json and manifest.json.
 
-        Args:
-            instrument_metadata: Optional instrument metadata dict
-
-        Returns:
-            Path to published directory
+        A valid previously-published partition is overwritten only after
+        staging is confirmed complete (manifest written).  An exception before
+        os.replace keeps the existing published output intact.
         """
-        # Write instrument.json if provided
         if instrument_metadata:
             instrument_path = self.staging_dir / "instrument.json"
             with open(instrument_path, "w") as f:
@@ -228,13 +309,11 @@ class ReplayWriter:
         if manifest is None:
             manifest = self.finalize_staging()
 
-        # Write manifest.json
         manifest_path = self.staging_dir / "manifest.json"
         with open(manifest_path, "w") as f:
             json.dump(manifest, f, indent=2)
         logger.info(f"Wrote manifest: {manifest_path}")
 
-        # Atomically publish the completed partition directory.
         if self.output_dir.exists():
             shutil.rmtree(self.output_dir)
         self.output_dir.parent.mkdir(parents=True, exist_ok=True)
@@ -242,3 +321,22 @@ class ReplayWriter:
 
         logger.info(f"Published replay data to: {self.output_dir}")
         return self.output_dir
+
+    def cleanup_staging(self) -> None:
+        """Remove staging directory and close/delete open spool files.
+
+        Safe to call on error paths or after successful publish.
+        """
+        for spool_attr in ("_depth_spool", "_trade_spool"):
+            spool = getattr(self, spool_attr)
+            if spool is not None:
+                try:
+                    spool.close()
+                except Exception:
+                    pass
+                setattr(self, spool_attr, None)
+        if self.staging_dir.exists():
+            try:
+                shutil.rmtree(self.staging_dir)
+            except Exception:
+                logger.warning(f"Could not remove staging dir {self.staging_dir}")

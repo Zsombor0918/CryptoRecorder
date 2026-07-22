@@ -93,6 +93,95 @@ An entry may be skipped **only** for:
 - <or "none — task fully completed">
 ```
 
+## 2026-07-22 — Memory-bounded replay-store builder (PR #18)
+
+### Change summary
+- `stores/replay_writer.py`: replaced unbounded `depth_batches`/`trade_batches`
+  Python-list accumulation with disk-backed SQLite spooling via
+  `converter.spool.RawRecordSpool`; incremental Parquet writing via
+  `pyarrow.parquet.ParquetWriter`; added `cleanup_staging()` method
+- `pipeline/build_replay_store.py`: import `REPLAY_SPOOL_TEMP_DIR`; pass
+  `spool_temp_dir` to `ReplayWriter`; added `_partition_is_valid()` helper with
+  checksum validation; skip-if-valid logic; stale staging removal;
+  `cleanup_staging()` on error
+- `pipeline/daily_build.py`: track `skipped` partitions; treat skipped-valid as
+  success; update log and return dict
+- `config.py`: added `REPLAY_SPOOL_TEMP_DIR` (optional, env-controlled)
+- `systemd/cryptorecorder-replay-build.service`: `Restart=on-failure` →
+  `Restart=no`; `StartLimitIntervalSec=86400` / `StartLimitBurst=3` in `[Unit]`
+- `systemd/cryptorecorder.env.example`: documented `CRYPTO_RECORDER_REPLAY_SPOOL_TEMP_DIR`
+- `tests/test_replay_memory_bounded.py`: new file, 17 regression tests
+- `CHANGELOG.md`: updated `[Unreleased]`
+
+### Files/packages touched
+- `stores/replay_writer.py`
+- `pipeline/build_replay_store.py`
+- `pipeline/daily_build.py`
+- `config.py`
+- `systemd/cryptorecorder-replay-build.service`
+- `systemd/cryptorecorder.env.example`
+- `tests/test_replay_memory_bounded.py`
+- `CHANGELOG.md`
+- `docs/CHANGE_AUDIT.md`
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] docs/REPO_STRUCTURE.md
+- [x] docs/PROJECT_STATUS.md
+- [x] docs/IMPLEMENTATION_AUDIT.md
+- [x] relevant feature docs: docs/REPLAY_STORE.md, docs/OPERATIONS.md,
+      docs/FULL_L2_REPLAY_CATALOG_PLAN.md, docs/VALIDATION.md
+
+### Docs updated
+- [x] CHANGELOG.md
+- [ ] README.md — No docs update required because: no public interface change
+- [ ] docs/PROJECT_STATUS.md — No docs update required because: no
+      validated/deferred status changed; ADAUSDT smoke remains the validated
+      baseline; DEXEUSDT production test requires production raw data not
+      available on this development machine
+- [ ] docs/REPLAY_STORE.md — No docs update required because: schema, filenames,
+      manifest fields, checksums, and reconstruction path are unchanged; only
+      internal memory management changed
+- [ ] docs/OPERATIONS.md — No docs update required because: operational command
+      reference remains accurate; restart-policy change documented in CHANGELOG
+
+### Status / validation impact
+- Validated status changed: no
+- Deferred status changed: no
+- New claims added: no
+- Evidence for any new validation claim:
+  - n/a
+
+### Tests run
+```
+pytest tests/test_replay_memory_bounded.py         # 17 passed
+pytest tests/test_replay_store.py                  # 3 passed
+pytest tests/test_streaming_conversion_memory.py   # 10 passed
+pytest tests/test_daily_build.py                   # 9 passed
+pytest tests/test_agent_infrastructure.py          # passed
+pytest tests/test_repo_structure.py                # passed
+pytest -q                                          # 300 passed, 3 skipped
+```
+
+### Validation CLIs run
+```
+python -m validation.audit_change_compliance --base main   # PASS
+bash -n scripts/deploy_linux_server.sh                     # OK
+systemd-analyze verify systemd/cryptorecorder-replay-build.service
+  # expected path-only warning on dev machine (no /home/zsom)
+```
+
+### Known limitations / out of scope
+- Real-data DEXEUSDT 2026-07-21 test not run — production raw data unavailable
+  on development machine. Required command documented in CHANGELOG.md.
+- uv migration (issue #20) explicitly excluded.
+- No changes to recorder.py, phase2_depth.py, native_trades.py, storage.py,
+  raw schemas, replay-store v0 schema, or existing production data.
+
+---
+
+
+
 ---
 
 ## Example of a GOOD entry

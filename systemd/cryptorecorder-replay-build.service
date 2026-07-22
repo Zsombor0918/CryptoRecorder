@@ -2,6 +2,10 @@
 Description=CryptoRecorder Replay Store Build (previous UTC day)
 Documentation=file:///home/zsom/services/CryptoRecorder/docs/REPLAY_STORE.md
 After=network.target
+# Hard restart-burst guard: cap at 3 attempts per 24 hours so a deterministic
+# failure cannot loop forever even if Restart is ever re-enabled.
+StartLimitIntervalSec=86400
+StartLimitBurst=3
 
 [Service]
 Type=oneshot
@@ -17,7 +21,7 @@ StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=cryptorecorder-replay-build
 
-Restart=on-failure
+Restart=no
 RestartSec=300
 TimeoutStartSec=3600
 

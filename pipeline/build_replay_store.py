@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from config import DATA_ROOT, REPLAY_ROOT
+from config import DATA_ROOT, REPLAY_ROOT, REPLAY_SPOOL_TEMP_DIR
 from converter.readers import stream_raw_records
 from stores.replay_writer import ReplayWriter
 
@@ -229,6 +229,40 @@ def _convert_trade_record(raw_record: dict, venue: str, symbol: str, date: str) 
         return None
 
 
+def _partition_is_valid(replay_root: Path, venue: str, symbol: str, date: str) -> bool:
+    """Return True only if the partition is complete with a valid manifest and files."""
+    out_dir = replay_root / f"venue={venue}" / f"symbol={symbol}" / f"date={date}"
+    manifest_path = out_dir / "manifest.json"
+    depth_path = out_dir / "depth.parquet"
+    trades_path = out_dir / "trades.parquet"
+    if not (manifest_path.exists() and depth_path.exists() and trades_path.exists()):
+        return False
+    try:
+        with open(manifest_path) as f:
+            manifest = json.load(f)
+        if manifest.get("status") != "complete":
+            return False
+        # Verify checksums
+        import hashlib
+        for key, path in (("depth_checksum", depth_path), ("trades_checksum", trades_path)):
+            expected = manifest.get(key)
+            if not expected:
+                return False
+            h = hashlib.sha256()
+            with open(path, "rb") as f:
+                for chunk in iter(lambda: f.read(65536), b""):
+                    h.update(chunk)
+            if h.hexdigest() != expected:
+                logger.warning(
+                    f"Checksum mismatch for {venue}/{symbol}/{date} ({key}): skipping"
+                )
+                return False
+        return True
+    except Exception as e:
+        logger.warning(f"Partition validation failed for {venue}/{symbol}/{date}: {e}")
+        return False
+
+
 def build_replay_for_symbol(
     venue: str,
     symbol: str,
@@ -238,6 +272,9 @@ def build_replay_for_symbol(
 ) -> dict:
     """
     Build replay store for a single venue/symbol/date.
+
+    Skips partitions that already have a complete, checksum-valid manifest so
+    that restarted runs make durable progress without rebuilding earlier work.
 
     Returns:
         Status dict with counts and errors.
@@ -252,7 +289,29 @@ def build_replay_for_symbol(
         "errors": [],
     }
 
-    writer = ReplayWriter(replay_root, venue, symbol, date)
+    # Skip already-complete valid partitions
+    if _partition_is_valid(replay_root, venue, symbol, date):
+        logger.info(
+            f"⏭ Skipping already-complete partition: {venue}/{symbol}/{date}"
+        )
+        status["status"] = "skipped"
+        return status
+
+    # Remove stale staging directory from a previous SIGKILL so it cannot be
+    # confused with a successful previous build.
+    staging_dir = (
+        replay_root / f"venue={venue}" / f"symbol={symbol}"
+        / f".staging_{date}_{symbol}"
+    )
+    if staging_dir.exists():
+        logger.info(f"Removing stale staging dir: {staging_dir}")
+        import shutil as _shutil
+        _shutil.rmtree(staging_dir, ignore_errors=True)
+
+    writer = ReplayWriter(
+        replay_root, venue, symbol, date,
+        spool_temp_dir=REPLAY_SPOOL_TEMP_DIR,
+    )
 
     try:
         # Stream depth records
@@ -333,6 +392,7 @@ def build_replay_for_symbol(
         status["status"] = "failed"
         status["errors"].append(str(e))
         logger.error(f"✗ Failed to build replay for {venue}/{symbol}/{date}: {e}")
+        writer.cleanup_staging()
 
     return status
 

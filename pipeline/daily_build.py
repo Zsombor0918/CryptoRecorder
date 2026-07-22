@@ -99,9 +99,14 @@ def run_build_replay_store(
             results.append(result)
     
     successful = sum(1 for r in results if r["status"] == "success")
+    skipped = sum(1 for r in results if r["status"] == "skipped")
+    failed_count = sum(1 for r in results if r["status"] == "failed")
     total_depth = sum(r.get("depth_count", 0) for r in results)
     total_trades = sum(r.get("trade_count", 0) for r in results)
-    
+
+    # A skipped partition is already-valid; treat it as success for status.
+    successful_or_skipped = successful + skipped
+
     if not results:
         # Zero eligible venue/symbol partitions for this date (empty/missing
         # raw data). Never report this as "success" — 0 successful == 0
@@ -111,9 +116,9 @@ def run_build_replay_store(
             "Replay build found no eligible venue/symbol partitions for "
             f"{date_str} — reporting no_data (not success)."
         )
-    elif successful == len(results):
+    elif successful_or_skipped == len(results):
         status = "success"
-    elif successful == 0:
+    elif successful_or_skipped == 0:
         # Partitions were attempted but every single one failed — distinct
         # from both "no_data" (nothing was eligible) and "partial" (a mix
         # of success/failure).
@@ -124,15 +129,17 @@ def run_build_replay_store(
         )
     else:
         status = "partial"
-    
+
     logger.info(
-        f"Replay build complete: {successful}/{len(results)} symbols, "
+        f"Replay build complete: {successful} built, {skipped} skipped, "
+        f"{failed_count} failed / {len(results)} total, "
         f"{total_depth} depth, {total_trades} trades"
     )
     
     return {
         "status": status,
         "symbols_processed": successful,
+        "symbols_skipped": skipped,
         "symbols_total": len(results),
         "depth_records": total_depth,
         "trade_records": total_trades,
