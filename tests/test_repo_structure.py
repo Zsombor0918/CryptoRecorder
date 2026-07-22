@@ -411,6 +411,9 @@ def test_docs_do_not_claim_deleted_converter_systemd_files_exist() -> None:
         "kept in the repo as manual/reference templates",
         "kept in the repo as manual",
         "converter systemd templates remain",
+        "template files remain in the repo",
+        "remain in the repo as manual/reference templates",
+        "remain in the repo as manual",
     ]
 
     # Wording varies ("templates remain in the repo", "template files remain

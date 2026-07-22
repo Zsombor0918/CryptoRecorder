@@ -93,6 +93,56 @@ An entry may be skipped **only** for:
 - <or "none — task fully completed">
 ```
 
+## 2026-07-22 — Follow-up 2: add exact wording-variant checks Codex asked for
+
+### Change summary
+- Codex reviewed commit `1f7a3f2` (superseded by `a0fe13b`, which already
+  reworded the stale `CHANGELOG.md` sentence) and asked that the guard test
+  also check the literal substrings `"template files remain in the repo"`
+  and `"remain in the repo as manual/reference templates"` (after whitespace
+  normalization), rather than relying only on the proximity regex added in
+  the prior follow-up.
+- `tests/test_repo_structure.py::test_docs_do_not_claim_deleted_converter_systemd_files_exist`:
+  added those two exact phrases (plus `"remain in the repo as manual"`) to
+  `forbidden_normalized_phrases`, in addition to the existing regex, so the
+  check is both explicit/auditable and resilient to further rewording.
+- Re-confirmed via `grep_search` across all `*.md` files that the only
+  remaining occurrence of `"template files remain in the repo as
+  manual/reference templates"` is the intentionally-quoted historical
+  narration inside the append-only `docs/CHANGE_AUDIT.md` log entry below
+  (exempted from the check by design), not any current-state doc.
+
+### Files/packages touched
+- `tests/test_repo_structure.py`
+- `docs/CHANGE_AUDIT.md`
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] docs/REPO_STRUCTURE.md
+- [x] CHANGELOG.md (re-confirmed no stale current-state claim remains)
+
+### Docs updated
+- No further CHANGELOG.md/IMPLEMENTATION_AUDIT.md changes needed: already
+  correct from the prior follow-up commit (`a0fe13b`).
+
+### Status / validation impact
+- Validated status changed: no
+- Deferred status changed: no
+
+### Tests run
+```bash
+pytest tests/test_repo_structure.py -q   # 23 passed
+pytest -q                                 # 331 passed, 3 skipped
+```
+
+### Validation CLIs run
+```bash
+python -m validation.audit_change_compliance --base main   # PASS
+```
+
+### Known limitations / out of scope
+- No code changes in this follow-up; test hardening only.
+
 ## 2026-07-22 — Follow-up: stale converter-template claim also present in an older CHANGELOG.md entry
 
 ### Change summary
