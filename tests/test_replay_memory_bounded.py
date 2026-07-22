@@ -641,8 +641,12 @@ def test_stale_staging_cleanup_fails_closed(tmp_path: Path) -> None:
                 f"error message should mention staging: {result['errors']}"
             )
     finally:
-        # Restore permissions so tmp_path cleanup works
-        staging_dir.chmod(stat.S_IRWXU)
+        # Restore permissions so tmp_path cleanup works. If rmtree succeeded
+        # despite the removed write bit (e.g. running as root, which ignores
+        # the write-permission check), staging_dir no longer exists and
+        # chmod would raise FileNotFoundError.
+        if staging_dir.exists():
+            staging_dir.chmod(stat.S_IRWXU)
 
 
 # ---------------------------------------------------------------------------

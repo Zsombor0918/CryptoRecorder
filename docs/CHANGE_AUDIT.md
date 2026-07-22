@@ -93,6 +93,61 @@ An entry may be skipped **only** for:
 - <or "none — task fully completed">
 ```
 
+## 2026-07-22 — Follow-up 3: fix FileNotFoundError in stale-staging-cleanup test finally block
+
+### Change summary
+- Codex, running as root inside a container, found that
+  `test_stale_staging_cleanup_fails_closed` in
+  `tests/test_replay_memory_bounded.py` fails: when `shutil.rmtree` succeeds
+  despite the removed write bit (root ignores the write-permission check
+  that normally blocks the delete on a non-root user), the test's own
+  `finally` block still unconditionally calls `staging_dir.chmod(...)` on a
+  directory that no longer exists, raising `FileNotFoundError` and turning a
+  passing regression test into a failure in that environment. This
+  contradicted the audit-entry claim of a full, reliable suite pass.
+- `tests/test_replay_memory_bounded.py`: guarded the `finally` block with
+  `if staging_dir.exists():` before calling `chmod`, so the cleanup is a
+  no-op (not an error) when `rmtree` already removed the directory.
+- Verified the fix logic directly with a standalone script that reproduces
+  the "directory already gone" condition and confirms the guarded chmod no
+  longer raises. Could not literally re-run as root on this dev machine (no
+  passwordless sudo available), but the guard is unconditionally correct:
+  `chmod` on a path is only ever attempted if it still exists.
+
+### Files/packages touched
+- `tests/test_replay_memory_bounded.py`
+- `docs/CHANGE_AUDIT.md`
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] docs/REPO_STRUCTURE.md
+
+### Docs updated
+- No docs update required because: test-only fix, no status/API/schema change.
+- CHANGELOG not required because: this is a test-infrastructure-only fix (a
+  regression test's own cleanup logic), with no user-facing behavior, API,
+  schema, or status change.
+
+### Status / validation impact
+- Validated status changed: no
+- Deferred status changed: no
+
+### Tests run
+```bash
+pytest tests/test_replay_memory_bounded.py -q   # 47 passed
+pytest -q                                        # 331 passed, 3 skipped
+```
+
+### Validation CLIs run
+```bash
+python -m validation.audit_change_compliance --base main   # PASS
+```
+
+### Known limitations / out of scope
+- Not re-verified under an actual root/container environment on this
+  machine (no privileged access available); fix was validated via isolated
+  logic simulation instead of the full pytest run as root.
+
 ## 2026-07-22 — Follow-up 2: add exact wording-variant checks Codex asked for
 
 ### Change summary
