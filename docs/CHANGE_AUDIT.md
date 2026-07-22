@@ -93,6 +93,88 @@ An entry may be skipped **only** for:
 - <or "none — task fully completed">
 ```
 
+## 2026-07-22 — PR #18 finalization: fail-closed crash-recovery state machine, best-effort backup deletion, converter systemd files deleted
+
+### Change summary
+- `pipeline/build_replay_store.py`: extracted `recover_partition_state()` helper
+  handling all 7 filesystem state combinations (Cases A-G). Old inline crash-recovery
+  only handled Case A and silently dropped invalid backups. New helper handles:
+  Case A (restore valid backup), Case B (fail on invalid backup + no output),
+  Case C (skip + remove stale backup), Case D (quarantine invalid + restore backup),
+  Case E (both invalid, fail and preserve), Case F (valid, no backup, skip),
+  Case G (missing, no backup, rebuild). `build_replay_for_symbol()` now calls this
+  helper instead of inline ad-hoc checks.
+- `pipeline/build_replay_store.py`: backup deletion after successful
+  `os.replace(staging, output)` is now best-effort — failure logs a warning and
+  does NOT re-raise. Previously any backup deletion exception was propagated,
+  turning a successful publication into a build failure.
+- `pipeline/build_replay_store.py`: all `status["status"] = "error"` replaced
+  with `"failed"` — `pipeline.daily_build` counts `r["status"] == "failed"`;
+  the old `"error"` value was silently excluded from the failed-partition count.
+- `systemd/cryptorecorder-convert.service` and `systemd/cryptorecorder-convert.timer`
+  deleted from the repository — converter systemd automation is not part of the
+  supported production architecture. The deploy script already stops/removes any
+  installed converter units (unchanged).
+- `INSTALL.md`: updated `> **Note:**` to correctly state that the converter systemd
+  files were deleted, not "kept as templates".
+- `docs/OPERATIONS.md`: updated converter unit reference from "is not installed" to
+  "deleted from the repository in PR #18".
+- `docs/REPO_STRUCTURE.md`: added amendment log entry for deletion of converter
+  systemd files.
+- `tests/test_replay_memory_bounded.py`: 10 new regression and failure injection tests
+  covering Cases A-G, best-effort backup deletion, and fail-closed scratch cleanup.
+
+### Files/packages touched
+- `pipeline/build_replay_store.py`
+- `systemd/cryptorecorder-convert.service` (deleted)
+- `systemd/cryptorecorder-convert.timer` (deleted)
+- `tests/test_replay_memory_bounded.py`
+- `INSTALL.md`
+- `CHANGELOG.md`
+- `docs/CHANGE_AUDIT.md`
+- `docs/OPERATIONS.md`
+- `docs/REPO_STRUCTURE.md`
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] docs/REPO_STRUCTURE.md
+- [x] docs/PROJECT_STATUS.md
+- [x] docs/IMPLEMENTATION_AUDIT.md
+- [x] relevant feature docs: docs/REPLAY_STORE.md, docs/OPERATIONS.md, docs/DAILY_BUILD_PIPELINE.md
+
+### Docs updated
+- [x] CHANGELOG.md
+- [x] docs/OPERATIONS.md
+- [x] docs/REPO_STRUCTURE.md (amendment log entry added)
+- [x] INSTALL.md
+- No docs/PROJECT_STATUS.md update required: validated/deferred status unchanged
+
+### Status / validation impact
+- Validated status changed: no
+- Deferred status changed: no
+- New claims added: no
+- Evidence: n/a — correctness/safety fixes with no new validation paths
+
+### Tests run
+```
+pytest tests/test_replay_memory_bounded.py -q   → 34 passed
+pytest -q                                        → 317 passed, 3 skipped
+```
+
+### Validation CLIs run
+```
+python -m validation.audit_change_compliance --base main   → PASS
+```
+
+### Known limitations / out of scope
+- Linux production validation (DEXEUSDT 2026-07-21, 12 GiB cgroup) cannot be run
+  from the dev machine — noted as pending in PR comment.
+- `test_staging_to_output_rename_failure_restores_backup` requires `_force_staging`
+  constructor parameter which was not added in this pass; that test was not written.
+  The publish() restore-on-failure path is covered by the existing
+  `test_publish_preserves_existing_partition_on_replace_error` test.
+- No changes to recorder.py, raw schema, replay schema, or replay ordering.
+
 ## 2026-07-22 — Crash-recovery, fail-closed cleanup, partition layout, INSTALL.md (PR #18)
 
 ### Change summary

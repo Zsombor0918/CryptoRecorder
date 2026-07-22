@@ -66,6 +66,51 @@ passes.** Until then, broader full-L2 equivalence stays **deferred** (see
 
 ## [Unreleased]
 
+### Fixed (PR #18 finalization — fail-closed crash-recovery, best-effort backup deletion, converter files deleted)
+- **`pipeline/build_replay_store.py` — `recover_partition_state()` extracted as
+  tested helper** — all 7 filesystem states (Cases A-G: canonical+backup combos,
+  valid/invalid/missing) are now handled by a dedicated function with explicit
+  action return values (`"skip"` / `"rebuild"` / `"fail"`). The old inline
+  crash-recovery handled only one case and silently dropped invalid backups.
+  Cases A, C, D now restore or clean up backups before proceeding; cases B and E
+  preserve invalid files for operator inspection and return `action="fail"`.
+- **`pipeline/build_replay_store.py` — backup deletion is best-effort after
+  successful `os.replace(staging, output)`** — previously any exception during
+  backup deletion was re-raised, turning a successful partition publication into
+  a build failure. Now backup deletion on the happy path is wrapped in a
+  `try/except` that logs a warning and does not re-raise. The partition is
+  published and the build returns `success` even if the old backup directory
+  cannot be deleted.
+- **`pipeline/build_replay_store.py` — all failure status values use `"failed"`**
+  — all `status["status"] = "error"` occurrences in `build_replay_for_symbol`
+  replaced with `"failed"` to match the values counted by `pipeline.daily_build`
+  (`r["status"] == "failed"`). The old `"error"` value was silently excluded
+  from the failed-partition count, making builds appear more successful than they
+  were.
+- **`systemd/cryptorecorder-convert.service` and `systemd/cryptorecorder-convert.timer`
+  deleted** — converter systemd automation is not part of the supported production
+  architecture. Stale installed converter units are still removed by
+  `scripts/deploy_linux_server.sh` cleanup (no change to the deploy script).
+  `convert_day.py` and `converter/` are unchanged and required.
+- **`INSTALL.md` note updated** — the `> **Note:**` that previously said converter
+  templates are "kept in the repo as manual-only reference templates" now correctly
+  states they were deleted in PR #18 and references the manual CLI command instead.
+- **`docs/OPERATIONS.md` updated** — references to converter units corrected to
+  say "deleted from the repository in PR #18".
+
+### Added (PR #18 finalization — recovery case tests and failure injection tests)
+- `tests/test_replay_memory_bounded.py` — 10 new tests:
+  - `test_recovery_case_f_valid_no_backup` — Case F: skip already-valid partition
+  - `test_recovery_case_g_missing_no_backup` — Case G: rebuild when missing
+  - `test_recovery_case_a_restores_valid_backup` — Case A: restore valid backup
+  - `test_recovery_case_b_fails_on_invalid_backup_no_output` — Case B: fail on invalid backup
+  - `test_recovery_case_c_valid_output_removes_stale_backup` — Case C: remove stale backup
+  - `test_recovery_case_d_restores_backup_when_output_invalid` — Case D: quarantine+restore
+  - `test_recovery_case_e_both_invalid` — Case E: both invalid, preserve both
+  - `test_recovery_failure_counts_as_failed_status` — fail returns `"failed"` not `"error"`
+  - `test_publish_backup_deletion_failure_does_not_fail_build` — best-effort backup deletion
+  - `test_scratch_nonempty_prevents_publication` — fail-closed scratch cleanup
+
 ### Fixed (PR #18 — crash-recovery, fail-closed cleanup, partition layout, INSTALL.md)
 - **`pipeline/build_replay_store.py` — crash-recovery for mid-publish SIGKILL**
   — a SIGKILL between the two `os.replace()` calls in `publish()` left
@@ -265,9 +310,8 @@ systemd-run --scope -p MemoryMax=12G \
   may still be reconstructed into temporary Nautilus catalogs by symbol (e.g.
   for KovacsTrader) via `validation.replay_catalog_reconstruct`, run
   manually — this is unaffected by the deployment-path change.
-  `systemd/cryptorecorder-convert.{service,timer}` remain in the repo as
-  manual/reference templates (marked as such in-file) but are not rendered
-  or installed by the deploy script for any target.
+  `systemd/cryptorecorder-convert.{service,timer}` were deleted from the repo
+  in a subsequent pass (PR #18 finalization — see latest `[Unreleased]` entry).
 - `docs/OPERATIONS.md` updated: the "Targets" and "Service groups" tables no
   longer list `legacy-converter`; the stale "daily chain runs convert →
   replay" ordering claim is corrected (`replay-build` reads directly from

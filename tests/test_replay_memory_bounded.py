@@ -636,10 +636,240 @@ def test_stale_staging_cleanup_fails_closed(tmp_path: Path) -> None:
         )
         # rmtree may still succeed on some Linux configurations (root user etc.);
         # if it succeeds, that's fine — just check we didn't build on stale files.
-        if result["status"] == "error":
+        if result["status"] == "failed":
             assert any("stale" in e.lower() or "staging" in e.lower() for e in result["errors"]), (
                 f"error message should mention staging: {result['errors']}"
             )
     finally:
         # Restore permissions so tmp_path cleanup works
         staging_dir.chmod(stat.S_IRWXU)
+
+
+# ---------------------------------------------------------------------------
+# 6. recover_partition_state() — cases A through G
+# ---------------------------------------------------------------------------
+
+from pipeline.build_replay_store import recover_partition_state  # noqa: E402
+
+
+def _make_valid_partition(replay_root: Path, venue: str, symbol: str, date: str,
+                          raw_root: Path) -> None:
+    """Build a valid partition for use in recovery case tests."""
+    result = build_replay_for_symbol(venue, symbol, date, raw_root, replay_root)
+    assert result["status"] == "success", f"setup failed: {result}"
+
+
+def test_recovery_case_f_valid_no_backup(tmp_path: Path) -> None:
+    """Case F: valid partition, no backup -> skip."""
+    raw_root = _make_raw_root(tmp_path, "BINANCE_SPOT", "TESTUSDT", "2026-07-01")
+    replay_root = tmp_path / "replay"
+    _make_valid_partition(replay_root, "BINANCE_SPOT", "TESTUSDT", "2026-07-01", raw_root)
+
+    action = recover_partition_state(replay_root, "BINANCE_SPOT", "TESTUSDT", "2026-07-01")
+    assert action.action == "skip", f"Expected skip, got: {action}"
+
+
+def test_recovery_case_g_missing_no_backup(tmp_path: Path) -> None:
+    """Case G: output missing, no backup -> rebuild."""
+    replay_root = tmp_path / "replay"
+
+    action = recover_partition_state(replay_root, "BINANCE_SPOT", "TESTUSDT", "2026-07-01")
+    assert action.action == "rebuild", f"Expected rebuild, got: {action}"
+
+
+def test_recovery_case_a_restores_valid_backup(tmp_path: Path) -> None:
+    """Case A: output missing, backup valid -> restore and return skip."""
+    import os
+    raw_root = _make_raw_root(tmp_path, "BINANCE_SPOT", "TESTUSDT", "2026-07-01")
+    replay_root = tmp_path / "replay"
+    _make_valid_partition(replay_root, "BINANCE_SPOT", "TESTUSDT", "2026-07-01", raw_root)
+
+    partition_dir = replay_root / "venue=BINANCE_SPOT" / "symbol=TESTUSDT" / "date=2026-07-01"
+    backup_dir = (
+        replay_root / "venue=BINANCE_SPOT" / "symbol=TESTUSDT"
+        / ".backup_2026-07-01_TESTUSDT"
+    )
+
+    # Simulate crash: output gone, backup exists
+    os.replace(partition_dir, backup_dir)
+    assert not partition_dir.exists()
+    assert backup_dir.exists()
+
+    action = recover_partition_state(replay_root, "BINANCE_SPOT", "TESTUSDT", "2026-07-01")
+    assert action.action == "skip", f"Expected skip after restore, got: {action}"
+    assert partition_dir.exists(), "Partition must be restored from backup"
+    assert not backup_dir.exists(), "Backup must be consumed by restore"
+
+
+def test_recovery_case_b_fails_on_invalid_backup_no_output(tmp_path: Path) -> None:
+    """Case B: output missing, backup exists but invalid -> fail (preserve for operator)."""
+    replay_root = tmp_path / "replay"
+    backup_dir = (
+        replay_root / "venue=BINANCE_SPOT" / "symbol=TESTUSDT"
+        / ".backup_2026-07-01_TESTUSDT"
+    )
+    backup_dir.mkdir(parents=True)
+    # Invalid backup: no manifest.json
+    (backup_dir / "depth.parquet").touch()
+
+    action = recover_partition_state(replay_root, "BINANCE_SPOT", "TESTUSDT", "2026-07-01")
+    assert action.action == "fail", f"Expected fail, got: {action}"
+    assert backup_dir.exists(), "Invalid backup must be preserved for operator inspection"
+
+
+def test_recovery_case_c_valid_output_removes_stale_backup(tmp_path: Path) -> None:
+    """Case C: canonical valid, stale backup exists -> skip, backup removed."""
+    import shutil
+    raw_root = _make_raw_root(tmp_path, "BINANCE_SPOT", "TESTUSDT", "2026-07-01")
+    replay_root = tmp_path / "replay"
+    _make_valid_partition(replay_root, "BINANCE_SPOT", "TESTUSDT", "2026-07-01", raw_root)
+
+    partition_dir = replay_root / "venue=BINANCE_SPOT" / "symbol=TESTUSDT" / "date=2026-07-01"
+    backup_dir = (
+        replay_root / "venue=BINANCE_SPOT" / "symbol=TESTUSDT"
+        / ".backup_2026-07-01_TESTUSDT"
+    )
+
+    # Create a stale backup (copy of valid partition)
+    shutil.copytree(partition_dir, backup_dir)
+    assert backup_dir.exists()
+
+    action = recover_partition_state(replay_root, "BINANCE_SPOT", "TESTUSDT", "2026-07-01")
+    assert action.action == "skip", f"Expected skip, got: {action}"
+    assert partition_dir.exists(), "Canonical partition must remain"
+    assert not backup_dir.exists(), "Stale backup must be removed"
+
+
+def test_recovery_case_d_restores_backup_when_output_invalid(tmp_path: Path) -> None:
+    """Case D: output invalid, backup valid -> quarantine invalid, restore backup, skip."""
+    import shutil
+    raw_root = _make_raw_root(tmp_path, "BINANCE_SPOT", "TESTUSDT", "2026-07-01")
+    replay_root = tmp_path / "replay"
+    _make_valid_partition(replay_root, "BINANCE_SPOT", "TESTUSDT", "2026-07-01", raw_root)
+
+    partition_dir = replay_root / "venue=BINANCE_SPOT" / "symbol=TESTUSDT" / "date=2026-07-01"
+    backup_dir = (
+        replay_root / "venue=BINANCE_SPOT" / "symbol=TESTUSDT"
+        / ".backup_2026-07-01_TESTUSDT"
+    )
+
+    # Create a valid backup (copy of valid partition) first
+    shutil.copytree(partition_dir, backup_dir)
+
+    # Corrupt the canonical output
+    (partition_dir / "manifest.json").write_text("CORRUPTED")
+
+    action = recover_partition_state(replay_root, "BINANCE_SPOT", "TESTUSDT", "2026-07-01")
+    assert action.action == "skip", f"Expected skip after restore, got: {action}"
+    assert partition_dir.exists(), "Partition must be restored from backup"
+    assert not backup_dir.exists(), "Backup must be consumed"
+    # The restored manifest must be valid (not corrupted)
+    manifest = json.loads((partition_dir / "manifest.json").read_text())
+    assert "depth_record_count" in manifest, "Restored manifest must be valid"
+
+
+def test_recovery_case_e_both_invalid(tmp_path: Path) -> None:
+    """Case E: both canonical and backup invalid -> fail, preserve both."""
+    replay_root = tmp_path / "replay"
+    partition_dir = replay_root / "venue=BINANCE_SPOT" / "symbol=TESTUSDT" / "date=2026-07-01"
+    backup_dir = (
+        replay_root / "venue=BINANCE_SPOT" / "symbol=TESTUSDT"
+        / ".backup_2026-07-01_TESTUSDT"
+    )
+
+    # Create both as invalid
+    partition_dir.mkdir(parents=True)
+    (partition_dir / "manifest.json").write_text("BAD")
+    backup_dir.mkdir(parents=True)
+    (backup_dir / "manifest.json").write_text("ALSO BAD")
+
+    action = recover_partition_state(replay_root, "BINANCE_SPOT", "TESTUSDT", "2026-07-01")
+    assert action.action == "fail", f"Expected fail, got: {action}"
+    # Both must be preserved for operator inspection
+    assert partition_dir.exists(), "Invalid canonical must be preserved"
+    assert backup_dir.exists(), "Invalid backup must be preserved"
+
+
+def test_recovery_failure_counts_as_failed_status(tmp_path: Path) -> None:
+    """Status returned for a fail-action recovery must be 'failed', not 'error'."""
+    raw_root = _make_raw_root(tmp_path, "BINANCE_SPOT", "TESTUSDT", "2026-07-01")
+    replay_root = tmp_path / "replay"
+
+    # Create an invalid backup with no canonical output -> Case B -> fail
+    backup_dir = (
+        replay_root / "venue=BINANCE_SPOT" / "symbol=TESTUSDT"
+        / ".backup_2026-07-01_TESTUSDT"
+    )
+    backup_dir.mkdir(parents=True)
+    (backup_dir / "garbage").touch()  # invalid backup
+
+    result = build_replay_for_symbol(
+        "BINANCE_SPOT", "TESTUSDT", "2026-07-01", raw_root, replay_root
+    )
+    assert result["status"] == "failed", (
+        f"Recovery failure must produce status='failed', got: {result['status']!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 7. Failure injection tests
+# ---------------------------------------------------------------------------
+
+def test_publish_backup_deletion_failure_does_not_fail_build(tmp_path: Path) -> None:
+    """
+    If backup deletion fails after a successful os.replace(staging -> output),
+    the build must still succeed (backup deletion is best-effort).
+    """
+    import shutil
+    import unittest.mock as mock
+
+    raw_root = _make_raw_root(tmp_path, "BINANCE_SPOT", "TESTUSDT", "2026-07-01")
+    replay_root = tmp_path / "replay"
+
+    # First build to create an existing partition that becomes the backup
+    _make_valid_partition(replay_root, "BINANCE_SPOT", "TESTUSDT", "2026-07-01", raw_root)
+
+    # Second build with injected failure on backup deletion
+    original_rmtree = shutil.rmtree
+    rmtree_calls: list = []
+
+    def failing_rmtree(path, *args, **kwargs):
+        p = str(path)
+        rmtree_calls.append(p)
+        if ".backup_" in p:
+            raise OSError("injected backup deletion failure")
+        return original_rmtree(path, *args, **kwargs)
+
+    with mock.patch("stores.replay_writer.shutil.rmtree", side_effect=failing_rmtree):
+        result = build_replay_for_symbol(
+            "BINANCE_SPOT", "TESTUSDT", "2026-07-01", raw_root, replay_root,
+            force=True,
+        )
+
+    # Build must succeed despite backup deletion failure
+    assert result["status"] == "success", (
+        f"Build must succeed even if backup deletion fails; got: {result}"
+    )
+    # New canonical partition must exist
+    partition_dir = replay_root / "venue=BINANCE_SPOT" / "symbol=TESTUSDT" / "date=2026-07-01"
+    assert partition_dir.exists(), "New partition must exist after publish"
+
+
+def test_scratch_nonempty_prevents_publication(tmp_path: Path) -> None:
+    """If a file remains in scratch after all spool-to-parquet, finalize must raise."""
+    replay_root = tmp_path / "replay"
+    writer = ReplayWriter(replay_root, "BINANCE_SPOT", "TESTUSDT", "2026-07-01")
+
+    writer.write_depth_batch([_depth_record(session=1, seq=1, raw_idx=1)])
+
+    # Inject a leftover file into scratch (simulating an unexpected file)
+    scratch_dir = writer._spool_scratch_dir
+    leftover = scratch_dir / "unexpected_leftover.dat"
+    leftover.touch()
+
+    with pytest.raises(Exception):
+        writer.finalize_staging()
+
+    # Canonical partition must not be created
+    partition_dir = replay_root / "venue=BINANCE_SPOT" / "symbol=TESTUSDT" / "date=2026-07-01"
+    assert not partition_dir.exists(), "Partition must not exist when scratch cleanup fails"

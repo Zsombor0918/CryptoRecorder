@@ -369,10 +369,10 @@ Meta target **`all`** installs/controls both groups together.
 
 `replay-build` reads directly from `data_raw` (via `pipeline.raw_manifest`); it
 does not depend on `convert_day.py` or any converter output, so there is no
-ordering dependency between them. The legacy converter
-(`cryptorecorder-convert.service` + `.timer`) is **not** installed, enabled, or
-started by `scripts/deploy_linux_server.sh` — it is deployment-boundary work
-only. `convert_day.py`, `converter/`, and `validation/replay_catalog_reconstruct.py`
+ordering dependency between them. The legacy converter systemd units
+(`cryptorecorder-convert.service` + `.timer`) were **deleted from the repository**
+in PR #18 — converter systemd automation is not part of the supported production
+architecture. `convert_day.py`, `converter/`, and `validation/replay_catalog_reconstruct.py`
 remain required implementation/reference code for replay building, validation,
 and local test-computer catalog reconstruction: replay stores are synced
 separately by the operator, and on the test computer the synced replay stores

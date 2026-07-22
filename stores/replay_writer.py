@@ -264,17 +264,31 @@ class ReplayWriter:
         trades_checksum = _compute_sha256(trades_path)
 
         # Remove the scratch directory — spools have been closed and deleted,
-        # so it should now be empty.  An empty scratch/ must not appear in
-        # the final published partition.
+        # so it should now be empty.  An empty scratch/ must NOT appear in the
+        # final published partition, and we must not publish while scratch
+        # artifacts remain.
         if self._spool_scratch_dir.exists():
-            try:
-                self._spool_scratch_dir.rmdir()  # fails if non-empty (safety)
-            except OSError:
-                # Non-empty means a spool was not cleaned up; remove anyway and log.
-                logger.warning(
-                    f"scratch dir {self._spool_scratch_dir} was not empty; removing."
+            # Verify that spool files are gone (they should be, given close() above)
+            remaining = list(self._spool_scratch_dir.iterdir())
+            if remaining:
+                raise RuntimeError(
+                    f"scratch dir {self._spool_scratch_dir} still contains "
+                    f"files after spool close: {remaining}. "
+                    "Refusing to publish — manual inspection required."
                 )
-                shutil.rmtree(self._spool_scratch_dir, ignore_errors=True)
+            # Directory is empty; remove it.
+            try:
+                self._spool_scratch_dir.rmdir()
+            except OSError as exc:
+                raise RuntimeError(
+                    f"Cannot remove scratch dir {self._spool_scratch_dir}: {exc}. "
+                    "Refusing to publish."
+                ) from exc
+            if self._spool_scratch_dir.exists():
+                raise RuntimeError(
+                    f"scratch dir {self._spool_scratch_dir} still exists after rmdir. "
+                    "Refusing to publish."
+                )
 
         manifest: dict = {
             "venue": self.venue,
@@ -320,18 +334,19 @@ class ReplayWriter:
         # is never lost if the replacement fails (I/O error, permissions, etc.).
         backup_dir = self.output_dir.parent / f".backup_{self.date}_{self.symbol}"
         self.output_dir.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            if self.output_dir.exists():
-                # Rename existing valid partition to backup; restore if replace fails.
-                if backup_dir.exists():
-                    shutil.rmtree(backup_dir)
-                os.replace(self.output_dir, backup_dir)
-            os.replace(self.staging_dir, self.output_dir)
-            # Success — discard backup.
+
+        # Step 1: rename existing output to backup (if it exists).
+        if self.output_dir.exists():
             if backup_dir.exists():
                 shutil.rmtree(backup_dir)
+            os.replace(self.output_dir, backup_dir)
+
+        try:
+            # Step 2: rename staging to canonical output.
+            os.replace(self.staging_dir, self.output_dir)
         except Exception:
-            # Restore backup so the last-known-good partition is not lost.
+            # Canonical publication failed — restore backup so the last-known-
+            # good partition is not lost.
             if backup_dir.exists() and not self.output_dir.exists():
                 try:
                     os.replace(backup_dir, self.output_dir)
@@ -343,6 +358,27 @@ class ReplayWriter:
                         f"Could not restore backup partition {backup_dir}: {restore_err}"
                     )
             raise
+
+        # Step 3: canonical publication succeeded — verify new output exists.
+        if not self.output_dir.exists():
+            logger.error(
+                f"Post-publish check: output_dir {self.output_dir} does not exist "
+                "after os.replace(). Leaving backup in place."
+            )
+            # Do NOT raise here — the replace did not raise, which is unexpected.
+            # Preserve backup and let the caller detect corruption via validation.
+            return self.output_dir
+
+        # Step 4: delete obsolete backup on a best-effort basis.
+        # A failure here must NOT cause publish() to raise or the build to fail.
+        if backup_dir.exists():
+            try:
+                shutil.rmtree(backup_dir)
+            except Exception as backup_del_err:
+                logger.warning(
+                    f"Could not delete obsolete backup {backup_dir}: {backup_del_err}. "
+                    "Leaving for startup cleanup; publication is still successful."
+                )
 
         logger.info(f"Published replay data to: {self.output_dir}")
         return self.output_dir

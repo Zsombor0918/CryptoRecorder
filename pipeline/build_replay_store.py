@@ -275,6 +275,193 @@ def _partition_is_valid(
         return False
 
 
+# ---------------------------------------------------------------------------
+# Partition crash-recovery state machine
+# ---------------------------------------------------------------------------
+
+class _RecoveryAction:
+    """Return value from recover_partition_state()."""
+    __slots__ = ("action", "message")
+
+    def __init__(self, action: str, message: str) -> None:
+        # action: "skip" | "rebuild" | "fail"
+        self.action = action
+        self.message = message
+
+    def __repr__(self) -> str:
+        return f"_RecoveryAction(action={self.action!r}, message={self.message!r})"
+
+
+def recover_partition_state(
+    replay_root: Path,
+    venue: str,
+    symbol: str,
+    date: str,
+) -> _RecoveryAction:
+    """
+    Examine the filesystem state for one partition and return the required action.
+
+    Handles every combination of canonical output, backup, and their validity:
+
+    Case A: output missing, backup valid
+        Restore backup → canonical output.
+        Returns action="skip" after successful restore (partition is now valid).
+        Returns action="fail" if restore fails (manual intervention required).
+
+    Case B: output missing, backup invalid
+        Preserve invalid backup for operator inspection.
+        Returns action="fail" (do not silently delete and rebuild).
+
+    Case C: output valid, backup exists
+        Canonical is authoritative; delete stale backup best-effort.
+        Returns action="skip".
+
+    Case D: output invalid, backup valid
+        Quarantine invalid output; restore valid backup to canonical.
+        Returns action="skip" after successful restore.
+        Returns action="fail" if restore fails.
+
+    Case E: output invalid, backup invalid
+        Preserve both for inspection.
+        Returns action="fail".
+
+    Case F: output valid, no backup
+        Normal valid state.
+        Returns action="skip".
+
+    Case G: output missing, no backup
+        Normal missing state.
+        Returns action="rebuild".
+    """
+    import shutil as _shutil
+
+    partition_dir = replay_root / f"venue={venue}" / f"symbol={symbol}" / f"date={date}"
+    backup_dir = replay_root / f"venue={venue}" / f"symbol={symbol}" / f".backup_{date}_{symbol}"
+
+    output_exists = partition_dir.exists()
+    backup_exists = backup_dir.exists()
+    output_valid = output_exists and _partition_is_valid(replay_root, venue, symbol, date)
+    backup_valid = backup_exists and _partition_is_valid(
+        replay_root, venue, symbol, date, _candidate=backup_dir
+    )
+
+    # --- Case F / G: no backup ---
+    if not backup_exists:
+        if output_valid:
+            return _RecoveryAction("skip", "Partition is complete and valid.")
+        if not output_exists:
+            return _RecoveryAction("rebuild", "No partition or backup; will build.")
+        # output exists but invalid, no backup
+        return _RecoveryAction(
+            "rebuild",
+            f"Partition {partition_dir} exists but is invalid; no backup. Will rebuild."
+        )
+
+    # --- Cases with backup present ---
+
+    if output_valid and backup_valid:
+        # Case F extended: both valid — canonical is authoritative.
+        try:
+            _shutil.rmtree(backup_dir)
+            logger.info(f"Removed stale backup (canonical is valid): {backup_dir}")
+        except Exception as e:
+            logger.warning(f"Could not remove stale backup {backup_dir}: {e}")
+        return _RecoveryAction("skip", "Canonical partition is valid; stale backup cleaned up.")
+
+    if output_valid and not backup_valid:
+        # Case C: canonical valid, stale/invalid backup.
+        try:
+            _shutil.rmtree(backup_dir)
+            logger.info(f"Removed invalid backup (canonical is valid): {backup_dir}")
+        except Exception as e:
+            logger.warning(f"Could not remove backup {backup_dir}: {e}")
+        return _RecoveryAction("skip", "Canonical partition is valid.")
+
+    if not output_exists and backup_valid:
+        # Case A: mid-publish SIGKILL — restore valid backup.
+        logger.warning(
+            f"Crash-recovery (Case A): output missing, valid backup present. "
+            f"Restoring {backup_dir} -> {partition_dir}"
+        )
+        partition_dir.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.replace(backup_dir, partition_dir)
+        except Exception as restore_err:
+            return _RecoveryAction(
+                "fail",
+                f"Crash-recovery: restore of {backup_dir} -> {partition_dir} failed: "
+                f"{restore_err}. Manual intervention required."
+            )
+        logger.info(f"Crash-recovery complete: {partition_dir}")
+        return _RecoveryAction("skip", f"Restored backup to {partition_dir}.")
+
+    if not output_exists and not backup_valid:
+        # Case B: output missing, backup invalid.
+        logger.error(
+            f"Crash-recovery (Case B): output missing, backup {backup_dir} is invalid. "
+            "Preserving backup for operator inspection. "
+            "Rebuild requires manual removal of the invalid backup or --force."
+        )
+        return _RecoveryAction(
+            "fail",
+            f"Crash-recovery: output missing and backup {backup_dir} is invalid. "
+            "Manual inspection required before rebuilding."
+        )
+
+    if output_exists and not output_valid and backup_valid:
+        # Case D: canonical invalid, valid backup available — quarantine and restore.
+        quarantine_dir = (
+            replay_root / f"venue={venue}" / f"symbol={symbol}"
+            / f".quarantine_{date}_{symbol}"
+        )
+        logger.warning(
+            f"Crash-recovery (Case D): canonical {partition_dir} is invalid; "
+            f"valid backup present. Quarantining invalid output, restoring backup."
+        )
+        try:
+            if quarantine_dir.exists():
+                _shutil.rmtree(quarantine_dir)
+            os.replace(partition_dir, quarantine_dir)
+        except Exception as qe:
+            return _RecoveryAction(
+                "fail",
+                f"Crash-recovery: could not quarantine invalid {partition_dir}: {qe}. "
+                "Manual intervention required."
+            )
+        try:
+            os.replace(backup_dir, partition_dir)
+        except Exception as restore_err:
+            # Restore failed — try to un-quarantine.
+            try:
+                os.replace(quarantine_dir, partition_dir)
+            except Exception:
+                pass
+            return _RecoveryAction(
+                "fail",
+                f"Crash-recovery: restore of {backup_dir} -> {partition_dir} failed: "
+                f"{restore_err}. Manual intervention required."
+            )
+        logger.info(f"Crash-recovery complete: restored {partition_dir}.")
+        # Remove quarantined invalid copy best-effort.
+        try:
+            _shutil.rmtree(quarantine_dir)
+        except Exception as e:
+            logger.warning(f"Could not remove quarantined copy {quarantine_dir}: {e}")
+        return _RecoveryAction("skip", f"Restored valid backup to {partition_dir}.")
+
+    # Case E: output invalid (or missing), backup invalid.
+    logger.error(
+        f"Crash-recovery (Case E): both canonical ({partition_dir}) and "
+        f"backup ({backup_dir}) are invalid or missing. "
+        "Preserving both for operator inspection."
+    )
+    return _RecoveryAction(
+        "fail",
+        f"Both canonical and backup are invalid/missing for {venue}/{symbol}/{date}. "
+        "Manual inspection required."
+    )
+
+
 def build_replay_for_symbol(
     venue: str,
     symbol: str,
@@ -307,71 +494,43 @@ def build_replay_for_symbol(
 
     import shutil as _shutil
 
-    partition_dir = (
-        replay_root / f"venue={venue}" / f"symbol={symbol}" / f"date={date}"
-    )
-    backup_dir = (
-        replay_root / f"venue={venue}" / f"symbol={symbol}"
-        / f".backup_{date}_{symbol}"
-    )
     staging_dir = (
         replay_root / f"venue={venue}" / f"symbol={symbol}"
         / f".staging_{date}_{symbol}"
     )
 
     # ---------------------------------------------------------------
-    # Crash-recovery: a previous SIGKILL may have occurred between the
-    # two os.replace() calls inside publish(), leaving output_dir gone
-    # and backup_dir present.  Restore the backup before doing anything
-    # else so no valid data is permanently lost.
+    # Crash-recovery: handle all possible backup/output state combinations
+    # before doing anything else.
     # ---------------------------------------------------------------
-    if backup_dir.exists() and not partition_dir.exists():
-        if _partition_is_valid(replay_root, venue, symbol, date, _candidate=backup_dir):
-            logger.warning(
-                f"Crash-recovery: restoring backup partition {backup_dir} -> {partition_dir}"
+    if not force:
+        recovery = recover_partition_state(replay_root, venue, symbol, date)
+        if recovery.action == "fail":
+            status["status"] = "failed"
+            status["errors"].append(recovery.message)
+            logger.error(recovery.message)
+            return status
+        if recovery.action == "skip":
+            # Partition is valid (possibly just restored from backup).
+            logger.info(
+                f"⏭ Skipping already-complete partition: {venue}/{symbol}/{date}"
             )
-            partition_dir.parent.mkdir(parents=True, exist_ok=True)
-            try:
-                os.replace(backup_dir, partition_dir)
-            except Exception as restore_err:
-                status["status"] = "error"
-                status["errors"].append(
-                    f"Crash-recovery restore failed: {restore_err}"
-                )
-                logger.error(
-                    f"Cannot restore backup {backup_dir}: {restore_err}. "
-                    "Manual intervention required."
-                )
-                return status
-            logger.info(f"Crash-recovery complete: {partition_dir}")
-        else:
-            logger.warning(
-                f"Crash-recovery: backup {backup_dir} is invalid/incomplete; "
-                "removing and rebuilding."
-            )
-            _shutil.rmtree(backup_dir, ignore_errors=True)
-    elif backup_dir.exists() and partition_dir.exists():
-        # Both exist: canonical output is complete → remove stale backup.
-        if _partition_is_valid(replay_root, venue, symbol, date):
-            logger.info(f"Removing stale backup (canonical partition is valid): {backup_dir}")
-            _shutil.rmtree(backup_dir, ignore_errors=True)
-        else:
-            # Canonical output is corrupt; backup may be newer.  Treat as
-            # corrupt partition — fall through to rebuild (backup removed by
-            # existing stale-staging cleanup below if it has staging_dir too,
-            # otherwise it stays harmlessly until publish() overwrites it).
-            logger.warning(
-                f"Both {partition_dir} and {backup_dir} exist but canonical is invalid; "
-                "will rebuild."
-            )
+            status["status"] = "skipped"
+            return status
+        # action == "rebuild" — fall through to build.
 
-    # Skip already-complete valid partitions (unless force rebuild requested).
-    if not force and _partition_is_valid(replay_root, venue, symbol, date):
-        logger.info(
-            f"⏭ Skipping already-complete partition: {venue}/{symbol}/{date}"
+    # When force=True, skip crash-recovery and proceed directly to rebuild.
+    # Remove any leftover backup dir so publish() does not get confused.
+    if force:
+        backup_dir = (
+            replay_root / f"venue={venue}" / f"symbol={symbol}"
+            / f".backup_{date}_{symbol}"
         )
-        status["status"] = "skipped"
-        return status
+        if backup_dir.exists():
+            try:
+                _shutil.rmtree(backup_dir)
+            except Exception as e:
+                logger.warning(f"--force: could not remove backup {backup_dir}: {e}")
 
     # Remove stale staging directory from a previous SIGKILL so it cannot be
     # confused with a successful previous build.
@@ -380,14 +539,14 @@ def build_replay_for_symbol(
         try:
             _shutil.rmtree(staging_dir)
         except Exception as exc:
-            status["status"] = "error"
+            status["status"] = "failed"
             status["errors"].append(
                 f"Failed to remove stale staging dir {staging_dir}: {exc}"
             )
             logger.error(status["errors"][-1])
             return status
         if staging_dir.exists():
-            status["status"] = "error"
+            status["status"] = "failed"
             status["errors"].append(
                 f"Failed to remove stale staging dir {staging_dir}; "
                 "refusing to build on top of stale files."

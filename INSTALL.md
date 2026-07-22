@@ -347,11 +347,13 @@ sudo systemd-analyze verify \
   /etc/systemd/system/cryptorecorder-replay-build.timer
 ```
 
-> **Note:** `systemd/cryptorecorder-convert.{service,timer}` are kept in the repo as
-> manual-only reference templates for local catalog reconstruction. They are **not**
-> part of the automated production service set and must not be installed or enabled
-> on the production server. Any previously installed converter units are removed by
-> `scripts/deploy_linux_server.sh` on the next deploy run.
+> **Note:** `systemd/cryptorecorder-convert.{service,timer}` were **deleted from
+> the repository** in PR #18 — converter systemd automation is not part of the
+> supported production architecture. Manual reconstruction uses documented CLI
+> commands (e.g. `python convert_day.py --date YYYY-MM-DD --staging`), not systemd
+> templates. Any previously installed converter units on an existing server are
+> stopped, disabled, and removed automatically by `scripts/deploy_linux_server.sh`
+> on the next deploy run.
 
 Current production unit behavior:
 
