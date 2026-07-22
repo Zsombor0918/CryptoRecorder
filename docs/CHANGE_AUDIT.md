@@ -93,6 +93,65 @@ An entry may be skipped **only** for:
 - <or "none — task fully completed">
 ```
 
+## 2026-07-22 — Follow-up: stale converter-template claim also present in an older CHANGELOG.md entry
+
+### Change summary
+- Codex flagged that the `[Unreleased]` CHANGELOG.md entry immediately below
+  the corrected one still said (about `INSTALL.md`'s note): "the converter
+  systemd template files remain in the repo as manual/reference templates
+  only and must not be installed on the production server." This wording
+  differs from the phrases the previous session's guard test checked for
+  ("kept in the repo as manual..." / "converter systemd templates remain"),
+  so it slipped through unnoticed.
+- `CHANGELOG.md`: reworded that older entry to describe the note as a
+  point-in-time historical fact ("at the time of this change... those unit
+  files were subsequently **deleted** in a later PR #18 finalization
+  commit... `INSTALL.md` no longer contains that note") instead of present
+  tense current-state language.
+- `docs/IMPLEMENTATION_AUDIT.md` lines 493-495: re-checked; already correctly
+  states the files "were deleted from the repository in PR #18 finalization"
+  from the prior session's fix. No further change needed there.
+- `tests/test_repo_structure.py::test_docs_do_not_claim_deleted_converter_systemd_files_exist`:
+  broadened from an exact-phrase list to also match a proximity regex
+  (`convert(er)? ... remain ... repo|manual`) so future wording variants of
+  the same stale claim are caught. Verified the new regex matches the
+  original stale sentence via a standalone sanity check before relying on it.
+
+### Files/packages touched
+- `CHANGELOG.md`
+- `tests/test_repo_structure.py`
+- `docs/CHANGE_AUDIT.md`
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] docs/REPO_STRUCTURE.md
+- [x] docs/IMPLEMENTATION_AUDIT.md (re-verified lines 480-505, already correct)
+- [x] CHANGELOG.md (full file grepped for remaining stale phrasing)
+
+### Docs updated
+- [x] CHANGELOG.md
+- No docs/PROJECT_STATUS.md update required: validated/deferred status unchanged
+- No docs/IMPLEMENTATION_AUDIT.md change needed: already correct
+
+### Status / validation impact
+- Validated status changed: no
+- Deferred status changed: no
+- New claims added: no
+
+### Tests run
+```bash
+pytest tests/test_repo_structure.py -q   # 23 passed
+pytest -q                                 # 331 passed, 3 skipped
+```
+
+### Validation CLIs run
+```bash
+python -m validation.audit_change_compliance --base main   # PASS
+```
+
+### Known limitations / out of scope
+- No code changes in this follow-up; documentation + guard-test only.
+
 ## 2026-07-22 — PR #18 final Codex findings: post-publish validation, cleanup-failure preservation, force-rebuild backup safety, converter doc consistency
 
 ### Change summary

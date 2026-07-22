@@ -413,6 +413,16 @@ def test_docs_do_not_claim_deleted_converter_systemd_files_exist() -> None:
         "converter systemd templates remain",
     ]
 
+    # Wording varies ("templates remain in the repo", "template files remain
+    # in the repo as manual/reference templates only", etc.) so also match a
+    # loose regex: "remain(s)" near "repo" and "manual" within the same
+    # sentence-ish window, scoped to a converter/systemd context.
+    forbidden_pattern = re.compile(
+        r"convert(?:er)?[^.]{0,80}remain[^.]{0,60}(?:repo|manual)"
+        r"|remain[^.]{0,80}repo[^.]{0,60}manual[^.]{0,40}template",
+        re.IGNORECASE,
+    )
+
     current_state_docs = [
         ROOT / "CHANGELOG.md",
         ROOT / "INSTALL.md",
@@ -429,6 +439,13 @@ def test_docs_do_not_claim_deleted_converter_systemd_files_exist() -> None:
                 f"systemd templates remain in the repo (found: {phrase!r}). "
                 "Update to state they were deleted in PR #18."
             )
+        match = forbidden_pattern.search(normalized)
+        assert match is None, (
+            f"{doc_path.relative_to(ROOT)} still claims deleted converter "
+            f"systemd templates remain in the repo "
+            f"(matched: {match.group(0) if match else None!r}). "
+            "Update to state they were deleted in PR #18."
+        )
 
 
 def test_docs_do_not_reference_validators_package() -> None:

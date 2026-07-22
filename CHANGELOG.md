@@ -138,10 +138,13 @@ passes.** Until then, broader full-L2 equivalence stays **deferred** (see
   service` / `cryptorecorder-convert.timer` as active units to install.
   These sections now reference only the production units
   (`cryptorecorder-recorder.service`, `cryptorecorder-replay-build.service`,
-  `cryptorecorder-replay-build.timer`). The stale "converter timer date" 
-  troubleshooting sub-section was removed. A `> **Note:**` clarifies that the
-  converter systemd template files remain in the repo as manual/reference
-  templates only and must not be installed on the production server.
+  `cryptorecorder-replay-build.timer`). The stale "converter timer date"
+  troubleshooting sub-section was removed. At the time of this change a
+  `> **Note:**` was added stating the converter systemd unit files were kept
+  in the repo for manual/reference use only; those unit files were
+  subsequently **deleted** in a later PR #18 finalization commit (see the
+  "converter files deleted" entry above) — `INSTALL.md` no longer contains
+  that note and instead documents the manual `convert_day.py` CLI command.
 
 ### Added (PR #18 — crash-recovery and layout regression tests)
 - `test_published_partition_layout_is_clean` — verifies that the published
