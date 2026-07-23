@@ -2,7 +2,7 @@
 Description=CryptoRecorder Replay Store Build Timer (daily, 01:00 UTC)
 
 [Timer]
-# Run after the legacy converter has had time to finish the previous UTC day.
+# Run at 01:00 UTC, after the previous UTC recording day has closed.
 OnCalendar=*-*-* 01:00:00 UTC
 Timezone=UTC
 Unit=cryptorecorder-replay-build.service

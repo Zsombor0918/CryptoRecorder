@@ -68,16 +68,33 @@ passes.** Until then, broader full-L2 equivalence stays **deferred** (see
 
 ### Changed
 - **`systemd/cryptorecorder-replay-build.service` — `TimeoutStartSec` raised
-  from `3600` (1 hour) to `infinity`** — the replay-build `oneshot` unit no
-  longer has a systemd-imposed maximum runtime. A finite `TimeoutStartSec`
-  risked systemd sending `SIGTERM`/`SIGKILL` to an in-progress, otherwise-
-  healthy build (e.g. a `--force` rebuild, a large backfill across many
-  missing days, or a full top50-universe run) purely because it exceeded 1
-  hour of wall-clock time. `StartLimitIntervalSec=86400` / `StartLimitBurst=3`
-  in `[Unit]` are unchanged and still cap *restart* attempts if `Restart` is
-  ever re-enabled; `Restart=no` is unchanged. See
+  from `3600` (1 hour) to `23h`** — the replay-build `oneshot` unit's
+  systemd-imposed maximum runtime was too short at 1 hour for a full-universe
+  replay build of the previous completed UTC day. An unbounded (`infinity`)
+  timeout was considered and **rejected**: the daily timer fires once at
+  `01:00 UTC` and systemd will not start a new instance while an existing one
+  is still active, so a genuinely stuck invocation must not be allowed to
+  remain active indefinitely — that would silently block every later
+  scheduled run. `23h` gives ample room for a long daily build while still
+  guaranteeing systemd terminates a stuck/hung run before the next `01:00
+  UTC` activation. If the ceiling is reached, systemd marks the invocation
+  failed; because `Restart=no` (unchanged), no restart loop is created — the
+  operator must inspect the journal and rerun manually.
+  `StartLimitIntervalSec=86400` / `StartLimitBurst=3` in `[Unit]` are
+  unchanged and still cap *restart* attempts if `Restart` is ever
+  re-enabled. The installed service only ever builds the previous completed
+  UTC day (`pipeline.daily_build --date yesterday`); it does not perform
+  `--force` rebuilds or arbitrary historical backfills — those are run
+  manually via the documented CLI or a separately controlled transient
+  systemd scope with its own explicit timeout. See
   [docs/OPERATIONS.md](docs/OPERATIONS.md) "Replay-build memory and restart
   behaviour" for the updated "Start timeout" note.
+- **`systemd/cryptorecorder-replay-build.timer` — stale converter comment
+  removed** — the timer's `OnCalendar` comment previously said "Run after
+  the legacy converter has had time to finish the previous UTC day", which
+  no longer applies: converter systemd automation was removed from the
+  supported architecture. Reworded to "Run at 01:00 UTC, after the previous
+  UTC recording day has closed."
 
 ### Fixed (PR #18 finalization — fail-closed crash-recovery, best-effort backup deletion, converter files deleted)
 - **`pipeline/build_replay_store.py` — `recover_partition_state()` extracted as

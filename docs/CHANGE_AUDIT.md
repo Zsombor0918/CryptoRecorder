@@ -93,6 +93,116 @@ An entry may be skipped **only** for:
 - <or "none — task fully completed">
 ```
 
+## 2026-07-23 — Correction: bound the daily replay-build timeout at 23h instead of infinity
+
+### Change summary
+- Corrects the immediately-preceding 2026-07-23 entry below ("Remove 1-hour
+  systemd start timeout on replay-build service"), which set
+  `TimeoutStartSec=infinity`. That entry is **not** rewritten (append-only
+  history); this entry supersedes its conclusion.
+- `systemd/cryptorecorder-replay-build.service`: `TimeoutStartSec` changed
+  from `infinity` to `23h`. Rationale: the daily timer fires once at `01:00
+  UTC`; systemd does not start a new instance of a service while an existing
+  invocation is still active. An unbounded timeout could therefore let a
+  genuinely stuck job remain active indefinitely, silently blocking every
+  later scheduled run — a worse failure mode than the original 1-hour cap
+  being too short. `23h` gives ample room for a long daily build of the
+  previous completed UTC day across a large symbol universe, while still
+  guaranteeing systemd terminates a stuck/hung run before the next `01:00
+  UTC` activation. `Restart=no`, `RestartSec=300`,
+  `StartLimitIntervalSec=86400`, `StartLimitBurst=3`, and `MemoryMax` are
+  all unchanged.
+- `systemd/cryptorecorder-replay-build.service` comments: corrected to no
+  longer claim the installed daily service performs `--force` rebuilds or
+  arbitrary multi-day backfills. The installed service only ever builds the
+  previous completed UTC day via `pipeline.daily_build --date yesterday`;
+  manual force rebuilds/backfills use the documented CLI or a separately
+  controlled transient systemd scope with its own explicit timeout.
+- `systemd/cryptorecorder-replay-build.timer`: removed the stale comment
+  "Run after the legacy converter has had time to finish the previous UTC
+  day" (converter systemd automation was removed from the supported
+  architecture in an earlier PR #18 commit). Replaced with "Run at 01:00
+  UTC, after the previous UTC recording day has closed."
+- `docs/OPERATIONS.md`: rewrote the "Start timeout" and "Durable progress on
+  restart" paragraphs in "Replay-build memory and restart behaviour" to
+  describe the `23h` contract (not `infinity`), the explicit tradeoff (1h
+  too short / infinity rejected / 23h chosen), what happens if the ceiling
+  is reached (systemd marks invocation failed, no restart per `Restart=no`,
+  operator must inspect journal and rerun manually), and that manual force
+  rebuilds/backfills are a separate, manually-run CLI/scope action, not part
+  of the installed daily service.
+- `CHANGELOG.md`: corrected the `[Unreleased]` "Changed" entry (still
+  unreleased, so edited in place rather than appended twice) to describe
+  the final `23h` value, the infinity-considered-and-rejected tradeoff, the
+  timer comment fix, and the corrected installed-service contract
+  description.
+- No Python source, recorder behavior, raw/replay schema, replay ordering,
+  reconstruction, converter automation, KovacsTrader integration, Syncthing,
+  or issue #20 uv work was touched.
+
+### Files/packages touched
+- `systemd/cryptorecorder-replay-build.service`
+- `systemd/cryptorecorder-replay-build.timer`
+- `docs/OPERATIONS.md`
+- `CHANGELOG.md`
+- `docs/CHANGE_AUDIT.md`
+- `tests/test_agent_infrastructure.py` (5 new lightweight systemd-contract tests)
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] docs/REPO_STRUCTURE.md (no folder/file contract change)
+- [x] docs/OPERATIONS.md
+- [x] docs/PROJECT_STATUS.md (no validated/deferred status affected)
+
+### Docs updated
+- [x] CHANGELOG.md (corrected in place; still `[Unreleased]`)
+- [x] docs/OPERATIONS.md
+- No docs/PROJECT_STATUS.md update required because: operational systemd
+  tuning correction, not a validated/deferred status change.
+
+### Status / validation impact
+- Validated status changed: no
+- Deferred status changed: no
+- New claims added: no
+- No production validation is claimed: the 23h ceiling has not been
+  exercised against an actual long-running production build on a real
+  server; this remains a deployment-time observation, not something
+  asserted as already proven here.
+
+### Tests run
+```bash
+pytest tests/test_agent_infrastructure.py -q   # 33 passed (5 new)
+pytest tests/test_repo_structure.py -q         # 23 passed
+pytest -q                                       # 336 passed, 3 skipped
+```
+
+### Validation CLIs run
+```bash
+python -m validation.audit_change_compliance --base main   # PASS
+bash -n scripts/deploy_linux_server.sh                       # OK (no output)
+./scripts/deploy_linux_server.sh --target all --dry-run
+  # Clean; only cryptorecorder-recorder.service,
+  # cryptorecorder-replay-build.service, cryptorecorder-replay-build.timer
+  # planned; no converter unit referenced.
+systemd-analyze verify systemd/cryptorecorder-replay-build.service
+  # Fails on this dev machine only: unit references the production path
+  # /home/zsom/services/CryptoRecorder/.venv/bin/python, which does not
+  # exist here. Pre-existing condition unrelated to this change (confirmed
+  # via git diff that only the TimeoutStartSec/comment block changed).
+systemd-analyze verify systemd/cryptorecorder-replay-build.timer
+  # Exit 0. One pre-existing warning ("Unknown key name 'Timezone' in
+  # section 'Timer', ignoring") on a line this change did not touch
+  # (confirmed via git diff — only the OnCalendar comment line changed).
+```
+
+### Known limitations / out of scope
+- No real production host run was performed to observe a >1h build
+  completing under the new 23h ceiling; this is a systemd configuration
+  correction, not a runtime-validated claim.
+- The prior 2026-07-23 audit entry describing `TimeoutStartSec=infinity` is
+  left as historical record per the append-only policy; it is superseded by
+  this entry, not deleted or edited.
+
 ## 2026-07-23 — Remove 1-hour systemd start timeout on replay-build service
 
 ### Change summary

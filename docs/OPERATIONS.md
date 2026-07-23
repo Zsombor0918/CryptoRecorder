@@ -408,25 +408,43 @@ the data filesystem.
 if the policy is ever re-enabled. To re-run the build manually after fixing the
 root cause: `sudo systemctl start cryptorecorder-replay-build.service`.
 
-**Start timeout**: `TimeoutStartSec=infinity` — the build has no maximum
-runtime imposed by systemd. A `oneshot` unit is normally considered "hung" by
-systemd if it does not exit before `TimeoutStartSec` elapses, at which point
-systemd sends `SIGTERM`/`SIGKILL` to the still-running process. A finite value
-(the unit previously used `3600`, i.e. 1 hour) risks systemd killing an
-in-progress, otherwise-healthy build — e.g. a `--force` rebuild, a large
-backfill across many missing days, or a run over the full top50 universe —
-mid-publish. Removing the cap trades "systemd auto-kills a stuck build" for
-"an operator must notice and intervene manually" (see Recovery command below);
-`StartLimitIntervalSec`/`StartLimitBurst` still bound *restart* attempts, and
-the memory-bounded writer plus crash-recovery state machine already make a
-`SIGKILL`/OOM mid-build safe to recover from on the next run.
+**Start timeout**: `TimeoutStartSec=23h`. A `oneshot` unit is considered
+"hung" by systemd if it does not exit before `TimeoutStartSec` elapses, at
+which point systemd sends `SIGTERM`/`SIGKILL` to the still-running process
+and marks the invocation failed. The daily timer fires once at `01:00 UTC`,
+and systemd will not start a new instance of this service while an existing
+invocation is still active — so a genuinely stuck run must not be allowed to
+stay active indefinitely, or it would silently block every later scheduled
+run. The original `3600` (1 hour) value was too short for a full-universe
+replay build; `infinity` (no cap at all) was considered and rejected because
+it could let a truly stuck job block all future daily activations forever.
+`23h` gives ample room for a long daily build of the previous completed UTC
+day across a large symbol universe, while still guaranteeing systemd
+terminates a stuck/hung run before the next `01:00 UTC` activation.
+`Restart=no` is unchanged, so a timeout failure does not create a restart
+loop; `StartLimitIntervalSec`/`StartLimitBurst` still bound restart attempts
+if `Restart` is ever re-enabled. If the ceiling is ever reached: `systemctl
+status`/`journalctl` will show the invocation as failed; because
+`Restart=no`, no automatic retry occurs — the operator must inspect the
+journal, resolve the root cause, and rerun manually (see Recovery command
+below). The installed service only ever builds the previous completed UTC
+day via `pipeline.daily_build --date yesterday`; it does not perform
+`--force` rebuilds or arbitrary historical backfills. Those are run
+manually via the documented CLI (`python -m pipeline.build_replay_store` /
+`python -m pipeline.daily_build --date YYYY-MM-DD`) or a separately
+controlled transient systemd scope (e.g. `systemd-run`) where an operator
+chooses an explicit timeout appropriate to the manual job — not through this
+installed daily service or its timer. The memory-bounded writer plus
+crash-recovery state machine already make a `SIGKILL`/OOM/timeout mid-build
+safe to recover from on the next run.
 
 **Durable progress on restart**: When a build is re-run, already-complete
 partitions (manifest exists, `status=complete`, checksums match) are skipped.
 Only genuinely incomplete or missing partitions are rebuilt. A stale staging
 directory from a previous SIGKILL is removed before starting a fresh build.
-Use `--force` to rebuild a complete partition after raw data has been repaired
-or backfilled.
+Manual `--force` rebuilds (to rebuild a complete partition after raw data has
+been repaired or backfilled) are run via the CLI directly, not via the
+installed daily service.
 
 **Recovery command** (after a confirmed OOM or failure):
 ```bash

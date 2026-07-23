@@ -392,3 +392,77 @@ def test_deploy_script_never_overwrites_existing_env_file() -> None:
     assert exists_idx < return_idx < render_idx, (
         "existing-file check must return before the env file is rendered/copied"
     )
+
+
+# ---------------------------------------------------------------------------
+# cryptorecorder-replay-build.service / .timer contract (bounded daily timeout)
+# ---------------------------------------------------------------------------
+
+REPLAY_BUILD_SERVICE = ROOT / "systemd" / "cryptorecorder-replay-build.service"
+REPLAY_BUILD_TIMER = ROOT / "systemd" / "cryptorecorder-replay-build.timer"
+
+
+def test_replay_build_service_has_bounded_23h_timeout() -> None:
+    """The installed daily replay-build service must use a bounded
+    TimeoutStartSec of 23h -- not the too-short original 1h (3600) and not
+    an unbounded 'infinity' (which could let a stuck run block every later
+    01:00 UTC scheduled activation, since systemd will not start a new
+    instance while one is still active)."""
+    text = REPLAY_BUILD_SERVICE.read_text()
+    match = re.search(r"^TimeoutStartSec=(\S+)$", text, flags=re.MULTILINE)
+    assert match, "TimeoutStartSec= must be set in cryptorecorder-replay-build.service"
+    value = match.group(1)
+    assert value == "23h", (
+        f"TimeoutStartSec must be '23h', found {value!r}. "
+        "1h (3600) is too short for a full-universe build; 'infinity' risks "
+        "blocking every later scheduled run if a build ever hangs."
+    )
+
+
+def test_replay_build_service_restart_policy_unchanged() -> None:
+    """Restart=no must remain unchanged so a start-timeout failure cannot
+    create a restart loop; StartLimitIntervalSec/StartLimitBurst still cap
+    restart attempts if Restart is ever re-enabled."""
+    text = REPLAY_BUILD_SERVICE.read_text()
+    assert re.search(r"^Restart=no$", text, flags=re.MULTILINE), (
+        "Restart=no must remain unchanged in cryptorecorder-replay-build.service"
+    )
+    assert "StartLimitIntervalSec=86400" in text
+    assert "StartLimitBurst=3" in text
+
+
+def test_replay_build_service_does_not_claim_force_or_backfill_in_installed_service() -> None:
+    """The installed daily service only ever runs `daily_build --date
+    yesterday`; its own comments must not claim it directly performs --force
+    rebuilds or arbitrary multi-day backfills (those are separate, manually
+    run CLI/scope actions)."""
+    text = REPLAY_BUILD_SERVICE.read_text()
+    assert "--date yesterday" in text
+    lowered = text.lower()
+    assert "not via this installed daily service" in lowered or (
+        "--force" not in lowered and "backfill" not in lowered
+    ), (
+        "if the service file mentions --force/backfill, it must explicitly "
+        "state those are not performed by this installed daily service"
+    )
+
+
+def test_replay_build_units_do_not_reference_legacy_converter() -> None:
+    """Neither the replay-build service nor its timer may describe a
+    dependency on, or wait for, the removed legacy converter systemd
+    automation."""
+    for path in (REPLAY_BUILD_SERVICE, REPLAY_BUILD_TIMER):
+        text = path.read_text().lower()
+        assert "legacy converter" not in text, (
+            f"{path.relative_to(ROOT)} must not reference the removed legacy converter"
+        )
+        assert "cryptorecorder-convert" not in text, (
+            f"{path.relative_to(ROOT)} must not reference a converter systemd unit"
+        )
+
+
+def test_no_converter_systemd_unit_files_exist() -> None:
+    """The converter systemd unit files must stay deleted (PR #18); no task
+    may reintroduce converter systemd automation."""
+    assert not (ROOT / "systemd" / "cryptorecorder-convert.service").exists()
+    assert not (ROOT / "systemd" / "cryptorecorder-convert.timer").exists()

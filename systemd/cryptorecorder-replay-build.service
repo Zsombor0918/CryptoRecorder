@@ -23,12 +23,21 @@ SyslogIdentifier=cryptorecorder-replay-build
 
 Restart=no
 RestartSec=300
-# No start timeout: replay builds over the full top50 universe can legitimately
-# run well past 1 hour (e.g. backfills, --force rebuilds, large multi-day
-# gaps). A finite TimeoutStartSec would SIGTERM/SIGKILL an in-progress,
-# otherwise-healthy build. StartLimitIntervalSec/StartLimitBurst above still
-# cap restart attempts if Restart is ever re-enabled.
-TimeoutStartSec=infinity
+# Bounded start timeout, not infinite: the daily timer fires once at 01:00
+# UTC and systemd will not start a new instance while this service is still
+# active, so a genuinely stuck invocation must not be allowed to remain
+# active indefinitely (that would silently block every subsequent scheduled
+# run). 1 hour (the previous value) was too short for a full-universe
+# replay build. 23 hours gives ample room for a long daily build (large
+# symbol universe, slow I/O, etc.) while still guaranteeing systemd
+# terminates a stuck/hung run before the next 01:00 UTC activation.
+# Restart=no is unchanged, so a timeout failure cannot create a restart
+# loop; the crash-safe staging/backup recovery in pipeline.build_replay_store
+# already protects replay data if systemd terminates the build mid-run.
+# Manual --force rebuilds and historical backfills are run via the
+# documented CLI (or a separately controlled transient systemd scope with
+# its own explicit timeout) -- not via this installed daily service.
+TimeoutStartSec=23h
 
 # Security hardening
 NoNewPrivileges=yes
