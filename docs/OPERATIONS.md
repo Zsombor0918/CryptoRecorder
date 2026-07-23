@@ -408,6 +408,19 @@ the data filesystem.
 if the policy is ever re-enabled. To re-run the build manually after fixing the
 root cause: `sudo systemctl start cryptorecorder-replay-build.service`.
 
+**Start timeout**: `TimeoutStartSec=infinity` — the build has no maximum
+runtime imposed by systemd. A `oneshot` unit is normally considered "hung" by
+systemd if it does not exit before `TimeoutStartSec` elapses, at which point
+systemd sends `SIGTERM`/`SIGKILL` to the still-running process. A finite value
+(the unit previously used `3600`, i.e. 1 hour) risks systemd killing an
+in-progress, otherwise-healthy build — e.g. a `--force` rebuild, a large
+backfill across many missing days, or a run over the full top50 universe —
+mid-publish. Removing the cap trades "systemd auto-kills a stuck build" for
+"an operator must notice and intervene manually" (see Recovery command below);
+`StartLimitIntervalSec`/`StartLimitBurst` still bound *restart* attempts, and
+the memory-bounded writer plus crash-recovery state machine already make a
+`SIGKILL`/OOM mid-build safe to recover from on the next run.
+
 **Durable progress on restart**: When a build is re-run, already-complete
 partitions (manifest exists, `status=complete`, checksums match) are skipped.
 Only genuinely incomplete or missing partitions are rebuilt. A stale staging

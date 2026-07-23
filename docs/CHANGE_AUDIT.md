@@ -93,6 +93,85 @@ An entry may be skipped **only** for:
 - <or "none — task fully completed">
 ```
 
+## 2026-07-23 — Remove 1-hour systemd start timeout on replay-build service
+
+### Change summary
+- `systemd/cryptorecorder-replay-build.service`: `TimeoutStartSec` changed
+  from `3600` (1 hour) to `infinity`. The unit is `Type=oneshot`; systemd
+  treats a `oneshot` unit as "hung" if it has not exited before
+  `TimeoutStartSec` elapses and will `SIGTERM`/`SIGKILL` it. A finite 1-hour
+  cap risked systemd killing an in-progress, otherwise-healthy replay build
+  (e.g. a `--force` rebuild, a large multi-day backfill, or a run across the
+  full top50 universe) purely for exceeding the wall-clock budget, not for
+  any actual failure. `Restart=no`, `RestartSec=300`, and
+  `StartLimitIntervalSec=86400`/`StartLimitBurst=3` in `[Unit]` are
+  unchanged — restart-attempt capping is unaffected; only the single-run
+  maximum duration is removed.
+- `docs/OPERATIONS.md`: added a new "Start timeout" paragraph in the
+  "Replay-build memory and restart behaviour" section explaining the
+  `TimeoutStartSec=infinity` setting, why the previous 1-hour value was
+  risky, and that `StartLimitIntervalSec`/`StartLimitBurst` still bound
+  restart attempts (not run duration).
+- `CHANGELOG.md`: added an `[Unreleased]` "Changed" entry documenting the
+  value change and rationale, cross-referencing the `docs/OPERATIONS.md`
+  section.
+- No change needed in `INSTALL.md`, `docs/REPLAY_STORE.md`, or
+  `scripts/deploy_linux_server.sh`: none of them hardcode or document the
+  specific `TimeoutStartSec` value; `INSTALL.md`'s manual-install steps just
+  copy/render the unit file as-is via `sed`, so the new value propagates
+  automatically.
+- No test asserted the old `3600` value (verified via repo-wide grep), so no
+  test changes were required.
+
+### Files/packages touched
+- `systemd/cryptorecorder-replay-build.service`
+- `docs/OPERATIONS.md`
+- `CHANGELOG.md`
+- `docs/CHANGE_AUDIT.md`
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] docs/REPO_STRUCTURE.md (no folder/file contract change — same file, edited in place)
+- [x] docs/OPERATIONS.md
+- [x] docs/PROJECT_STATUS.md (no validated/deferred status affected)
+- [x] INSTALL.md (confirmed no hardcoded timeout value to update)
+- [x] docs/REPLAY_STORE.md (confirmed no mention of this setting)
+
+### Docs updated
+- [x] CHANGELOG.md
+- [x] docs/OPERATIONS.md
+- No docs/PROJECT_STATUS.md update required because: this is an operational
+  systemd tuning change, not a validated/deferred status change.
+- No docs/REPO_STRUCTURE.md update required because: no files added, moved,
+  or removed.
+
+### Status / validation impact
+- Validated status changed: no
+- Deferred status changed: no
+- New claims added: no
+
+### Tests run
+```bash
+pytest -q   # 331 passed, 3 skipped
+```
+
+### Validation CLIs run
+```bash
+systemd-analyze verify systemd/cryptorecorder-replay-build.service
+  # Fails on this dev machine only because the unit references the production
+  # path /home/zsom/services/CryptoRecorder/.venv/bin/python, which does not
+  # exist here. Pre-existing condition unrelated to this change (confirmed
+  # the same failure occurs on the unmodified file too); TimeoutStartSec=infinity
+  # itself introduces no new parse/verify error.
+python -m validation.audit_change_compliance --staged   # PASS
+```
+
+### Known limitations / out of scope
+- Not verified on an actual production host that a long-running (>1 hour)
+  build now completes without being killed — this dev-machine change only
+  removes the systemd-side cap; real long-duration production verification
+  remains a separate deployment-time check.
+
 ## 2026-07-22 — Follow-up 3: fix FileNotFoundError in stale-staging-cleanup test finally block
 
 ### Change summary
