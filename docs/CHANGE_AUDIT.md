@@ -93,6 +93,143 @@ An entry may be skipped **only** for:
 - <or "none — task fully completed">
 ```
 
+## 2026-07-24 — Issue #20 Phases 2–3: raw-retention safety, legacy-v0 inventory, traceability, versioning design, and finalized field/consumer/integrity matrix
+
+### Change summary
+- **Design/documentation only — no code was changed in this commit.** Both
+  phases are documented as new sections appended to
+  `docs/IMPLEMENTATION_AUDIT.md` rather than as two separate commits,
+  because Phase 3's matrix directly builds on and cross-references Phase
+  2's design conclusions (e.g. the `native_payload_hash`/`quality_flags`
+  "unresolved/unproven" status in the matrix is defined by Phase 2's
+  traceability-design and consumer-proof sections) — splitting them into
+  two commits within the same file via interactive patch staging was
+  judged more fragile than a single reviewable append covering both,
+  given both are strictly additive, non-destructive documentation.
+- **Phase 2 — Raw-retention safety contract**: corrected a false assumption
+  from the previously-approved plan. Verified directly in code that
+  `disk_monitor.py::cleanup_old_data()` **already** automatically deletes
+  raw data above `CRYPTO_RECORDER_DISK_SOFT_LIMIT_GB`, and that
+  `get_oldest_date_dir()`'s `venue → channel → symbol → date` glob makes
+  `depth_v2` and `trade_v2` for the same symbol/date independently
+  deletable — i.e. `data_raw` is not retained forever, and the current
+  deletion unit is not atomic across the channels of one logical
+  partition. Documented a 9-point precondition gate (replay
+  exists/complete/checksummed/self-contained/gate-passed, etc.) that must
+  hold before any raw deletion of a corrected, atomic per-partition
+  deletion unit is permitted, fail-closed by default, layered as an
+  additive safety check over the existing (unmodified in this commit)
+  `cleanup_old_data()` mechanism.
+- **Phase 2 — Legacy-v0 inventory design**: documented the
+  rebuildable/not-rebuildable/uncertain classification approach for
+  existing v0 partitions, given that raw availability can no longer be
+  assumed. Non-rebuildable/uncertain partitions are designed to be
+  preserved with the legacy v0 reader kept available indefinitely (not a
+  fixed migration window); reader removal is conditioned on an explicit
+  future inventory run proving zero dependency.
+- **Phase 2 — Traceability design**: documented the planned replacement
+  integrity hierarchy (raw file/chunk checksums → source
+  offset/ordinal → block checksums → published-file checksums →
+  deterministic event-to-source mapping) that must be implemented and
+  proven equivalent-or-stronger than the current per-row
+  `native_payload_hash` before that field may be demoted or removed. This
+  explicitly reverses the prior plan draft's "hash demotion is low risk"
+  framing to "unresolved, pending proof."
+- **Phase 2 — Versioning/`encoding_profile` design**: documented that a
+  missing `schema_version` today means legacy v0 (today's manifest has no
+  version fields at all, verified against `docs/REPLAY_STORE.md`'s
+  manifest example), and designed a new `encoding_profile` manifest field
+  as the build-configuration identity needed for a future
+  deterministic-rebuild proof.
+- **Phase 3 — Finalized field/consumer/integrity matrix**: audited every
+  column of `stores/replay_schema.py`'s current `DEPTH_REPLAY_SCHEMA` and
+  `TRADE_REPLAY_SCHEMA` (verified directly in code) and classified each by
+  writer, current representation, reconstruction consumer, audit/
+  integrity consumer, semantic necessity, partition-constancy, proposed
+  compact representation, and migration concern. No field is approved for
+  removal or repacking by this matrix — every compaction candidate is
+  explicitly gated on a named, not-yet-satisfied proof condition (e.g. the
+  4-condition fixed-point round-trip proof for `bids`/`asks`/`price`/
+  `quantity`, or the consumer-and-semantics proof for `quality_flags`).
+- This entry, together with the Phase 1 oracle (`validation/catalog_compare.py`
+  + `tests/test_semantic_oracle_detects_injected_faults.py`, already
+  committed), constitutes the review-checkpoint evidence the approved plan
+  requires before any compact physical replay schema implementation
+  (Phase 5+) may begin.
+
+### Files/packages touched
+- `docs/IMPLEMENTATION_AUDIT.md` (extended — two new top-level sections)
+- `CHANGELOG.md` (`[Unreleased]` → `Added`)
+- `docs/CHANGE_AUDIT.md` (this entry)
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] docs/REPO_STRUCTURE.md (no folder/file contract change — content
+  added to an existing, already-owned doc, not a new file)
+- [x] docs/PROJECT_STATUS.md (reviewed; no validated/deferred status
+  changed — this is design documentation, not a new validated/deferred
+  claim)
+- [x] docs/IMPLEMENTATION_AUDIT.md (this is the file extended)
+- [x] relevant feature docs:
+  - docs/REPLAY_STORE.md (reviewed; its documented schema/manifest example
+    remains accurate as the *current* v0 state — the new sections in
+    IMPLEMENTATION_AUDIT.md explicitly describe the *planned* future
+    schema/manifest, not a change to what REPLAY_STORE.md documents today)
+  - docs/FULL_L2_REPLAY_CATALOG_PLAN.md (reviewed; no gate status changed)
+
+### Docs updated
+- [x] CHANGELOG.md
+- [x] docs/IMPLEMENTATION_AUDIT.md
+- No further docs update required because: `docs/REPLAY_STORE.md` and
+  `docs/ARCHITECTURE.md` describe the *current* (v0, unchanged) schema and
+  architecture, which remains accurate; the new design content is
+  explicitly forward-looking and lives in `docs/IMPLEMENTATION_AUDIT.md`
+  (the ground-truth/audit-history doc) rather than duplicated elsewhere.
+
+### Status / validation impact
+- Validated status changed: no
+- Deferred status changed: no
+- New claims added: no — every claim in the new sections is explicitly
+  labeled "design only, not implemented" / "planned" / "unresolved" /
+  "unproven," per the honesty-labeling requirement; no capability is
+  claimed as done.
+- Evidence for any new validation claim: n/a (no new validation claim made)
+
+### Tests run
+```bash
+source .venv/bin/activate
+python -m pytest tests/test_agent_infrastructure.py tests/test_repo_structure.py -q   # 56 passed
+python -m pytest -q   # 366 passed, 3 skipped (unchanged from Phase 1 — docs-only change)
+```
+
+### Validation CLIs run
+```bash
+none required beyond the honesty-guard tests above — no schema, config,
+or deployment file was touched; docs/CHANGE_AUDIT.md and CHANGELOG.md
+updates are covered by the standard change-audit compliance check.
+```
+
+### Known limitations / out of scope
+- No code implementing any part of this design (raw-retention gate,
+  legacy-v0 inventory scan, traceability hierarchy, `encoding_profile`
+  field, or schema changes implied by the matrix) was written in this
+  commit — per the approved plan, that requires the Phase 0–4 review
+  checkpoint (this entry plus the already-committed Phase 1 oracle) to be
+  reviewed and approved first.
+- The field/consumer/integrity matrix does not yet cover any *new* fields
+  a future compact schema might introduce (e.g. a mantissa/scale pair) —
+  it only audits what exists in the current `stores/replay_schema.py`,
+  which is the correct scope for a "before you remove/repack anything,
+  prove it" audit.
+- No representative production-day or KovacsTrader-contract verification
+  was performed as part of this design work — the KovacsTrader contract
+  question was already resolved (non-blocking; CryptoRecorder exposes
+  exact logical values via a future versioned `ReplayReader` regardless of
+  physical schema) in the previously-approved plan and is not re-litigated
+  here.
+
+---
+
 ## 2026-07-24 — Issue #20 Phase 1: semantic-oracle coverage audit, missing comparisons, failure-injection proof
 
 ### Change summary

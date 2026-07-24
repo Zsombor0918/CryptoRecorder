@@ -641,3 +641,251 @@ Caveats that make the ×50 column unreliable:
 - **Pending**: a stratified multi-symbol storage benchmark across the top50 and a
   multi-day projection. Until that exists, production storage sizing is an open
   question, not a settled number.
+
+---
+
+## Issue #20 — Compact Replay Storage: Phase 2 Design
+
+**Status: design only, not implemented.** This section records the raw-retention
+safety contract, legacy-v0 inventory approach, traceability design, versioning
+contract, and `encoding_profile` design that must exist and be reviewed
+**before** any compact physical replay schema is implemented (Phase 5+ of the
+issue #20 plan). No code in this section has been built yet; every claim below
+is labeled `planned`, never `implemented` or `validated`.
+
+### 1. Raw-retention safety contract (corrects a prior false assumption)
+
+**Verified fact, not an assumption:** `disk_monitor.py::cleanup_old_data()`
+(confirmed directly in code, `disk_monitor.py` lines ~863–945) **automatically
+deletes raw data** whenever fresh `data_raw` usage exceeds
+`CRYPTO_RECORDER_DISK_SOFT_LIMIT_GB` (default 750 GB), repeatedly deleting the
+single oldest `(venue, channel, symbol, date)` directory found by
+`get_oldest_date_dir()` (lines ~827–859) — up to 10 deletions per invocation —
+until usage falls to `CRYPTO_RECORDER_DISK_CLEANUP_TARGET_GB` (default
+700 GB). Because `get_oldest_date_dir()`'s glob walks
+`venue → channel → symbol → date`, **`depth_v2` and `trade_v2` for the same
+symbol/date are separate, independently-deletable directories** — there is no
+atomicity across the channels that make up one logical raw partition today.
+This means `data_raw` is **not** retained forever, and a legacy replay
+partition cannot be assumed rebuildable without checking actual raw
+availability (see Section 2 below).
+
+**Corrected atomic deletion unit (planned):** the deletion unit must become
+**all raw channels and metadata required to reconstruct one logical
+partition** — i.e. `depth_v2` **and** `trade_v2` (and any other channel a
+given replay partition actually consumed) for the same `(venue, symbol,
+date)`, treated as one atomic candidate for deletion, never partially deleted.
+This is a change to `disk_monitor.py`'s deletion-unit granularity, planned for
+implementation alongside the raw-retention gate itself (Phase 10 of the
+approved plan), not in this design phase.
+
+**Preconditions (planned) — all must hold before any raw deletion is
+permitted for a given deletion unit:**
+
+1. The corresponding compact replay partition exists.
+2. Its manifest `status` is `complete`.
+3. Every required raw source file/channel for that partition is represented
+   in the partition's source-identity manifest (Section 4 below).
+4. Source checksums recorded in the manifest match the actual raw files
+   currently on disk (detects silent raw repair/corruption since the replay
+   was built).
+5. Published replay file **and** block checksums pass (Section 3 below).
+6. Instrument/exchange metadata required for reconstruction is embedded in
+   the replay partition itself, not merely referenced in raw `exchangeinfo`.
+7. The partition reconstructs successfully **without consulting `data_raw`** —
+   proven by a dedicated self-contained-replay acceptance test (planned,
+   Phase 9 of the approved plan; not implemented in this design phase).
+8. The compact replay format has already passed the global semantic **and**
+   representative-day (Tier 3) acceptance gates — this precondition cannot be
+   satisfied by an unvalidated schema.
+9. No partial, failed, unknown-version, or source-identity-changed replay is
+   ever treated as sufficient.
+
+**Fail-closed default (planned):** if any precondition cannot be positively
+proven, raw cleanup for that unit is refused and logged clearly; the existing
+`cleanup_old_data()` soft/hard-limit behavior continues to operate on units
+that *do* pass the gate. This is an additive safety layer over the existing
+mechanism, not a redesign of its trigger thresholds.
+
+**Shared `exchangeinfo` handling (planned):** shared exchange-info data for a
+venue/date must not be removed while any other retained partition for that
+venue/date still requires it, unless the necessary instrument metadata has
+already been embedded directly into every affected replay partition
+(satisfying precondition 6 independently per partition).
+
+**Never automatically pruned by this issue:** valid, already-published replay
+partitions. Only staging/quarantine/backup lifecycle cleanup (a separate,
+already-scoped piece of the approved plan) is in scope for automated deletion
+of replay-side artifacts; raw deletion remains gated by the above contract,
+layered over the existing (already-shipping) `cleanup_old_data()` mechanism.
+
+### 2. Legacy v0 inventory design
+
+Because `data_raw` can already have been partially or fully deleted by the
+existing mechanism above, **no existing v0 replay partition may be assumed
+rebuildable.** Planned inventory pass, to run once the compact schema exists
+(Phase 5+), classifying every existing v0 partition as one of:
+
+- **Rebuildable** — complete matching `data_raw` (all channels required for
+  that venue/symbol/date) still exists and its identity can be verified
+  against the partition's recorded source identity.
+- **Not rebuildable** — required raw data has already been deleted.
+- **Uncertain** — source identity cannot be proven either way (e.g. raw
+  exists but checksums/coverage cannot be confirmed).
+
+For **rebuildable** partitions: prefer an isolated rebuild from raw into a
+separate candidate root, validated per the semantic oracle (Phase 1, already
+implemented — see above) before promotion.
+
+For **non-rebuildable or uncertain** partitions: preserve them as-is; keep the
+legacy v0 reader available for them **indefinitely**, not for a fixed
+migration window; never automatically delete them; report their reduced
+audit/migration confidence honestly once the inventory pass actually runs.
+
+**Legacy-reader removal condition (planned):** removal is permitted only
+after an explicit inventory run proves no retained v0 partition depends on
+it. The reader is never described as "necessarily temporary."
+
+### 3. Traceability design (replaces "hash demotion is low-risk")
+
+Per-event 64-character hex `native_payload_hash` removal remains **unresolved**,
+not "low-risk," pending this design. Verified in code: no internal reader
+consumes the hash's *value* today (`stores/replay_depth_adapter.py` and every
+file in `validation/` were grep'd; only a non-null check exists in
+`audit_replay_store.py`) — but that absence of an internal consumer does not
+prove an external consumer (e.g. KovacsTrader) or the audit contract itself
+doesn't need it.
+
+**Planned replacement traceability hierarchy, evaluated in this order:**
+
+1. Raw file/chunk identity + SHA-256 checksum, recorded per partition in the
+   manifest (extends `pipeline/raw_manifest.py`'s existing coverage scan,
+   which today records channel presence but not checksums).
+2. Source file/chunk ordinal + source record offset/index recorded per
+   replay block (not per row).
+3. Replay block-level checksums (e.g. per Parquet row group).
+4. Canonical published-file checksums (already exist today via
+   `depth_checksum`/`trades_checksum` in the manifest).
+5. A deterministic mapping function from a replay event (partition + row
+   ordinal) back to its exact source raw record.
+6. Corruption detection at all four levels: raw, build-time (spool/merge),
+   block, and published-file.
+
+Per-event hash removal is permitted only if this design, once implemented, is
+shown to provide **equivalent or stronger** integrity/traceability than
+today's per-row hex hash. If a per-event hash remains judged necessary after
+implementation, a 32-byte binary representation must be benchmarked against
+the current 64-character hex column before being adopted. **None of this
+hierarchy has been implemented yet** — this section is a design record, and
+the schema (Phase 5+) is not started.
+
+### 4. Versioning and `encoding_profile` design
+
+**Verified gap:** today's manifest (see `docs/REPLAY_STORE.md`'s example) has
+**no** `format_version`, `schema_version`, or `builder_version` field at all.
+A missing field today has no defined meaning.
+
+**Planned contract:**
+
+- A manifest with no `schema_version` field is explicitly defined as
+  **legacy v0** — never silently reinterpreted as a newer schema.
+- New manifests will carry `format_version`, `schema_version`,
+  `builder_version`, and a new `encoding_profile` field (see below)
+  explicitly. `ReplayReader` will reject any `schema_version` it does not
+  explicitly support, with a clear error naming the found vs. supported
+  version — never a silent fallback parse.
+- `encoding_profile` (planned new manifest field) is an explicit identity
+  for the build configuration that produced a partition — e.g. schema
+  version, compression codec/level, row-group sizing, and any other
+  build-time choice that could otherwise cause two "valid" builds of the
+  same input to differ physically. This is what will make the planned
+  deterministic-rebuild proof (build twice into separate empty roots for the
+  same raw source identity + `schema_version` + `builder_version` +
+  `encoding_profile` + compression configuration + partition scope, and
+  require identical logical event order/values, identical replay data-file
+  checksums where the format supports byte-deterministic output, and
+  manifest equality except explicitly-named observational fields such as
+  build timestamp) auditable and reproducible.
+- Old and new partitions may coexist during validation: a new (candidate)
+  partition is built into an isolated candidate root, never overwriting the
+  existing published v0 partition in place. A new partition becomes
+  canonical only after it passes the full semantic-equivalence gate (Phase 1
+  oracle, already implemented) **and**, where relevant, the Section 1
+  raw-retention preconditions, for that specific venue/symbol/date.
+- Old replay data may be manually removed only after the corresponding new
+  partition has passed validation, an operator has explicitly confirmed it
+  canonical, and a documented retention window has passed — never automatic.
+
+### 5. Explicit statement of what remains not-yet-implemented
+
+Everything in this section is a **design record only**. No compact physical
+replay schema, no `pipeline/raw_manifest.py` checksum extension, no
+`ReplayReader` version-rejection logic, no `encoding_profile` manifest field,
+no legacy-v0 inventory scan, and no raw-retention precondition gate has been
+implemented as of this entry. Implementation of any of the above requires the
+Phase 0–4 review checkpoint (this design, the Phase 1 oracle, and the Phase 3
+field/consumer/integrity matrix) to be reviewed and approved first, per the
+plan.
+
+---
+
+## Issue #20 — Compact Replay Storage: Phase 3 Field / Consumer / Integrity Matrix
+
+**Status: design/audit only, not implemented.** This is the finalized
+field-necessity audit for `stores/replay_schema.py`'s current `DEPTH_REPLAY_SCHEMA`
+and `TRADE_REPLAY_SCHEMA` (both verified directly in code), classifying every
+stored field by writer, current physical representation, reconstruction
+consumer, audit/integrity consumer, whether it is required for exact
+semantics, whether it is partition-constant, its proposed compact
+representation, and any migration/compatibility concern. No field below is
+removed, renamed, or repacked by this entry — this is analysis, gating future
+schema work (Phase 5+), not schema implementation.
+
+### Depth fields
+
+| Field | Writer | Current representation | Reconstruction consumer | Audit/integrity consumer | Required for exact semantics? | Partition-constant? | Proposed compact representation | Migration/compatibility concern |
+|---|---|---|---|---|---|---|---|---|
+| `venue`, `symbol`, `date` | `stores/replay_writer.py` | string, repeated every row | none directly (path-derivable) | schema check (`validation/audit_replay_store.py`) | No — derivable from the Hive partition path | **Yes** | manifest/partition metadata only | readers must stop expecting these columns — `schema_version` bump |
+| `stream_session_id`, `session_seq`, `raw_index` | writer | uint64/uint64/uint32 | ordering key in `stores/replay_depth_adapter.py`, `stores/replay_reader.py` | ordering audit (`audit_replay_store.py`) | Yes — deterministic order | No | keep integer; consider Parquet delta-binary-packing | none — same logical values |
+| `record_type` | writer | string (`snapshot_seed`/`depth_update`) | branch logic in adapter and `converter/depth_phase2.py` | schema completeness | Yes | No | small enum/dictionary; consider int8 | reader enum mapping table |
+| `U`, `u`, `pu` | writer | nullable string | continuity/gap logic in `depth_phase2.py`/adapter | gap/fence diagnostics (`tests/test_gap_and_fence_diagnostics.py`) | **Yes — continuity contract** | No | int64 nullable, **only after proving range/null/overflow safety separately for spot and futures** | benchmark-needed before type change |
+| `ts_exchange_ns`, `ts_receive_ns` | writer | int64 ns | book/trade timestamps | equivalence timestamp compare (`validation/catalog_compare.py`) | Yes | No | keep int64; Parquet delta encoding, not a custom scheme | none |
+| `bids`/`asks` (nested `price`, `size`, `price_str`, `size_str`) | writer | `list<struct{float64, float64, string, string}>` per level | `stores/replay_depth_adapter.py` reconstructs deltas | book-checkpoint compare (`compare_book_checkpoints()` in `catalog_compare.py`) | Yes — exact decimal reconstruction | No | fixed-point integer mantissa derived from Binance `PRICE_FILTER.tickSize`/`LOT_SIZE.stepSize`/`MARKET_LOT_SIZE` (date-specific exchangeInfo; spot vs. futures may differ) — **not** from `pricePrecision`/`quantityPrecision` alone; parsed via `Decimal`, never float | must prove, in tests, before dropping the lexical strings: (1) numeric value exactly reconstructable from mantissa+scale; (2) instrument's required scale exactly reconstructable from manifest/instrument metadata; (3) the replay partition itself — not `data_raw`, which is not guaranteed to survive per Phase 2 Section 1 — carries this reconstructability; (4) replay-to-source traceability preserved per Phase 2 Section 3 |
+| `is_snapshot_seed`, `is_depth_update`, `is_sync_state`, `is_desync`, `is_resync` | writer | 5 separate bool columns | book-state/continuity logic | continuity/gap tests | **Yes** | No | packed flags byte/enum, **only after a consumer-and-semantics proof that no equivalence-critical information lives only here** | reader bit-unpacking helper |
+| `quality_flags` | writer | JSON string, nullable | **no confirmed internal reconstruction consumer** (verified: zero matches across `stores/replay_depth_adapter.py` and all of `validation/`; only writer-side pass-through in `pipeline/build_replay_store.py`) | none confirmed internally | **Unproven — treated as required until the Phase 1 `compare_quality_flags_semantic()` oracle (implemented) and a KovacsTrader-contract check both prove otherwise** | No | compact enum/flags for common cases + sparse side table for rare cases, pending that proof | must show no equivalence-critical info lives only here |
+| `native_payload_hash` | writer | 64-character hex SHA-256, every row | none internal (only non-null check in `audit_replay_store.py`) | corruption/traceability, **unresolved — see Phase 2 Section 3** | **Unresolved** | No | manifest/chunk/file-level checksum, pending the Phase 2 Section 3 traceability design being implemented and proven equivalent-or-stronger | also feeds the Phase 2 Section 1 raw-retention preconditions |
+
+### Trade fields
+
+| Field | Writer | Current representation | Reconstruction consumer | Audit/integrity consumer | Required for exact semantics? | Partition-constant? | Proposed compact representation | Migration/compatibility concern |
+|---|---|---|---|---|---|---|---|---|
+| `venue`, `symbol`, `date` | writer | string, repeated every row | none directly | schema check | No — path-derivable | **Yes** | manifest/partition metadata only | `schema_version` bump |
+| `trade_stream_session_id`, `trade_session_seq`, `raw_index` | writer | uint64/uint64/uint32 | ordering key | ordering audit | Yes | No | keep integer; consider delta-binary Parquet | none |
+| `record_type` | writer | string (`trade`/`agg_trade`) | branch logic | schema completeness | Yes | No | small enum/dictionary | reader enum table |
+| `market_type` | writer | string (`spot`/`futures`) | instrument routing | schema | Partly — derivable from venue in practice | **Yes, pending an invariant proof that no row ever has a differing value for its partition** | move to manifest if the invariant holds | confirm invariant across all rows before removing |
+| `trade_id`, `agg_trade_id` | writer | nullable string | `TradeTick` id fields | equivalence compare where exposed (`compare_trade_ticks_semantic()`) | Yes where exposed | No | numeric id + delta encoding, **only after proving range/nullable/monotonic behavior separately for spot and futures** | benchmark-needed |
+| `ts_exchange_ns`, `ts_receive_ns` | writer | int64 ns | trade timestamps | equivalence compare | Yes | No | keep int64; Parquet delta encoding | none |
+| `price`, `quantity`, `price_str`, `quantity_str` | writer | float64 ×2 + string ×2 | `TradeTick` reconstruction | trade-tick equivalence | Yes | No | fixed-point mantissa, same 4-condition proof as depth levels above | same as depth `bids`/`asks` |
+| `buyer_maker`, `aggressor_side` | writer | bool + nullable string | aggressor logic | equivalence compare | Yes | No | compact enum | none |
+| `quality_flags` | writer | JSON string, nullable | no confirmed consumer | none confirmed | Unproven — same status as the depth field above | No | compact enum/flags, pending proof | same as depth `quality_flags` |
+| `native_payload_hash` | writer | 64-character hex, every row | none internal | corruption/traceability, unresolved | Unresolved | No | same as depth `native_payload_hash` | same |
+
+### New fields identified as required by Phase 2 design (not yet implemented)
+
+| Field | Purpose | Required by |
+|---|---|---|
+| Source raw-file identity/checksums (per partition) | Proves replay-to-raw traceability; a precondition for any future raw-retention auto-delete gate | Phase 2 Section 1 (raw-retention safety) and Section 3 (traceability design) |
+| `encoding_profile` / build-configuration identity (manifest field) | Makes output provenance reproducible; the basis for a future deterministic-rebuild proof | Phase 2 Section 4 (versioning design) |
+| `format_version`, `schema_version`, `builder_version` (manifest fields) | Explicit version contract; today's manifest has none of these — a missing field today has no defined meaning | Phase 2 Section 4 |
+
+### Matrix conclusion
+
+No field in either table above is approved for removal or repacking as of
+this entry. Every "pending proof"/"unproven"/"unresolved" cell above is an
+explicit precondition that must be satisfied by evidence — produced during
+Phase 5+ implementation and reviewed — before the corresponding compaction is
+applied. This matrix, together with the Phase 1 oracle (implemented, see
+above) and the Phase 2 design (raw-retention, legacy-v0, traceability,
+versioning — design only, see above), constitutes the review checkpoint the
+approved plan requires before any compact physical schema implementation
+begins.

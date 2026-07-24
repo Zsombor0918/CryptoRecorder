@@ -119,6 +119,25 @@ passes.** Until then, broader full-L2 equivalence stays **deferred** (see
   bug in new compact-decoding logic could not silently pass both sides of
   a future schema comparison. This is Phase 1 of the issue #20
   compact-replay-storage plan; no compact schema was implemented.
+- **`docs/IMPLEMENTATION_AUDIT.md` — issue #20 Phases 2–3 design record**
+  (docs only, no code) — added the raw-retention safety contract (the
+  precondition gate that must hold before any raw deletion of a
+  venue/symbol/date unit is permitted, and the corrected atomic
+  per-partition deletion-unit design that fixes the existing
+  per-channel-independent deletion gap in `disk_monitor.py`'s
+  `get_oldest_date_dir()`/`cleanup_old_data()`), the legacy-v0 inventory
+  design (rebuildable/not-rebuildable/uncertain classification, with the
+  legacy reader kept available indefinitely for the latter two — never
+  described as "necessarily temporary"), the traceability design that
+  replaces the previously-assumed "hash demotion is low-risk" framing with
+  an explicit unresolved-pending-proof status, the versioning contract
+  (legacy-v0-by-absence, explicit `format_version`/`schema_version`/
+  `builder_version`, and a new planned `encoding_profile` manifest field),
+  and the finalized field/consumer/integrity matrix for every column in
+  `stores/replay_schema.py`'s current `DEPTH_REPLAY_SCHEMA` and
+  `TRADE_REPLAY_SCHEMA`. This is design/audit documentation only — no
+  compact schema, no `disk_monitor.py` deletion-unit change, no manifest
+  field, and no raw-retention gate was implemented in this change.
 
 ### Changed
 - **`systemd/cryptorecorder-replay-build.service` — `TimeoutStartSec` raised
