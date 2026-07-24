@@ -40,7 +40,7 @@ from config import (
     PHASE2_SNAPSHOT_LIMIT,
     STATE_ROOT,
 )
-from converter.depth_phase2 import convert_depth_v2_streaming
+from converter.depth_phase2 import canonical_fence_digest, convert_depth_v2_streaming
 from converter.catalog import _parse_parquet_date_range, purge_catalog_date_range
 from converter.instruments import build_instruments, load_exchange_info
 from converter.readers import stream_raw_records
@@ -649,6 +649,24 @@ def convert_date(
                             for fence in annotated_fences
                             if fence["classification"] in {"reconnect", "real_desync"}
                         ][:3],
+                        # Issue #20 Phase 1 correction: `examples` above is
+                        # truncated to 3 for human readability and cannot by
+                        # itself prove candidate/reference equivalence for a
+                        # symbol with more than 3 fences. `canonical_count`/
+                        # `canonical_digest` cover the COMPLETE
+                        # `depth_metrics.fenced_ranges` list (already fully
+                        # materialized in memory by this point — no new
+                        # full-day materialization is introduced) and are
+                        # what validation.validate_catalog_equivalence
+                        # actually gates equivalence on.
+                        "canonical_count": len(depth_metrics.fenced_ranges),
+                        "canonical_digest": canonical_fence_digest(depth_metrics.fenced_ranges),
+                    }
+                else:
+                    per_symbol_fenced_ranges[f"{venue}/{symbol}"] = {
+                        "fenced_ranges": 0,
+                        "canonical_count": 0,
+                        "canonical_digest": canonical_fence_digest([]),
                     }
 
             # ── track data presence ───────────────────────────────────

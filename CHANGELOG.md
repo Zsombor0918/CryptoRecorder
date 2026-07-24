@@ -67,6 +67,81 @@ passes.** Until then, broader full-L2 equivalence stays **deferred** (see
 ## [Unreleased]
 
 ### Added
+- **Issue #20 Phase 1 second follow-up correction: gating book checkpoints,
+  Depth10, complete fenced-range digest, and RAM-bounded raw-to-replay
+  metadata comparison** — the previous correction wired exhaustive
+  trade/delta comparison into the real path, but book checkpoints and
+  Depth10 were still marked `"gating": False` full-day-list diagnostics,
+  fenced-range comparison only checked the reference's 3-example
+  truncation and treated a candidate's extra fence as expected/non-gating,
+  and quality-flag comparison collected a full day into Python lists and
+  compared them as an order-independent multiset. All four are corrected:
+  - **Book checkpoints**: new `reconstruct_book_checkpoints_streaming()`/
+    `compare_book_checkpoints_streaming()` in `validation/catalog_compare.py`
+    process a windowed `OrderBookDeltas` iterator sequentially, retaining
+    only the current book state plus the requested checkpoint snapshots —
+    never materializing a full-day list — and add a deterministic SHA-256
+    hash per checkpoint. `validate_catalog_equivalence()` now feeds this
+    from a second pair of windowed delta iterators (checkpoints need an
+    independent traversal from the exhaustive delta comparison) and its
+    `passed` result gates the final status; the full-day
+    `load_order_book_deltas()`-based `compare_book_checkpoints()` path is
+    no longer used by the acceptance path at all.
+  - **Depth10**: new `iter_order_book_depth10_windowed()` +
+    `compare_order_book_depth10_exhaustive()` compare every Depth10
+    snapshot positionally (no sampling, no re-sorting) when
+    `--emit-depth10`/`emit_depth10=True` is enabled, and gate `passed`;
+    when explicitly disabled, it is reported as `{"skipped": True,
+    "passed": True}` rather than compared-but-ignored.
+  - **Fenced ranges**: `convert_day.py` now computes a
+    `canonical_count`/`canonical_digest` (SHA-256 over the COMPLETE
+    per-symbol fenced-range collection — new `canonical_fence_digest()` in
+    `converter/depth_phase2.py`) alongside its existing 3-example
+    `examples` field, and `validate_catalog_equivalence.py`'s new
+    `compare_fenced_ranges_digest()` gates on that complete digest instead
+    of the truncated example list — an extra candidate fence, or a
+    difference beyond the 3rd example, now correctly fails; the previous
+    `gating_passed`/"extra_in_new is expected" carve-out is removed.
+  - **Quality/continuity metadata**: new
+    `compare_event_metadata_exhaustive()` in `validation/catalog_compare.py`
+    compares raw-vs-replay logical metadata (continuity IDs, sync/desync/
+    resync state, `quality_flags`) at each canonical event position,
+    keeping information associated with its source event instead of a
+    multiset — detecting a value moved to a different event even when the
+    overall multiset is unchanged. `validate_catalog_equivalence.py`'s raw
+    side is sorted into canonical `(session_id, session_seq, raw_index)`
+    order via `converter.spool.RawRecordSpool` (an existing disk-backed
+    bounded spool, not a full-day Python list); the replay side streams
+    from `stores.replay_reader.ReplayReader`, already guaranteed sorted by
+    the replay-store contract. Both channels (depth_v2, trade_v2) are
+    filtered to the same record types the replay writer actually converts,
+    to avoid spurious mismatches from intentionally-dropped raw record
+    types (e.g. `sync_state`).
+  - Added `tests/test_streaming_gating_bounded_memory.py` (6 tests):
+    empirical live-object-counter proofs that
+    `compare_book_checkpoints_streaming()`,
+    `compare_order_book_depth10_exhaustive()`, and
+    `compare_event_metadata_exhaustive()` all stay bounded-memory
+    (independent of stream length, 20,000–50,000 synthetic events) while
+    still detecting a difference injected near the end of the stream,
+    including a value moved between two events with the multiset
+    unchanged.
+  - Rewrote `tests/test_validate_catalog_equivalence_exhaustive_wiring.py`
+    (23 tests) to prove, through the real `validate_catalog_equivalence()`
+    orchestration: book-checkpoint mismatch, enabled-Depth10 mismatch,
+    Depth10 reorder, Depth10-disabled-is-intentionally-skipped, a
+    fenced-range mismatch after the first 3 matching examples, an extra
+    candidate fenced range, a quality flag moved to the wrong event with
+    an unchanged overall multiset (via the real raw→replay pipeline,
+    monkeypatching only the raw-side generator), changed `U`/`u`/`pu`,
+    changed sync/desync/resync state, and missing/extra diagnostic
+    events — plus the existing trade/delta/instrument/continuity
+    scenarios and two regression guards (a static import check and a
+    call-counting spy proving the gating comparators are genuinely
+    invoked).
+  - No compact replay schema was changed. This remains Phase 1 (oracle
+    hardening) work, still gating any future compact schema
+    implementation (Phase 5+, not started).
 - **`validation/validate_catalog_equivalence.py` — wire the exhaustive
   oracle into the real acceptance command (follow-up correction to the
   Phase 1 oracle work)** — the previous Phase 1 correction added

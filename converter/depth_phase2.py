@@ -11,6 +11,8 @@ committed canonical ordering from the recorder.  Book state uses exact
 """
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -40,6 +42,50 @@ F_LAST = 1 << 7
 F_SNAPSHOT = 1 << 5
 EPOCH_LIKE_NS_MIN = 946684800000000000  # 2000-01-01T00:00:00Z
 DEFAULT_CONVERTER_BATCH_SIZE = 5000
+
+
+def fence_canonical_key(fence: Dict[str, Any]) -> Tuple[Any, ...]:
+    """Canonical identity for one fenced (unrecovered discontinuity) range,
+    independent of wall-clock diagnostic metadata (e.g. detection time) or
+    display-only annotations (e.g. `classification` added by
+    convert_day.py's `_annotated_fence_examples()`). Used both to key
+    set-difference comparison (validation.catalog_compare.compare_fenced_ranges_semantic())
+    and to compute a stable digest over a complete fence collection
+    (canonical_fence_digest() below), so both the reference (convert_day.py)
+    and candidate (replay_catalog_reconstruct.py) sides agree on what
+    "the same fence" means."""
+    return (
+        fence.get("venue"),
+        fence.get("symbol"),
+        fence.get("start_ts_ns", fence.get("start")),
+        fence.get("end_ts_ns", fence.get("end")),
+        fence.get("severity"),
+        fence.get("reason", fence.get("kind")),
+    )
+
+
+def canonical_fence_digest(fences: Iterable[Dict[str, Any]]) -> str:
+    """Deterministic SHA-256 hex digest over the complete canonical identity
+    of every fence in `fences`, sorted for order-independence.
+
+    Issue #20 Phase 1 correction: convert_day.py's own report JSON only
+    persists up to 3 example fences per symbol (a human-readability
+    truncation), which cannot by itself prove candidate/reference
+    equivalence for symbols with more than 3 fences. This digest is
+    computed over the COMPLETE in-memory `Phase2ReplayMetrics.fenced_ranges`
+    list (already fully materialized by the existing depth-conversion
+    engine for the day being converted — this digest adds no new
+    full-day materialization) and is a bounded, constant-size stand-in for
+    the full fence list: any difference in count, content, or a single
+    additional/missing fence anywhere in the collection (including beyond
+    the first 3 examples) changes the digest.
+    """
+    keys = sorted(
+        (fence_canonical_key(fence) for fence in fences),
+        key=lambda key: json.dumps(list(key), sort_keys=True, default=str),
+    )
+    payload = json.dumps([list(key) for key in keys], sort_keys=True, default=str).encode()
+    return hashlib.sha256(payload).hexdigest()
 
 
 @dataclass

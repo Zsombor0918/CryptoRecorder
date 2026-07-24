@@ -18,24 +18,24 @@ from config import (
     EMIT_DEPTH10_DEFAULT,
 )
 from converter.readers import stream_raw_records
+from converter.spool import RawRecordSpool
 from pipeline.build_replay_store import build_replay_for_symbol
 from stores.replay_reader import ReplayReader
 from validation.replay_catalog_reconstruct import generate_catalog_from_replay
 from validation.catalog_compare import (
-    compare_book_checkpoints,
+    compare_book_checkpoints_streaming,
     compare_continuity_diagnostics_semantic,
-    compare_depth10_semantic,
-    compare_fenced_ranges_semantic,
+    compare_event_metadata_exhaustive,
+    compare_fenced_ranges_digest,
     compare_instruments_semantic,
     compare_order_book_deltas_exhaustive,
-    compare_quality_flags_semantic,
+    compare_order_book_depth10_exhaustive,
     compare_trade_ticks_exhaustive,
     iter_order_book_deltas_windowed,
+    iter_order_book_depth10_windowed,
     iter_trade_ticks_windowed,
     load_instrument_ids,
     load_instruments,
-    load_order_book_deltas,
-    load_order_book_depth10,
     write_validation_report,
 )
 
@@ -168,29 +168,25 @@ def _compare_depth_for_instrument(
     emit_depth10: bool,
     levels: int,
 ) -> dict[str, Any]:
-    """Compare OrderBookDeltas exhaustively (bounded-memory, order-preserving
-    — the acceptance-gating comparison), plus Depth10 and reconstructed
-    book checkpoints as non-gating diagnostics.
+    """Compare OrderBookDeltas, book-state checkpoints, and (if enabled)
+    Depth10 — all exhaustively, in bounded memory, and ALL gating `passed`
+    (issue #20 follow-up correction: none of these may be marked
+    non-gating or degraded to a full-day-list diagnostic).
 
-    `order_book_deltas` uses compare_order_book_deltas_exhaustive() fed by
-    iter_order_book_deltas_windowed() (bounded-memory streaming, no
-    full-day list materialization) and is the comparison that gates
-    `passed` here — this is the acceptance-path wiring corrected per the
-    issue #20 follow-up review.
-
-    `book_checkpoints` and `order_book_depth10` remain informational-only
-    diagnostics, NOT part of `passed`: compare_book_checkpoints() and
-    load_order_book_depth10() both require a full-day list materialization
-    internally (compare_book_checkpoints() calls `list(objects)` on both
-    inputs; there is no windowed/streaming equivalent for either today),
-    which is exactly what the bounded-memory acceptance path is designed to
-    avoid for a complete production day. They remain useful, low-cost smoke
-    signal on the small/local (Tier 1/2) data these currently run against,
-    but must not be relied on as the pass/fail gate for a Tier-3
-    representative production day. This is a deliberate, documented
-    limitation, not an oversight — closing it (a windowed/streaming
-    checkpoint reconstruction and Depth10 comparison) is out of scope for
-    this correction and remains future work.
+    - `order_book_deltas`: compare_order_book_deltas_exhaustive() fed by
+      iter_order_book_deltas_windowed().
+    - `book_checkpoints`: compare_book_checkpoints_streaming() — the
+      bounded-memory checkpoint reconstruction, fed by a SECOND pair of
+      windowed delta iterators (checkpoints need their own independent
+      traversal from the exhaustive delta comparison above, since a
+      generator can only be consumed once; this doubles the on-disk read
+      for the delta channel but keeps memory bounded for each pass). The
+      full-day `load_order_book_deltas()`-based `compare_book_checkpoints()`
+      is no longer used here at all.
+    - `order_book_depth10`: compare_order_book_depth10_exhaustive() fed by
+      iter_order_book_depth10_windowed() when `emit_depth10` is True and
+      gates `passed`; when explicitly disabled, reported as intentionally
+      skipped (not a failing-but-ignored comparison).
     """
     old_delta_stream = iter_order_book_deltas_windowed(
         old_catalog_root, instrument_id, start_ns, end_ns, window_ns=window_ns
@@ -200,33 +196,32 @@ def _compare_depth_for_instrument(
     )
     deltas_cmp = compare_order_book_deltas_exhaustive(old_delta_stream, new_delta_stream)
 
-    # Diagnostic-only: full-day materialization, not gating `passed`.
-    old_deltas_full = load_order_book_deltas(old_catalog_root, instrument_id, start=start_ns, end=end_ns)
-    new_deltas_full = load_order_book_deltas(new_catalog_path, instrument_id, start=start_ns, end=end_ns)
-    checkpoints_cmp = compare_book_checkpoints(
-        old_deltas_full, new_deltas_full, start_ns, end_ns, levels=levels
+    old_delta_stream_for_checkpoints = iter_order_book_deltas_windowed(
+        old_catalog_root, instrument_id, start_ns, end_ns, window_ns=window_ns
     )
-    checkpoints_cmp["gating"] = False
+    new_delta_stream_for_checkpoints = iter_order_book_deltas_windowed(
+        new_catalog_path, instrument_id, start_ns, end_ns, window_ns=window_ns
+    )
+    checkpoints_cmp = compare_book_checkpoints_streaming(
+        old_delta_stream_for_checkpoints, new_delta_stream_for_checkpoints, start_ns, end_ns, levels=levels
+    )
 
     out: dict[str, Any] = {
         "order_book_deltas": deltas_cmp,
         "book_checkpoints": checkpoints_cmp,
     }
     if emit_depth10:
-        old_depth10 = load_order_book_depth10(
-            old_catalog_root, instrument_id, start=start_ns, end=end_ns
+        old_depth10_stream = iter_order_book_depth10_windowed(
+            old_catalog_root, instrument_id, start_ns, end_ns, window_ns=window_ns
         )
-        new_depth10 = load_order_book_depth10(
-            new_catalog_path, instrument_id, start=start_ns, end=end_ns
+        new_depth10_stream = iter_order_book_depth10_windowed(
+            new_catalog_path, instrument_id, start_ns, end_ns, window_ns=window_ns
         )
-        depth10_cmp = compare_depth10_semantic(old_depth10, new_depth10)
-        depth10_cmp["gating"] = False
-        out["order_book_depth10"] = depth10_cmp
+        out["order_book_depth10"] = compare_order_book_depth10_exhaustive(old_depth10_stream, new_depth10_stream)
     else:
-        out["order_book_depth10"] = {"passed": True, "skipped": True, "gating": False}
+        out["order_book_depth10"] = {"passed": True, "skipped": True, "reason": "emit_depth10 disabled"}
 
-    # Only the exhaustive, bounded-memory delta comparison gates `passed`.
-    out["passed"] = deltas_cmp["passed"]
+    out["passed"] = deltas_cmp["passed"] and checkpoints_cmp["passed"] and out["order_book_depth10"]["passed"]
     return out
 
 
@@ -269,86 +264,247 @@ def _compare_continuity_for_symbol(
 def _compare_fenced_ranges_for_symbol(
     old_report: dict[str, Any], new_manifest: dict[str, Any], venue: str, symbol: str
 ) -> dict[str, Any]:
-    """Compare individual fenced ranges by content where possible.
+    """Compare the reference route's COMPLETE fenced-range collection
+    (via its canonical count + SHA-256 digest, computed by convert_day.py
+    over every fence — see converter.depth_phase2.canonical_fence_digest())
+    against the candidate route's actual fenced-range list for this
+    venue/symbol.
 
-    The reference route (convert_day.py) only records up to 3 example
-    fences per symbol in `per_symbol_fenced_ranges[...]["examples"]`, not
-    the complete per-fence list — so an "extra_in_new" result is EXPECTED
-    whenever the candidate legitimately has more than 3 fences for that
-    symbol/day, and is not itself an equivalence failure. Only
-    "missing_in_new" (every reference example must be reproduced in the
-    candidate) is a meaningful signal from this truncated reference data;
-    it is surfaced separately as `gating_passed` so callers can gate on the
-    part of this comparison that is actually apples-to-apples, while
-    `extra_in_new`/`count_match` remain visible for diagnostic context.
+    Issue #20 follow-up correction: the reference route's report used to
+    expose only up to 3 example fences per symbol, and this validator used
+    to treat a candidate `extra_in_new` fence as expected/non-gating.
+    Neither is true anymore: `canonical_count`/`canonical_digest` cover the
+    reference's complete fence collection, so a candidate that has an
+    extra fence the reference does not (or a difference beyond the 3rd
+    fence) changes the digest and correctly fails via
+    compare_fenced_ranges_digest()'s `passed`, with no separate
+    "gating_passed" carve-out.
     """
     key = f"{venue}/{symbol}"
     old_entry = (old_report.get("per_symbol_fenced_ranges") or {}).get(key, {})
-    old_examples = old_entry.get("examples") or []
+    old_canonical_count = int(old_entry.get("canonical_count", 0))
+    old_canonical_digest = old_entry.get("canonical_digest", "")
     new_fences_all = new_manifest.get("fenced_ranges") or []
     new_fences_for_symbol = [
         f for f in new_fences_all if f.get("venue") == venue and f.get("symbol") == symbol
     ]
-    result = compare_fenced_ranges_semantic(old_examples, new_fences_for_symbol)
-    result["gating_passed"] = not result["missing_in_new"]
-    result["note"] = (
-        "reference side exposes only up to 3 example fences per symbol; "
-        "extra_in_new is expected and non-gating, missing_in_new (via "
-        "gating_passed) is the meaningful equivalence signal here"
-    )
-    return result
+    return compare_fenced_ranges_digest(old_canonical_count, old_canonical_digest, new_fences_for_symbol)
 
 
-def _collect_quality_flags_from_raw(
-    data_root: Path, venue: str, symbol: str, date: str
-) -> list[Any]:
-    flags: list[Any] = []
-    for channel in ("depth_v2", "trade_v2"):
-        for rec in stream_raw_records(venue, symbol, channel, date, root=data_root):
-            flags.append(rec.get("quality_flags"))
-    return flags
+# ---------------------------------------------------------------------------
+# Raw-to-replay logical metadata comparison (quality/continuity, event-keyed)
+# ---------------------------------------------------------------------------
+#
+# Issue #20 follow-up correction: the previous implementation collected a
+# complete day of raw+replay quality_flags values into two Python lists and
+# compared them as a multiset (compare_quality_flags_semantic()). That both
+# violates the bounded-memory requirement for a complete production day AND
+# can miss a quality flag (or any other per-event field) that MOVED from one
+# event to another while the overall multiset of values stayed the same.
+# This section replaces it with a streaming, event-identity-keyed comparison
+# via compare_event_metadata_exhaustive().
+
+_DEPTH_ACCEPTED_RECORD_TYPES = {"snapshot_seed", "depth_update"}
+_TRADE_ACCEPTED_RECORD_TYPES = {"trade", "agg_trade"}
+
+_DEPTH_COMPARE_FIELDS = (
+    "channel",
+    "stream_session_id",
+    "session_seq",
+    "raw_index",
+    "record_type",
+    "U",
+    "u",
+    "pu",
+    "is_snapshot_seed",
+    "is_depth_update",
+    "is_sync_state",
+    "is_desync",
+    "is_resync",
+    "quality_flags",
+)
+_TRADE_COMPARE_FIELDS = (
+    "channel",
+    "trade_stream_session_id",
+    "trade_session_seq",
+    "raw_index",
+    "record_type",
+    "quality_flags",
+)
 
 
-def _collect_quality_flags_from_replay(
-    replay_root: Path, venue: str, symbol: str, date: str
-) -> list[Any]:
-    reader = ReplayReader(replay_root)
-    flags: list[Any] = []
-    for rec in reader.iter_depths(venue, symbol, date):
-        flags.append(rec.get("quality_flags"))
-    for rec in reader.iter_trades(venue, symbol, date):
-        flags.append(rec.get("quality_flags"))
-    return flags
+def _canonical_quality_flags(value: Any) -> Any:
+    """Parse and re-serialize quality_flags deterministically (sorted
+    keys) so two logically identical JSON payloads that merely differ in
+    key order/whitespace compare equal, matching
+    compare_quality_flags_semantic()'s existing normalization approach."""
+    if value is None:
+        return None
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, sort_keys=True)
+    try:
+        return json.dumps(json.loads(value), sort_keys=True)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return value
 
 
-def _compare_quality_flags_for_symbol(
+def _normalize_raw_depth_record(rec: dict[str, Any]) -> dict[str, Any]:
+    record_type = rec.get("record_type", "depth_update")
+    sync_state = rec.get("sync_state")
+    is_desync = bool(rec.get("is_desync", False) or sync_state == "desynced")
+    is_resync = bool(rec.get("is_resync", False) or sync_state == "resync_required")
+    return {
+        "channel": "depth_v2",
+        "stream_session_id": rec.get("stream_session_id"),
+        "session_seq": rec.get("session_seq"),
+        "raw_index": rec.get("raw_index"),
+        "record_type": record_type,
+        "U": None if rec.get("U") is None else str(rec.get("U")),
+        "u": None if (rec.get("u") or rec.get("lastUpdateId")) is None else str(rec.get("u") or rec.get("lastUpdateId")),
+        "pu": None if rec.get("pu") is None else str(rec.get("pu")),
+        "is_snapshot_seed": record_type == "snapshot_seed",
+        "is_depth_update": record_type == "depth_update",
+        "is_sync_state": record_type == "sync_state",
+        "is_desync": is_desync,
+        "is_resync": is_resync,
+        "quality_flags": _canonical_quality_flags(rec.get("quality_flags")),
+    }
+
+
+def _normalize_replay_depth_record(rec: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "channel": "depth_v2",
+        "stream_session_id": rec.get("stream_session_id"),
+        "session_seq": rec.get("session_seq"),
+        "raw_index": rec.get("raw_index"),
+        "record_type": rec.get("record_type"),
+        "U": rec.get("U"),
+        "u": rec.get("u"),
+        "pu": rec.get("pu"),
+        "is_snapshot_seed": rec.get("is_snapshot_seed"),
+        "is_depth_update": rec.get("is_depth_update"),
+        "is_sync_state": rec.get("is_sync_state"),
+        "is_desync": rec.get("is_desync"),
+        "is_resync": rec.get("is_resync"),
+        "quality_flags": _canonical_quality_flags(rec.get("quality_flags")),
+    }
+
+
+def _normalize_raw_trade_record(rec: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "channel": "trade_v2",
+        "trade_stream_session_id": rec.get("trade_stream_session_id"),
+        "trade_session_seq": rec.get("trade_session_seq"),
+        "raw_index": rec.get("raw_index"),
+        "record_type": rec.get("record_type", "trade"),
+        "quality_flags": _canonical_quality_flags(rec.get("quality_flags")),
+    }
+
+
+def _normalize_replay_trade_record(rec: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "channel": "trade_v2",
+        "trade_stream_session_id": rec.get("trade_stream_session_id"),
+        "trade_session_seq": rec.get("trade_session_seq"),
+        "raw_index": rec.get("raw_index"),
+        "record_type": rec.get("record_type"),
+        "quality_flags": _canonical_quality_flags(rec.get("quality_flags")),
+    }
+
+
+def _iter_sorted_raw_depth(data_root: Path, venue: str, symbol: str, date: str):
+    """Stream depth_v2 raw records for one venue/symbol/date, filtered to
+    only the record types the replay writer actually converts
+    (`snapshot_seed`/`depth_update` — see pipeline/build_replay_store.py's
+    `_convert_depth_record()`; other raw record types such as `sync_state`
+    are intentionally never written to replay and would otherwise show up
+    as spurious "extra on the raw side" mismatches), sorted into the
+    canonical `(stream_session_id, session_seq, raw_index)` order via
+    converter.spool.RawRecordSpool — an existing disk-backed bounded
+    spool, reused here rather than sorting a full-day Python list in
+    memory. The raw hourly files are not guaranteed to already be in this
+    order across file boundaries, so sorting is required for a correct
+    positional comparison against the replay side (which the replay-store
+    contract already guarantees is delivered in this order)."""
+    with RawRecordSpool(prefix="cr-validate-depth-") as spool:
+        raw_index = 0
+        for rec in stream_raw_records(venue, symbol, "depth_v2", date, root=data_root):
+            if rec.get("record_type", "depth_update") not in _DEPTH_ACCEPTED_RECORD_TYPES:
+                raw_index += 1
+                continue
+            session_id = int(rec.get("stream_session_id") or 0)
+            session_seq = int(rec.get("session_seq") or 0)
+            rec = dict(rec)
+            rec["raw_index"] = raw_index
+            spool.insert(rec, (session_id, session_seq, 0), raw_index)
+            raw_index += 1
+        spool.commit()
+        for rec in spool.iter_records():
+            yield _normalize_raw_depth_record(rec)
+
+
+def _iter_sorted_raw_trades(data_root: Path, venue: str, symbol: str, date: str):
+    """Same rationale as _iter_sorted_raw_depth(), for trade_v2 records
+    (filtered to `trade`/`agg_trade`, matching
+    pipeline/build_replay_store.py's `_convert_trade_record()`), sorted by
+    `(trade_stream_session_id, trade_session_seq, raw_index)`."""
+    with RawRecordSpool(prefix="cr-validate-trade-") as spool:
+        raw_index = 0
+        for rec in stream_raw_records(venue, symbol, "trade_v2", date, root=data_root):
+            if rec.get("record_type", "trade") not in _TRADE_ACCEPTED_RECORD_TYPES:
+                raw_index += 1
+                continue
+            session_id = int(rec.get("trade_stream_session_id") or 0)
+            session_seq = int(rec.get("trade_session_seq") or 0)
+            rec = dict(rec)
+            rec["raw_index"] = raw_index
+            spool.insert(rec, (session_id, session_seq, 0), raw_index)
+            raw_index += 1
+        spool.commit()
+        for rec in spool.iter_records():
+            yield _normalize_raw_trade_record(rec)
+
+
+def _compare_raw_to_replay_metadata_for_symbol(
     data_root: Path, replay_root: Path, venue: str, symbol: str, date: str
 ) -> dict[str, Any]:
-    """Compare quality_flags content between the permanent raw source
-    (data_raw, read directly) and the replay_store the candidate route
-    builds from that same raw source.
+    """Bounded-memory, event-identity-keyed comparison of raw-vs-replay
+    logical metadata (continuity IDs, sync/desync/resync state, and
+    quality_flags) for both the depth_v2 and trade_v2 channels of one
+    venue/symbol/date. Replaces the prior full-day-list multiset
+    quality-flags comparison; see this module's header comment above
+    `_DEPTH_ACCEPTED_RECORD_TYPES` for the full rationale.
 
-    convert_day.py's Nautilus catalog output does not persist a per-event
-    quality_flags field at all (Nautilus's TradeTick/OrderBookDelta objects
-    have no such field) and its own report JSON does not expose a
-    per-event quality_flags stream either — so there is no "old Nautilus
-    catalog vs new Nautilus catalog" quality_flags comparison available.
-    The one place quality_flags genuinely exists on both a reference and a
-    candidate side is: the permanent raw source (`data_raw`, the ultimate
-    ground truth both routes read from) versus the replay_store the
-    candidate pipeline builds from it. This proves the replay pipeline
-    faithfully preserves quality_flags content — a real, meaningful
-    equivalence check, using a different "reference" (raw) than the rest of
-    this validator (convert_day.py's catalog), documented explicitly here
-    rather than silently assumed.
-
-    Uses multiset (Counter) comparison via compare_quality_flags_semantic(),
-    which does not depend on the raw stream's per-file ordering matching the
-    replay's sorted ordering.
+    convert_day.py's Nautilus catalog output does not persist any of
+    this per-event metadata at all (Nautilus's TradeTick/OrderBookDelta
+    objects have no such fields), so there is no "old Nautilus catalog vs
+    new Nautilus catalog" comparison available for it. The one place this
+    metadata genuinely exists on both a reference and a candidate side is:
+    the permanent raw source (`data_raw`) versus the replay_store the
+    candidate pipeline builds from it — this proves the replay pipeline
+    faithfully preserves per-event continuity/quality metadata, using a
+    different "reference" (raw) than the rest of this validator
+    (convert_day.py's catalog), documented explicitly here.
     """
-    old_flags = _collect_quality_flags_from_raw(data_root, venue, symbol, date)
-    new_flags = _collect_quality_flags_from_replay(replay_root, venue, symbol, date)
-    return compare_quality_flags_semantic(old_flags, new_flags)
+    reader = ReplayReader(replay_root)
+
+    old_depth_stream = _iter_sorted_raw_depth(data_root, venue, symbol, date)
+    new_depth_stream = (_normalize_replay_depth_record(rec) for rec in reader.iter_depths(venue, symbol, date))
+    depth_cmp = compare_event_metadata_exhaustive(
+        old_depth_stream, new_depth_stream, compare_fields=_DEPTH_COMPARE_FIELDS
+    )
+
+    old_trade_stream = _iter_sorted_raw_trades(data_root, venue, symbol, date)
+    new_trade_stream = (_normalize_replay_trade_record(rec) for rec in reader.iter_trades(venue, symbol, date))
+    trade_cmp = compare_event_metadata_exhaustive(
+        old_trade_stream, new_trade_stream, compare_fields=_TRADE_COMPARE_FIELDS
+    )
+
+    return {
+        "depth": depth_cmp,
+        "trades": trade_cmp,
+        "passed": depth_cmp["passed"] and trade_cmp["passed"],
+    }
 
 
 def _read_new_manifest(new_catalog_path: Path) -> dict[str, Any]:
@@ -525,15 +681,14 @@ def validate_catalog_equivalence(
             per_instrument["order_book_depth10"] = depth_cmp["order_book_depth10"]
             per_instrument["book_checkpoints"] = depth_cmp["book_checkpoints"]
             deltas_all_passed = deltas_all_passed and depth_cmp["order_book_deltas"]["passed"]
-            depth10_all_passed = depth10_all_passed and depth_cmp["order_book_depth10"].get(
-                "passed", True
-            )
+            depth10_all_passed = depth10_all_passed and depth_cmp["order_book_depth10"]["passed"]
             checkpoints_all_passed = (
                 checkpoints_all_passed and depth_cmp["book_checkpoints"]["passed"]
             )
-            # Only order_book_deltas gates `passed` here; book_checkpoints
-            # and order_book_depth10 are diagnostic-only (see
-            # _compare_depth_for_instrument()'s docstring).
+            # order_book_deltas, book_checkpoints, and order_book_depth10
+            # (when enabled) ALL gate `passed` here — see
+            # _compare_depth_for_instrument()'s docstring; none of these
+            # may be downgraded to a non-gating diagnostic.
             all_passed = all_passed and depth_cmp["passed"]
 
             continuity_cmp = _compare_continuity_for_symbol(old_report, new_manifest, venue, symbol)
@@ -543,13 +698,13 @@ def validate_catalog_equivalence(
 
             fenced_ranges_cmp = _compare_fenced_ranges_for_symbol(old_report, new_manifest, venue, symbol)
             per_instrument["fenced_ranges"] = fenced_ranges_cmp
-            fenced_ranges_all_passed = fenced_ranges_all_passed and fenced_ranges_cmp["gating_passed"]
-            all_passed = all_passed and fenced_ranges_cmp["gating_passed"]
+            fenced_ranges_all_passed = fenced_ranges_all_passed and fenced_ranges_cmp["passed"]
+            all_passed = all_passed and fenced_ranges_cmp["passed"]
 
-            quality_flags_cmp = _compare_quality_flags_for_symbol(data_root, replay_root, venue, symbol, date)
-            per_instrument["quality_flags"] = quality_flags_cmp
-            quality_flags_all_passed = quality_flags_all_passed and quality_flags_cmp["passed"]
-            all_passed = all_passed and quality_flags_cmp["passed"]
+            metadata_cmp = _compare_raw_to_replay_metadata_for_symbol(data_root, replay_root, venue, symbol, date)
+            per_instrument["raw_to_replay_metadata"] = metadata_cmp
+            quality_flags_all_passed = quality_flags_all_passed and metadata_cmp["passed"]
+            all_passed = all_passed and metadata_cmp["passed"]
 
         comparison["by_instrument"][instrument_id] = per_instrument
 
@@ -561,12 +716,11 @@ def validate_catalog_equivalence(
         comparison["order_book_depth10"] = {
             "passed": depth10_all_passed,
             "emitted": emit_depth10,
-            "gating": False,
         }
-        comparison["book_checkpoints"] = {"passed": checkpoints_all_passed, "gating": False}
+        comparison["book_checkpoints"] = {"passed": checkpoints_all_passed}
         comparison["continuity_diagnostics"] = {"passed": continuity_all_passed}
         comparison["fenced_ranges"] = {"passed": fenced_ranges_all_passed}
-        comparison["quality_flags"] = {"passed": quality_flags_all_passed}
+        comparison["raw_to_replay_metadata"] = {"passed": quality_flags_all_passed}
 
     # Backward-compatible flat single-instrument trade fields. Field shape
     # intentionally changed (issue #20 follow-up correction): the exhaustive

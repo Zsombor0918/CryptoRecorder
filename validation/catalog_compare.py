@@ -1,6 +1,7 @@
 """Semantic comparison utilities for Nautilus ParquetDataCatalog outputs."""
 from __future__ import annotations
 
+import hashlib
 import itertools
 import json
 import math
@@ -8,6 +9,8 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator
 
 from nautilus_trader.persistence.catalog import ParquetDataCatalog
+
+from converter.depth_phase2 import canonical_fence_digest
 
 # Sentinel used by the exhaustive streaming comparators below to detect
 # length divergence via itertools.zip_longest without confusing a genuine
@@ -1046,6 +1049,250 @@ def compare_book_checkpoints(
     }
 
 
+def _book_state_hash(book: dict[str, list[list[str]]]) -> str:
+    """Deterministic SHA-256 digest of a top-N book snapshot, for a
+    cheap-to-compare, order-independent-within-the-snapshot fingerprint."""
+    payload = json.dumps(book, sort_keys=True).encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
+def reconstruct_book_checkpoints_streaming(
+    objects: Iterable[Any],
+    checkpoint_tss: Iterable[int],
+    *,
+    ts_field: str = "ts_init",
+    levels: int = 10,
+) -> dict[int, dict[str, list[list[str]]]]:
+    """Bounded-memory equivalent of reconstruct_book_checkpoints_from_deltas():
+    processes `objects` (an iterable/generator of OrderBookDeltas, e.g. from
+    iter_order_book_deltas_windowed()) sequentially, one flattened delta at
+    a time via _iter_flatten_deltas(), retaining only the current top-N
+    book state (`bids`/`asks` dicts) plus the handful of already-captured
+    checkpoint snapshots — never the full-day delta list.
+
+    This relies on `objects` arriving in non-decreasing `ts_field` order,
+    which Nautilus's own ParquetDataCatalog already enforces at write time
+    (`_objects_to_table()` raises ValueError otherwise — verified directly;
+    see tests/test_windowed_loader_boundaries.py) and which
+    iter_order_book_deltas_windowed()'s closed, non-overlapping windows
+    preserve across window boundaries. It does not perform the original
+    function's extra `(ts, sequence, read_index)` sort — that additional
+    sort assumed an unordered input; it is unneeded and would itself
+    require full materialization, defeating the point of this function.
+    """
+    sorted_cps = sorted(set(int(ts) for ts in checkpoint_tss))
+    snapshots: dict[int, dict[str, list[list[str]]]] = {}
+    bids: dict[str, str] = {}
+    asks: dict[str, str] = {}
+    cp_idx = 0
+
+    for delta in _iter_flatten_deltas(objects):
+        ts = int(delta.ts_init) if ts_field == "ts_init" else int(delta.ts_event)
+        while cp_idx < len(sorted_cps) and ts > sorted_cps[cp_idx]:
+            snapshots[sorted_cps[cp_idx]] = _top_of_book(bids, asks, levels)
+            cp_idx += 1
+        if cp_idx >= len(sorted_cps):
+            break
+        _apply_delta_to_book(bids, asks, delta)
+
+    while cp_idx < len(sorted_cps):
+        snapshots[sorted_cps[cp_idx]] = _top_of_book(bids, asks, levels)
+        cp_idx += 1
+
+    return snapshots
+
+
+def compare_book_checkpoints_streaming(
+    old_objects: Iterable[Any],
+    new_objects: Iterable[Any],
+    start_ns: int,
+    end_ns: int,
+    *,
+    ts_field: str = "ts_init",
+    levels: int = 10,
+) -> dict[str, Any]:
+    """Bounded-memory equivalent of compare_book_checkpoints(): reconstructs
+    and compares top-N book state at canonical checkpoints using
+    reconstruct_book_checkpoints_streaming() instead of materializing
+    `old_objects`/`new_objects` into full-day lists. Adds a deterministic
+    SHA-256 hash per checkpoint (`old_hash`/`new_hash`/`hash_match`) as a
+    compact, deterministic book-state fingerprint alongside the full
+    top-of-book comparison.
+
+    This is the GATING book-checkpoint comparison for the real acceptance
+    path (issue #20 follow-up correction) — compare_book_checkpoints()
+    remains available for other callers/tests but must not be used by
+    validation.validate_catalog_equivalence, since it requires full-day
+    list materialization of both delta streams.
+    """
+    labeled = _checkpoint_labels(start_ns, end_ns)
+    checkpoint_tss = [ts for _, ts in labeled]
+
+    old_snaps = reconstruct_book_checkpoints_streaming(
+        old_objects, checkpoint_tss, ts_field=ts_field, levels=levels
+    )
+    new_snaps = reconstruct_book_checkpoints_streaming(
+        new_objects, checkpoint_tss, ts_field=ts_field, levels=levels
+    )
+
+    empty_book = {"bids": [], "asks": []}
+    results: list[dict[str, Any]] = []
+    all_match = True
+    for label, ts in labeled:
+        old_book = old_snaps.get(ts, empty_book)
+        new_book = new_snaps.get(ts, empty_book)
+        old_hash = _book_state_hash(old_book)
+        new_hash = _book_state_hash(new_book)
+        match = old_book == new_book
+        if not match:
+            all_match = False
+        results.append(
+            {
+                "label": label,
+                "ts": ts,
+                "match": match,
+                "old_hash": old_hash,
+                "new_hash": new_hash,
+                "hash_match": old_hash == new_hash,
+                "old_bid_levels": len(old_book["bids"]),
+                "old_ask_levels": len(old_book["asks"]),
+                "new_bid_levels": len(new_book["bids"]),
+                "new_ask_levels": len(new_book["asks"]),
+                "old_best_bid": old_book["bids"][0] if old_book["bids"] else None,
+                "new_best_bid": new_book["bids"][0] if new_book["bids"] else None,
+                "old_best_ask": old_book["asks"][0] if old_book["asks"] else None,
+                "new_best_ask": new_book["asks"][0] if new_book["asks"] else None,
+                "old_crossed": _is_crossed(old_book),
+                "new_crossed": _is_crossed(new_book),
+            }
+        )
+
+    return {
+        "passed": all_match,
+        "checkpoint_count": len(labeled),
+        "any_crossed_old": any(item["old_crossed"] for item in results),
+        "any_crossed_new": any(item["new_crossed"] for item in results),
+        "checkpoints": results,
+    }
+
+
+# ---------------------------------------------------------------------------
+# OrderBookDepth10 — windowed loader + exhaustive comparator
+# ---------------------------------------------------------------------------
+
+
+def iter_order_book_depth10_windowed(
+    catalog_root: Path,
+    instrument_id: str,
+    start_ns: int,
+    end_ns: int,
+    *,
+    window_ns: int = 3_600_000_000_000,  # 1 hour
+) -> Iterator[Any]:
+    """Yield OrderBookDepth10 objects for one instrument across the
+    half-open caller range [start_ns, end_ns) using the same closed-window
+    partitioning as iter_trade_ticks_windowed()/iter_order_book_deltas_windowed()
+    (see the former's docstring for the discovered Nautilus inclusive-
+    both-ends query semantics this avoids double-yielding on). Depth10
+    volume is normally small relative to raw deltas, but the acceptance
+    path should still avoid an unnecessary full-day materialization."""
+    if end_ns <= start_ns:
+        return
+    catalog = ParquetDataCatalog(str(catalog_root))
+    last_inclusive_ns = end_ns - 1
+    window_start = start_ns
+    while window_start <= last_inclusive_ns:
+        window_end = min(window_start + window_ns - 1, last_inclusive_ns)
+        depths = catalog.order_book_depth10(instrument_ids=[instrument_id], start=window_start, end=window_end)
+        for obj in depths or []:
+            yield obj
+        window_start = window_end + 1
+
+
+def compare_order_book_depth10_exhaustive(
+    old_objects: Iterable[Any],
+    new_objects: Iterable[Any],
+    *,
+    numeric_tolerance: float = 0.0,
+    max_reported_mismatches: int = 200,
+) -> dict[str, Any]:
+    """Exhaustively compare every OrderBookDepth10 snapshot between two
+    streams, in original (deterministic emission) order — no sampling, no
+    re-sorting. Detects missing/extra snapshots (via length divergence)
+    and reordered or field-different snapshots (via positional field
+    comparison, including a full per-level bid/ask comparison), the same
+    way compare_trade_ticks_exhaustive()/compare_order_book_deltas_exhaustive()
+    do for their respective streams. Duplicate-event semantics are
+    identical to those functions: an identical duplicate at the same
+    position on both sides is equivalent and passes; any other duplicate-
+    shaped difference is caught positionally.
+    """
+    position_mismatches: list[dict[str, Any]] = []
+    old_count = 0
+    new_count = 0
+    first_length_divergence_position: int | None = None
+    position = -1
+
+    for position, (old_depth, new_depth) in enumerate(
+        itertools.zip_longest(old_objects, new_objects, fillvalue=_MISSING)
+    ):
+        old_present = old_depth is not _MISSING
+        new_present = new_depth is not _MISSING
+        if old_present:
+            old_count += 1
+        if new_present:
+            new_count += 1
+        if old_present != new_present and first_length_divergence_position is None:
+            first_length_divergence_position = position
+
+        if old_present and new_present:
+            old_record = _depth10_to_record(old_depth)
+            new_record = _depth10_to_record(new_depth)
+            mismatches: dict[str, Any] = {}
+            for field in ("instrument_id", "sequence", "flags", "ts_event", "ts_init"):
+                if old_record[field] != new_record[field]:
+                    mismatches[field] = {"old": old_record[field], "new": new_record[field]}
+            for side_key in ("bids", "asks"):
+                old_levels = old_record[side_key]
+                new_levels = new_record[side_key]
+                if len(old_levels) != len(new_levels):
+                    mismatches[f"{side_key}_len"] = {"old": len(old_levels), "new": len(new_levels)}
+                else:
+                    for level_index, (old_level, new_level) in enumerate(zip(old_levels, new_levels)):
+                        for field in ("side", "order_id"):
+                            if old_level[field] != new_level[field]:
+                                mismatches[f"{side_key}[{level_index}].{field}"] = {
+                                    "old": old_level[field], "new": new_level[field],
+                                }
+                        for field in ("price", "size"):
+                            equal, _used = _compare_decimal_field(field, old_level, new_level, numeric_tolerance)
+                            if not equal:
+                                mismatches[f"{side_key}[{level_index}].{field}"] = {
+                                    "old": old_level[field], "new": new_level[field],
+                                }
+            if mismatches and len(position_mismatches) < max_reported_mismatches:
+                position_mismatches.append(
+                    {"position": position, "old": old_record, "new": new_record, "fields": mismatches}
+                )
+
+    positions_compared = position + 1
+    passed = (
+        old_count == new_count
+        and first_length_divergence_position is None
+        and not position_mismatches
+    )
+    return {
+        "positions_compared": positions_compared,
+        "depth10_count_old": old_count,
+        "depth10_count_new": new_count,
+        "depth10_count_match": old_count == new_count,
+        "first_length_divergence_position": first_length_divergence_position,
+        "position_mismatches": position_mismatches,
+        "position_mismatch_count_capped_at": max_reported_mismatches,
+        "passed": passed,
+    }
+
+
 def write_validation_report(report: dict[str, Any], output_path: Path) -> Path:
     """Write a validation report as pretty JSON."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1199,7 +1446,21 @@ def compare_quality_flags_semantic(
     semantic comparison and must remain reconstructable — this proves the
     oracle can actually detect a difference in quality-flag content, ahead
     of any decision about whether/how to compact that field's physical
-    representation."""
+    representation.
+
+    SUPERSEDED for the real acceptance path (issue #20 follow-up
+    correction): this function (a) requires both inputs be fully
+    materialized into Python lists by the caller, and (b) is a pure
+    multiset comparison that cannot detect a quality flag moved from one
+    event to another while the overall multiset of values is unchanged —
+    a real equivalence bug this comparator would silently pass. See
+    compare_event_metadata_exhaustive() below, which validation.
+    validate_catalog_equivalence now uses instead: it keeps quality/
+    continuity information associated with its source event via a
+    canonical per-event identity key, and remains bounded-memory via
+    streaming generators. This function remains available for lightweight/
+    Tier-1 ad-hoc comparisons where full multiset equivalence is a
+    sufficient quick check."""
 
     def _parse(value: Any) -> Any:
         if value is None:
@@ -1241,4 +1502,137 @@ def compare_quality_flags_semantic(
         "distinct_values_new": len(new_counter),
         "mismatches": mismatches,
         "passed": not mismatches,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Fenced ranges — canonical digest comparison (gating)
+# ---------------------------------------------------------------------------
+
+
+def compare_fenced_ranges_digest(
+    old_canonical_count: int,
+    old_canonical_digest: str,
+    new_fenced_ranges: Iterable[dict[str, Any]],
+) -> dict[str, Any]:
+    """Compare the reference route's complete fenced-range collection (as a
+    bounded count + SHA-256 digest — see
+    converter.depth_phase2.canonical_fence_digest()) against the candidate
+    route's actual fenced-range list for one symbol.
+
+    Replaces compare_fenced_ranges_semantic() as the GATING fenced-range
+    comparison for the real acceptance path (issue #20 follow-up
+    correction): the reference route's own report only ever persisted up
+    to 3 example fences per symbol, which cannot prove equivalence for a
+    symbol with more fences, and a prior version of this validator's
+    wiring incorrectly treated any candidate `extra_in_new` fence as
+    expected/non-gating. Neither limitation applies here: `old_canonical_count`/
+    `old_canonical_digest` are computed by convert_day.py over the
+    COMPLETE fenced-range collection, so ANY difference in count or
+    content — including a fence the candidate has that the reference does
+    not, and including a difference that only shows up after the 3rd
+    fence — changes the digest and fails this comparison.
+    """
+    new_list = list(new_fenced_ranges)
+    new_count = len(new_list)
+    new_digest = canonical_fence_digest(new_list)
+    return {
+        "count_old": old_canonical_count,
+        "count_new": new_count,
+        "count_match": old_canonical_count == new_count,
+        "digest_old": old_canonical_digest,
+        "digest_new": new_digest,
+        "digest_match": old_canonical_digest == new_digest,
+        "passed": old_canonical_count == new_count and old_canonical_digest == new_digest,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Generic bounded-memory, event-identity-keyed metadata comparison
+# ---------------------------------------------------------------------------
+
+
+def compare_event_metadata_exhaustive(
+    old_records: Iterable[dict[str, Any]],
+    new_records: Iterable[dict[str, Any]],
+    *,
+    compare_fields: tuple[str, ...],
+    max_reported_mismatches: int = 200,
+) -> dict[str, Any]:
+    """Exhaustively compare two streams of normalized event-metadata
+    dicts (e.g. raw depth_v2/trade_v2 records vs. their replay_store
+    counterparts) at each position, keeping quality/continuity information
+    associated with its source event rather than reducing it to an
+    order-independent multiset.
+
+    Both `old_records` and `new_records` MUST already be delivered in the
+    SAME canonical order (e.g. `(stream_session_id, session_seq,
+    raw_index)` for depth, `(trade_stream_session_id, trade_session_seq,
+    raw_index)` for trades) before being passed here — this function does
+    not sort; see validation.validate_catalog_equivalence's raw-side
+    callers, which use converter.spool.RawRecordSpool (an existing
+    disk-backed bounded spool) to establish that canonical order for the
+    raw side, while the replay_store side is read via
+    stores.replay_reader.ReplayReader, which is already guaranteed sorted
+    in that same canonical order by the replay-store contract.
+
+    `compare_fields` should include the canonical identity fields
+    themselves (e.g. `raw_index`, `session_seq`) alongside the actual
+    content fields to compare (e.g. `quality_flags`, `U`, `u`, `pu`,
+    `is_desync`) — including the identity fields in the comparison is what
+    detects a quality flag or continuity marker that moved to a
+    DIFFERENT event: if a value moves from the event at position i to the
+    event at position j, both positions' identity+content fields no
+    longer match position-for-position between old and new, and this
+    function reports a mismatch at both positions, even though a pure
+    multiset comparison of just the moved value would see no difference
+    at all.
+
+    Streams both inputs lazily (never materializes either into a list
+    internally) and runs in O(N) time, remaining bounded-memory and
+    practical for a complete production day's event volume.
+    """
+    position_mismatches: list[dict[str, Any]] = []
+    old_count = 0
+    new_count = 0
+    first_length_divergence_position: int | None = None
+    position = -1
+
+    for position, (old_rec, new_rec) in enumerate(
+        itertools.zip_longest(old_records, new_records, fillvalue=_MISSING)
+    ):
+        old_present = old_rec is not _MISSING
+        new_present = new_rec is not _MISSING
+        if old_present:
+            old_count += 1
+        if new_present:
+            new_count += 1
+        if old_present != new_present and first_length_divergence_position is None:
+            first_length_divergence_position = position
+
+        if old_present and new_present:
+            mismatches: dict[str, Any] = {}
+            for field in compare_fields:
+                old_value = old_rec.get(field)
+                new_value = new_rec.get(field)
+                if old_value != new_value:
+                    mismatches[field] = {"old": old_value, "new": new_value}
+            if mismatches and len(position_mismatches) < max_reported_mismatches:
+                position_mismatches.append({"position": position, "fields": mismatches})
+
+    positions_compared = position + 1
+    passed = (
+        old_count == new_count
+        and first_length_divergence_position is None
+        and not position_mismatches
+    )
+    return {
+        "positions_compared": positions_compared,
+        "count_old": old_count,
+        "count_new": new_count,
+        "count_match": old_count == new_count,
+        "first_length_divergence_position": first_length_divergence_position,
+        "position_mismatches": position_mismatches,
+        "position_mismatch_count_capped_at": max_reported_mismatches,
+        "passed": passed,
     }
