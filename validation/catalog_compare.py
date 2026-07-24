@@ -15,6 +15,71 @@ def load_instrument_ids(catalog_root: Path) -> list[str]:
     return sorted(str(instrument.id) for instrument in catalog.instruments())
 
 
+def load_instruments(catalog_root: Path) -> dict[str, Any]:
+    """Return {instrument_id: Instrument object} for a Nautilus catalog.
+
+    Unlike load_instrument_ids(), this keeps the full Instrument object so
+    precision/increment fields can be compared, not just identity.
+    """
+    catalog = ParquetDataCatalog(str(catalog_root))
+    return {str(instrument.id): instrument for instrument in catalog.instruments()}
+
+
+def _instrument_to_record(instrument: Any) -> dict[str, Any]:
+    """Normalize the subset of Instrument fields required for exact full-L2
+    reconstruction: precision and price/size increment (tick/step size).
+    `price_precision`/`size_precision` alone do not define valid tick/step
+    sizes (per issue #20's explicit correction) — `price_increment` and
+    `size_increment` are the authoritative Binance PRICE_FILTER.tickSize /
+    LOT_SIZE.stepSize-derived values Nautilus actually uses for rounding."""
+    return {
+        "instrument_id": str(instrument.id),
+        "price_precision": int(instrument.price_precision),
+        "size_precision": int(instrument.size_precision),
+        "price_increment": str(instrument.price_increment),
+        "size_increment": str(instrument.size_increment),
+    }
+
+
+def compare_instruments_semantic(
+    old_instruments: dict[str, Any],
+    new_instruments: dict[str, Any],
+) -> dict[str, Any]:
+    """Compare instrument identity AND precision/increment metadata.
+
+    load_instrument_ids()-based comparison only proves the *set* of
+    instrument ids matches; it does not prove the reconstructed instrument
+    has the same price/size precision or tick/step size as the reference,
+    which would silently corrupt exact-decimal reconstruction downstream.
+    This closes that gap (issue #20 Phase 1 oracle coverage audit finding).
+    """
+    old_ids = set(old_instruments)
+    new_ids = set(new_instruments)
+    missing_in_new = sorted(old_ids - new_ids)
+    extra_in_new = sorted(new_ids - old_ids)
+
+    mismatches: list[dict[str, Any]] = []
+    for instrument_id in sorted(old_ids & new_ids):
+        old_record = _instrument_to_record(old_instruments[instrument_id])
+        new_record = _instrument_to_record(new_instruments[instrument_id])
+        field_mismatches = {
+            field: {"old": old_record[field], "new": new_record[field]}
+            for field in ("price_precision", "size_precision", "price_increment", "size_increment")
+            if old_record[field] != new_record[field]
+        }
+        if field_mismatches:
+            mismatches.append({"instrument_id": instrument_id, "fields": field_mismatches})
+
+    return {
+        "instrument_count_old": len(old_ids),
+        "instrument_count_new": len(new_ids),
+        "missing_in_new": missing_in_new,
+        "extra_in_new": extra_in_new,
+        "precision_mismatches": mismatches,
+        "passed": not missing_in_new and not extra_in_new and not mismatches,
+    }
+
+
 def load_trade_ticks(
     catalog_root: Path,
     instrument_id: str,
@@ -670,3 +735,194 @@ def write_validation_report(report: dict[str, Any], output_path: Path) -> Path:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(report, indent=2, default=str))
     return output_path
+
+
+# ---------------------------------------------------------------------------
+# Continuity / sync-desync-resync / fenced-range diagnostics
+# ---------------------------------------------------------------------------
+#
+# The Nautilus catalog itself (TradeTick / OrderBookDeltas / Depth10) never
+# stores snapshot-seed, sync/desync/resync, or fenced-range bookkeeping —
+# those are process-level diagnostics emitted alongside the catalog by the
+# converter engine (converter/depth_phase2.py's shared Phase2ReplayMetrics),
+# not catalog contents. Comparing only the Nautilus objects (as
+# compare_order_book_deltas_semantic() etc. do) therefore cannot detect a
+# difference in continuity/quality behavior between the reference and
+# candidate routes even though the issue's contract explicitly requires it.
+# This is the Phase 1 oracle-coverage gap closed here.
+#
+# Reference-side (convert_day.py) per-symbol shape:
+#   report["per_symbol_depth"]["VENUE/SYMBOL"] = {
+#       "snapshot_seed_count": int, "resync_count": int,
+#       "desync_events": int, "fenced_ranges": int, ...
+#   }
+# Candidate-side (validation/replay_catalog_reconstruct.py) manifest shape:
+#   manifest["depth_diagnostics"] = {
+#       "snapshot_seeds": int, "resyncs": int, "desyncs": int,
+#       "fenced_range_count": int, ...
+#   }
+#   manifest["fenced_ranges"] = [ {..fence dict with venue/symbol/date..}, ... ]
+#
+# Both ultimately originate from the same shared
+# converter.depth_phase2.Phase2ReplayMetrics dataclass, but the two call
+# sites (convert_day.py vs. replay_catalog_reconstruct.py) independently
+# renamed the aggregated fields when assembling their own report/manifest
+# dicts — this comparator normalizes both naming conventions rather than
+# assuming either one.
+
+_CONTINUITY_FIELD_ALIASES: dict[str, tuple[str, ...]] = {
+    "snapshot_seed_count": ("snapshot_seed_count", "snapshot_seeds"),
+    "resync_count": ("resync_count", "resyncs"),
+    "desync_events": ("desync_events", "desyncs"),
+    "fenced_range_count": ("fenced_ranges", "fenced_range_count"),
+}
+
+
+def _extract_continuity_value(source: dict[str, Any], canonical_field: str) -> Any:
+    for alias in _CONTINUITY_FIELD_ALIASES[canonical_field]:
+        if alias in source:
+            value = source[alias]
+            # convert_day.py's "fenced_ranges" field is an int *count*
+            # (`len(depth_metrics.fenced_ranges)`), not the list itself —
+            # but guard defensively in case a caller passes the raw list.
+            if canonical_field == "fenced_range_count" and isinstance(value, list):
+                return len(value)
+            return value
+    return None
+
+
+def compare_continuity_diagnostics_semantic(
+    old_per_symbol_depth: dict[str, Any],
+    new_depth_diagnostics: dict[str, Any],
+) -> dict[str, Any]:
+    """Compare snapshot/resync/desync/fenced-range *counts* between the
+    reference route's per-symbol depth report and the candidate route's
+    depth_diagnostics manifest section.
+
+    This is a count-level comparison (both sides already aggregate to a
+    scalar count per symbol/day); a stronger content-level comparison of
+    individual fenced-range boundaries is provided by
+    compare_fenced_ranges_semantic() below.
+    """
+    result: dict[str, Any] = {"field_mismatches": {}}
+    for canonical_field in _CONTINUITY_FIELD_ALIASES:
+        old_value = _extract_continuity_value(old_per_symbol_depth, canonical_field)
+        new_value = _extract_continuity_value(new_depth_diagnostics, canonical_field)
+        result[f"{canonical_field}_old"] = old_value
+        result[f"{canonical_field}_new"] = new_value
+        if old_value is None or new_value is None:
+            result["field_mismatches"][canonical_field] = {
+                "old": old_value,
+                "new": new_value,
+                "reason": "missing on one side",
+            }
+        elif old_value != new_value:
+            result["field_mismatches"][canonical_field] = {"old": old_value, "new": new_value}
+
+    result["passed"] = not result["field_mismatches"]
+    return result
+
+
+def _fence_key(fence: dict[str, Any]) -> tuple[Any, ...]:
+    """A fence's identity should not depend on wall-clock diagnostic
+    metadata (e.g. detection time); key on the boundary itself."""
+    return (
+        fence.get("venue"),
+        fence.get("symbol"),
+        fence.get("start_ts_ns", fence.get("start")),
+        fence.get("end_ts_ns", fence.get("end")),
+        fence.get("severity"),
+        fence.get("reason", fence.get("kind")),
+    )
+
+
+def compare_fenced_ranges_semantic(
+    old_fenced_ranges: Iterable[dict[str, Any]],
+    new_fenced_ranges: Iterable[dict[str, Any]],
+) -> dict[str, Any]:
+    """Compare individual fenced (unrecovered discontinuity) ranges by
+    content, not just by count. Only meaningful when both the reference and
+    candidate routes expose a per-fence list (convert_day.py's own
+    per-symbol report today only exposes a count — see
+    compare_continuity_diagnostics_semantic() for that case); this function
+    is for routes/versions that do expose the list (e.g. the candidate
+    manifest's `fenced_ranges`), and is forward-looking for a reference-side
+    fenced-range list export."""
+    old_list = list(old_fenced_ranges)
+    new_list = list(new_fenced_ranges)
+    old_keys = {_fence_key(f) for f in old_list}
+    new_keys = {_fence_key(f) for f in new_list}
+    missing = sorted(str(k) for k in (old_keys - new_keys))
+    extra = sorted(str(k) for k in (new_keys - old_keys))
+    return {
+        "count_old": len(old_list),
+        "count_new": len(new_list),
+        "count_match": len(old_list) == len(new_list),
+        "missing_in_new": missing,
+        "extra_in_new": extra,
+        "passed": len(old_list) == len(new_list) and not missing and not extra,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Quality-flag behavior
+# ---------------------------------------------------------------------------
+
+
+def compare_quality_flags_semantic(
+    old_quality_flags: Iterable[Any],
+    new_quality_flags: Iterable[Any],
+) -> dict[str, Any]:
+    """Compare per-event quality-flag payloads by decoded content (multiset
+    of parsed JSON dicts), not raw string equality — the underlying replay
+    schema stores `quality_flags` as a JSON-encoded string
+    (`stores/replay_schema.py`), and two logically identical flag sets could
+    differ in key ordering or whitespace without differing semantically.
+
+    Per issue #20 Phase 1: quality-flag behavior is part of the required
+    semantic comparison and must remain reconstructable — this proves the
+    oracle can actually detect a difference in quality-flag content, ahead
+    of any decision about whether/how to compact that field's physical
+    representation."""
+
+    def _parse(value: Any) -> Any:
+        if value is None:
+            return None
+        if isinstance(value, (dict, list)):
+            return value
+        try:
+            return json.loads(value)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return value
+
+    old_parsed = [_parse(v) for v in old_quality_flags]
+    new_parsed = [_parse(v) for v in new_quality_flags]
+
+    def _to_comparable(value: Any) -> str:
+        if isinstance(value, (dict, list)):
+            return json.dumps(value, sort_keys=True)
+        return str(value)
+
+    old_counter: dict[str, int] = {}
+    for value in old_parsed:
+        key = _to_comparable(value)
+        old_counter[key] = old_counter.get(key, 0) + 1
+    new_counter: dict[str, int] = {}
+    for value in new_parsed:
+        key = _to_comparable(value)
+        new_counter[key] = new_counter.get(key, 0) + 1
+
+    all_keys = set(old_counter) | set(new_counter)
+    mismatches = {
+        key: {"old_count": old_counter.get(key, 0), "new_count": new_counter.get(key, 0)}
+        for key in all_keys
+        if old_counter.get(key, 0) != new_counter.get(key, 0)
+    }
+    return {
+        "count_old": len(old_parsed),
+        "count_new": len(new_parsed),
+        "distinct_values_old": len(old_counter),
+        "distinct_values_new": len(new_counter),
+        "mismatches": mismatches,
+        "passed": not mismatches,
+    }

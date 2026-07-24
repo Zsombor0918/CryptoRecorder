@@ -93,6 +93,149 @@ An entry may be skipped **only** for:
 - <or "none — task fully completed">
 ```
 
+## 2026-07-24 — Issue #20 Phase 1: semantic-oracle coverage audit, missing comparisons, failure-injection proof
+
+### Change summary
+- Coverage-audited `validation/catalog_compare.py` against the issue #20
+  full semantic-equivalence contract (instrument identity/precision;
+  ordered TradeTicks; ordered OrderBookDeltas incl. actions/sides/prices/
+  sizes/flags/sequence/timestamps; snapshot seeds; clear/reset; sync/
+  desync/resync; continuity gaps/fenced ranges; session/day boundaries;
+  Depth10; quality-flag behavior; deterministic book-state checkpoints).
+  Found the existing comparators already cover: TradeTicks, OrderBookDeltas
+  (incl. CLEAR/snapshot flags since `action`/`flags` are compared fields),
+  Depth10, and 7-checkpoint deterministic book-state reconstruction.
+- Identified and closed five gaps that the pre-existing comparators could
+  not detect, because none of the corresponding data is visible in the
+  Nautilus catalog objects themselves:
+  - `compare_instruments_semantic()` (new) — the prior `load_instrument_ids()`
+    only compared the *set* of instrument ids; it could not detect a wrong
+    `price_precision`/`size_precision`/`price_increment`/`size_increment`
+    on an otherwise-correctly-named instrument, which would silently
+    corrupt exact-decimal reconstruction downstream.
+  - `compare_continuity_diagnostics_semantic()` (new) — compares
+    snapshot-seed/resync/desync/fenced-range **counts** between the
+    reference route's `convert_day.py` `per_symbol_depth` report and the
+    candidate route's `validation/replay_catalog_reconstruct.py` manifest
+    `depth_diagnostics` section. Both originate from the same shared
+    `converter.depth_phase2.Phase2ReplayMetrics` dataclass, but the two
+    call sites independently renamed the aggregated fields (e.g.
+    `resync_count` vs. `resyncs`, `fenced_ranges` count vs.
+    `fenced_range_count`) — the new comparator normalizes both naming
+    conventions rather than assuming either one.
+  - `compare_fenced_ranges_semantic()` (new) — per-fence content
+    comparison (venue/symbol/start/end/severity/reason), not just a count,
+    for routes/versions that expose the fence list (the candidate manifest
+    already does via `manifest["fenced_ranges"]`).
+  - `compare_quality_flags_semantic()` (new) — compares `quality_flags` by
+    decoded JSON content (a multiset of parsed values), not raw string
+    equality, since the replay schema stores it as a JSON-encoded string
+    that could differ in key order/whitespace without differing
+    semantically.
+- Added `tests/test_semantic_oracle_detects_injected_faults.py` (19 tests):
+  for each required fault class, starts from an otherwise-passing synthetic
+  reference/candidate pair and injects exactly one deliberate corruption,
+  asserting the relevant comparator flips from `passed=True` to
+  `passed=False`. Covers: wrong trade price, wrong trade timestamp, dropped
+  trade, dropped delta, wrong sequence number, wrong flag, wrong side,
+  missing snapshot-seed/CLEAR delta, wrong Depth10 level, a mismatched
+  deterministic book-state checkpoint (plus a matching-checkpoints sanity
+  check), wrong instrument precision, a missing instrument, wrong
+  snapshot/resync/desync/fenced-range counts (three separate injected-count
+  tests), a missing fenced range by content, and a corrupted quality-flag
+  value.
+- Added a structural independence test
+  (`test_reference_and_candidate_decoders_are_independently_implemented`)
+  proving `validation/catalog_compare.py` does not import
+  `stores.replay_depth_adapter`/`stores.replay_reader`/`stores.replay_writer`,
+  and `stores/replay_depth_adapter.py` does not import
+  `validation.catalog_compare` — i.e. the oracle and the candidate's
+  schema-specific decoding logic cannot silently share a bug through a
+  direct import dependency. The only intentionally shared component
+  remains `converter/depth_phase2.py`'s book-replay engine (unchanged,
+  already the documented shared component per
+  `docs/IMPLEMENTATION_AUDIT.md`).
+- No compact replay schema, builder, staging-cleanup, or raw-retention
+  behavior was implemented or changed in this commit — this is oracle
+  hardening only, per the plan's requirement that the oracle be proven
+  before any schema code is written.
+
+### Files/packages touched
+- `validation/catalog_compare.py` (extended — 5 new comparison functions)
+- `tests/test_semantic_oracle_detects_injected_faults.py` (new — 19 tests)
+- `CHANGELOG.md` (`[Unreleased]` → `Added`)
+- `docs/CHANGE_AUDIT.md` (this entry)
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] docs/REPO_STRUCTURE.md (no folder/file contract change —
+  `validation/` already owns `catalog_compare.py`)
+- [x] docs/PROJECT_STATUS.md (no validated/deferred status changed — the
+  oracle is validation *tooling*; it does not itself change the `full_l2`
+  validated/deferred gate status)
+- [x] docs/IMPLEMENTATION_AUDIT.md (reviewed; no ground-truth claim changed)
+- [x] relevant feature docs:
+  - docs/VALIDATION.md (reviewed; existing `validate_catalog_equivalence`
+    CLI description remains accurate — new comparison functions are
+    additive library functions, not yet wired into the CLI's default
+    profile output; that wiring is deferred to the schema-implementation
+    phase per the approved plan, since it depends on which manifest/report
+    fields the finalized schema actually produces)
+
+### Docs updated
+- [x] CHANGELOG.md
+- No docs update required because: this is additive comparator tooling
+  with no new CLI surface and no status/gate change; the existing
+  `docs/VALIDATION.md` description of `validate_catalog_equivalence` and
+  `catalog_compare` remains accurate.
+
+### Status / validation impact
+- Validated status changed: no
+- Deferred status changed: no
+- New claims added: no — this proves the *oracle* detects injected faults
+  in synthetic data; it does not itself constitute a new semantic-
+  equivalence validation run against real data, and does not change the
+  `full_l2`/v2.0.0 gate status.
+- Evidence for any new validation claim: n/a (no new validation claim made)
+
+### Tests run
+```bash
+source .venv/bin/activate
+python -m pytest tests/test_semantic_oracle_detects_injected_faults.py -q   # 19 passed
+python -m pytest tests/test_catalog_equivalence.py tests/test_catalog_equivalence_full_l2.py \
+  tests/test_semantic_equivalence.py tests/test_replay_catalog_reconstruct.py -q   # 11 passed, 1 skipped
+python -m pytest -q   # 366 passed, 3 skipped
+```
+
+### Validation CLIs run
+```bash
+none required for this change type — no schema, config, or deployment
+file was touched; the new comparison functions are exercised directly by
+the new pytest suite above.
+```
+
+### Known limitations / out of scope
+- The new comparison functions are not yet wired into
+  `validation/validate_catalog_equivalence.py`'s default output — that
+  integration is deferred until the compact schema (Phase 5+, not started
+  in this session) determines the exact manifest/report field shapes to
+  compare against.
+- `compare_fenced_ranges_semantic()` is forward-looking on the reference
+  side: `convert_day.py`'s own per-symbol report today only exposes a
+  fenced-range *count*, not the per-fence list — the content-level
+  comparator is exercised here against synthetic data and is ready for the
+  reference side once/if a per-fence list is exported there; until then,
+  `compare_continuity_diagnostics_semantic()`'s count-level comparison is
+  the one actually usable against today's `convert_day.py` output.
+- No representative production-day or even local real-data (Tier 2) run of
+  the extended oracle was performed in this session — per the approved
+  plan, Tier 3 requires production-server access this session does not
+  have; this Phase 1 work is proven only against synthetic (Tier 1) data,
+  which is exactly what "prove the oracle before using it as a gate" is
+  meant to establish.
+
+---
+
 ## 2026-07-24 — Issue #20 Phase 0: baseline storage-audit breakdown (allocated/apparent, per-unit, root-wide scratch scan)
 
 ### Change summary

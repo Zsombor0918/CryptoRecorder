@@ -84,6 +84,41 @@ passes.** Until then, broader full-L2 equivalence stays **deferred** (see
   not yet cleaning, orphans like the known BANKUSDT `2026-07-21` staging
   directory). This is Phase 0 of the issue #20 compact-replay-storage plan;
   no replay schema, builder, or lifecycle behavior was changed.
+- **`validation/catalog_compare.py` — issue #20 Phase 1 oracle-coverage
+  gaps closed** — the semantic-equivalence comparator gained five new
+  comparison functions the coverage audit found missing against the
+  issue's full contract: `compare_instruments_semantic()` (precision and
+  price/size increment, not just instrument-id set membership — a wrong
+  `price_precision`/`tick size` previously would not have been detected);
+  `compare_continuity_diagnostics_semantic()` (snapshot-seed/resync/
+  desync/fenced-range **counts**, comparing the reference route's
+  `per_symbol_depth` report fields against the candidate route's
+  `depth_diagnostics` manifest fields — normalizing the two independently
+  chosen naming conventions, e.g. `resync_count` vs. `resyncs`, since both
+  originate from the same shared `converter.depth_phase2.Phase2ReplayMetrics`
+  dataclass but were renamed differently at each call site);
+  `compare_fenced_ranges_semantic()` (per-fence content comparison, not
+  just a count); `compare_quality_flags_semantic()` (decoded JSON-content
+  comparison of the `quality_flags` field, not raw string equality). None
+  of these fields are visible in the Nautilus catalog objects themselves
+  (`TradeTick`/`OrderBookDeltas`/`OrderBookDepth10`), so the pre-existing
+  comparators could never have caught a regression in them.
+- **`tests/test_semantic_oracle_detects_injected_faults.py`** (new, 19
+  tests) — proves the oracle actually detects each required fault class
+  by injecting exactly one deliberate corruption at a time into an
+  otherwise-passing synthetic pair: wrong trade price, wrong trade
+  timestamp, dropped trade, dropped delta, wrong sequence number, wrong
+  flag, wrong side, missing snapshot-seed/CLEAR delta, wrong Depth10
+  level, a mismatched deterministic book-state checkpoint, wrong
+  instrument precision, a missing instrument, wrong
+  snapshot/resync/desync/fenced-range counts, a missing fenced range by
+  content, and a corrupted quality-flag value. A structural test also
+  proves the reference and candidate decoding paths remain independently
+  implemented (the comparator does not import the replay-schema-specific
+  decoder, and the decoder does not import the comparator), so a shared
+  bug in new compact-decoding logic could not silently pass both sides of
+  a future schema comparison. This is Phase 1 of the issue #20
+  compact-replay-storage plan; no compact schema was implemented.
 
 ### Changed
 - **`systemd/cryptorecorder-replay-build.service` — `TimeoutStartSec` raised
