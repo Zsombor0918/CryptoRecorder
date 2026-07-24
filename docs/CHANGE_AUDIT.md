@@ -93,6 +93,184 @@ An entry may be skipped **only** for:
 - <or "none — task fully completed">
 ```
 
+## 2026-07-24 — Issue #20 Phase 1 correction: exhaustive, order-preserving, bounded-memory oracle comparison (closes sampling/multiset/streaming gap)
+
+### Change summary
+- A follow-up review of the already-committed Phase 1 oracle-hardening
+  work correctly identified that it was still insufficient for the
+  issue's actual requirement: `compare_trade_ticks_semantic()` samples up
+  to `sample_count` (default 100) positions after re-sorting both streams
+  by `(ts_event, trade_id)`, and `compare_order_book_deltas_semantic()` is
+  a multiset comparison that also re-sorts before comparing. Verified
+  directly (and demonstrated in the new test suite) that both designs
+  have real, non-hypothetical blind spots:
+  - a difference placed at a position the sampler does not select is
+    invisible to `compare_trade_ticks_semantic()`;
+  - a pure reordering of two otherwise-identical-content trades/deltas is
+    invisible to both the sampled comparator (same trade_id set, no
+    missing/extra keys) and the multiset comparator (same multiset);
+  - a reordering of two independent, non-conflicting depth updates that
+    happens to produce an *identical final book state* is invisible even
+    to `compare_book_checkpoints()`'s deterministic book-state
+    reconstruction, since the checkpoint only observes the state *after*
+    both deltas have been applied, not the order they arrived in.
+- Added `compare_trade_ticks_exhaustive()` and
+  `compare_order_book_deltas_exhaustive()` to `validation/catalog_compare.py`:
+  both compare every event at its original stream position via
+  `itertools.zip_longest` (no re-sorting, no sampling), so a reordering,
+  an out-of-sample-range difference, or an extra/missing event anywhere
+  in the stream is detected. Neither function materializes either input
+  stream into a list internally — they accept and consume arbitrary
+  iterables (including one-shot generators), keeping memory bounded and
+  independent of total event count.
+- Added `_BoundedDedupeWindow` (O(window) memory) to detect duplicate
+  events using a bounded recent-window lookback per stream side — a
+  documented, deliberate trade-off against a true O(total-event-count)
+  global duplicate check, which would itself violate the bounded-memory
+  requirement for a complete production day's tens/hundreds of millions
+  of events. The docstring states this trade-off explicitly: a duplicate
+  whose two occurrences are farther apart than the window will not be
+  flagged by this specific check.
+- Added `iter_trade_ticks_windowed()` and `iter_order_book_deltas_windowed()`
+  to `validation/catalog_compare.py`: bounded-memory catalog loaders that
+  fetch in fixed time windows (default 1 hour) via repeated
+  `catalog.trade_ticks()`/`catalog.order_book_deltas()` calls, rather than
+  materializing an entire requested time range in one call the way
+  `load_trade_ticks()`/`load_order_book_deltas()` do. These are the
+  necessary companion loaders for the new exhaustive comparators to
+  actually achieve bounded memory end-to-end against a real catalog for a
+  complete production day (issue #20 Tier 3), not just within the
+  comparator function itself.
+- Added `tests/test_semantic_oracle_exhaustive_streaming.py` (11 tests):
+  - a difference outside the legacy sampler's selected positions is
+    missed by the legacy comparator and caught by the new one (sanity
+    assertion on the legacy comparator's "false pass" included, to prove
+    the gap is real, not assumed);
+  - a pure reordering of two independent depth deltas is reported as
+    equal by the multiset comparator and as a mismatch by the exhaustive
+    one (same structure: sanity assertion on the multiset comparator's
+    "false pass" included);
+  - extra trade appended / missing trade / extra delta — all detected via
+    `first_length_divergence_position`;
+  - duplicate trade added (new-side duplicate) and duplicate trade removed
+    (old-side-only duplicate) — both detected via
+    `duplicate_events_new`/`duplicate_events_old` respectively;
+  - reordered trades at positions outside the legacy sampler's selection —
+    detected, with an explicit sanity check that the legacy comparator's
+    `missing_keys`/`extra_keys` stay empty (proving a set-based check
+    alone cannot see a pure reordering);
+  - reordered commutative-looking depth deltas producing an *identical*
+    final book state — verified via `compare_book_checkpoints()` reporting
+    `passed=True` (sanity check that the scenario is genuinely
+    commutative), while `compare_order_book_deltas_exhaustive()` reports
+    `passed=False`;
+  - two bounded-memory + late-difference proofs (one for trades at
+    n=20,000, one for deltas at n=5,000): a `_LiveCounter`/`_FakeTick` pair
+    tracks how many synthetic event objects are simultaneously alive via
+    Python's refcounting `__del__` hook (not merely asserted from
+    implementation reading), proving peak simultaneous liveness stays
+    under 100 objects — independent of n — while a single difference
+    injected 3–5 positions before the end of each stream is still
+    detected, proving the entire stream is genuinely scanned rather than
+    truncated or sampled.
+- The pre-existing sampled/multiset comparators
+  (`compare_trade_ticks_semantic()`, `compare_order_book_deltas_semantic()`)
+  are unchanged and retained — they remain useful for fast
+  summary-level comparisons during iterative development (Tier 1/2); the
+  new exhaustive comparators are the ones required for the Tier 3
+  representative-production-day gate and are additive, not a replacement.
+- No compact replay schema, builder, staging-cleanup, or raw-retention
+  behavior was changed. This is a correction within Phase 1 (oracle
+  hardening), which continues to gate any future compact schema
+  implementation (Phase 5+, not started).
+
+### Files/packages touched
+- `validation/catalog_compare.py` (extended — 2 new exhaustive comparators,
+  2 new bounded-memory catalog loaders, 1 new dedupe-window helper)
+- `tests/test_semantic_oracle_exhaustive_streaming.py` (new — 11 tests)
+- `CHANGELOG.md` (`[Unreleased]` → `Added`)
+- `docs/CHANGE_AUDIT.md` (this entry)
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] docs/REPO_STRUCTURE.md (no folder/file contract change —
+  `validation/` already owns `catalog_compare.py`)
+- [x] docs/PROJECT_STATUS.md (reviewed; no validated/deferred status
+  changed — this is oracle tooling correction, not a new validation run
+  against real data)
+- [x] docs/IMPLEMENTATION_AUDIT.md (reviewed; consistent with the Phase 2-3
+  entry, which already references "the Phase 1 oracle (implemented)" —
+  this correction strengthens, not contradicts, that reference)
+- [x] relevant feature docs:
+  - docs/VALIDATION.md (reviewed; existing `validate_catalog_equivalence`
+    CLI description remains accurate — the new comparators are additive
+    library functions, not yet wired into the CLI's default profile
+    output, consistent with the prior Phase 1 entry's same known
+    limitation)
+
+### Docs updated
+- [x] CHANGELOG.md
+- No docs update required because: this is additive comparator/loader
+  tooling correcting a gap within the already-documented Phase 1 scope;
+  no new CLI surface, status, or gate changed.
+
+### Status / validation impact
+- Validated status changed: no
+- Deferred status changed: no
+- New claims added: no — this proves the *oracle* now performs exhaustive,
+  order-preserving, bounded-memory comparison on synthetic data; it does
+  not constitute a new semantic-equivalence validation run against real
+  data, and does not change the `full_l2`/v2.0.0 gate status.
+- Evidence for any new validation claim: n/a (no new validation claim made)
+
+### Tests run
+```bash
+source .venv/bin/activate
+python -m pytest tests/test_semantic_oracle_exhaustive_streaming.py -q   # 11 passed
+python -m pytest tests/test_semantic_oracle_exhaustive_streaming.py \
+  tests/test_semantic_oracle_detects_injected_faults.py \
+  tests/test_catalog_equivalence.py tests/test_catalog_equivalence_full_l2.py \
+  tests/test_semantic_equivalence.py tests/test_replay_catalog_reconstruct.py -q   # 41 passed, 1 skipped
+python -m pytest tests/test_repo_structure.py tests/test_agent_infrastructure.py -q   # 56 passed
+python -m pytest -q   # 377 passed, 3 skipped
+```
+
+### Validation CLIs run
+```bash
+none required for this change type — no schema, config, or deployment
+file was touched; the new comparators/loaders are exercised directly by
+the new pytest suite above.
+```
+
+### Known limitations / out of scope
+- The new comparison functions are not yet wired into
+  `validation/validate_catalog_equivalence.py`'s default output — same
+  known limitation already recorded in the prior Phase 1 entry; that
+  integration is deferred until the compact schema (Phase 5+, not started)
+  determines the exact manifest/report field shapes to compare against.
+- `_BoundedDedupeWindow`'s duplicate detection is bounded-window, not
+  global — a duplicate whose two occurrences are farther apart than
+  `dedupe_window` (default 100,000 events) will not be flagged. This is a
+  documented, deliberate trade-off, not an oversight: true global
+  duplicate detection over hundreds of millions of events would itself
+  require unbounded memory.
+- No representative production-day (Tier 3: 2026-07-22/23) or even local
+  real-data (Tier 2) run of the new exhaustive comparators was performed
+  in this session — this correction is proven only against synthetic
+  (Tier 1) data and a live-object-counter memory proof, which is exactly
+  what "prove the oracle before using it as a gate" requires before any
+  real-data run.
+- `iter_trade_ticks_windowed()`/`iter_order_book_deltas_windowed()` were
+  not exercised against a real on-disk Nautilus catalog in this session's
+  test suite (no test writes a multi-hour synthetic catalog and asserts
+  the windowed loader issues multiple bounded `catalog.trade_ticks()`
+  calls); the loaders' correctness rests on straightforward, directly
+  auditable logic (a `while` loop advancing a fixed time window) rather
+  than an integration test in this commit. Adding that integration test is
+  explicitly left as a candidate follow-up, not claimed as already done.
+
+---
+
 ## 2026-07-24 — Issue #20 Phase 4: deliberate repository-boundary and guard alignment for a future selected-scope reconstruction CLI
 
 ### Change summary

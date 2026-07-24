@@ -67,6 +67,45 @@ passes.** Until then, broader full-L2 equivalence stays **deferred** (see
 ## [Unreleased]
 
 ### Added
+- **`validation/catalog_compare.py` — Phase 1 correction: exhaustive,
+  order-preserving, bounded-memory oracle comparators** — the original
+  Phase 1 oracle hardening left two real gaps against the issue #20
+  contract: `compare_trade_ticks_semantic()` only samples up to
+  `sample_count` positions after re-sorting both streams, and
+  `compare_order_book_deltas_semantic()` is a multiset (sorted)
+  comparison — neither can detect a difference outside the sampled
+  positions, a pure reordering of otherwise-valid events (sorting erases
+  position), or a reordering of "commutative-looking" depth deltas that
+  happens to produce the same final book state. Added
+  `compare_trade_ticks_exhaustive()` and
+  `compare_order_book_deltas_exhaustive()`: both compare **every** event
+  at its original stream position (no sampling, no re-sorting), stream
+  both inputs lazily via `itertools.zip_longest` (never materializing
+  either side into a list internally, so memory is bounded and
+  independent of total event count), detect duplicate events via a new
+  `_BoundedDedupeWindow` (O(window) memory, documented trade-off vs. a
+  true O(total-events) global duplicate check), and report the first
+  position where stream lengths diverge (extra/missing events). Added
+  `iter_trade_ticks_windowed()` / `iter_order_book_deltas_windowed()`:
+  bounded-memory catalog loaders that fetch in fixed time windows
+  (default 1 hour) rather than materializing an entire requested range up
+  front — the necessary companion to the new comparators for a complete
+  production day's tens/hundreds of millions of events. Added
+  `tests/test_semantic_oracle_exhaustive_streaming.py` (11 tests) proving:
+  a difference outside the legacy sampler's selected positions is caught;
+  a pure reordering the legacy sampled/multiset comparators miss is
+  caught (for both trades and deltas); a reordering of commutative-
+  looking depth deltas that produces an *identical* final book state (as
+  verified via the existing `compare_book_checkpoints()`) is still caught
+  by the new comparator; extra/missing/duplicate (both added and removed)
+  events are detected; and — empirically, via a live-object counter, not
+  merely asserted — peak simultaneously-alive event objects stays small
+  and independent of stream length (proven on a 20,000-trade / 5,000-delta
+  synthetic stream) while a difference injected 3–5 positions before the
+  end is still detected, proving the whole stream is genuinely scanned.
+  No compact replay schema was changed; this is a correction to the
+  already-committed Phase 1 oracle-hardening work, still gating any
+  future compact schema implementation.
 - **`validation/audit_storage_size.py` — issue #20 Phase 0 baseline
   breakdown** — the storage-size audit CLI now reports allocated (actual
   disk blocks, `st_blocks * 512`) *and* apparent (`st_size`) bytes for every

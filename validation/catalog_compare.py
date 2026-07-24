@@ -1,12 +1,18 @@
 """Semantic comparison utilities for Nautilus ParquetDataCatalog outputs."""
 from __future__ import annotations
 
+import itertools
 import json
 import math
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
 
 from nautilus_trader.persistence.catalog import ParquetDataCatalog
+
+# Sentinel used by the exhaustive streaming comparators below to detect
+# length divergence via itertools.zip_longest without confusing a genuine
+# `None` field value for "this stream ran out of events here".
+_MISSING = object()
 
 
 def load_instrument_ids(catalog_root: Path) -> list[str]:
@@ -95,6 +101,34 @@ def load_trade_ticks(
         kwargs["end"] = end
     ticks = catalog.trade_ticks(**kwargs)
     return list(ticks or [])
+
+
+def iter_trade_ticks_windowed(
+    catalog_root: Path,
+    instrument_id: str,
+    start_ns: int,
+    end_ns: int,
+    *,
+    window_ns: int = 3_600_000_000_000,  # 1 hour
+) -> Iterator[Any]:
+    """Yield TradeTick objects for one instrument across [start_ns, end_ns)
+    in bounded time windows (default: 1 hour), so at most one window's worth
+    of ticks is ever held in memory at once, rather than materializing the
+    full requested range up front like load_trade_ticks() does.
+
+    For a complete production day (tens/hundreds of millions of trades),
+    load_trade_ticks() over the whole day is not bounded-memory. This
+    generator is the bounded-memory loader intended for use with
+    compare_trade_ticks_exhaustive() when validating a full representative
+    day (issue #20 Tier 3)."""
+    catalog = ParquetDataCatalog(str(catalog_root))
+    window_start = start_ns
+    while window_start < end_ns:
+        window_end = min(window_start + window_ns, end_ns)
+        ticks = catalog.trade_ticks(instrument_ids=[instrument_id], start=window_start, end=window_end)
+        for tick in ticks or []:
+            yield tick
+        window_start = window_end
 
 
 def _enum_name(value: Any) -> str:
@@ -262,6 +296,149 @@ def compare_trade_ticks_semantic(
     return result
 
 
+class _BoundedDedupeWindow:
+    """Duplicate-event detector with O(window) memory, not O(total events).
+
+    Detecting a *global* duplicate (two identical events anywhere in a
+    stream of hundreds of millions of events) requires remembering every
+    key ever seen, which is exactly the unbounded-memory materialization
+    the issue #20 plan forbids. This class instead remembers only the most
+    recent `maxlen` keys per stream side, which catches the realistic bug
+    shape (a duplicate inserted/removed adjacent to, or near, its original
+    occurrence) with strictly bounded memory. A duplicate whose two
+    occurrences are farther apart than `maxlen` positions will not be
+    flagged by this specific check — that limitation is deliberate and
+    documented, not hidden.
+    """
+
+    __slots__ = ("_maxlen", "_order", "_counts")
+
+    def __init__(self, maxlen: int) -> None:
+        self._maxlen = maxlen
+        self._order: list[Any] = []
+        self._counts: dict[Any, int] = {}
+
+    def observe(self, key: Any) -> bool:
+        """Record `key` as seen; return True if it was already present in
+        the current bounded window (i.e. a duplicate within the lookback)."""
+        is_duplicate = self._counts.get(key, 0) > 0
+        self._counts[key] = self._counts.get(key, 0) + 1
+        self._order.append(key)
+        if len(self._order) > self._maxlen:
+            evicted = self._order.pop(0)
+            remaining = self._counts[evicted] - 1
+            if remaining <= 0:
+                del self._counts[evicted]
+            else:
+                self._counts[evicted] = remaining
+        return is_duplicate
+
+
+def compare_trade_ticks_exhaustive(
+    old_ticks: Iterable[Any],
+    new_ticks: Iterable[Any],
+    *,
+    dedupe_window: int = 100_000,
+    numeric_tolerance: float = 0.0,
+    max_reported_mismatches: int = 200,
+) -> dict[str, Any]:
+    """Exhaustively compare every TradeTick between two streams, in original
+    (deterministic arrival) order — no sampling, no re-sorting.
+
+    Unlike compare_trade_ticks_semantic() (which samples up to
+    `sample_count` positions after re-sorting both streams by
+    `(ts_event, trade_id)`), this function:
+
+    - compares EVERY event at its original stream position, so a
+      difference anywhere in the stream is detected, not only at one of a
+      fixed number of sampled positions;
+    - does NOT re-sort before comparing, so a reordering of two otherwise-
+      valid events is detected (the swapped positions will each show a
+      mismatch) instead of disappearing into a re-sorted canonical order —
+      compare_trade_ticks_semantic()'s sort-then-sample approach cannot
+      detect a pure reordering of the same set of trades;
+    - accepts and streams *iterables* (including one-shot generators) for
+      both `old_ticks` and `new_ticks` and never materializes either into a
+      list internally, so memory use is independent of total event count —
+      suitable for a complete production day's tens/hundreds of millions of
+      trades when paired with iter_trade_ticks_windowed() as the loader;
+    - detects duplicate `trade_id`s within a bounded recent window (see
+      _BoundedDedupeWindow's docstring for the documented global-duplicate
+      trade-off).
+    """
+    old_dedupe = _BoundedDedupeWindow(dedupe_window)
+    new_dedupe = _BoundedDedupeWindow(dedupe_window)
+
+    position_mismatches: list[dict[str, Any]] = []
+    duplicate_events_old: list[dict[str, Any]] = []
+    duplicate_events_new: list[dict[str, Any]] = []
+
+    old_count = 0
+    new_count = 0
+    first_length_divergence_position: int | None = None
+    position = -1
+
+    for position, (old_tick, new_tick) in enumerate(
+        itertools.zip_longest(old_ticks, new_ticks, fillvalue=_MISSING)
+    ):
+        old_present = old_tick is not _MISSING
+        new_present = new_tick is not _MISSING
+        if old_present:
+            old_count += 1
+        if new_present:
+            new_count += 1
+        if old_present != new_present and first_length_divergence_position is None:
+            first_length_divergence_position = position
+
+        old_record: dict[str, Any] | None = None
+        new_record: dict[str, Any] | None = None
+        if old_present:
+            old_record = _tick_to_record(old_tick)
+            key = old_record["trade_id"]
+            if old_dedupe.observe(key) and len(duplicate_events_old) < max_reported_mismatches:
+                duplicate_events_old.append({"position": position, "trade_id": key})
+        if new_present:
+            new_record = _tick_to_record(new_tick)
+            key = new_record["trade_id"]
+            if new_dedupe.observe(key) and len(duplicate_events_new) < max_reported_mismatches:
+                duplicate_events_new.append({"position": position, "trade_id": key})
+
+        if old_present and new_present:
+            mismatches: dict[str, Any] = {}
+            for field in ("instrument_id", "trade_id", "aggressor_side", "ts_event", "ts_init"):
+                if old_record[field] != new_record[field]:
+                    mismatches[field] = {"old": old_record[field], "new": new_record[field]}
+            for field in ("price", "size"):
+                equal, _used_numeric = _compare_decimal_field(field, old_record, new_record, numeric_tolerance)
+                if not equal:
+                    mismatches[field] = {"old": old_record[field], "new": new_record[field]}
+            if mismatches and len(position_mismatches) < max_reported_mismatches:
+                position_mismatches.append(
+                    {"position": position, "old": old_record, "new": new_record, "fields": mismatches}
+                )
+
+    positions_compared = position + 1
+    passed = (
+        old_count == new_count
+        and first_length_divergence_position is None
+        and not position_mismatches
+        and not duplicate_events_old
+        and not duplicate_events_new
+    )
+    return {
+        "positions_compared": positions_compared,
+        "trade_count_old": old_count,
+        "trade_count_new": new_count,
+        "trade_count_match": old_count == new_count,
+        "first_length_divergence_position": first_length_divergence_position,
+        "position_mismatches": position_mismatches,
+        "position_mismatch_count_capped_at": max_reported_mismatches,
+        "duplicate_events_old": duplicate_events_old,
+        "duplicate_events_new": duplicate_events_new,
+        "passed": passed,
+    }
+
+
 # ---------------------------------------------------------------------------
 # OrderBookDeltas
 # ---------------------------------------------------------------------------
@@ -284,6 +461,30 @@ def load_order_book_deltas(
     return list(deltas or [])
 
 
+def iter_order_book_deltas_windowed(
+    catalog_root: Path,
+    instrument_id: str,
+    start_ns: int,
+    end_ns: int,
+    *,
+    window_ns: int = 3_600_000_000_000,  # 1 hour
+) -> Iterator[Any]:
+    """Yield OrderBookDeltas group objects for one instrument across
+    [start_ns, end_ns) in bounded time windows; see
+    iter_trade_ticks_windowed() for the rationale (bounded memory for a
+    complete production day). Pass the result directly to
+    compare_order_book_deltas_exhaustive(), which flattens the grouped
+    objects internally without materializing the full flattened stream."""
+    catalog = ParquetDataCatalog(str(catalog_root))
+    window_start = start_ns
+    while window_start < end_ns:
+        window_end = min(window_start + window_ns, end_ns)
+        deltas = catalog.order_book_deltas(instrument_ids=[instrument_id], start=window_start, end=window_end)
+        for obj in deltas or []:
+            yield obj
+        window_start = window_end
+
+
 def _flatten_deltas(objects: Iterable[Any]) -> list[Any]:
     """Flatten grouped OrderBookDeltas into individual OrderBookDelta objects."""
     flat: list[Any] = []
@@ -294,6 +495,19 @@ def _flatten_deltas(objects: Iterable[Any]) -> list[Any]:
         else:
             flat.append(obj)
     return flat
+
+
+def _iter_flatten_deltas(objects: Iterable[Any]) -> Iterator[Any]:
+    """Streaming (generator) equivalent of _flatten_deltas(): yields each
+    individual OrderBookDelta one at a time without ever materializing the
+    flattened stream into a list. Used by
+    compare_order_book_deltas_exhaustive() to keep memory bounded."""
+    for obj in objects:
+        inner = getattr(obj, "deltas", None)
+        if inner is not None:
+            yield from inner
+        else:
+            yield obj
 
 
 def _book_order_record(order: Any) -> dict[str, Any]:
@@ -430,6 +644,141 @@ def compare_order_book_deltas_semantic(
         and not result["sample_mismatches"]
     )
     return result
+
+
+def _delta_dedupe_key(record: dict[str, Any]) -> tuple:
+    """Dedupe key for a normalized delta record. Deltas have no natural
+    unique identifier like a trade_id, so the full set of semantic fields
+    is used as the key."""
+    return (
+        record["action"],
+        record["side"],
+        record["price"],
+        record["size"],
+        record["order_id"],
+        record["flags"],
+        record["sequence"],
+        record["ts_event"],
+        record["ts_init"],
+    )
+
+
+def compare_order_book_deltas_exhaustive(
+    old_objects: Iterable[Any],
+    new_objects: Iterable[Any],
+    *,
+    dedupe_window: int = 100_000,
+    numeric_tolerance: float = 0.0,
+    max_reported_mismatches: int = 200,
+) -> dict[str, Any]:
+    """Exhaustively compare every OrderBookDelta between two streams, in
+    original (deterministic emission) order — no sampling, no re-sorting.
+
+    Unlike compare_order_book_deltas_semantic() (a multiset comparison
+    that re-sorts both streams by a canonical key before comparing, so two
+    streams containing the exact same deltas in a different order are
+    reported as equal), this function compares every delta at its original
+    stream position. Two deltas that touch different, independent book
+    levels ("commutative-looking" — applying them in either order yields
+    the same eventual book state) are still positionally distinct events;
+    a reordering between them is detected here even though it would be
+    invisible both to compare_order_book_deltas_semantic() and to
+    compare_book_checkpoints()'s deterministic book-state reconstruction at
+    checkpoint granularity (the final book state can be identical while the
+    emission order differs — this function is the one that actually
+    detects that class of difference).
+
+    Streams both inputs lazily via _iter_flatten_deltas() (never
+    materializes the flattened delta stream into a list), so memory is
+    bounded and independent of total event count — suitable for a complete
+    production day's tens/hundreds of millions of depth events when paired
+    with iter_order_book_deltas_windowed() as the loader. Duplicate
+    detection uses the same bounded recent-window trade-off documented on
+    _BoundedDedupeWindow.
+    """
+    old_stream = _iter_flatten_deltas(old_objects)
+    new_stream = _iter_flatten_deltas(new_objects)
+
+    old_dedupe = _BoundedDedupeWindow(dedupe_window)
+    new_dedupe = _BoundedDedupeWindow(dedupe_window)
+
+    position_mismatches: list[dict[str, Any]] = []
+    duplicate_events_old: list[dict[str, Any]] = []
+    duplicate_events_new: list[dict[str, Any]] = []
+
+    old_count = 0
+    new_count = 0
+    first_length_divergence_position: int | None = None
+    position = -1
+
+    for position, (old_delta, new_delta) in enumerate(
+        itertools.zip_longest(old_stream, new_stream, fillvalue=_MISSING)
+    ):
+        old_present = old_delta is not _MISSING
+        new_present = new_delta is not _MISSING
+        if old_present:
+            old_count += 1
+        if new_present:
+            new_count += 1
+        if old_present != new_present and first_length_divergence_position is None:
+            first_length_divergence_position = position
+
+        old_record: dict[str, Any] | None = None
+        new_record: dict[str, Any] | None = None
+        if old_present:
+            old_record = _delta_to_record(old_delta)
+            key = _delta_dedupe_key(old_record)
+            if old_dedupe.observe(key) and len(duplicate_events_old) < max_reported_mismatches:
+                duplicate_events_old.append({"position": position, "key": key})
+        if new_present:
+            new_record = _delta_to_record(new_delta)
+            key = _delta_dedupe_key(new_record)
+            if new_dedupe.observe(key) and len(duplicate_events_new) < max_reported_mismatches:
+                duplicate_events_new.append({"position": position, "key": key})
+
+        if old_present and new_present:
+            mismatches: dict[str, Any] = {}
+            for field in (
+                "instrument_id",
+                "action",
+                "side",
+                "order_id",
+                "flags",
+                "sequence",
+                "ts_event",
+                "ts_init",
+            ):
+                if old_record[field] != new_record[field]:
+                    mismatches[field] = {"old": old_record[field], "new": new_record[field]}
+            for field in ("price", "size"):
+                equal, _used_numeric = _compare_decimal_field(field, old_record, new_record, numeric_tolerance)
+                if not equal:
+                    mismatches[field] = {"old": old_record[field], "new": new_record[field]}
+            if mismatches and len(position_mismatches) < max_reported_mismatches:
+                position_mismatches.append(
+                    {"position": position, "old": old_record, "new": new_record, "fields": mismatches}
+                )
+
+    positions_compared = position + 1
+    passed = (
+        old_count == new_count
+        and first_length_divergence_position is None
+        and not position_mismatches
+        and not duplicate_events_old
+        and not duplicate_events_new
+    )
+    return {
+        "positions_compared": positions_compared,
+        "delta_count_old": old_count,
+        "delta_count_new": new_count,
+        "delta_count_match": old_count == new_count,
+        "first_length_divergence_position": first_length_divergence_position,
+        "position_mismatches": position_mismatches,
+        "position_mismatch_count_capped_at": max_reported_mismatches,
+        "duplicate_events_old": duplicate_events_old,
+        "duplicate_events_new": duplicate_events_new,
+        "passed": passed,
+    }
 
 
 # ---------------------------------------------------------------------------
