@@ -66,6 +66,25 @@ passes.** Until then, broader full-L2 equivalence stays **deferred** (see
 
 ## [Unreleased]
 
+### Added
+- **`validation/audit_storage_size.py` — issue #20 Phase 0 baseline
+  breakdown** — the storage-size audit CLI now reports allocated (actual
+  disk blocks, `st_blocks * 512`) *and* apparent (`st_size`) bytes for every
+  component, instead of apparent bytes only. It also computes per-trade,
+  per-depth-event, and per-depth-level byte estimates from a partition's
+  manifest record counts and an exact depth-level count (via pyarrow),
+  explicitly flagged as orientation-only since depth events carry a varying
+  number of book levels — a single "bytes per replay row" average hides
+  that variance. A new `audit_scratch_bytes()` function / `--scratch-only`
+  CLI flag performs a **root-wide** scan of `.staging_*`/`.backup_*`/
+  `.quarantine_*` directories across the entire `--replay-root`,
+  independent of any single day's eligible venue/symbol universe — this is
+  measurement-only and never deletes, renames, or otherwise mutates any
+  discovered directory (it is the diagnostic groundwork for detecting, but
+  not yet cleaning, orphans like the known BANKUSDT `2026-07-21` staging
+  directory). This is Phase 0 of the issue #20 compact-replay-storage plan;
+  no replay schema, builder, or lifecycle behavior was changed.
+
 ### Changed
 - **`systemd/cryptorecorder-replay-build.service` — `TimeoutStartSec` raised
   from `3600` (1 hour) to `23h`** — the replay-build `oneshot` unit's

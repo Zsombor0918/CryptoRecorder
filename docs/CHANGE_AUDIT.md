@@ -93,6 +93,116 @@ An entry may be skipped **only** for:
 - <or "none — task fully completed">
 ```
 
+## 2026-07-24 — Issue #20 Phase 0: baseline storage-audit breakdown (allocated/apparent, per-unit, root-wide scratch scan)
+
+### Change summary
+- Extended `validation/audit_storage_size.py` (audit-only, no build/transform
+  logic added) to report **allocated** bytes (`st_blocks * 512`) alongside
+  the existing **apparent** bytes (`st_size`) for every measured component,
+  since sparse/compressed filesystems can make these differ meaningfully —
+  the issue #20 size-acceptance gate requires both, not just one.
+- Added per-trade, per-depth-event, and per-depth-level byte estimates,
+  computed from a partition's `manifest.json` record counts plus an exact
+  depth-level count read via `pyarrow.parquet.ParquetFile.iter_batches()`.
+  These are explicitly labeled orientation-only in the report `note` field:
+  depth events carry a varying number of book levels, so a flat "bytes per
+  replay row" average (as used in the issue's own ≈39.7/≈15.9 bytes/row
+  orientation figures) can be misleading on its own.
+- Added `audit_scratch_bytes()` and a new `--scratch-only` CLI mode: a
+  **root-wide** scan of `.staging_*` / `.backup_*` / `.quarantine_*`
+  directories under `replay_root/venue=*/symbol=*/`, independent of any
+  single venue/symbol/date being queried. This directly targets the known
+  gap where the existing builder only checks the *current* build's own
+  `.staging_{date}_{symbol}` path (confirmed in
+  `pipeline/build_replay_store.py` and `stores/replay_writer.py`), which is
+  why the real BANKUSDT `2026-07-21` staging orphan was never rediscovered
+  by later BANKUSDT builds for other dates. This CLI **only measures** —
+  it does not delete, quarantine, or otherwise mutate any discovered
+  directory. No lifecycle/cleanup logic was added or changed.
+- Missing manifests, zero record counts, and missing/unreadable
+  `depth.parquet` files all report `None` for the affected per-unit metric
+  (never a false `0`), consistent with the repo's existing
+  fail-visibly-not-silently-zero convention used elsewhere (e.g.
+  `disk_monitor.py`'s `DirectoryMeasurement`).
+- This is Phase 0 ("reproducible baseline") of the issue #20 compact-replay-
+  storage plan. No replay schema (`stores/replay_schema.py`), builder
+  (`pipeline/build_replay_store.py`), staging-cleanup, or raw-retention
+  behavior was touched — this change is read-only measurement tooling.
+
+### Files/packages touched
+- `validation/audit_storage_size.py` (extended)
+- `tests/test_audit_storage_size.py` (new — 11 tests)
+- `CHANGELOG.md` (`[Unreleased]` → `Added`)
+- `docs/CHANGE_AUDIT.md` (this entry)
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] docs/REPO_STRUCTURE.md (no folder/file contract change — `validation/`
+  already owns `audit_storage_size.py`; no new top-level package added)
+- [x] docs/PROJECT_STATUS.md (no validated/deferred status changed by this
+  measurement-only change)
+- [x] docs/IMPLEMENTATION_AUDIT.md (no ground-truth claim changed)
+- [x] relevant feature docs:
+  - docs/FULL_L2_REPLAY_CATALOG_PLAN.md (reviewed; no gate status changed)
+  - docs/VALIDATION.md (reviewed; `audit_storage_size` CLI reference
+    remains accurate — flags added are additive, existing usage unchanged)
+
+### Docs updated
+- [x] CHANGELOG.md
+- No docs update required because: this is an additive, backward-compatible
+  extension to an existing audit-only CLI (no new CLI, no schema change, no
+  status/gate change); `docs/VALIDATION.md`'s existing description of
+  `audit_storage_size` remains accurate without edits.
+
+### Status / validation impact
+- Validated status changed: no
+- Deferred status changed: no
+- New claims added: no — this is instrumentation only; it does not itself
+  claim any storage-size reduction or gate result. The issue #20 plan's
+  Tier-3 (representative-day) gate still requires production-server
+  execution, which this change does not perform.
+- Evidence for any new validation claim: n/a (no new validation claim made)
+
+### Tests run
+```bash
+source .venv/bin/activate
+python -m pytest tests/test_audit_storage_size.py -q   # 11 passed
+python -m pytest tests/test_repo_structure.py tests/test_agent_infrastructure.py -q   # 56 passed
+python -m pytest -q                                     # 347 passed, 3 skipped
+```
+
+### Validation CLIs run
+```bash
+python -m validation.audit_storage_size --venue BINANCE_SPOT --symbol ADAUSDT --date 2026-06-12 \
+  --replay-root <local test fixture> --json   # exercised via tests/test_audit_storage_size.py
+```
+`python -m validation.audit_change_compliance --staged` was not run in this
+session because commit staging is out of scope for this plan-mode-derived
+implementation increment (task only requested "start implementation", not
+committing); this entry documents the change ahead of any future commit so
+the compliance check can be run at commit time.
+
+### Known limitations / out of scope
+- No replay schema, builder lifecycle, staging cleanup, raw-retention gate,
+  semantic-oracle hardening, or reconstruction CLI work was implemented in
+  this increment — per the reviewed issue #20 plan, those require the
+  Phase 0–4 review checkpoint (semantic oracle + failure-injection proof +
+  field/consumer/integrity matrix + raw-retention/legacy/traceability
+  design) to complete and be reviewed before any schema code is written.
+- Per-column (individual Parquet field) byte-contribution estimation is not
+  yet implemented — only per-trade/per-depth-event/per-depth-level
+  aggregates are provided. A true per-column breakdown (e.g. via Parquet
+  column-chunk metadata) is deferred to a follow-up within Phase 0.
+- No representative production-day (Tier 3: 2026-07-22 or 2026-07-23) data
+  was measured — this workspace only has local raw data for
+  2026-06-10..12; running this CLI against a real production day requires
+  server access, per the plan's own Tier-3 logistics note.
+- `--scratch-only` is measurement-only; no quarantine/deletion lifecycle was
+  implemented — that remains future work per the plan's fail-closed staging
+  lifecycle design (Phase 11 of the reviewed plan).
+
+---
+
 ## 2026-07-23 — Correction: bound the daily replay-build timeout at 23h instead of infinity
 
 ### Change summary
