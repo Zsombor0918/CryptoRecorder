@@ -93,6 +93,130 @@ An entry may be skipped **only** for:
 - <or "none — task fully completed">
 ```
 
+## 2026-07-24 — Issue #20 Phase 4: deliberate repository-boundary and guard alignment for a future selected-scope reconstruction CLI
+
+### Change summary
+- `docs/REPO_STRUCTURE.md`'s `pipeline/` role text previously stated
+  pipeline "does not contain a product-facing catalog-generation CLI
+  (removed; see docs/ARCHITECTURE.md)" — an absolute prohibition dating
+  from issue #17's removal of the old unscoped `pipeline/generate_catalog.py`.
+  Issue #20 Phase 4 requires reversing that prohibition for one narrow,
+  explicitly bounded case: a development-computer selected-reconstruction
+  CLI that builds a **temporary** Nautilus full-L2 catalog for an
+  explicitly requested venue/symbol list and start/end time window only —
+  never an unscoped, all-history/all-universe rebuild, and never an
+  unattended Linux production service.
+- Updated the `pipeline/` role description in `docs/REPO_STRUCTURE.md` to
+  permit exactly one such CLI, while explicitly re-stating four hard
+  prohibitions that must hold regardless: no default/silent expansion to
+  "all symbols/all venues/all history"; no permanent all-universe catalog;
+  no unattended systemd/production service; and the caller must always
+  explicitly supply both a venue/symbol scope and a start/end window.
+  Named the historical `pipeline/generate_catalog.py` shape as
+  permanently forbidden by name and by its unscoped design, distinct from
+  any future scoped CLI (which must use a different name).
+- Added a 2026-07-24 entry to the `docs/REPO_STRUCTURE.md` Amendment Log
+  documenting this contract change and pointing at the rewritten guard
+  test.
+- Rewrote (did not delete or weaken) the corresponding guard test in
+  `tests/test_repo_structure.py`:
+  `test_pipeline_does_not_contain_generate_catalog_cli()` →
+  `test_pipeline_reconstruction_cli_stays_explicitly_scoped()`. The new
+  test (a) still asserts `pipeline/generate_catalog.py` must never exist —
+  the old unscoped name stays permanently forbidden — and (b) additionally
+  scans every *other* module in `pipeline/` (i.e. anything beyond the
+  three known, already-existing modules `build_replay_store.py`,
+  `daily_build.py`, `raw_manifest.py`) for unscoped-reconstruction text
+  markers (`all_symbols`, `all_venues`, `full_universe`, `--all-history`,
+  etc.), so that once a future selected-reconstruction CLI is added, this
+  guard will immediately fail if it silently reintroduces an unscoped
+  default. No reconstruction CLI exists in the repository yet, so this
+  half of the test is presently forward-looking/vacuously satisfied — it
+  is exercised and will start actively gating the moment such a file is
+  added in a future implementation phase.
+- Verified the existing `test_docs_do_not_reference_pipeline_audit_modules()`
+  guard (which forbids the historical dotted-module import path for the
+  removed catalog CLI appearing in any `docs/*.md` file) is not tripped by
+  this change: all new text in `docs/REPO_STRUCTURE.md` uses the slash-path
+  form (`` `pipeline/generate_catalog.py` ``), confirmed via a direct grep
+  for the dotted form before committing.
+- No selected-reconstruction CLI, no compact schema, and no other pipeline/
+  module was implemented in this commit. This is a deliberate,
+  documented, test-enforced contract change only, per AGENTS.md's
+  allowance for updating a guard "when the product contract truly
+  changes."
+
+### Files/packages touched
+- `docs/REPO_STRUCTURE.md` (role text + amendment-log entry)
+- `tests/test_repo_structure.py` (guard test rewritten, not deleted)
+- `CHANGELOG.md` (`[Unreleased]` → `Added`)
+- `docs/CHANGE_AUDIT.md` (this entry)
+
+### Docs reviewed
+- [x] AGENTS.md (Section 2 folder-boundary rules; Section 5 "a guard may be
+  updated when the product contract truly changes" — the basis for this
+  change being permitted at all)
+- [x] docs/REPO_STRUCTURE.md (this is the file amended)
+- [x] docs/PROJECT_STATUS.md (reviewed; no validated/deferred status
+  changed — no CLI was implemented, only the future contract for one)
+- [x] docs/IMPLEMENTATION_AUDIT.md (reviewed; consistent with the Phase
+  2-3 design entry immediately above, which already anticipates a future
+  selected-reconstruction CLI without implementing one)
+- [x] relevant feature docs:
+  - docs/ARCHITECTURE.md (reviewed; its "does not build a feature/label
+    layer or a general-purpose consumer catalog" statement remains
+    accurate — a *selected, temporary* catalog for an explicit
+    venue/symbol/window is a distinct, narrower thing than a
+    general-purpose consumer catalog, and is not yet implemented)
+
+### Docs updated
+- [x] CHANGELOG.md
+- [x] docs/REPO_STRUCTURE.md
+- No further docs update required because: `docs/ARCHITECTURE.md` and
+  `docs/PROJECT_STATUS.md` describe *current, implemented* behavior, which
+  is unchanged by this contract-only amendment; the amendment itself lives
+  in `docs/REPO_STRUCTURE.md` per the "identify the right existing home"
+  rule.
+
+### Status / validation impact
+- Validated status changed: no
+- Deferred status changed: no
+- New claims added: no — no reconstruction CLI is claimed as implemented;
+  the amendment explicitly states "No such CLI exists yet in this
+  repository."
+- Evidence for any new validation claim: n/a (no new validation claim made)
+
+### Tests run
+```bash
+source .venv/bin/activate
+python -m pytest tests/test_repo_structure.py tests/test_agent_infrastructure.py -q   # 56 passed
+python -m pytest -q   # 366 passed, 3 skipped
+```
+
+### Validation CLIs run
+```bash
+grep -n "pipeline[.]generate_catalog" docs/REPO_STRUCTURE.md   # no matches (dotted forbidden form absent)
+```
+
+### Known limitations / out of scope
+- No selected-reconstruction CLI was implemented — this commit only
+  updates the repository contract and its guard test ahead of a future
+  implementation phase (Phase 6/7 of the approved plan, not started).
+- The guard's "unscoped marker" scan is a text-content heuristic on any
+  future `pipeline/*.py` file, not a semantic/AST analysis of its actual
+  CLI argument parser; it is deliberately simple and forward-looking, and
+  will need to be revisited once the actual future CLI's argument names
+  are known, without weakening its current forbidding assertions.
+- This is Phase 4 of the issue #20 plan. Per the approved plan, Phases
+  0-4 (baseline, oracle + failure-injection proof, raw-retention/legacy/
+  traceability/versioning design, finalized field/consumer/integrity
+  matrix, and this repository-boundary alignment) are now all complete;
+  compact physical replay schema implementation (Phase 5+) requires the
+  explicit review checkpoint the approved plan calls for before it may
+  begin.
+
+---
+
 ## 2026-07-24 — Issue #20 Phases 2–3: raw-retention safety, legacy-v0 inventory, traceability, versioning design, and finalized field/consumer/integrity matrix
 
 ### Change summary

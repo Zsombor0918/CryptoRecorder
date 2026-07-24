@@ -137,8 +137,24 @@ passes.** Until then, broader full-L2 equivalence stays **deferred** (see
   `stores/replay_schema.py`'s current `DEPTH_REPLAY_SCHEMA` and
   `TRADE_REPLAY_SCHEMA`. This is design/audit documentation only — no
   compact schema, no `disk_monitor.py` deletion-unit change, no manifest
-  field, and no raw-retention gate was implemented in this change.
-
+  field, and no raw-retention gate was implemented in this change.- **`docs/REPO_STRUCTURE.md` / `tests/test_repo_structure.py` — issue #20
+  Phase 4 repository-boundary alignment** — deliberately re-scoped the
+  `pipeline/` package contract to permit exactly one future, explicitly-
+  scoped selected-reconstruction CLI (development-computer, temporary
+  catalog, explicit venue/symbol list and start/end time window only),
+  reversing the issue #17 removal of the old unscoped
+  `pipeline/generate_catalog.py` product CLI for that one narrow, bounded
+  case. The old unscoped name/shape remains permanently forbidden. Rewrote
+  (not deleted) the corresponding guard test —
+  `test_pipeline_does_not_contain_generate_catalog_cli()` became
+  `test_pipeline_reconstruction_cli_stays_explicitly_scoped()` — which
+  still asserts `pipeline/generate_catalog.py` must never exist, and now
+  additionally scans any other module that may later appear in `pipeline/`
+  for unscoped-reconstruction markers (`all_symbols`, `full_universe`,
+  etc.), so a future CLI cannot silently default to an unscoped selection.
+  Added a 2026-07-24 amendment-log entry to `docs/REPO_STRUCTURE.md`. No
+  reconstruction CLI has been implemented yet — this is a contract/guard
+  change only, ahead of the future implementation phase.
 ### Changed
 - **`systemd/cryptorecorder-replay-build.service` — `TimeoutStartSec` raised
   from `3600` (1 hour) to `23h`** — the replay-build `oneshot` unit's

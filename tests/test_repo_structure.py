@@ -213,17 +213,70 @@ def test_pipeline_does_not_contain_feature_store_modules() -> None:
     )
 
 
-def test_pipeline_does_not_contain_generate_catalog_cli() -> None:
-    """generate_catalog is no longer a product/runtime CLI (issue #17). Its
-    reconstruction logic moved to validation/replay_catalog_reconstruct.py,
-    which has no CLI entrypoint."""
+def test_pipeline_reconstruction_cli_stays_explicitly_scoped() -> None:
+    """Issue #17 removed `pipeline/generate_catalog.py` — a general-purpose,
+    unscoped ("all symbols/all history") consumer catalog CLI. Issue #20
+    Phase 4 deliberately re-scopes `pipeline/` to permit exactly one
+    *explicitly-scoped* selected-reconstruction CLI (venue/symbol list +
+    start/end time window, development-computer only, temporary catalog) —
+    see docs/REPO_STRUCTURE.md's 2026-07-24 amendment-log entry. This guard
+    was rewritten (not deleted) to reflect that real contract change: it
+    must keep forbidding the old unscoped shape by name forever, while
+    allowing a differently-named, explicitly-scoped CLI to exist once one is
+    implemented.
+
+    No selected-reconstruction CLI has been implemented in this repository
+    yet (issue #20 Phase 4 is a documentation/guard-alignment change only);
+    this test is therefore forward-looking for the "if it exists, it must be
+    scoped" half of its assertions.
+    """
+    # The old, permanently-forbidden unscoped product CLI must never return
+    # under its original name.
     assert not (PIPELINE / "generate_catalog.py").exists(), (
-        "pipeline/generate_catalog.py must not exist; use "
-        "validation/replay_catalog_reconstruct.py (validation-only, no CLI)."
+        "pipeline/generate_catalog.py must not exist; the historical "
+        "unscoped ('all symbols/all history') product catalog CLI was "
+        "removed in issue #17 and must not be reintroduced under this name. "
+        "A future selected-reconstruction CLI must use a different name and "
+        "must be explicitly scoped (see docs/REPO_STRUCTURE.md)."
     )
     assert (VALIDATION / "replay_catalog_reconstruct.py").exists(), (
         "validation/replay_catalog_reconstruct.py is missing."
     )
+
+    # If a future selected-reconstruction CLI has been added to pipeline/,
+    # it must not resurrect the unscoped shape: no module in pipeline/ may
+    # claim to build/retain a permanent all-universe catalog, run as an
+    # unattended systemd service, or default to an unscoped selection.
+    forbidden_unscoped_markers = (
+        "all_symbols",
+        "all_venues",
+        "all-symbols",
+        "all-venues",
+        "--all-history",
+        "full_universe",
+        "full-universe",
+    )
+    known_module_names = {
+        "__init__.py",
+        "build_replay_store.py",
+        "daily_build.py",
+        "raw_manifest.py",
+    }
+    for py_file in PIPELINE.glob("*.py"):
+        if py_file.name in known_module_names:
+            continue
+        # Any other module in pipeline/ is presumed to be the future
+        # selected-reconstruction CLI (or a helper for it); it must not
+        # contain any of the unscoped markers above.
+        text = py_file.read_text()
+        for marker in forbidden_unscoped_markers:
+            assert marker not in text.lower(), (
+                f"pipeline/{py_file.name} contains '{marker}', which suggests "
+                "an unscoped all-symbol/all-history reconstruction path. "
+                "The selected-reconstruction CLI permitted by issue #20 "
+                "Phase 4 must always require an explicit venue/symbol list "
+                "and start/end time window from the caller."
+            )
 
 
 def test_pipeline_does_not_contain_equivalence_module() -> None:

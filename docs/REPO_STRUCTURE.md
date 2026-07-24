@@ -79,9 +79,32 @@ logic here; this package is the old-converter boundary.
 
 **`pipeline/`** — Build and transform commands that create data artifacts from
 raw data. Contains daily build orchestration and the replay builder. Does
-**not** contain a feature-store builder or a product-facing catalog-generation
-CLI (removed; see docs/ARCHITECTURE.md), and does **not** contain audit or
+**not** contain a feature-store builder, and does **not** contain audit or
 equivalence check commands; those belong in `validation/`.
+
+`pipeline/` **may** contain exactly one supported, explicitly-scoped
+selected-reconstruction CLI (issue #20): a development-computer command that
+builds a **temporary** Nautilus full-L2 catalog for an explicitly requested
+venue/symbol list and start/end time window only. This is a deliberate,
+foreseeable re-scoping of the boundary drawn in issue #17 — CryptoRecorder is
+re-scoped to own selected full-L2 reconstruction as a first-class supported
+CLI, not merely a hidden validation-only helper. It remains hard-forbidden for
+any file in `pipeline/` to:
+
+- default to, or silently expand to, "all symbols"/"all venues"/"all history";
+- build or retain a permanent all-universe Nautilus catalog;
+- run as an unattended Linux production service or systemd unit (Mode 1, the
+  Linux production server, remains recorder + compact replay-build only — see
+  `docs/ARCHITECTURE.md`);
+- be reachable without the caller explicitly supplying a venue/symbol scope
+  and a start/end time window.
+
+The historical `pipeline/generate_catalog.py` product CLI (removed, issue
+#17) is a distinct, permanently-forbidden design: it built a general-purpose,
+unscoped consumer catalog. A future scoped-reconstruction CLI must use a
+different name and must not resurrect that unscoped shape. See the 2026-07-24
+amendment log entry below and `tests/test_repo_structure.py`'s
+`test_pipeline_reconstruction_cli_stays_explicitly_scoped()` guard.
 
 **`stores/`** — Parquet schemas, writers, and readers for `replay_store` only.
 Pure data access layer; no CLI entrypoints. There is no feature-store or
@@ -339,3 +362,4 @@ replay_store -> validation.replay_catalog_reconstruct (validation-only, no CLI)
 | 2026-07-15 | Issue #17: removed the feature-store subsystem (`stores/feature_*.py`, `pipeline/build_feature_store.py`, `validation/audit_feature_store.py`, `tests/test_feature_store.py`, feature-build systemd units) and the `pipeline/generate_catalog.py` product CLI (reconstruction logic moved to `validation/replay_catalog_reconstruct.py`, an internal CLI-less helper). Removed `config.py` `FEATURE_ROOT`/`LABEL_ROOT`/`CATALOG_JOBS_ROOT`. Simplified `pipeline.daily_build` to replay-only (dropped `--steps`/`--timeframes`/`--feature-root`). Deleted `docs/FEATURE_STORE.md` and `docs/GENERATE_CATALOG.md`; docs/ fixed count dropped from 14 to 12. Superseded issue #15. |
 | 2026-07-20 | Issues #17/#19 completion: expanded the Root-Level Files table to list every real root `.py` module; deleted stale duplicate systemd units (`crypto-recorder.service`, `nautilus-convert.{service,timer}`, `cryptorecorder-daily-build.{service,timer}`) superseded by `cryptorecorder-recorder.service`, `cryptorecorder-convert.{service,timer}`, and `cryptorecorder-replay-build.{service,timer}`, the units actually referenced by `scripts/deploy_linux_server.sh`; removed root `inspect_catalog.py` (dead code); removed `docs/GUARANTEES.md` (superseded by `ARCHITECTURE.md`); added 7 tests to `tests/test_repo_structure.py` enforcing this contract exactly. |
 | 2026-07-22 | PR #18 finalization: deleted `systemd/cryptorecorder-convert.service` and `systemd/cryptorecorder-convert.timer` — converter systemd automation is not part of the supported production architecture. Manual reconstruction uses documented CLI commands, not systemd templates. Stale installed converter units are still removed by `scripts/deploy_linux_server.sh` cleanup. Converter Python code (`convert_day.py`, `converter/`) is unchanged and required. |
+| 2026-07-24 | Issue #20 Phase 4: `pipeline/` may now contain exactly one supported, explicitly-scoped selected-reconstruction CLI (development-computer, temporary catalog, explicit venue/symbol/time-window only) — this deliberately re-scopes the issue #17 removal of `pipeline/generate_catalog.py`, which stays permanently forbidden by name and by its unscoped ("all symbols/all history") shape. No such CLI exists yet in this repository; this amendment only updates the contract and its guard test (`tests/test_repo_structure.py::test_pipeline_reconstruction_cli_stays_explicitly_scoped`) ahead of a future implementation phase. |
