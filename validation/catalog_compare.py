@@ -111,24 +111,50 @@ def iter_trade_ticks_windowed(
     *,
     window_ns: int = 3_600_000_000_000,  # 1 hour
 ) -> Iterator[Any]:
-    """Yield TradeTick objects for one instrument across [start_ns, end_ns)
-    in bounded time windows (default: 1 hour), so at most one window's worth
-    of ticks is ever held in memory at once, rather than materializing the
-    full requested range up front like load_trade_ticks() does.
+    """Yield TradeTick objects for one instrument across the half-open
+    caller range [start_ns, end_ns) in bounded time windows (default:
+    1 hour; configurable via `window_ns` for both testing and production
+    tuning), so that at most one window's worth of ticks is materialized by
+    the Nautilus catalog query at a time, rather than the full requested
+    range up front like load_trade_ticks() does.
 
-    For a complete production day (tens/hundreds of millions of trades),
-    load_trade_ticks() over the whole day is not bounded-memory. This
-    generator is the bounded-memory loader intended for use with
-    compare_trade_ticks_exhaustive() when validating a full representative
-    day (issue #20 Tier 3)."""
+    IMPORTANT — Nautilus's own `catalog.trade_ticks(start=a, end=b)` query
+    is INCLUSIVE on both `a` and `b` (verified directly against a real
+    on-disk catalog in tests/test_windowed_loader_boundaries.py — an event
+    at exactly `ts == b` is returned by that query, not excluded). Naively
+    chaining windows with `next_start = previous_end` therefore yields any
+    event that lands exactly on an internal window boundary TWICE (once as
+    the inclusive `end` of one window, once as the inclusive `start` of the
+    next). To honor the caller's half-open [start_ns, end_ns) contract
+    while querying Nautilus's inclusive-both-ends interface without
+    duplication, this function partitions the range into non-overlapping
+    CLOSED sub-windows: each window's query uses
+    `end = min(window_start + window_ns - 1, end_ns - 1)`, and the next
+    window starts at exactly `end + 1`. Since all Nautilus event
+    timestamps are integer nanoseconds, `+1`/`-1` unambiguously identifies
+    "the next/previous distinct representable instant" with no possible
+    event landing in the gap between two adjacent closed windows.
+
+    IMPORTANT — this bounds the query result size per window, which is a
+    reasonable proxy for reduced peak memory versus loading the whole day
+    in one call, but a fixed *time* window does not by itself guarantee a
+    fixed *event-count* (and therefore RSS) bound: an unusually active
+    window (e.g. a volatility spike) can still contain far more events than
+    a quiet window of the same duration. Treat `window_ns` as a tuning knob
+    to be validated against measured per-window RSS on real production data
+    (issue #20 Tier 3), not as a proven strict memory ceiling from time
+    alone."""
+    if end_ns <= start_ns:
+        return
     catalog = ParquetDataCatalog(str(catalog_root))
+    last_inclusive_ns = end_ns - 1
     window_start = start_ns
-    while window_start < end_ns:
-        window_end = min(window_start + window_ns, end_ns)
+    while window_start <= last_inclusive_ns:
+        window_end = min(window_start + window_ns - 1, last_inclusive_ns)
         ticks = catalog.trade_ticks(instrument_ids=[instrument_id], start=window_start, end=window_end)
         for tick in ticks or []:
             yield tick
-        window_start = window_end
+        window_start = window_end + 1
 
 
 def _enum_name(value: Any) -> str:
@@ -296,49 +322,10 @@ def compare_trade_ticks_semantic(
     return result
 
 
-class _BoundedDedupeWindow:
-    """Duplicate-event detector with O(window) memory, not O(total events).
-
-    Detecting a *global* duplicate (two identical events anywhere in a
-    stream of hundreds of millions of events) requires remembering every
-    key ever seen, which is exactly the unbounded-memory materialization
-    the issue #20 plan forbids. This class instead remembers only the most
-    recent `maxlen` keys per stream side, which catches the realistic bug
-    shape (a duplicate inserted/removed adjacent to, or near, its original
-    occurrence) with strictly bounded memory. A duplicate whose two
-    occurrences are farther apart than `maxlen` positions will not be
-    flagged by this specific check — that limitation is deliberate and
-    documented, not hidden.
-    """
-
-    __slots__ = ("_maxlen", "_order", "_counts")
-
-    def __init__(self, maxlen: int) -> None:
-        self._maxlen = maxlen
-        self._order: list[Any] = []
-        self._counts: dict[Any, int] = {}
-
-    def observe(self, key: Any) -> bool:
-        """Record `key` as seen; return True if it was already present in
-        the current bounded window (i.e. a duplicate within the lookback)."""
-        is_duplicate = self._counts.get(key, 0) > 0
-        self._counts[key] = self._counts.get(key, 0) + 1
-        self._order.append(key)
-        if len(self._order) > self._maxlen:
-            evicted = self._order.pop(0)
-            remaining = self._counts[evicted] - 1
-            if remaining <= 0:
-                del self._counts[evicted]
-            else:
-                self._counts[evicted] = remaining
-        return is_duplicate
-
-
 def compare_trade_ticks_exhaustive(
     old_ticks: Iterable[Any],
     new_ticks: Iterable[Any],
     *,
-    dedupe_window: int = 100_000,
     numeric_tolerance: float = 0.0,
     max_reported_mismatches: int = 200,
 ) -> dict[str, Any]:
@@ -361,17 +348,32 @@ def compare_trade_ticks_exhaustive(
       both `old_ticks` and `new_ticks` and never materializes either into a
       list internally, so memory use is independent of total event count —
       suitable for a complete production day's tens/hundreds of millions of
-      trades when paired with iter_trade_ticks_windowed() as the loader;
-    - detects duplicate `trade_id`s within a bounded recent window (see
-      _BoundedDedupeWindow's docstring for the documented global-duplicate
-      trade-off).
-    """
-    old_dedupe = _BoundedDedupeWindow(dedupe_window)
-    new_dedupe = _BoundedDedupeWindow(dedupe_window)
+      trades when paired with iter_trade_ticks_windowed() as the loader,
+      and runs in O(N) time (a single pass, no per-event bookkeeping
+      structure beyond position counters), so it remains practical at
+      200M+ events.
 
+    Duplicate-event semantics: equivalence means the reference and
+    candidate streams are identical, INCLUDING any identical duplicate
+    occurrences either side may (legitimately or not) contain. Two streams
+    that both contain the exact same duplicate event at the exact same
+    position are, by definition, equivalent, and this function reports
+    `passed=True` for that case. An extra, missing, or differently
+    positioned duplicate is not given special-cased duplicate detection —
+    it is caught the same way any other insertion/deletion/reorder is
+    caught: it shifts every subsequent position, producing
+    `first_length_divergence_position` and/or `position_mismatches` from
+    that point on, which already fails `passed`. A prior version of this
+    function additionally flagged "a duplicate exists on either side" as
+    an independent failure condition and used an O(window)-per-event
+    bookkeeping structure to do so; that was incorrect (identical
+    duplicates present on both sides do not indicate non-equivalence) and
+    has been removed rather than merely made more efficient, since the
+    positional/length comparison already provides full detection power for
+    every duplicate-related discrepancy that can actually indicate
+    non-equivalence.
+    """
     position_mismatches: list[dict[str, Any]] = []
-    duplicate_events_old: list[dict[str, Any]] = []
-    duplicate_events_new: list[dict[str, Any]] = []
 
     old_count = 0
     new_count = 0
@@ -390,20 +392,9 @@ def compare_trade_ticks_exhaustive(
         if old_present != new_present and first_length_divergence_position is None:
             first_length_divergence_position = position
 
-        old_record: dict[str, Any] | None = None
-        new_record: dict[str, Any] | None = None
-        if old_present:
-            old_record = _tick_to_record(old_tick)
-            key = old_record["trade_id"]
-            if old_dedupe.observe(key) and len(duplicate_events_old) < max_reported_mismatches:
-                duplicate_events_old.append({"position": position, "trade_id": key})
-        if new_present:
-            new_record = _tick_to_record(new_tick)
-            key = new_record["trade_id"]
-            if new_dedupe.observe(key) and len(duplicate_events_new) < max_reported_mismatches:
-                duplicate_events_new.append({"position": position, "trade_id": key})
-
         if old_present and new_present:
+            old_record = _tick_to_record(old_tick)
+            new_record = _tick_to_record(new_tick)
             mismatches: dict[str, Any] = {}
             for field in ("instrument_id", "trade_id", "aggressor_side", "ts_event", "ts_init"):
                 if old_record[field] != new_record[field]:
@@ -422,8 +413,6 @@ def compare_trade_ticks_exhaustive(
         old_count == new_count
         and first_length_divergence_position is None
         and not position_mismatches
-        and not duplicate_events_old
-        and not duplicate_events_new
     )
     return {
         "positions_compared": positions_compared,
@@ -433,8 +422,6 @@ def compare_trade_ticks_exhaustive(
         "first_length_divergence_position": first_length_divergence_position,
         "position_mismatches": position_mismatches,
         "position_mismatch_count_capped_at": max_reported_mismatches,
-        "duplicate_events_old": duplicate_events_old,
-        "duplicate_events_new": duplicate_events_new,
         "passed": passed,
     }
 
@@ -469,20 +456,29 @@ def iter_order_book_deltas_windowed(
     *,
     window_ns: int = 3_600_000_000_000,  # 1 hour
 ) -> Iterator[Any]:
-    """Yield OrderBookDeltas group objects for one instrument across
-    [start_ns, end_ns) in bounded time windows; see
-    iter_trade_ticks_windowed() for the rationale (bounded memory for a
-    complete production day). Pass the result directly to
-    compare_order_book_deltas_exhaustive(), which flattens the grouped
-    objects internally without materializing the full flattened stream."""
+    """Yield OrderBookDeltas group objects for one instrument across the
+    half-open caller range [start_ns, end_ns) in bounded (configurable)
+    time windows; see iter_trade_ticks_windowed() for the discovered
+    Nautilus inclusive-both-ends query semantics, the closed-window
+    partitioning this function uses to avoid double-yielding a boundary
+    event, and the explicit caveat that a fixed time window bounds query
+    result size per window but is not by itself a proven strict
+    event-count/RSS bound — it must be tuned against measured per-window
+    memory on real production data (issue #20 Tier 3). Pass the result
+    directly to compare_order_book_deltas_exhaustive(), which flattens the
+    grouped objects internally without materializing the full flattened
+    stream."""
+    if end_ns <= start_ns:
+        return
     catalog = ParquetDataCatalog(str(catalog_root))
+    last_inclusive_ns = end_ns - 1
     window_start = start_ns
-    while window_start < end_ns:
-        window_end = min(window_start + window_ns, end_ns)
+    while window_start <= last_inclusive_ns:
+        window_end = min(window_start + window_ns - 1, last_inclusive_ns)
         deltas = catalog.order_book_deltas(instrument_ids=[instrument_id], start=window_start, end=window_end)
         for obj in deltas or []:
             yield obj
-        window_start = window_end
+        window_start = window_end + 1
 
 
 def _flatten_deltas(objects: Iterable[Any]) -> list[Any]:
@@ -646,28 +642,10 @@ def compare_order_book_deltas_semantic(
     return result
 
 
-def _delta_dedupe_key(record: dict[str, Any]) -> tuple:
-    """Dedupe key for a normalized delta record. Deltas have no natural
-    unique identifier like a trade_id, so the full set of semantic fields
-    is used as the key."""
-    return (
-        record["action"],
-        record["side"],
-        record["price"],
-        record["size"],
-        record["order_id"],
-        record["flags"],
-        record["sequence"],
-        record["ts_event"],
-        record["ts_init"],
-    )
-
-
 def compare_order_book_deltas_exhaustive(
     old_objects: Iterable[Any],
     new_objects: Iterable[Any],
     *,
-    dedupe_window: int = 100_000,
     numeric_tolerance: float = 0.0,
     max_reported_mismatches: int = 200,
 ) -> dict[str, Any]:
@@ -692,19 +670,23 @@ def compare_order_book_deltas_exhaustive(
     materializes the flattened delta stream into a list), so memory is
     bounded and independent of total event count — suitable for a complete
     production day's tens/hundreds of millions of depth events when paired
-    with iter_order_book_deltas_windowed() as the loader. Duplicate
-    detection uses the same bounded recent-window trade-off documented on
-    _BoundedDedupeWindow.
+    with iter_order_book_deltas_windowed() as the loader, and runs in O(N)
+    time (a single pass, no per-event bookkeeping structure), remaining
+    practical at 200M+ events.
+
+    Duplicate-event semantics: identical to compare_trade_ticks_exhaustive()
+    — two identical ordered streams pass even if both contain the same
+    duplicate delta at the same position; equivalence means the two streams
+    are identical, including identical duplicate occurrences. An extra,
+    missing, or differently positioned duplicate delta is caught by the
+    positional/length comparison, not by a separate duplicate-presence
+    check (removed; see compare_trade_ticks_exhaustive()'s docstring for
+    the full rationale, which applies identically here).
     """
     old_stream = _iter_flatten_deltas(old_objects)
     new_stream = _iter_flatten_deltas(new_objects)
 
-    old_dedupe = _BoundedDedupeWindow(dedupe_window)
-    new_dedupe = _BoundedDedupeWindow(dedupe_window)
-
     position_mismatches: list[dict[str, Any]] = []
-    duplicate_events_old: list[dict[str, Any]] = []
-    duplicate_events_new: list[dict[str, Any]] = []
 
     old_count = 0
     new_count = 0
@@ -723,20 +705,9 @@ def compare_order_book_deltas_exhaustive(
         if old_present != new_present and first_length_divergence_position is None:
             first_length_divergence_position = position
 
-        old_record: dict[str, Any] | None = None
-        new_record: dict[str, Any] | None = None
-        if old_present:
-            old_record = _delta_to_record(old_delta)
-            key = _delta_dedupe_key(old_record)
-            if old_dedupe.observe(key) and len(duplicate_events_old) < max_reported_mismatches:
-                duplicate_events_old.append({"position": position, "key": key})
-        if new_present:
-            new_record = _delta_to_record(new_delta)
-            key = _delta_dedupe_key(new_record)
-            if new_dedupe.observe(key) and len(duplicate_events_new) < max_reported_mismatches:
-                duplicate_events_new.append({"position": position, "key": key})
-
         if old_present and new_present:
+            old_record = _delta_to_record(old_delta)
+            new_record = _delta_to_record(new_delta)
             mismatches: dict[str, Any] = {}
             for field in (
                 "instrument_id",
@@ -764,8 +735,6 @@ def compare_order_book_deltas_exhaustive(
         old_count == new_count
         and first_length_divergence_position is None
         and not position_mismatches
-        and not duplicate_events_old
-        and not duplicate_events_new
     )
     return {
         "positions_compared": positions_compared,
@@ -775,8 +744,6 @@ def compare_order_book_deltas_exhaustive(
         "first_length_divergence_position": first_length_divergence_position,
         "position_mismatches": position_mismatches,
         "position_mismatch_count_capped_at": max_reported_mismatches,
-        "duplicate_events_old": duplicate_events_old,
-        "duplicate_events_new": duplicate_events_new,
         "passed": passed,
     }
 

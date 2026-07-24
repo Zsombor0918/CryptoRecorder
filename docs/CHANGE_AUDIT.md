@@ -93,6 +93,219 @@ An entry may be skipped **only** for:
 - <or "none — task fully completed">
 ```
 
+## 2026-07-24 — Issue #20 Phase 1 follow-up correction: wire exhaustive oracle into the real acceptance path, fix duplicate semantics, fix windowed-loader boundary bug
+
+### Change summary
+- A review of the previously pushed head (`7ca0854`) correctly found that
+  the Phase 1 correction's exhaustive/streaming comparators and windowed
+  loaders were added to `validation/catalog_compare.py` but never wired
+  into `validation/validate_catalog_equivalence.py` — the actual function
+  the CLI and any future Tier-2/Tier-3 acceptance run calls. The real
+  orchestration still used `load_trade_ticks()` +
+  `compare_trade_ticks_semantic()` (sampled) and `load_order_book_deltas()` +
+  `compare_order_book_deltas_semantic()` (multiset). This entry corrects
+  that gap and two further defects found while doing so.
+- **Wired into the real path** (`validation/validate_catalog_equivalence.py`,
+  `validate_catalog_equivalence()` and `_compare_depth_for_instrument()`):
+  - `load_instruments()` + `compare_instruments_semantic()` — instrument
+    identity/precision now gates `report["comparison"]["instrument_precision"]`.
+  - `iter_trade_ticks_windowed()` + `compare_trade_ticks_exhaustive()` —
+    replaces the sampled trade comparison entirely; gates
+    `comparison["by_instrument"][iid]["trade_ticks"]`.
+  - `iter_order_book_deltas_windowed()` + `compare_order_book_deltas_exhaustive()` —
+    replaces the multiset delta comparison entirely; gates
+    `comparison["by_instrument"][iid]["order_book_deltas"]`.
+  - `compare_continuity_diagnostics_semantic()` — new
+    `_load_old_convert_report()` reads convert_day.py's own report JSON
+    (`catalog_root.parent / "convert_reports" / f"{date}.json"`, per
+    convert_day.py's own `_save_report()`) for `per_symbol_depth`, compared
+    against the candidate manifest's `depth_diagnostics`; gates
+    `continuity_diagnostics`.
+  - `compare_fenced_ranges_semantic()` — reference-side
+    `per_symbol_fenced_ranges[...]["examples"]` (convert_day.py only
+    records up to 3 example fences per symbol, not the full list) against
+    the candidate manifest's `fenced_ranges` filtered to that venue/symbol.
+    Documented explicitly: `extra_in_new` is expected whenever the
+    candidate legitimately has more than 3 fences (a reference-side
+    data-shape truncation, not an equivalence failure) and does not gate;
+    only `missing_in_new` (every reference example must be reproduced) is
+    gating, exposed as a new `gating_passed` field.
+  - `compare_quality_flags_semantic()` — new
+    `_collect_quality_flags_from_raw()`/`_collect_quality_flags_from_replay()`
+    compare quality_flags read directly from `data_raw` (via
+    `converter.readers.stream_raw_records()`) against the replay_store the
+    candidate builds from that same raw source (via
+    `stores.replay_reader.ReplayReader`). Documented explicitly why: neither
+    convert_day.py's Nautilus catalog output nor its own report JSON
+    persists a per-event quality_flags stream, so there is no "old Nautilus
+    catalog vs new Nautilus catalog" comparison available for this field —
+    raw is the one place it exists on both a reference and candidate side.
+  - Every one of the above `passed` results now contributes to
+    `report["status"]`.
+  - `compare_book_checkpoints()` and Depth10 comparison remain wired but
+    are now explicit non-gating diagnostics (new `"gating": False` field on
+    each): both still require full-day list materialization
+    (`compare_book_checkpoints()` calls `list(...)` on its inputs; there is
+    no windowed/streaming equivalent for either today), which the bounded-
+    memory acceptance path is specifically designed to avoid. This is a
+    documented, deliberate limitation, not silently hidden — closing it is
+    explicitly out of scope for this correction and left as future work.
+  - The legacy sampled/multiset comparators and the full-day
+    `load_trade_ticks()`/`load_order_book_deltas()`-as-primary-loader
+    pattern are no longer imported by `validate_catalog_equivalence.py` at
+    all (confirmed by a new static regression test, see below).
+- **Corrected duplicate-event semantics** (`validation/catalog_compare.py`):
+  two identical ordered streams now correctly pass even when both contain
+  the exact same duplicate event at the same position — equivalence means
+  the reference and candidate streams are identical, including identical
+  duplicate occurrences. The prior version incorrectly treated "a
+  duplicate exists on either side" as an independent failure condition.
+  Removed `_BoundedDedupeWindow` (which stored keys in a Python `list` and
+  called `pop(0)` on eviction — O(N) per eviction once the window filled,
+  an O(N×window) cost across a full stream) entirely, rather than merely
+  replacing it with a `collections.deque`: the pre-existing positional/
+  length comparison already fully detects every duplicate-related
+  discrepancy that can actually indicate non-equivalence (an extra,
+  missing, or differently-positioned duplicate shifts every subsequent
+  position). This keeps `compare_trade_ticks_exhaustive()`/
+  `compare_order_book_deltas_exhaustive()` O(N) end-to-end, remaining
+  practical at 200M+ events per the issue's requirement.
+- **Found and fixed a real windowed-loader boundary bug**
+  (`validation/catalog_compare.py`): `iter_trade_ticks_windowed()`/
+  `iter_order_book_deltas_windowed()` previously assumed Nautilus's
+  `catalog.trade_ticks(start=a, end=b)`/`catalog.order_book_deltas(start=a,
+  end=b)` queries were half-open `[a, b)`. Direct testing against a real
+  on-disk `ParquetDataCatalog` (new
+  `tests/test_windowed_loader_boundaries.py`) proved this false: the query
+  is inclusive on **both** `a` and `b` — confirmed directly by querying
+  `start=0, end=1000` against a single event at `ts=1000` and observing it
+  returned. The previous window-chaining logic
+  (`next_window_start = previous_window_end`) therefore double-yielded any
+  event landing exactly on an internal window boundary (reproduced
+  directly: `[0, 999, 1000, 1000, 1001, 2999]` instead of
+  `[0, 999, 1000, 1001, 2999]`). Both loaders now partition the caller's
+  half-open `[start_ns, end_ns)` range into non-overlapping **closed**
+  sub-windows (`window_end = min(window_start + window_ns - 1,
+  end_ns - 1)`, next `window_start = window_end + 1`), safe because all
+  Nautilus event timestamps are integer nanoseconds. Re-verified after the
+  fix: every boundary-position event (overall start; immediately
+  before/on/after an internal boundary; immediately before the overall
+  end) is yielded exactly once, in order, for both loaders, and windowed
+  iteration matches a single unwindowed full-range query exactly.
+  `window_ns` remains fully configurable (two different window sizes
+  proven to yield identical results against the same data); docstrings no
+  longer claim a fixed time window is a strict event-count/RSS bound —
+  only that it bounds query result size per window, to be tuned against
+  measured per-window RSS on real production data (issue #20 Tier 3).
+- Added `tests/test_validate_catalog_equivalence_exhaustive_wiring.py`
+  (new, 12 tests): end-to-end integration tests that monkeypatch only the
+  build steps (`_run_old_converter`, `_run_new_pipeline`, `_prepare_dir`)
+  to no-ops so each test can pre-construct fully controlled real Nautilus
+  catalogs (via `ParquetDataCatalog.write_data()`) plus a matching
+  convert_day.py-shaped report and replay manifest, then calls the real,
+  unmodified `validate_catalog_equivalence()` — proving the orchestration
+  itself, not just the comparator helpers in isolation, fails for: a trade
+  mismatch beyond the legacy sampled comparator's 100 positions; reordered
+  trades (content-swapped between adjacent timestamp slots, since
+  Nautilus's catalog enforces monotonically increasing `ts_init` at write
+  time — a literal object swap cannot be written to a real catalog, which
+  is itself a documented finding of this work); reordered commutative-
+  looking depth deltas (with a sanity assertion that the non-gating
+  book-checkpoint diagnostic legitimately still matches, demonstrating
+  exactly why the exhaustive comparison must be the actual gate);
+  extra/missing trades; an instrument precision/increment mismatch; a
+  continuity (resync-count) mismatch; a fenced-range mismatch; and a
+  quality-flags mismatch. Plus a passing baseline and two regression
+  guards: a static check that `compare_trade_ticks_semantic`,
+  `compare_order_book_deltas_semantic`, and `load_trade_ticks` are no
+  longer attributes of the `validate_catalog_equivalence` module (would
+  fail immediately if a future change re-adds those imports), and a
+  call-counting spy proving `compare_trade_ticks_exhaustive`/
+  `compare_order_book_deltas_exhaustive` are genuinely invoked (not merely
+  importable-but-unused) during a real run.
+- No compact replay schema was changed. This remains Phase 1 (oracle
+  hardening) work, still gating any future compact schema implementation
+  (Phase 5+, not started).
+
+### Files/packages touched
+- `validation/validate_catalog_equivalence.py` (real acceptance-path wiring)
+- `validation/catalog_compare.py` (duplicate-semantics fix, windowed-loader
+  boundary-bug fix)
+- `tests/test_semantic_oracle_exhaustive_streaming.py` (updated duplicate
+  tests to match corrected semantics)
+- `tests/test_windowed_loader_boundaries.py` (new — 6 tests)
+- `tests/test_validate_catalog_equivalence_exhaustive_wiring.py` (new — 12 tests)
+- `CHANGELOG.md` (`[Unreleased]` → `Added`)
+- `docs/CHANGE_AUDIT.md` (this entry)
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] docs/REPO_STRUCTURE.md (no folder/file contract change)
+- [x] docs/PROJECT_STATUS.md (reviewed; no validated/deferred status
+  changed — this remains oracle-hardening tooling, not a new real-data
+  validation run)
+- [x] docs/IMPLEMENTATION_AUDIT.md (reviewed; consistent with the existing
+  Phase 1/2/3 entries — this correction strengthens, not contradicts, the
+  "Phase 1 oracle (implemented)" reference already recorded there)
+- [x] relevant feature docs:
+  - docs/VALIDATION.md (reviewed; `validate_catalog_equivalence` CLI
+    description remains accurate — internal comparison logic changed, the
+    documented CLI invocation/flags did not, aside from the additive
+    `--window-hours` flag)
+
+### Docs updated
+- [x] CHANGELOG.md
+- No docs update required because: `docs/VALIDATION.md`'s existing
+  CLI-level description remains accurate; the new `--window-hours` flag
+  is additive and self-documenting via `--help`.
+
+### Status / validation impact
+- Validated status changed: no
+- Deferred status changed: no
+- New claims added: no — this proves the *oracle wiring* is correct via
+  synthetic/local integration tests; it does not constitute a new
+  semantic-equivalence validation run against real production data, and
+  does not change the `full_l2`/v2.0.0 gate status.
+- Evidence for any new validation claim: n/a (no new validation claim made)
+
+### Tests run
+```bash
+source .venv/bin/activate
+python -m pytest tests/test_semantic_oracle_exhaustive_streaming.py tests/test_semantic_oracle_detects_injected_faults.py tests/test_windowed_loader_boundaries.py tests/test_validate_catalog_equivalence_exhaustive_wiring.py -q   # 50 passed
+python -m pytest tests/test_repo_structure.py tests/test_agent_infrastructure.py -q   # 56 passed
+python -m pytest -q   # 397 passed, 3 skipped
+```
+
+### Validation CLIs run
+```bash
+none required for this change type — no schema, systemd, or deployment
+file was touched; the wiring is exercised directly by the new
+integration-test suite above.
+```
+
+### Known limitations / out of scope
+- `compare_book_checkpoints()` and Depth10 comparison remain full-day
+  list-materializing and are explicitly non-gating diagnostics — a
+  windowed/streaming equivalent for either is out of scope for this
+  correction and remains future work.
+- `_collect_quality_flags_from_raw()`/`_collect_quality_flags_from_replay()`
+  are not themselves windowed/bounded-memory (they materialize a Python
+  list of quality_flags values for the requested venue/symbol/date) —
+  acceptable for now since `quality_flags` values are small compared to
+  full event objects, but this should be revisited if quality_flags volume
+  becomes a real memory concern for a full production day.
+- No representative production-day (Tier 3: 2026-07-22/23) run of the
+  corrected wiring was performed in this session — proven only against
+  synthetic (Tier 1) data via real, on-disk Nautilus catalogs and a
+  genuine end-to-end orchestration call, which is exactly what "prove the
+  wiring before using it as a gate" requires before any real-data run.
+- The `--window-hours` CLI default (1 hour) has not been validated against
+  measured per-window RSS on real production data; it remains a
+  configurable starting point per the docstring's explicit caveat, not a
+  proven-safe value.
+
+---
+
 ## 2026-07-24 — Issue #20 Phase 1 correction: exhaustive, order-preserving, bounded-memory oracle comparison (closes sampling/multiset/streaming gap)
 
 ### Change summary

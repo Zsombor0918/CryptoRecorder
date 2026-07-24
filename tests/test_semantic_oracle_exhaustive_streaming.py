@@ -235,25 +235,36 @@ def test_exhaustive_delta_detects_extra_and_missing() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_exhaustive_detects_duplicate_trade_added() -> None:
-    """The candidate ("new") stream contains a duplicated trade the
-    reference does not — must be flagged as a new-side duplicate."""
+def test_exhaustive_detects_duplicate_trade_added_asymmetrically() -> None:
+    """The candidate ("new") stream contains an EXTRA duplicated trade the
+    reference does not — this is an asymmetric duplicate (present on one
+    side only), which must fail equivalence. Even though both streams end
+    up the same *length* here (the extra duplicate shifts, rather than
+    grows, the tail), the shift itself is caught as a content mismatch at
+    every subsequent position — the same mechanism used for any reorder —
+    not by an independent "a duplicate exists" check. See
+    compare_trade_ticks_exhaustive()'s docstring for why the latter was
+    removed as incorrect."""
     counter_old = _LiveCounter()
     counter_new = _LiveCounter()
     old_ticks = [_fake_tick(i, counter_old) for i in range(10)]
     new_ticks = [_fake_tick(i, counter_new) for i in range(5)]
-    # Duplicate trade_id=4 immediately after its original occurrence.
+    # Duplicate trade_id=4 immediately after its original occurrence,
+    # present only on the new side (shifts, not grows, the remaining tail).
     new_ticks.insert(5, _fake_tick(4, counter_new))
     new_ticks.extend(_fake_tick(i, counter_new) for i in range(5, 9))
 
     result = compare_trade_ticks_exhaustive(old_ticks, new_ticks)
-    assert result["duplicate_events_new"], "duplicate insertion on the new side must be detected"
     assert result["passed"] is False
+    assert any(m["position"] == 5 for m in result["position_mismatches"])
 
 
-def test_exhaustive_detects_duplicate_trade_removed() -> None:
+def test_exhaustive_detects_duplicate_trade_removed_asymmetrically() -> None:
     """The reference ("old") stream contains a duplicate that the candidate
-    does not reproduce — must be flagged as an old-side duplicate."""
+    does not reproduce — an asymmetric duplicate present on one side only.
+    This grows the old stream by one, so it is caught both as a content
+    mismatch from the duplicate's position onward and as a length
+    divergence once old's extra trailing event has no new-side counterpart."""
     counter_old = _LiveCounter()
     counter_new = _LiveCounter()
     old_ticks = [_fake_tick(i, counter_old) for i in range(5)]
@@ -261,8 +272,44 @@ def test_exhaustive_detects_duplicate_trade_removed() -> None:
     new_ticks = [_fake_tick(i, counter_new) for i in range(5)]  # new does not
 
     result = compare_trade_ticks_exhaustive(old_ticks, new_ticks)
-    assert result["duplicate_events_old"], "duplicate present only on the old side must be detected"
     assert result["passed"] is False
+    assert result["trade_count_match"] is False
+    assert any(m["position"] == 3 for m in result["position_mismatches"])
+    assert result["first_length_divergence_position"] == 5
+
+
+def test_exhaustive_passes_when_both_sides_share_identical_duplicate() -> None:
+    """Corrected duplicate semantics (issue #20 follow-up correction):
+    equivalence means the reference and candidate streams are identical,
+    INCLUDING identical duplicate occurrences. A duplicate present at the
+    same position on both sides must NOT independently fail equivalence."""
+    counter_old = _LiveCounter()
+    counter_new = _LiveCounter()
+
+    def _build_with_duplicate(counter: _LiveCounter) -> list[_FakeTick]:
+        ticks = [_fake_tick(i, counter) for i in range(5)]
+        ticks.insert(3, _fake_tick(2, counter))  # identical duplicate, same position, both sides
+        return ticks
+
+    old_ticks = _build_with_duplicate(counter_old)
+    new_ticks = _build_with_duplicate(counter_new)
+
+    result = compare_trade_ticks_exhaustive(old_ticks, new_ticks)
+    assert result["passed"] is True
+    assert result["trade_count_match"] is True
+    assert result["first_length_divergence_position"] is None
+
+
+def test_exhaustive_delta_passes_when_both_sides_share_identical_duplicate() -> None:
+    """Same corrected duplicate semantics for OrderBookDeltas."""
+    instrument = _instrument()
+    delta = OrderBookDelta.clear(instrument.id, 1, 1_000, 1_100)
+    old = [OrderBookDeltas(instrument.id, [delta, delta])]  # identical duplicate, both sides
+    new = [OrderBookDeltas(instrument.id, [delta, delta])]
+
+    result = compare_order_book_deltas_exhaustive(old, new)
+    assert result["passed"] is True
+    assert result["delta_count_match"] is True
 
 
 # ---------------------------------------------------------------------------
