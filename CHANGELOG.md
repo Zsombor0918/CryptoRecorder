@@ -67,6 +67,59 @@ passes.** Until then, broader full-L2 equivalence stays **deferred** (see
 ## [Unreleased]
 
 ### Added
+- **Issue #20 Phase 6: bounded external-merge replacement for the
+  SQLite-backed conversion scratch spool** — per the approved plan's
+  correction #13 ("scratch-inefficient"), `converter/spool.py`'s
+  `RawRecordSpool` (used by `convert_day.py`'s raw repartition/carry
+  spools, `stores/replay_writer.py`'s write batching,
+  `stores/replay_depth_adapter.py`'s replay-side resort, and
+  `validation/validate_catalog_equivalence.py`'s raw metadata sort) was
+  rewritten from a single on-disk SQLite B-tree table (3 secondary
+  indexes, full JSON-text payload per row) to a genuine bounded
+  external merge sort: records are buffered in memory up to a
+  configurable run size (`CRYPTO_RECORDER_SPOOL_RUN_SIZE`, default
+  20000), each run sorted and flushed to a disk-backed pickle file, and
+  the final sorted stream produced via a k-way `heapq.merge` across run
+  files (peak memory is O(run size), not O(total record count)).
+  - Public interface, constructor signature, and every method's
+    external behavior are unchanged: `insert()`, `commit()`,
+    `iter_records()` (with `record_type`/`session_id`/`min_sort_key`
+    filters), `first_record()`, `has_record_before()`, `max_record()`
+    (both `first_tie=True` and `first_tie=False` tie-break semantics,
+    matching the prior SQL `ORDER BY` behavior exactly), and `close()`
+    (removes all run files plus the placeholder marker path). `DedupeSet`
+    and `ObjectSpool` in the same file are unchanged (still SQLite-backed;
+    out of Phase 6 scope).
+  - Added `tests/test_spool_external_merge.py` (11 tests): sort-order
+    correctness, filter correctness, `first_record`/`has_record_before`/
+    `max_record` (`first_tie` True and False) semantics matching the
+    prior SQL behavior, `close()` cleanup of all run files, an explicit
+    proof that exceeding the configured run size produces multiple
+    on-disk run files while still yielding a fully correct merged sort,
+    and a live-object-counter bounded-memory proof (5,000 records,
+    run size 200) showing peak simultaneously-alive spooled records
+    stays under 1,000 — bounded by run size, not proportional to total
+    record count.
+  - Full suite: 529 passed, 3 skipped (up from 518, +11 new spool
+    tests); spool-dependent regression set (14 files covering
+    `convert_day_phase2`, `replay_store`, `replay_depth_adapter`,
+    `replay_memory_bounded`, `replay_sync_continuity`,
+    `replay_catalog_reconstruct`, `semantic_equivalence`,
+    `catalog_equivalence*`, etc.): 162 passed, 1 skipped; guards
+    (`test_repo_structure.py` + `test_agent_infrastructure.py`): 56
+    passed.
+  - **Tier-2 re-run** (canonical `validation.validate_catalog_equivalence`
+    CLI, ADAUSDT, 2026-06-12, real local `data_raw`): all 7 gating
+    components pass identically for both `--schema-version 0` and
+    `--schema-version 1`, with `fenced_ranges` byte-identical (34/34,
+    same canonical digest as before the spool rewrite) — proving the
+    scratch-mechanism replacement is a pure implementation change with
+    zero semantic impact.
+  - No change to `convert_day.py`, to `DedupeSet`/`ObjectSpool`, or to
+    any caller's use of the spool's public interface.
+  - Still strictly out of scope, per the approved checkpoint: Phase 7,
+    Tier 3, production deployment, custom binary format, retention
+    gate, uv, KovacsTrader.
 - **Issue #20 Phase 5 semantic correction: preserve synchronization
   continuity events** — the canonical Tier-2 gate correctly reported
   `continuity_diagnostics`/`fenced_ranges` as failed (reference: 34

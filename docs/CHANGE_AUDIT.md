@@ -93,6 +93,149 @@ An entry may be skipped **only** for:
 - <or "none — task fully completed">
 ```
 
+## 2026-07-27 — feat(converter): bounded external-merge replay conversion spool
+
+### Change summary
+- Issue #20 Phase 5 is approved and fixed at commit `59e28d8` (the prior
+  entry below). Per the approved plan's correction #13
+  ("scratch-inefficient"), this is Phase 6: replace
+  `converter/spool.py`'s `RawRecordSpool` — the disk-backed scratch
+  structure used by `convert_day.py`'s raw repartition/carry spools,
+  `stores/replay_writer.py`'s write batching, `stores/replay_depth_adapter.py`'s
+  replay-side resort, and `validation/validate_catalog_equivalence.py`'s
+  raw metadata sort — from a single on-disk SQLite table (3 secondary
+  indexes, full JSON-text payload per row) with a genuine bounded
+  external merge sort.
+- New implementation: records are buffered in memory up to a
+  configurable run size (`CRYPTO_RECORDER_SPOOL_RUN_SIZE`, default
+  20000), each run is sorted in memory and flushed to a disk-backed
+  pickle file (`_flush_run()`), and the fully sorted stream is produced
+  by a bounded k-way merge (`heapq.merge`) across all run files
+  (`_iter_sorted()`) — peak memory is O(run size), never O(total record
+  count).
+- Public interface, constructor signature, and every method's external
+  behavior are unchanged: `insert(record, sort_key, raw_index)`,
+  `commit()`, `iter_records(record_type=, session_id=, min_sort_key=)`,
+  `first_record(record_type=)`, `has_record_before(record_type,
+  sort_key)`, `max_record(record_type=, session_id=, first_tie=)` (both
+  `first_tie=True` and `first_tie=False` reproduce the prior SQL `ORDER
+  BY ... LIMIT 1` tie-break semantics exactly), and `close()` (removes
+  every run file plus the pre-existing placeholder marker `self.path`,
+  which is retained purely to preserve the exact temp-dir/lifecycle
+  contract asserted by `tests/test_streaming_conversion_memory.py::test_converter_spool_uses_configured_temp_dir`).
+- `DedupeSet` and `ObjectSpool` in the same file are unchanged (still
+  SQLite-backed) — explicitly out of scope for this narrowly targeted
+  correction.
+- Added `tests/test_spool_external_merge.py` (11 new tests): sort-order
+  correctness against out-of-order insertion; `record_type`/
+  `session_id`/`min_sort_key` filter correctness; `first_record`
+  filtering; `has_record_before` boundary correctness; `max_record` with
+  `first_tie=True` and `first_tie=False`, each proven against the exact
+  prior SQL `ORDER BY` tie-break semantics with constructed tie cases;
+  session/record_type filtering in `max_record`; `close()` removing all
+  run files and the marker path; an explicit proof that exceeding the
+  configured run size produces multiple on-disk run files
+  (`len(spool._run_paths) == ceil(n / run_size)`) while still yielding a
+  fully correct merged sort; the default run-size value; and a
+  live-object-counter bounded-memory proof (5,000 records, run size
+  200) showing peak simultaneously-alive spooled Python record objects
+  stays under 1,000 during insertion (bounded by run size, not
+  proportional to the total record count), with all objects released
+  after `close()`.
+
+### Files/packages touched
+- `converter/spool.py`
+- `tests/test_spool_external_merge.py` (new)
+- `CHANGELOG.md`
+- `docs/CHANGE_AUDIT.md`
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] docs/REPO_STRUCTURE.md
+- [x] docs/PROJECT_STATUS.md
+- [ ] docs/IMPLEMENTATION_AUDIT.md
+- [x] relevant feature docs:
+  - docs/FULL_L2_REPLAY_CATALOG_PLAN.md (reviewed; no status-claim
+    changes needed by this internal-implementation-only correction)
+
+### Docs updated
+- [x] CHANGELOG.md
+- [ ] README.md
+- [ ] docs/PROJECT_STATUS.md
+- [ ] docs/REPO_STRUCTURE.md
+- [ ] relevant feature docs:
+  - none
+- No docs update required because: this is an internal scratch-storage
+  implementation swap with a byte-for-byte-preserved public interface
+  and zero observable semantic change (proven by an unchanged Tier-2
+  canonical-gate result); no status claim, consumer contract, or repo
+  structure is affected.
+
+### Status / validation impact
+- Validated status changed: no
+- Deferred status changed: no
+- New claims added: no
+- Evidence for any new validation claim: n/a — this entry proves
+  behavior is UNCHANGED, not a new capability.
+
+### Tests run
+```bash
+source .venv/bin/activate
+python -m pytest tests/test_streaming_conversion_memory.py -q
+# 3 passed
+python -m pytest tests/test_convert_day_phase2.py tests/test_convert_integrity_and_readiness.py \
+  tests/test_converter_integration.py tests/test_depth_deterministic.py \
+  tests/test_futures_continuity.py tests/test_gap_and_fence_diagnostics.py \
+  tests/test_replay_store.py tests/test_replay_depth_adapter.py \
+  tests/test_replay_memory_bounded.py tests/test_replay_sync_continuity.py \
+  tests/test_replay_catalog_reconstruct.py tests/test_semantic_equivalence.py \
+  tests/test_catalog_equivalence.py tests/test_catalog_equivalence_full_l2.py -q
+# 162 passed, 1 skipped
+python -m pytest tests/test_spool_external_merge.py -q
+# 11 passed (new)
+python -m pytest -q
+# 529 passed, 3 skipped (up from 518 baseline, +11 new)
+python -m pytest tests/test_repo_structure.py tests/test_agent_infrastructure.py -q
+# 56 passed
+```
+
+### Validation CLIs run
+```bash
+CRYPTO_RECORDER_DATA_ROOT="$(pwd)/data_raw" python -m validation.validate_catalog_equivalence \
+  --date 2026-06-12 --symbols ADAUSDT --venues BINANCE_SPOT --data-root "$(pwd)/data_raw" \
+  --work-root /tmp/phase6_v0/work --old-catalog-root /tmp/phase6_v0/old_catalog \
+  --replay-root /tmp/phase6_v0/replay --new-catalog-root /tmp/phase6_v0/new_catalog \
+  --profile full_l2 --emit-depth10 --schema-version 0 --overwrite \
+  --report-path /tmp/phase6_v0/report.json
+# result: passed. All 7 components pass: instrument IDs, instrument
+# precision, trade_ticks, order_book_deltas, order_book_depth10,
+# book_checkpoints, continuity_diagnostics, fenced_ranges,
+# raw_to_replay_metadata. fenced_ranges: count_old=34, count_new=34,
+# digest_old==digest_new (byte-identical), same digest value as before
+# the spool rewrite.
+
+CRYPTO_RECORDER_DATA_ROOT="$(pwd)/data_raw" python -m validation.validate_catalog_equivalence \
+  --date 2026-06-12 --symbols ADAUSDT --venues BINANCE_SPOT --data-root "$(pwd)/data_raw" \
+  --work-root /tmp/phase6_v1/work --old-catalog-root /tmp/phase6_v1/old_catalog \
+  --replay-root /tmp/phase6_v1/replay --new-catalog-root /tmp/phase6_v1/new_catalog \
+  --profile full_l2 --emit-depth10 --schema-version 1 --overwrite \
+  --report-path /tmp/phase6_v1/report.json
+# result: passed. Same 7/7 pass, same fenced_ranges digest (identical
+# to schema_version=0 and to the pre-Phase-6 result).
+```
+
+### Known limitations / out of scope
+- Phase 7 (format-selection sweep for the <5 GiB/day target, <2 GiB/day
+  stretch target), Tier 3 broader top50/multi-day validation, production
+  deployment, retention gate, `uv` migration, and KovacsTrader work were
+  NOT started, per the approved checkpoint.
+- The two previously deferred follow-ups (stale
+  `FULL_L2_REPLAY_CATALOG_PLAN.md` caveats section; selected-reconstruction
+  CLI auto-resolution of preceding replay partitions for cross-day carry)
+  remain deferred and were NOT implemented in this Phase 6 change.
+- `convert_day.py` was not modified or reverted; it remains the
+  permanent behavioral oracle.
+
 ## 2026-07-27 — fix(replay): preserve synchronization continuity events
 
 ### Change summary

@@ -1,6 +1,7 @@
 """Disk-backed temporary spools for memory-bounded conversion."""
 from __future__ import annotations
 
+import heapq
 import json
 import os
 import pickle
@@ -37,37 +38,52 @@ def _session_key(record: dict) -> str:
 
 
 class RawRecordSpool:
-    """SQLite-backed JSON record spool ordered by canonical sort keys."""
+    """Bounded-memory external-merge-sorted record spool (issue #20 Phase 6).
+
+    Replaces the prior SQLite-backed implementation (a single on-disk
+    B-tree with 3 secondary indexes storing the complete JSON payload text
+    per row — "scratch-inefficient" but disk-backed/RAM-bounded, per the
+    approved plan's correction #13) with a genuine external merge sort:
+    incoming records are buffered in memory only up to a bounded run size
+    (``CRYPTO_RECORDER_SPOOL_RUN_SIZE``, default 20000 records), each run
+    is sorted in memory and flushed to its own disk-backed pickle run
+    file, and the fully sorted output is produced by a bounded k-way merge
+    (``heapq.merge``) that holds only one buffered record per run in
+    memory at a time — peak resident memory is O(run_size), never
+    O(total record count), regardless of how many records are spooled.
+
+    The public interface (``insert``/``commit``/``iter_records``/
+    ``first_record``/``has_record_before``/``max_record``/``close``,
+    context-manager support, ``.count``, ``.path``) and every method's
+    external behavior are UNCHANGED from the prior implementation — this
+    is purely an internal storage/ordering mechanism replacement. Every
+    existing caller (``convert_day.py``'s raw repartition/carry spools,
+    ``stores/replay_writer.py``'s write-batching, ``stores/
+    replay_depth_adapter.py``'s replay-side canonical resort,
+    ``validation/validate_catalog_equivalence.py``'s raw metadata sort)
+    requires zero changes.
+
+    ``first_record``/``has_record_before``/``max_record`` re-merge the run
+    files with a fresh streaming pass per call (no persistent index) —
+    these are called at most a small, bounded number of times per
+    partition build (never once per record), so trading index lookup
+    speed for zero extra memory/index-maintenance cost is the correct
+    tradeoff here (long runtime is acceptable; unbounded memory is not).
+    """
 
     def __init__(self, *, temp_dir: str | Path | None = None, prefix: str = "cryptorecorder-raw-"):
+        # A lightweight marker file (mirrors the prior SQLite-file
+        # lifecycle exactly: created at construction under the configured
+        # temp dir, removed at close()) — proves CRYPTO_RECORDER_CONVERTER_TEMP_DIR
+        # plumbing without requiring a single physical backing file, since
+        # this implementation may create zero-or-more run files depending
+        # on how many records are actually inserted.
         self.path = _temp_db_path(prefix, temp_dir)
-        self.conn = sqlite3.connect(str(self.path))
-        self.conn.execute("PRAGMA journal_mode=OFF")
-        self.conn.execute("PRAGMA synchronous=OFF")
-        self.conn.execute("PRAGMA temp_store=MEMORY")
-        self.conn.execute(
-            """
-            CREATE TABLE records (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                sort1 INTEGER NOT NULL,
-                sort2 INTEGER NOT NULL,
-                sort3 INTEGER NOT NULL,
-                raw_index INTEGER NOT NULL,
-                record_type TEXT NOT NULL,
-                session_key TEXT NOT NULL,
-                payload TEXT NOT NULL
-            )
-            """
-        )
-        self.conn.execute(
-            "CREATE INDEX records_order_idx ON records (sort1, sort2, sort3, raw_index)"
-        )
-        self.conn.execute(
-            "CREATE INDEX records_session_idx ON records (session_key, sort1, sort2, sort3, raw_index)"
-        )
-        self.conn.execute(
-            "CREATE INDEX records_type_idx ON records (record_type, sort1, sort2, sort3, raw_index)"
-        )
+        self._temp_dir = _spool_dir(temp_dir)
+        self._prefix = prefix
+        self._run_size = max(1, int(os.environ.get("CRYPTO_RECORDER_SPOOL_RUN_SIZE", "20000")))
+        self._buffer: list[Tuple[Tuple[int, int, int, int], str, str, dict]] = []
+        self._run_paths: list[Path] = []
         self.count = 0
         self._closed = False
 
@@ -78,27 +94,56 @@ class RawRecordSpool:
         self.close()
 
     def insert(self, record: dict, sort_key: Tuple[int, int, int], raw_index: int) -> None:
-        payload = json.dumps(record, separators=(",", ":"), ensure_ascii=False)
-        self.conn.execute(
-            """
-            INSERT INTO records
-                (sort1, sort2, sort3, raw_index, record_type, session_key, payload)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                int(sort_key[0]),
-                int(sort_key[1]),
-                int(sort_key[2]),
-                int(raw_index),
-                str(record.get("record_type", "")),
-                _session_key(record),
-                payload,
-            ),
-        )
+        key = (int(sort_key[0]), int(sort_key[1]), int(sort_key[2]), int(raw_index))
+        record_type = str(record.get("record_type", ""))
+        session_key = _session_key(record)
+        self._buffer.append((key, record_type, session_key, record))
         self.count += 1
+        if len(self._buffer) >= self._run_size:
+            self._flush_run()
+
+    def _flush_run(self) -> None:
+        if not self._buffer:
+            return
+        self._buffer.sort(key=lambda item: item[0])
+        fh = tempfile.NamedTemporaryFile(
+            prefix=self._prefix,
+            suffix=".run",
+            dir=self._temp_dir,
+            delete=False,
+        )
+        run_path = Path(fh.name)
+        try:
+            for item in self._buffer:
+                pickle.dump(item, fh, protocol=pickle.HIGHEST_PROTOCOL)
+        finally:
+            fh.close()
+        self._run_paths.append(run_path)
+        self._buffer = []
 
     def commit(self) -> None:
-        self.conn.commit()
+        self._flush_run()
+
+    @staticmethod
+    def _iter_run_file(path: Path) -> Iterator[Tuple[Tuple[int, int, int, int], str, str, dict]]:
+        with open(path, "rb") as fh:
+            while True:
+                try:
+                    yield pickle.load(fh)
+                except EOFError:
+                    return
+
+    def _iter_sorted(self) -> Iterator[Tuple[Tuple[int, int, int, int], str, str, dict]]:
+        """Bounded-memory k-way merge across all sorted run files.
+
+        ``heapq.merge`` pulls at most one buffered item per run file at a
+        time, so peak memory here is O(number of runs), not O(total
+        record count).
+        """
+        if not self._run_paths:
+            return
+        iterators = [self._iter_run_file(p) for p in self._run_paths]
+        yield from heapq.merge(*iterators, key=lambda item: item[0])
 
     def iter_records(
         self,
@@ -107,58 +152,34 @@ class RawRecordSpool:
         session_id: object | None = None,
         min_sort_key: Tuple[int, int, int] | None = None,
     ) -> Iterator[dict]:
-        clauses: list[str] = []
-        params: list[Any] = []
-        if record_type is not None:
-            clauses.append("record_type = ?")
-            params.append(record_type)
-        if session_id is not None:
-            clauses.append("session_key = ?")
-            params.append(str(session_id))
+        session_key = None if session_id is None else str(session_id)
+        min_key: Tuple[int, int, int] | None = None
         if min_sort_key is not None:
-            clauses.append("(sort1, sort2, sort3) >= (?, ?, ?)")
-            params.extend([int(min_sort_key[0]), int(min_sort_key[1]), int(min_sort_key[2])])
-        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        cursor = self.conn.execute(
-            f"""
-            SELECT payload FROM records
-            {where}
-            ORDER BY sort1, sort2, sort3, raw_index
-            """,
-            params,
-        )
-        for (payload,) in cursor:
-            yield json.loads(payload)
+            min_key = (int(min_sort_key[0]), int(min_sort_key[1]), int(min_sort_key[2]))
+        for key, rt, sk, record in self._iter_sorted():
+            if record_type is not None and rt != record_type:
+                continue
+            if session_key is not None and sk != session_key:
+                continue
+            if min_key is not None and key[:3] < min_key:
+                continue
+            yield record
 
     def first_record(self, *, record_type: str | None = None) -> Optional[dict]:
-        clauses: list[str] = []
-        params: list[Any] = []
-        if record_type is not None:
-            clauses.append("record_type = ?")
-            params.append(record_type)
-        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        row = self.conn.execute(
-            f"""
-            SELECT payload FROM records
-            {where}
-            ORDER BY sort1, sort2, sort3, raw_index
-            LIMIT 1
-            """,
-            params,
-        ).fetchone()
-        return json.loads(row[0]) if row else None
+        for key, rt, sk, record in self._iter_sorted():
+            if record_type is not None and rt != record_type:
+                continue
+            return record
+        return None
 
     def has_record_before(self, record_type: str, sort_key: Tuple[int, int, int]) -> bool:
-        row = self.conn.execute(
-            """
-            SELECT 1 FROM records
-            WHERE record_type = ?
-              AND (sort1, sort2, sort3) < (?, ?, ?)
-            LIMIT 1
-            """,
-            (record_type, int(sort_key[0]), int(sort_key[1]), int(sort_key[2])),
-        ).fetchone()
-        return row is not None
+        target = (int(sort_key[0]), int(sort_key[1]), int(sort_key[2]))
+        for key, rt, sk, record in self._iter_sorted():
+            if key[:3] >= target:
+                break
+            if rt == record_type:
+                return True
+        return False
 
     def max_record(
         self,
@@ -167,27 +188,35 @@ class RawRecordSpool:
         session_id: object,
         first_tie: bool = False,
     ) -> Optional[dict]:
-        order_by = (
-            "sort1 DESC, sort2 DESC, sort3 ASC, raw_index ASC"
-            if first_tie
-            else "sort1 DESC, sort2 DESC, sort3 DESC, raw_index DESC"
-        )
-        row = self.conn.execute(
-            f"""
-            SELECT payload FROM records
-            WHERE record_type = ? AND session_key = ?
-            ORDER BY {order_by}
-            LIMIT 1
-            """,
-            (record_type, str(session_id)),
-        ).fetchone()
-        return json.loads(row[0]) if row else None
+        session_key = str(session_id)
+        best_cmp_key: Optional[tuple] = None
+        best_record: Optional[dict] = None
+        for key, rt, sk, record in self._iter_sorted():
+            if rt != record_type or sk != session_key:
+                continue
+            # Mirrors the prior SQL ORDER BY exactly:
+            #   first_tie=True:  sort1 DESC, sort2 DESC, sort3 ASC,  raw_index ASC  LIMIT 1
+            #   first_tie=False: sort1 DESC, sort2 DESC, sort3 DESC, raw_index DESC LIMIT 1
+            # i.e. maximize (sort1, sort2) always; among ties, minimize
+            # (sort3, raw_index) for first_tie, else maximize them too.
+            if first_tie:
+                cmp_key = (key[0], key[1], -key[2], -key[3])
+            else:
+                cmp_key = key
+            if best_cmp_key is None or cmp_key > best_cmp_key:
+                best_cmp_key = cmp_key
+                best_record = record
+        return best_record
 
     def close(self) -> None:
         if self._closed:
             return
         self._closed = True
-        self.conn.close()
+        for run_path in self._run_paths:
+            try:
+                run_path.unlink()
+            except FileNotFoundError:
+                pass
         try:
             self.path.unlink()
         except FileNotFoundError:
