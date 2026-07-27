@@ -88,15 +88,47 @@ class RawRecordSpool:
     ``*.run.part`` file which is flushed and closed *before* being
     atomically renamed (``os.replace``, a single filesystem rename) to
     its final ``*.run`` path — a reader can therefore never observe a
-    partially written merge output under its final name. The input run
-    files for a given pass are unlinked only *after* their replacement
-    output file has been durably closed and atomically renamed into
-    place. If an exception is raised while writing a merge output, the
-    partial ``*.run.part`` file is removed and the exception propagates;
-    the (still-untouched) input run files for that pass are left in
-    place so no data is lost. Broader process-kill/SIGKILL/unknown crash
-    cleanup of stray temp files is explicitly out of scope here and is
-    deferred to the already-planned Phase 11 (per the approved plan).
+    partially written merge output under its final name. If
+    ``os.replace`` itself fails (e.g. disk full, cross-device, permission
+    error), the still-fully-written-and-closed ``*.run.part`` file is
+    treated as a partial output and removed, exactly like a failure
+    during writing.
+
+    **Transactional ownership/state model** (corrected): ``self._run_paths``
+    is updated to reflect a completed merge — replacing the batch's
+    input paths with the new merged output path — only *after*
+    ``_merge_batch`` has returned successfully (i.e. after the output is
+    fully written, fsync'd, closed, and atomically renamed into place).
+    If any batch or merge pass raises partway through a multi-pass
+    reduction, ``self._run_paths`` therefore still reflects exactly the
+    complete, valid, retryable set of sorted runs from immediately
+    before that failing batch — every already-completed batch from this
+    same call remains reflected (its output tracked, its inputs no
+    longer part of ``self._run_paths``), and the failing batch's own
+    inputs are left untouched on disk and still listed. A subsequent
+    call (e.g. the next query) automatically retries from that exact
+    state — no manual reset is required, since ``self._merged`` is only
+    ever set ``True`` once every run has been folded down to one. Every
+    run file this spool ever creates (initial flushed runs and every
+    merge output, including a ``*.run.part`` that fails before rename)
+    is also recorded in ``self._owned_paths``, an append-only ownership
+    set consulted by ``close()`` — so ``close()`` reliably removes every
+    file this spool ever created, including any intermediate output
+    already logically superseded but that happened to fail to unlink,
+    and any partial output left behind by a caught failure. Broader
+    process-kill/SIGKILL/unknown crash discovery of stray temp files
+    *after this process exits* is explicitly out of scope here and
+    remains deferred to the already-planned Phase 11 (per the approved
+    plan).
+
+    Inserting additional records after a query (which triggers the
+    lazy merge-and-cache) is still supported, exactly like the original
+    SQLite-backed implementation (where every query was a live view of
+    the current table contents): ``insert()`` unconditionally invalidates
+    the cached merged state (``self._merged = False``), and the merge is
+    lazily redone (folding in the already-merged run alongside any newly
+    buffered/flushed records) the next time a query is made — so later
+    records are never silently ignored.
 
     The public interface (``insert``/``commit``/``iter_records``/
     ``first_record``/``has_record_before``/``max_record``/``close``,
@@ -136,6 +168,13 @@ class RawRecordSpool:
         self._buffer: list[Tuple[Tuple[int, int, int, int], str, str, bytes]] = []
         self._buffer_bytes = 0
         self._run_paths: list[Path] = []
+        # Append-only record of every run file this spool has ever
+        # created (initial flushed runs and every merge output,
+        # including a ``.run.part`` that failed before its rename) — the
+        # safety net ``close()`` uses to guarantee every owned file is
+        # removed, independent of ``self._run_paths``'s current logical
+        # state.
+        self._owned_paths: set[Path] = set()
         self._merged = False
         self.count = 0
         self._closed = False
@@ -154,6 +193,12 @@ class RawRecordSpool:
         self._buffer.append((key, record_type, session_key, payload))
         self._buffer_bytes += len(payload)
         self.count += 1
+        # Any new record invalidates a previously cached fully merged
+        # single run: a later query must fold this (and any other new)
+        # record in, exactly like the original SQLite-backed
+        # implementation where every query was a live view of the
+        # current table contents. Never silently ignored.
+        self._merged = False
         # Flushing whenever accumulated bytes reach the budget — even
         # for a single, individually oversized record — bounds memory
         # unconditionally: an oversized record becomes its own
@@ -173,6 +218,7 @@ class RawRecordSpool:
             delete=False,
         )
         run_path = Path(fh.name)
+        self._owned_paths.add(run_path)
         try:
             for item in self._buffer:
                 pickle.dump(item, fh, protocol=pickle.HIGHEST_PROTOCOL)
@@ -210,6 +256,7 @@ class RawRecordSpool:
             delete=False,
         )
         tmp_path = Path(tmp_fh.name)
+        self._owned_paths.add(tmp_path)
         try:
             iterators = [self._iter_run_file(p) for p in batch]
             for item in heapq.merge(*iterators, key=lambda entry: entry[0]):
@@ -226,7 +273,18 @@ class RawRecordSpool:
         else:
             tmp_fh.close()
         final_path = Path(str(tmp_path)[: -len(".part")])
-        os.replace(tmp_path, final_path)
+        try:
+            os.replace(tmp_path, final_path)
+        except BaseException:
+            # os.replace() itself failed: the fully written, closed
+            # `.run.part` file is a partial output exactly like a
+            # mid-write failure — remove it and propagate.
+            try:
+                tmp_path.unlink()
+            except FileNotFoundError:
+                pass
+            raise
+        self._owned_paths.add(final_path)
         return final_path
 
     def _ensure_single_run(self) -> None:
@@ -234,29 +292,48 @@ class RawRecordSpool:
         file via bounded fan-in hierarchical (multi-pass) merging, then
         cache the result so subsequent calls are no-ops. Each pass opens
         at most ``fan_in`` input files plus 1 output file — never
-        proportional to the total number of runs."""
+        proportional to the total number of runs.
+
+        Any pending buffered records are flushed first, so records
+        inserted since the last merge (whether or not they triggered an
+        automatic budget-flush) are always folded in — a later query
+        never silently misses them.
+
+        Processes one bounded batch at a time (rather than whole
+        "levels"), reassigning ``self._run_paths`` only immediately
+        after each individual batch's merge has fully and successfully
+        completed (write + fsync + close + atomic rename). This keeps
+        ``self._run_paths`` a complete, valid, retryable set of sorted
+        runs at every point — if a later batch (or a later pass over the
+        shrinking run list) raises, every already-completed batch from
+        this same call remains correctly reflected, and the exception
+        propagates with ``self._merged`` still ``False`` so the next
+        query call automatically retries from that exact state.
+        """
+        self._flush_run()
         if self._merged:
             return
-        current = list(self._run_paths)
-        while len(current) > 1:
-            next_level: list[Path] = []
-            for i in range(0, len(current), self._fan_in):
-                batch = current[i : i + self._fan_in]
-                if len(batch) == 1:
-                    next_level.append(batch[0])
-                    continue
-                merged_path = self._merge_batch(batch)
-                next_level.append(merged_path)
-                # Inputs are unlinked only now: after their replacement
-                # output has been durably written, closed, and atomically
-                # renamed into place above.
-                for p in batch:
-                    try:
-                        p.unlink()
-                    except FileNotFoundError:
-                        pass
-            current = next_level
-        self._run_paths = current
+        while len(self._run_paths) > 1:
+            batch = self._run_paths[: self._fan_in]
+            merged_path = self._merge_batch(batch)
+            # Commit the new logical state only now that the merge for
+            # this batch has fully and durably succeeded: the batch's
+            # inputs are atomically replaced by the single merged output
+            # in one assignment, so a reader of ``self._run_paths`` (e.g.
+            # a failure handler after a caught exception) never observes
+            # a partial in-between state.
+            self._run_paths = [merged_path] + self._run_paths[len(batch) :]
+            # Only now, after the new state is committed, remove the
+            # superseded input files from disk. Any file that fails to
+            # unlink here (anything other than already-gone) is still in
+            # ``self._owned_paths`` and will be cleaned up by ``close()``;
+            # it is no longer part of ``self._run_paths``, so it can
+            # never be double-processed.
+            for p in batch:
+                try:
+                    p.unlink()
+                except FileNotFoundError:
+                    pass
         self._merged = True
 
     def _iter_sorted(self) -> Iterator[Tuple[Tuple[int, int, int, int], str, str, dict]]:
@@ -336,7 +413,12 @@ class RawRecordSpool:
         if self._closed:
             return
         self._closed = True
-        for run_path in self._run_paths:
+        # Union of the current logical run set and every run file ever
+        # created by this spool: guarantees removal of every owned file,
+        # including intermediate merge outputs already logically
+        # superseded, and any partial output left behind by a caught
+        # failure (e.g. a ``.run.part`` from a failed ``os.replace``).
+        for run_path in set(self._run_paths) | self._owned_paths:
             try:
                 run_path.unlink()
             except FileNotFoundError:

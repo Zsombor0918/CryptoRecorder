@@ -495,9 +495,11 @@ def test_merge_failure_cleans_partial_output_and_preserves_inputs(tmp_path, monk
         assert all(p.exists() for p in pre_merge_paths)
 
         # Recovery: with the fault no longer injected, the spool must
-        # still be able to complete the merge correctly on a later call.
+        # still be able to complete the merge correctly on a later call —
+        # no manual reset is required: `self._merged` was never set True
+        # by the failed attempt, so the next query automatically retries
+        # from the exact pre-failure state.
         monkeypatch.setattr(os, "fsync", real_fsync)
-        spool._merged = False  # allow a fresh attempt (simulating a retry)
         seqs = [r["session_seq"] for r in spool.iter_records()]
         assert seqs == list(range(5))
     finally:
@@ -513,3 +515,210 @@ def test_run_bytes_and_fan_in_env_defaults(monkeypatch):
         assert spool._fan_in == 16
     finally:
         spool.close()
+
+
+# ---------------------------------------------------------------------------
+# 4. Transactional ownership/state model corrections: retry safety across
+#    multiple successful batches, later merge passes, os.replace failures,
+#    and insertion after a query.
+# ---------------------------------------------------------------------------
+
+
+def test_retry_after_failure_in_second_batch_after_first_batch_succeeded(tmp_path, monkeypatch):
+    """Injects a failure into the *second* merge batch, after the first
+    batch has already completed successfully (its output tracked, its
+    inputs unlinked). Proves ``self._run_paths`` after the caught
+    failure reflects exactly that complete, valid, retryable state — not
+    a stale reference to already-deleted inputs — and that a later
+    retry recovers every original record exactly once, with no owned
+    file leaked after ``close()``."""
+    fan_in = 4
+    monkeypatch.setenv("CRYPTO_RECORDER_SPOOL_FAN_IN", str(fan_in))
+    monkeypatch.setenv("CRYPTO_RECORDER_SPOOL_RUN_BYTES", "1")  # ~1 record per run
+    n = 12
+
+    spool = RawRecordSpool(temp_dir=tmp_path, prefix="cr-test-2ndbatch-")
+    try:
+        for i in range(n):
+            spool.insert(_record(seq=i, ts=i), (1, i, 0), i)
+        spool.commit()
+        assert len(spool._run_paths) == n
+
+        original_merge_batch = RawRecordSpool._merge_batch
+        calls = {"n": 0}
+
+        def failing_merge_batch(self, batch):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise RuntimeError("simulated failure in second batch")
+            return original_merge_batch(self, batch)
+
+        monkeypatch.setattr(RawRecordSpool, "_merge_batch", failing_merge_batch)
+
+        with pytest.raises(RuntimeError, match="simulated failure in second batch"):
+            list(spool.iter_records())
+
+        assert calls["n"] == 2  # the first batch succeeded before the second failed
+        assert spool._merged is False
+
+        # Exactly one successful reduction (the first batch) must be
+        # reflected: run count shrank by (fan_in - 1), every remaining
+        # path (the first batch's merged output plus every untouched
+        # run) actually exists on disk, and is retryable.
+        assert len(spool._run_paths) == n - (fan_in - 1)
+        for p in spool._run_paths:
+            assert p.exists()
+
+        # Restore the real merge and retry: must recover completely.
+        monkeypatch.setattr(RawRecordSpool, "_merge_batch", original_merge_batch)
+        seqs = [r["session_seq"] for r in spool.iter_records()]
+        assert seqs == list(range(n))
+    finally:
+        spool.close()
+
+    remaining = list(tmp_path.glob("cr-test-2ndbatch-*"))
+    assert remaining == [], f"close() left owned file(s) behind: {remaining}"
+
+
+def test_retry_after_failure_during_later_merge_pass(tmp_path, monkeypatch):
+    """Injects a failure several successful batches into the reduction
+    (i.e. well after the very first batch — representative of a failure
+    during a later merge pass over an already-partially-reduced run
+    list), and proves the same retry-safety guarantee holds regardless
+    of how many prior batches already succeeded."""
+    fan_in = 4
+    monkeypatch.setenv("CRYPTO_RECORDER_SPOOL_FAN_IN", str(fan_in))
+    monkeypatch.setenv("CRYPTO_RECORDER_SPOOL_RUN_BYTES", "1")  # ~1 record per run
+    n = 40  # forces many successful batch merges before the injected failure
+
+    spool = RawRecordSpool(temp_dir=tmp_path, prefix="cr-test-laterpass-")
+    try:
+        for i in range(n):
+            spool.insert(_record(seq=i, ts=i), (1, i, 0), i)
+        spool.commit()
+        assert len(spool._run_paths) == n
+
+        original_merge_batch = RawRecordSpool._merge_batch
+        calls = {"n": 0}
+        fail_at = 5  # several batches succeed first
+
+        def failing_merge_batch(self, batch):
+            calls["n"] += 1
+            if calls["n"] == fail_at:
+                raise RuntimeError("simulated failure during a later merge pass")
+            return original_merge_batch(self, batch)
+
+        monkeypatch.setattr(RawRecordSpool, "_merge_batch", failing_merge_batch)
+
+        with pytest.raises(RuntimeError, match="simulated failure during a later merge pass"):
+            list(spool.iter_records())
+
+        assert calls["n"] == fail_at
+        assert spool._merged is False
+        expected_run_count = n - (fail_at - 1) * (fan_in - 1)
+        assert len(spool._run_paths) == expected_run_count
+        for p in spool._run_paths:
+            assert p.exists()
+
+        monkeypatch.setattr(RawRecordSpool, "_merge_batch", original_merge_batch)
+        seqs = [r["session_seq"] for r in spool.iter_records()]
+        assert seqs == list(range(n))
+    finally:
+        spool.close()
+
+    remaining = list(tmp_path.glob("cr-test-laterpass-*"))
+    assert remaining == [], f"close() left owned file(s) behind: {remaining}"
+
+
+def test_retry_after_os_replace_failure_cleans_partial_output(tmp_path, monkeypatch):
+    """A failure raised by ``os.replace`` itself (after the merge output
+    has been fully written, fsync'd, and closed under its ``.run.part``
+    name) must be treated exactly like a mid-write failure: the partial
+    output is removed, the not-yet-consumed inputs for that batch are
+    left untouched, and a later retry (once the fault is gone) recovers
+    every original record exactly once with no owned file leaked."""
+    fan_in = 4
+    monkeypatch.setenv("CRYPTO_RECORDER_SPOOL_FAN_IN", str(fan_in))
+    monkeypatch.setenv("CRYPTO_RECORDER_SPOOL_RUN_BYTES", "1")  # ~1 record per run
+    n = 5  # > fan_in -> a real merge batch is required
+
+    spool = RawRecordSpool(temp_dir=tmp_path, prefix="cr-test-replacefail-")
+    try:
+        for i in range(n):
+            spool.insert(_record(seq=i, ts=i), (1, i, 0), i)
+        spool.commit()
+        pre_merge_paths = list(spool._run_paths)
+        assert len(pre_merge_paths) == n
+        assert all(p.exists() for p in pre_merge_paths)
+
+        real_replace = os.replace
+        state = {"raised": False}
+
+        def failing_replace(src, dst):
+            if not state["raised"]:
+                state["raised"] = True
+                raise OSError("simulated os.replace failure")
+            return real_replace(src, dst)
+
+        monkeypatch.setattr(os, "replace", failing_replace)
+
+        with pytest.raises(OSError):
+            list(spool.iter_records())
+
+        # No partial merge output (.run.part) must remain — an
+        # os.replace failure is treated exactly like a mid-write failure.
+        leftover_parts = list(tmp_path.glob("*.run.part"))
+        assert leftover_parts == [], f"partial merge output(s) left behind: {leftover_parts}"
+
+        # Inputs for the failed batch are untouched, and the logical
+        # state is still the complete, valid, retryable pre-failure set.
+        assert spool._run_paths == pre_merge_paths
+        assert all(p.exists() for p in pre_merge_paths)
+        assert spool._merged is False
+
+        monkeypatch.setattr(os, "replace", real_replace)
+        seqs = [r["session_seq"] for r in spool.iter_records()]
+        assert seqs == list(range(n))
+    finally:
+        spool.close()
+
+    remaining = list(tmp_path.glob("cr-test-replacefail-*"))
+    assert remaining == [], f"close() left owned file(s) behind: {remaining}"
+
+
+def test_insert_after_query_then_commit_then_query_sees_all_records_exactly_once(tmp_path):
+    """Insertion, a query (which merges and caches), then additional
+    insertion, ``commit()``, and another query — the second query must
+    see every original record plus every newly inserted record, each
+    exactly once. Proves inserting after a query never silently ignores
+    the new records (matching the original SQLite-backed implementation,
+    where every query was a live view of the current table contents),
+    and that no owned file leaks after ``close()``."""
+    tmp_dir = tmp_path
+    spool = RawRecordSpool(temp_dir=tmp_dir, prefix="cr-test-insertafterquery-")
+    try:
+        for i in range(5):
+            spool.insert(_record(seq=i, ts=i), (1, i, 0), i)
+        spool.commit()
+
+        first_pass = [r["session_seq"] for r in spool.iter_records()]
+        assert first_pass == list(range(5))
+        assert spool._merged is True  # cached after the first query
+
+        # Insert more records AFTER a query has already merged/cached the
+        # spool — must invalidate the cache rather than silently drop
+        # these records from any future query.
+        for i in range(5, 8):
+            spool.insert(_record(seq=i, ts=i), (1, i, 0), i)
+        assert spool._merged is False  # invalidated immediately on insert
+
+        spool.commit()
+
+        second_pass = [r["session_seq"] for r in spool.iter_records()]
+        assert second_pass == list(range(8)), "later records must not be silently ignored"
+        assert sorted(second_pass) == list(range(8)), "no duplicates, no loss"
+    finally:
+        spool.close()
+
+    remaining = list(tmp_dir.glob("cr-test-insertafterquery-*"))
+    assert remaining == [], f"close() left owned file(s) behind: {remaining}"

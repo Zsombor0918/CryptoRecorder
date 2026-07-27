@@ -93,6 +93,180 @@ An entry may be skipped **only** for:
 - <or "none — task fully completed">
 ```
 
+## 2026-07-27 — fix(converter): make spool merge state transactionally retryable
+
+### Change summary
+- `bc00b1e` was reviewed and its byte-budget/bounded-fan-in/atomic-write/
+  descriptor-bound fixes were accepted. One remaining transactional-state
+  gap was identified and is fixed here, on top of `bc00b1e` (kept, not
+  reverted): `_ensure_single_run()` only reassigned `self._run_paths`
+  once the *entire* multi-level reduction finished successfully. If one
+  or more batches had already merged successfully and unlinked their
+  inputs, and a *later* batch (or a later merge pass) then raised,
+  `self._run_paths` still referenced the already-deleted inputs from the
+  successful batches — retry was impossible (the stale paths no longer
+  existed on disk) and `close()` would leak the completed intermediate
+  merge outputs (they were reachable from neither `self._run_paths` nor
+  any other tracked collection).
+- **Fix — ownership/state model corrected**:
+  - `_ensure_single_run()` rewritten as a single rolling reduction
+    (rather than processing whole "levels" of the reduction tree at
+    once): it repeatedly takes the next `fan_in`-sized batch directly
+    from the front of `self._run_paths`, calls `_merge_batch()` (which
+    may raise, leaving `self._run_paths` completely untouched), and only
+    once that call returns successfully reassigns `self._run_paths` in
+    a single atomic Python statement (`self._run_paths = [merged_path] +
+    self._run_paths[len(batch):]`) *before* unlinking the batch's
+    now-superseded input files from disk. This guarantees
+    `self._run_paths` is a complete, valid, retryable set of sorted runs
+    at every single point during the reduction — including immediately
+    after a caught failure — with every already-completed batch from the
+    same call correctly reflected (its output tracked, its inputs no
+    longer listed).
+  - Added `self._owned_paths: set[Path]`, an append-only ownership
+    record populated in `_flush_run()` (every initial flushed run) and
+    `_merge_batch()` (both the `*.run.part` temporary name, immediately
+    on creation, and the final `*.run` name, after a successful atomic
+    rename). `close()` now unlinks the union of `self._run_paths` and
+    `self._owned_paths` — guaranteeing every file this spool has ever
+    created is removed, including any intermediate output that was
+    logically superseded (e.g. by a subsequent successful merge) but
+    happened to fail its unlink, and any partial output left behind by a
+    caught failure — independent of the spool's current logical state.
+  - `_merge_batch()` now also wraps the `os.replace()` call itself in a
+    try/except: if the atomic rename fails (disk full, cross-device
+    rename, permission error), the fully written, fsync'd, and closed
+    `*.run.part` file is treated as a partial output and removed exactly
+    like a mid-write failure, and the exception then propagates.
+  - `_ensure_single_run()` now unconditionally calls `self._flush_run()`
+    at its very start (before checking the `self._merged` cache), so any
+    records buffered but not yet flushed since the last merge always
+    participate in the next merge. `insert()` now unconditionally sets
+    `self._merged = False` on every call (previously this was implicit/
+    accidental via the byte-budget flush path only) — so additional
+    insertion after a query (which triggers the lazy merge-and-cache) is
+    still fully supported, exactly matching the original SQLite-backed
+    implementation's behavior (every query there was a live view of the
+    current table contents): a later query always folds in newly
+    inserted records; no record is ever silently ignored. No manual
+    cache reset is needed anywhere by any caller: retry after a caught
+    failure is now fully automatic, since `self._merged` is only ever
+    set `True` once the entire reduction completes without error.
+- Added 4 new tests to `tests/test_spool_external_merge.py` (now 21
+  total, up from 17), each proving retry recovers every original record
+  exactly once, no owned file leaks after `close()`, and no required
+  input is deleted prematurely:
+  1. a failure injected into the *second* merge batch, after the first
+     batch already succeeded (monkeypatches `RawRecordSpool._merge_batch`
+     with a counting wrapper) — asserts the run count after the caught
+     failure reflects exactly one completed reduction, every remaining
+     path still exists on disk, and a retry (restoring the real method)
+     recovers all records;
+  2. the same pattern with the injected failure occurring several
+     successful batches into a larger (40-record) reduction —
+     representative of a failure during a later merge pass, not just the
+     very first one;
+  3. a failure injected into `os.replace()` itself — proves the
+     fully-written `.run.part` output is cleaned up exactly like a
+     mid-write failure, inputs are untouched, and retry recovers fully;
+  4. insert → commit → query (merges and caches, `self._merged is True`)
+     → additional insert (`self._merged` immediately becomes `False`) →
+     commit → query again — proves the second query sees every original
+     plus every newly inserted record exactly once (no loss, no
+     duplication).
+  Also removed the now-unnecessary manual `spool._merged = False` reset
+  from the pre-existing merge-failure test (retry is automatic now).
+
+### Files/packages touched
+- `converter/spool.py`
+- `tests/test_spool_external_merge.py`
+- `CHANGELOG.md`
+- `docs/CHANGE_AUDIT.md`
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] docs/REPO_STRUCTURE.md
+- [x] docs/PROJECT_STATUS.md
+- [ ] docs/IMPLEMENTATION_AUDIT.md
+- [x] relevant feature docs:
+  - docs/FULL_L2_REPLAY_CATALOG_PLAN.md (reviewed; no status-claim
+    changes needed — this is a correction to an already-internal-only
+    scratch mechanism's failure/retry semantics)
+
+### Docs updated
+- [x] CHANGELOG.md
+- [ ] README.md
+- [ ] docs/PROJECT_STATUS.md
+- [ ] docs/REPO_STRUCTURE.md
+- [ ] relevant feature docs:
+  - none
+- No docs update required because: this is a correction to an internal
+  scratch-storage mechanism's failure/retry state model, with a
+  byte-for-byte-preserved public interface and zero observable semantic
+  change on the success path (proven by an unchanged Tier-2
+  canonical-gate result); no status claim, consumer contract, or repo
+  structure is affected.
+
+### Status / validation impact
+- Validated status changed: no
+- Deferred status changed: no
+- New claims added: no
+- Evidence for any new validation claim: n/a — this entry proves
+  behavior is still UNCHANGED on the success path, and corrects the
+  previously-broken failure/retry path to actually be retryable and
+  leak-free.
+
+### Tests run
+```bash
+source .venv/bin/activate
+python -m pytest tests/test_spool_external_merge.py -q
+# 21 passed
+python -m pytest tests/test_streaming_conversion_memory.py tests/test_convert_day_phase2.py \
+  tests/test_convert_integrity_and_readiness.py tests/test_converter_integration.py \
+  tests/test_depth_deterministic.py tests/test_futures_continuity.py \
+  tests/test_gap_and_fence_diagnostics.py tests/test_replay_store.py \
+  tests/test_replay_depth_adapter.py tests/test_replay_memory_bounded.py \
+  tests/test_replay_sync_continuity.py tests/test_replay_catalog_reconstruct.py \
+  tests/test_semantic_equivalence.py tests/test_catalog_equivalence.py \
+  tests/test_catalog_equivalence_full_l2.py -q
+# 165 passed, 1 skipped
+python -m pytest -q
+# 539 passed, 3 skipped (up from 535 in bc00b1e)
+python -m pytest tests/test_repo_structure.py tests/test_agent_infrastructure.py -q
+# 56 passed
+```
+
+### Validation CLIs run
+```bash
+CRYPTO_RECORDER_DATA_ROOT="$(pwd)/data_raw" python -m validation.validate_catalog_equivalence \
+  --date 2026-06-12 --symbols ADAUSDT --venues BINANCE_SPOT --data-root "$(pwd)/data_raw" \
+  --work-root /tmp/phase6c_v0/work --old-catalog-root /tmp/phase6c_v0/old_catalog \
+  --replay-root /tmp/phase6c_v0/replay --new-catalog-root /tmp/phase6c_v0/new_catalog \
+  --profile full_l2 --emit-depth10 --schema-version 0 --overwrite \
+  --report-path /tmp/phase6c_v0/report.json
+# result: passed. All 7 components pass. fenced_ranges: count_old=34,
+# count_new=34, digest_old==digest_new, same digest as before this
+# correction, bc00b1e, c131217, and the original Phase 6 commit.
+
+CRYPTO_RECORDER_DATA_ROOT="$(pwd)/data_raw" python -m validation.validate_catalog_equivalence \
+  --date 2026-06-12 --symbols ADAUSDT --venues BINANCE_SPOT --data-root "$(pwd)/data_raw" \
+  --work-root /tmp/phase6c_v1/work --old-catalog-root /tmp/phase6c_v1/old_catalog \
+  --replay-root /tmp/phase6c_v1/replay --new-catalog-root /tmp/phase6c_v1/new_catalog \
+  --profile full_l2 --emit-depth10 --schema-version 1 --overwrite \
+  --report-path /tmp/phase6c_v1/report.json
+# result: passed. Same 7/7 pass, same fenced_ranges digest.
+```
+
+### Known limitations / out of scope
+- Phase 7, Tier 3 broader validation, production deployment, retention
+  gate, `uv` migration, and KovacsTrader work were NOT started.
+- Phase 11 (broader unknown/SIGKILL crash-lifecycle discovery of stray
+  temp/scratch files across process restarts) remains explicitly
+  deferred — only the atomic-write + caught-exception cleanup path
+  within a single process's lifetime was corrected here.
+- `convert_day.py`, schema semantics, `DedupeSet`, and `ObjectSpool` were
+  not modified.
+
 ## 2026-07-27 — fix(converter): bound spool memory by bytes and fan-in, not record count
 
 ### Change summary

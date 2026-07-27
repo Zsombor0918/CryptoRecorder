@@ -67,6 +67,77 @@ passes.** Until then, broader full-L2 equivalence stays **deferred** (see
 ## [Unreleased]
 
 ### Added
+- **Issue #20 Phase 6 correction #2: transactionally retryable spool
+  merge state** — a review of `bc00b1e` (accepted the byte-budget/
+  bounded-fan-in/atomic-write/descriptor fixes) found one remaining
+  transactional-state gap: `_ensure_single_run()` only reassigned
+  `self._run_paths` once the *entire* multi-level reduction finished. If
+  one or more batches merged successfully and unlinked their inputs, and
+  a *later* batch (or a later merge pass) then failed, `self._run_paths`
+  still referenced the already-deleted inputs from the successful
+  batches — making retry impossible and causing `close()` to leak the
+  completed intermediate merge outputs. Fixed on top of `bc00b1e` (kept,
+  not reverted):
+  - `_ensure_single_run()` is now a single rolling reduction (not
+    level-by-level): it repeatedly takes the next `fan_in`-sized batch
+    directly from the front of `self._run_paths`, merges it, and — only
+    once that merge has fully and durably succeeded — reassigns
+    `self._run_paths` in one atomic Python assignment (`[merged_path] +
+    self._run_paths[len(batch):]`) *before* unlinking the batch's
+    now-superseded input files. `self._run_paths` is therefore a
+    complete, valid, retryable set of sorted runs at every point in the
+    reduction, including immediately after a caught failure — every
+    already-completed batch remains correctly reflected.
+  - Added `self._owned_paths`, an append-only ownership record of every
+    run file this spool has ever created (initial flushed runs, every
+    merge output including a `*.run.part` that fails before its rename).
+    `close()` now unlinks the union of `self._run_paths` and
+    `self._owned_paths`, guaranteeing every owned file is removed —
+    including any intermediate output already logically superseded, and
+    any partial output left behind by a caught failure — independent of
+    the spool's current logical state.
+  - `_merge_batch()` now also wraps the `os.replace()` call itself in a
+    try/except: if the atomic rename fails (disk full, cross-device,
+    permission error), the fully written and closed `*.run.part` file is
+    treated as a partial output and removed exactly like a mid-write
+    failure, then the exception propagates.
+  - `_ensure_single_run()` now unconditionally flushes any pending
+    buffered records first, and `insert()` now unconditionally
+    invalidates the cached merged state (`self._merged = False`) on
+    every call — so additional insertion after a query is still fully
+    supported (matching the original SQLite-backed implementation, where
+    every query was a live view of the current table), a later query
+    always folds in newly inserted records, and no record is ever
+    silently ignored. No manual cache reset is needed anywhere anymore:
+    retry after a caught failure is fully automatic, since `self._merged`
+    is only ever set `True` once the whole reduction completes without
+    error.
+  - Added 4 new tests to `tests/test_spool_external_merge.py` (now 21
+    total, up from 17): a failure injected into the *second* merge batch
+    after the first batch already succeeded (proves the exact retryable
+    state and a full recovery on retry), a failure injected several
+    batches into a larger reduction (representative of a failure during
+    a later merge pass), a failure injected into `os.replace()` itself
+    (proves the same partial-output cleanup and retry-safety), and an
+    insert-after-query-then-commit-then-query test (proves later records
+    are folded in, not silently dropped, with no duplication or loss).
+    Every new failure-injection test also asserts `close()` leaves zero
+    files behind under the spool's temp-file prefix.
+  - **Tier-2 re-run** (canonical `validation.validate_catalog_equivalence`
+    CLI, ADAUSDT, 2026-06-12, real local `data_raw`): both
+    `--schema-version 0` and `--schema-version 1` still pass all 7
+    gating components, `fenced_ranges` still byte-identical (34/34, same
+    canonical digest as before this correction, `bc00b1e`, `c131217`,
+    and the original Phase 6 commit).
+  - Full suite: 539 passed, 3 skipped (up from 535 in `bc00b1e`, +4 new
+    tests); spool-dependent regression set (15 files): 165 passed, 1
+    skipped; guards: 56 passed.
+  - No change to `convert_day.py`, schema semantics, `DedupeSet`, or
+    `ObjectSpool`. Broader unknown/SIGKILL crash-lifecycle discovery of
+    stray temp files after this process exits remains deferred to the
+    already-planned Phase 11. Still strictly out of scope: Phase 7,
+    Tier 3, production deployment, custom binary format, retention gate,
+    uv, KovacsTrader.
 - **Issue #20 Phase 6 correction: byte-budgeted buffering + bounded
   fan-in hierarchical merge** — a review of the first Phase 6 commit
   (`c131217`, not approved) correctly identified 4 violations of the
