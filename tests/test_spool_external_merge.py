@@ -1,26 +1,43 @@
-"""Focused tests for the issue #20 Phase 6 correction: replace the
-scratch-heavy SQLite full-JSON RawRecordSpool with a bounded-memory
-external merge sort (buffered runs sorted in memory up to a bounded run
-size, flushed to disk-backed pickle files, merged via a k-way
-``heapq.merge``).
+"""Focused tests for the issue #20 Phase 6 correction (RawRecordSpool):
+a bounded-memory external merge sort replacing the SQLite full-JSON
+scratch store, corrected to satisfy the approved Phase 6 RAM/scratch
+model exactly:
+
+  - the in-memory run buffer is bounded by *serialized byte size*
+    (``CRYPTO_RECORDER_SPOOL_RUN_BYTES``), not by record count, since
+    raw depth records vary hugely in size;
+  - the final merge is a bounded-fan-in hierarchical (multi-pass) merge
+    (``CRYPTO_RECORDER_SPOOL_FAN_IN``), never a flat merge across every
+    run file, so memory/file-descriptor usage during a merge pass is
+    O(fan_in), never O(number of runs);
+  - each intermediate merge output is written atomically (temp name,
+    flush+fsync+close, then os.replace) and inputs are unlinked only
+    after the replacement output is durably in place;
+  - a failure while writing an intermediate merge output cleans up the
+    partial output and leaves not-yet-consumed inputs untouched.
 
 These tests prove:
   - correctness is unchanged (sort order, filters, first_record,
     has_record_before, max_record semantics all match the prior
-    SQLite-backed behavior exactly, including first_tie tie-breaking);
-  - peak memory is bounded by the configured run size, not by the total
-    number of spooled records (live-object-counter proof, same pattern
-    as tests/test_streaming_gating_bounded_memory.py);
-  - multiple run files are actually created once the run-size threshold
-    is exceeded (proving the external-merge path, not an in-memory sort,
-    is exercised for large inputs);
-  - temp-file cleanup on close() still works (multiple run files, not
-    just a single sqlite file).
+    SQL-based behavior exactly, including first_tie tie-breaking),
+    including across multiple bounded-fan-in merge passes;
+  - the byte budget — not record count — governs run-file flush
+    boundaries, even for highly variable/large nested payloads, and a
+    single oversized record is still accepted without blocking;
+  - forcing more than 100 runs never opens more than
+    ``fan_in + small constant`` files at once, including across
+    repeated query passes (which reuse the cached, already-merged
+    single run file);
+  - a failure during an intermediate merge cleans the partial output
+    and does not delete inputs prematurely;
+  - close() cleans up all remaining run files and the marker path.
 """
 from __future__ import annotations
 
+import builtins
 import gc
 import os
+import pickle
 
 import pytest
 
@@ -65,6 +82,38 @@ def _record(*, session=1, seq, ts, record_type="depth_update", counter=None, **e
     if counter is not None:
         return _TrackedRecord(base, counter=counter)
     return base
+
+
+class _OpenTracker:
+    """Wraps builtins.open to count concurrently-open file handles,
+    used to empirically prove the bounded-fan-in file-descriptor
+    guarantee without depending on platform-specific /proc/self/fd
+    inspection."""
+
+    def __init__(self):
+        self.current = 0
+        self.peak = 0
+        self._real_open = builtins.open
+
+    def install(self, monkeypatch):
+        monkeypatch.setattr(builtins, "open", self._tracked_open)
+
+    def _tracked_open(self, path, mode="r", *args, **kwargs):
+        fh = self._real_open(path, mode, *args, **kwargs)
+        tracker = self
+        real_close = fh.close
+
+        def _close():
+            if not getattr(fh, "_tracked_closed", False):
+                fh._tracked_closed = True
+                tracker.current -= 1
+            real_close()
+
+        fh._tracked_closed = False
+        fh.close = _close
+        tracker.current += 1
+        tracker.peak = max(tracker.peak, tracker.current)
+        return fh
 
 
 def test_iter_records_sort_order_matches_canonical_key(tmp_path):
@@ -169,37 +218,112 @@ def test_close_removes_all_run_files_and_marker(tmp_path):
     assert list(tmp_path.iterdir()) == []
 
 
-def test_run_size_env_var_produces_multiple_run_files(tmp_path, monkeypatch):
-    """Forcing a small run size must produce multiple on-disk run files
-    for a moderate number of records — proving the external-merge path
-    (not a single in-memory sort) is genuinely exercised."""
-    monkeypatch.setenv("CRYPTO_RECORDER_SPOOL_RUN_SIZE", "10")
-    with RawRecordSpool(temp_dir=tmp_path, prefix="cr-test-runsize-") as spool:
-        for i in range(55):
-            spool.insert(_record(seq=i, ts=i), (1, i, 0), i)
+# ---------------------------------------------------------------------------
+# 1. Byte-budgeted buffering (not record-count buffering)
+# ---------------------------------------------------------------------------
+
+
+def test_byte_budget_flushes_based_on_serialized_size_not_record_count(tmp_path, monkeypatch):
+    """The run buffer must flush once *cumulative serialized bytes*
+    cross the configured budget — never once a record *count* is
+    reached. Predicts exact flush boundaries by replicating the spool's
+    own accounting against directly measured pickle sizes, so the test
+    is not tied to a specific pickle-protocol byte count."""
+    budget = 100_000
+    monkeypatch.setenv("CRYPTO_RECORDER_SPOOL_RUN_BYTES", str(budget))
+    monkeypatch.setenv("CRYPTO_RECORDER_SPOOL_FAN_IN", "16")
+
+    pad_len = 40_000
+    n = 7
+
+    def make(i):
+        return _record(seq=i, ts=i, pad="x" * pad_len)
+
+    sizes = [len(pickle.dumps(make(i), protocol=pickle.HIGHEST_PROTOCOL)) for i in range(n)]
+    expected_run_sizes: list[int] = []
+    running = 0
+    count_in_run = 0
+    for s in sizes:
+        running += s
+        count_in_run += 1
+        if running >= budget:
+            expected_run_sizes.append(count_in_run)
+            running = 0
+            count_in_run = 0
+    if count_in_run:
+        expected_run_sizes.append(count_in_run)
+    # Sanity: the budget must actually be exercised (multiple runs), not
+    # collapse into one giant in-memory run.
+    assert len(expected_run_sizes) >= 2
+
+    with RawRecordSpool(temp_dir=tmp_path, prefix="cr-test-bytesbudget-") as spool:
+        for i in range(n):
+            spool.insert(make(i), (1, i, 0), i)
         spool.commit()
-        assert len(spool._run_paths) == 6  # ceil(55/10)
-        # Correctness must still hold across multiple runs.
+        assert len(spool._run_paths) == len(expected_run_sizes)
         seqs = [r["session_seq"] for r in spool.iter_records()]
-        assert seqs == list(range(55))
+        assert seqs == list(range(n))
 
 
-def test_run_size_env_var_default_is_bounded(monkeypatch):
-    monkeypatch.delenv("CRYPTO_RECORDER_SPOOL_RUN_SIZE", raising=False)
-    spool = RawRecordSpool()
-    try:
-        assert spool._run_size == 20000
-    finally:
-        spool.close()
+def test_byte_budget_handles_highly_variable_payload_sizes(tmp_path, monkeypatch):
+    """Mixes tiny records with large nested-array payloads (mirroring
+    real depth_update vs sync_state size variance) and proves the byte
+    budget still bounds run sizes and correctness is preserved."""
+    budget = 200_000
+    monkeypatch.setenv("CRYPTO_RECORDER_SPOOL_RUN_BYTES", str(budget))
+    monkeypatch.setenv("CRYPTO_RECORDER_SPOOL_FAN_IN", "8")
+
+    def make(i):
+        if i % 5 == 0:
+            # Large nested payload, mirroring a real depth_update with a
+            # sizeable bids/asks array.
+            book = [[str(i + j), str(j)] for j in range(5000)]
+            return _record(seq=i, ts=i, bids=book, asks=book)
+        # Small payload, mirroring a sync_state/stream_lifecycle record.
+        return _record(seq=i, ts=i, record_type="sync_state", state="synced")
+
+    n = 40
+    with RawRecordSpool(temp_dir=tmp_path, prefix="cr-test-variable-") as spool:
+        for i in range(n):
+            spool.insert(make(i), (1, i, 0), i)
+        spool.commit()
+        # Multiple runs must have been produced (budget genuinely exercised).
+        assert len(spool._run_paths) >= 2
+        seqs = [r["session_seq"] for r in spool.iter_records()]
+        assert seqs == list(range(n))
 
 
-def test_peak_live_records_bounded_by_run_size_not_total_count(tmp_path, monkeypatch):
+def test_oversized_single_record_flushes_alone_without_blocking(tmp_path, monkeypatch):
+    """A single record whose serialized size already exceeds the byte
+    budget must still be accepted: it becomes its own one-record run,
+    flushed immediately, rather than blocking or growing the buffer
+    without bound."""
+    monkeypatch.setenv("CRYPTO_RECORDER_SPOOL_RUN_BYTES", "1000")
+    with RawRecordSpool(temp_dir=tmp_path, prefix="cr-test-oversized-") as spool:
+        huge = _record(seq=0, ts=0, pad="x" * 100_000)  # payload far exceeds budget
+        spool.insert(huge, (1, 0, 0), 0)
+        # Buffer must have been flushed immediately after this single
+        # oversized insert — never retained/accumulated further.
+        assert spool._buffer == []
+        assert spool._buffer_bytes == 0
+        assert len(spool._run_paths) == 1
+
+        spool.insert(_record(seq=1, ts=1), (1, 1, 0), 1)
+        spool.commit()
+        seqs = [r["session_seq"] for r in spool.iter_records()]
+        assert seqs == [0, 1]
+
+
+def test_peak_live_records_bounded_not_proportional_to_total_count(tmp_path, monkeypatch):
     """Live-object-counter proof (same pattern as
     tests/test_streaming_gating_bounded_memory.py): insert far more
-    records than the configured run size and prove the number of
+    records than fit in a single run buffer and prove the number of
     simultaneously-alive Python record objects during insertion never
-    exceeds a small bound tied to the run size, not the total count."""
-    monkeypatch.setenv("CRYPTO_RECORDER_SPOOL_RUN_SIZE", "200")
+    grows proportionally to the total record count. Records are
+    serialized to bytes immediately on insert() and the live object is
+    not retained beyond that call, so peak-alive should stay very small
+    regardless of how many records are spooled."""
+    monkeypatch.setenv("CRYPTO_RECORDER_SPOOL_RUN_BYTES", "50000")
     counter = _LiveCounter()
     n = 5_000
 
@@ -213,18 +337,179 @@ def test_peak_live_records_bounded_by_run_size_not_total_count(tmp_path, monkeyp
         spool.commit()
         gc.collect()
 
-        # Peak alive records while inserting must stay small relative to
-        # the total record count (bounded by run size, with some slack for
-        # transient references during flush), never proportional to n.
-        assert counter.max_alive < 1000, (
+        assert counter.max_alive < 50, (
             f"peak alive records ({counter.max_alive}) not bounded — "
-            f"expected well under total count {n}"
+            f"expected far under total count {n}"
         )
 
-        # Correctness: full sorted output must still be exactly right even
-        # though it spanned many run files.
         seqs = [r["session_seq"] for r in spool.iter_records()]
         assert seqs == list(range(n))
 
     gc.collect()
     assert counter.alive == 0, "all spooled records must be released after spool.close()"
+
+
+# ---------------------------------------------------------------------------
+# 2. Bounded fan-in hierarchical (multi-pass) merge
+# ---------------------------------------------------------------------------
+
+
+def test_multipass_merge_preserves_correctness_across_many_small_runs(tmp_path, monkeypatch):
+    """Forces a small fan_in and a tiny byte budget so many runs are
+    created and several merge passes are genuinely required (not just
+    one flat merge), then proves the final output is still fully and
+    correctly sorted, and every existing query method still matches the
+    prior SQL-based semantics."""
+    monkeypatch.setenv("CRYPTO_RECORDER_SPOOL_FAN_IN", "2")
+    monkeypatch.setenv("CRYPTO_RECORDER_SPOOL_RUN_BYTES", "1")  # ~1 record per run
+
+    n = 50
+    with RawRecordSpool(temp_dir=tmp_path, prefix="cr-test-multipass-") as spool:
+        # Insert in reverse order to prove sorting (not insertion order)
+        # drives the final output, across multiple merge passes.
+        for i in reversed(range(n)):
+            spool.insert(_record(seq=i, ts=i), (1, i, 0), i)
+        spool.commit()
+        assert len(spool._run_paths) > 20  # sanity: genuinely many runs, multi-pass required
+
+        seqs = [r["session_seq"] for r in spool.iter_records()]
+        assert seqs == list(range(n))
+        assert spool.first_record()["session_seq"] == 0
+        assert spool.has_record_before("depth_update", (1, 10, 0)) is True
+        assert spool.has_record_before("depth_update", (1, 0, 0)) is False
+        best = spool.max_record(record_type="depth_update", session_id=1, first_tie=False)
+        assert best["session_seq"] == n - 1
+
+
+def test_fan_in_bounds_concurrent_open_files_across_many_runs(tmp_path, monkeypatch):
+    """Forcing more than 100 runs must never open more than
+    ``fan_in + small documented constant`` files at once during the
+    merge, and repeated query passes (which reuse the cached, already
+    merged single run) must stay within the same bound."""
+    fan_in = 8
+    monkeypatch.setenv("CRYPTO_RECORDER_SPOOL_FAN_IN", str(fan_in))
+    monkeypatch.setenv("CRYPTO_RECORDER_SPOOL_RUN_BYTES", "1")  # ~1 record per run
+    n = 130
+
+    with RawRecordSpool(temp_dir=tmp_path, prefix="cr-test-faninfiles-") as spool:
+        for i in range(n):
+            spool.insert(_record(seq=i, ts=i), (1, i, 0), i)
+        spool.commit()
+        assert len(spool._run_paths) > 100  # sanity: genuinely many runs
+
+        tracker = _OpenTracker()
+        tracker.install(monkeypatch)
+
+        first_pass = [r["session_seq"] for r in spool.iter_records()]
+        assert first_pass == list(range(n))
+        peak_after_first_pass = tracker.peak
+
+        # A small documented slack constant (2) covers the merge's own
+        # +1 output-file handle plus incidental overlap; it must never
+        # scale with the number of runs (130 >> fan_in + 2).
+        assert tracker.peak <= fan_in + 2, (
+            f"peak concurrent open files ({tracker.peak}) exceeded fan_in+2 ({fan_in + 2})"
+        )
+
+        # Repeated query passes must reuse the already-merged single run
+        # file and never re-open more than the same small bound.
+        second_pass = [r["session_seq"] for r in spool.iter_records()]
+        assert second_pass == list(range(n))
+        assert tracker.peak == peak_after_first_pass, (
+            "a second query pass must not increase peak concurrent open files "
+            "(the merged single run file must be cached and reused)"
+        )
+        assert tracker.peak <= fan_in + 2
+
+
+def test_repeated_first_record_and_max_record_passes_stay_within_descriptor_bound(tmp_path, monkeypatch):
+    """first_record/has_record_before/max_record are called repeatedly
+    per partition build; each call must reuse the cached merged run
+    rather than re-triggering a fresh bounded-fan-in merge every time."""
+    fan_in = 4
+    monkeypatch.setenv("CRYPTO_RECORDER_SPOOL_FAN_IN", str(fan_in))
+    monkeypatch.setenv("CRYPTO_RECORDER_SPOOL_RUN_BYTES", "1")
+    n = 40
+
+    with RawRecordSpool(temp_dir=tmp_path, prefix="cr-test-repeatedquery-") as spool:
+        for i in range(n):
+            spool.insert(_record(seq=i, ts=i), (1, i, 0), i)
+        spool.commit()
+        assert len(spool._run_paths) > fan_in * 2  # sanity: multi-pass required
+
+        tracker = _OpenTracker()
+        tracker.install(monkeypatch)
+
+        for _ in range(5):
+            spool.first_record()
+            spool.has_record_before("depth_update", (1, 5, 0))
+            spool.max_record(record_type="depth_update", session_id=1)
+
+        assert tracker.peak <= fan_in + 2
+
+
+# ---------------------------------------------------------------------------
+# 3. Atomic intermediate merge output + failure cleanup
+# ---------------------------------------------------------------------------
+
+
+def test_merge_failure_cleans_partial_output_and_preserves_inputs(tmp_path, monkeypatch):
+    """A failure while writing an intermediate merge output must leave
+    no partial ``*.run.part`` file behind, and must not delete the
+    not-yet-consumed input run files for that pass (they are only
+    unlinked after the replacement output is durably renamed into
+    place)."""
+    monkeypatch.setenv("CRYPTO_RECORDER_SPOOL_FAN_IN", "4")
+    monkeypatch.setenv("CRYPTO_RECORDER_SPOOL_RUN_BYTES", "1")  # ~1 record per run
+
+    spool = RawRecordSpool(temp_dir=tmp_path, prefix="cr-test-mergefail-")
+    try:
+        for i in range(5):  # > fan_in (4) -> a real merge batch is required
+            spool.insert(_record(seq=i, ts=i), (1, i, 0), i)
+        spool.commit()
+        pre_merge_paths = list(spool._run_paths)
+        assert len(pre_merge_paths) == 5
+        assert all(p.exists() for p in pre_merge_paths)
+
+        real_fsync = os.fsync
+        state = {"raised": False}
+
+        def failing_fsync(fd):
+            if not state["raised"]:
+                state["raised"] = True
+                raise OSError("simulated failure during merge output fsync")
+            return real_fsync(fd)
+
+        monkeypatch.setattr(os, "fsync", failing_fsync)
+
+        with pytest.raises(OSError):
+            list(spool.iter_records())
+
+        # No partial merge output must remain.
+        leftover_parts = list(tmp_path.glob("*.run.part"))
+        assert leftover_parts == [], f"partial merge output(s) left behind: {leftover_parts}"
+
+        # Input run files for the (failed) pass must be untouched —
+        # deletion only happens after a successful atomic replace.
+        assert spool._run_paths == pre_merge_paths
+        assert all(p.exists() for p in pre_merge_paths)
+
+        # Recovery: with the fault no longer injected, the spool must
+        # still be able to complete the merge correctly on a later call.
+        monkeypatch.setattr(os, "fsync", real_fsync)
+        spool._merged = False  # allow a fresh attempt (simulating a retry)
+        seqs = [r["session_seq"] for r in spool.iter_records()]
+        assert seqs == list(range(5))
+    finally:
+        spool.close()
+
+
+def test_run_bytes_and_fan_in_env_defaults(monkeypatch):
+    monkeypatch.delenv("CRYPTO_RECORDER_SPOOL_RUN_BYTES", raising=False)
+    monkeypatch.delenv("CRYPTO_RECORDER_SPOOL_FAN_IN", raising=False)
+    spool = RawRecordSpool()
+    try:
+        assert spool._run_bytes_budget == 64 * 1024 * 1024
+        assert spool._fan_in == 16
+    finally:
+        spool.close()

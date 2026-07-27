@@ -37,38 +37,86 @@ def _session_key(record: dict) -> str:
     return "" if session_id is None else str(session_id)
 
 
+_DEFAULT_RUN_BYTES = 64 * 1024 * 1024  # 64 MiB
+_DEFAULT_FAN_IN = 16
+
+
 class RawRecordSpool:
-    """Bounded-memory external-merge-sorted record spool (issue #20 Phase 6).
+    """Bounded-memory external-merge-sorted record spool (issue #20 Phase 6,
+    corrected).
 
     Replaces the prior SQLite-backed implementation (a single on-disk
     B-tree with 3 secondary indexes storing the complete JSON payload text
-    per row — "scratch-inefficient" but disk-backed/RAM-bounded, per the
-    approved plan's correction #13) with a genuine external merge sort:
-    incoming records are buffered in memory only up to a bounded run size
-    (``CRYPTO_RECORDER_SPOOL_RUN_SIZE``, default 20000 records), each run
-    is sorted in memory and flushed to its own disk-backed pickle run
-    file, and the fully sorted output is produced by a bounded k-way merge
-    (``heapq.merge``) that holds only one buffered record per run in
-    memory at a time — peak resident memory is O(run_size), never
-    O(total record count), regardless of how many records are spooled.
+    per row — "scratch-inefficient" per the approved plan's correction
+    #13) with a genuine bounded external merge sort, in two respects:
+
+    1. **Byte-budgeted buffering, not record-count buffering.** Each
+       inserted record is serialized immediately
+       (``pickle.dumps(record, protocol=HIGHEST_PROTOCOL)``); only the
+       resulting bytes (never the live Python object graph) are retained
+       in the in-memory buffer. The buffer is flushed to a new sorted,
+       disk-backed run file once its *accumulated serialized byte size*
+       reaches ``CRYPTO_RECORDER_SPOOL_RUN_BYTES`` (default 64 MiB) — not
+       once a record *count* threshold is hit. This is the only
+       guarantee that actually bounds RAM on a 16 GB machine: raw depth
+       records vary hugely in size (a `depth_update` with a large
+       nested `bids`/`asks` array can be orders of magnitude larger than
+       a `sync_state` record), so a fixed record count does not bound
+       bytes. A single record whose own serialized size already exceeds
+       the budget is still accepted — it becomes its own one-record run,
+       flushed immediately after being buffered, so an oversized record
+       never blocks or grows the buffer without bound.
+
+    2. **Bounded fan-in hierarchical (multi-pass) merge, not a flat
+       k-way merge over every run file.** A flat ``heapq.merge`` across
+       *all* run files opens (and holds one buffered item for) one file
+       per run — memory and file-descriptor usage would be proportional
+       to the number of runs, which is unbounded for large inputs. This
+       implementation instead merges runs in a tournament of bounded
+       passes: each pass takes at most ``CRYPTO_RECORDER_SPOOL_FAN_IN``
+       run files (default 16) at a time, merges them via ``heapq.merge``
+       into one new output run file, and repeats until a single fully
+       sorted run remains. Each merge pass therefore opens at most
+       ``fan_in`` input file handles plus 1 output file handle
+       (``fan_in + 1`` total) — never proportional to the total number
+       of runs. The merge-down is performed once (lazily, on first
+       query) and its single resulting run file is cached and reused for
+       every subsequent query, so repeated query passes also never
+       exceed that same small descriptor bound.
+
+    Each intermediate merge output is written to a temporary
+    ``*.run.part`` file which is flushed and closed *before* being
+    atomically renamed (``os.replace``, a single filesystem rename) to
+    its final ``*.run`` path — a reader can therefore never observe a
+    partially written merge output under its final name. The input run
+    files for a given pass are unlinked only *after* their replacement
+    output file has been durably closed and atomically renamed into
+    place. If an exception is raised while writing a merge output, the
+    partial ``*.run.part`` file is removed and the exception propagates;
+    the (still-untouched) input run files for that pass are left in
+    place so no data is lost. Broader process-kill/SIGKILL/unknown crash
+    cleanup of stray temp files is explicitly out of scope here and is
+    deferred to the already-planned Phase 11 (per the approved plan).
 
     The public interface (``insert``/``commit``/``iter_records``/
     ``first_record``/``has_record_before``/``max_record``/``close``,
     context-manager support, ``.count``, ``.path``) and every method's
-    external behavior are UNCHANGED from the prior implementation — this
-    is purely an internal storage/ordering mechanism replacement. Every
-    existing caller (``convert_day.py``'s raw repartition/carry spools,
-    ``stores/replay_writer.py``'s write-batching, ``stores/
-    replay_depth_adapter.py``'s replay-side canonical resort,
-    ``validation/validate_catalog_equivalence.py``'s raw metadata sort)
-    requires zero changes.
+    external, observable behavior are UNCHANGED from the prior
+    implementation and from the original SQLite-backed implementation
+    before it — this is purely an internal storage/ordering mechanism
+    correction. Every existing caller (``convert_day.py``'s raw
+    repartition/carry spools, ``stores/replay_writer.py``'s
+    write-batching, ``stores/replay_depth_adapter.py``'s replay-side
+    canonical resort, ``validation/validate_catalog_equivalence.py``'s
+    raw metadata sort) requires zero changes.
 
-    ``first_record``/``has_record_before``/``max_record`` re-merge the run
-    files with a fresh streaming pass per call (no persistent index) —
-    these are called at most a small, bounded number of times per
-    partition build (never once per record), so trading index lookup
-    speed for zero extra memory/index-maintenance cost is the correct
-    tradeoff here (long runtime is acceptable; unbounded memory is not).
+    ``first_record``/``has_record_before``/``max_record`` stream the
+    (lazily merged, then cached) single sorted run — these are called at
+    most a small, bounded number of times per partition build (never once
+    per record), so trading index lookup speed for zero extra
+    memory/index-maintenance cost is the correct tradeoff here (long
+    runtime is acceptable; unbounded memory or unbounded descriptors are
+    not).
     """
 
     def __init__(self, *, temp_dir: str | Path | None = None, prefix: str = "cryptorecorder-raw-"):
@@ -81,9 +129,14 @@ class RawRecordSpool:
         self.path = _temp_db_path(prefix, temp_dir)
         self._temp_dir = _spool_dir(temp_dir)
         self._prefix = prefix
-        self._run_size = max(1, int(os.environ.get("CRYPTO_RECORDER_SPOOL_RUN_SIZE", "20000")))
-        self._buffer: list[Tuple[Tuple[int, int, int, int], str, str, dict]] = []
+        self._run_bytes_budget = max(
+            1, int(os.environ.get("CRYPTO_RECORDER_SPOOL_RUN_BYTES", str(_DEFAULT_RUN_BYTES)))
+        )
+        self._fan_in = max(2, int(os.environ.get("CRYPTO_RECORDER_SPOOL_FAN_IN", str(_DEFAULT_FAN_IN))))
+        self._buffer: list[Tuple[Tuple[int, int, int, int], str, str, bytes]] = []
+        self._buffer_bytes = 0
         self._run_paths: list[Path] = []
+        self._merged = False
         self.count = 0
         self._closed = False
 
@@ -97,9 +150,16 @@ class RawRecordSpool:
         key = (int(sort_key[0]), int(sort_key[1]), int(sort_key[2]), int(raw_index))
         record_type = str(record.get("record_type", ""))
         session_key = _session_key(record)
-        self._buffer.append((key, record_type, session_key, record))
+        payload = pickle.dumps(record, protocol=pickle.HIGHEST_PROTOCOL)
+        self._buffer.append((key, record_type, session_key, payload))
+        self._buffer_bytes += len(payload)
         self.count += 1
-        if len(self._buffer) >= self._run_size:
+        # Flushing whenever accumulated bytes reach the budget — even
+        # for a single, individually oversized record — bounds memory
+        # unconditionally: an oversized record becomes its own
+        # one-record run immediately, rather than blocking or growing
+        # the buffer without limit.
+        if self._buffer_bytes >= self._run_bytes_budget:
             self._flush_run()
 
     def _flush_run(self) -> None:
@@ -120,12 +180,13 @@ class RawRecordSpool:
             fh.close()
         self._run_paths.append(run_path)
         self._buffer = []
+        self._buffer_bytes = 0
 
     def commit(self) -> None:
         self._flush_run()
 
     @staticmethod
-    def _iter_run_file(path: Path) -> Iterator[Tuple[Tuple[int, int, int, int], str, str, dict]]:
+    def _iter_run_file(path: Path) -> Iterator[Tuple[Tuple[int, int, int, int], str, str, bytes]]:
         with open(path, "rb") as fh:
             while True:
                 try:
@@ -133,17 +194,80 @@ class RawRecordSpool:
                 except EOFError:
                     return
 
-    def _iter_sorted(self) -> Iterator[Tuple[Tuple[int, int, int, int], str, str, dict]]:
-        """Bounded-memory k-way merge across all sorted run files.
-
-        ``heapq.merge`` pulls at most one buffered item per run file at a
-        time, so peak memory here is O(number of runs), not O(total
-        record count).
+    def _merge_batch(self, batch: list[Path]) -> Path:
+        """Merge at most ``fan_in`` sorted run files into one new sorted
+        run file, written atomically: the output is fully written and
+        durably closed under a temporary ``*.run.part`` name, then
+        atomically renamed (``os.replace``) to its final ``*.run`` name.
+        On any failure, the partial output is removed and the exception
+        propagates; the input ``batch`` files are left untouched (the
+        caller only unlinks them after this method returns successfully).
         """
+        tmp_fh = tempfile.NamedTemporaryFile(
+            prefix=self._prefix,
+            suffix=".run.part",
+            dir=self._temp_dir,
+            delete=False,
+        )
+        tmp_path = Path(tmp_fh.name)
+        try:
+            iterators = [self._iter_run_file(p) for p in batch]
+            for item in heapq.merge(*iterators, key=lambda entry: entry[0]):
+                pickle.dump(item, tmp_fh, protocol=pickle.HIGHEST_PROTOCOL)
+            tmp_fh.flush()
+            os.fsync(tmp_fh.fileno())
+        except BaseException:
+            tmp_fh.close()
+            try:
+                tmp_path.unlink()
+            except FileNotFoundError:
+                pass
+            raise
+        else:
+            tmp_fh.close()
+        final_path = Path(str(tmp_path)[: -len(".part")])
+        os.replace(tmp_path, final_path)
+        return final_path
+
+    def _ensure_single_run(self) -> None:
+        """Reduce ``self._run_paths`` to at most one fully sorted run
+        file via bounded fan-in hierarchical (multi-pass) merging, then
+        cache the result so subsequent calls are no-ops. Each pass opens
+        at most ``fan_in`` input files plus 1 output file — never
+        proportional to the total number of runs."""
+        if self._merged:
+            return
+        current = list(self._run_paths)
+        while len(current) > 1:
+            next_level: list[Path] = []
+            for i in range(0, len(current), self._fan_in):
+                batch = current[i : i + self._fan_in]
+                if len(batch) == 1:
+                    next_level.append(batch[0])
+                    continue
+                merged_path = self._merge_batch(batch)
+                next_level.append(merged_path)
+                # Inputs are unlinked only now: after their replacement
+                # output has been durably written, closed, and atomically
+                # renamed into place above.
+                for p in batch:
+                    try:
+                        p.unlink()
+                    except FileNotFoundError:
+                        pass
+            current = next_level
+        self._run_paths = current
+        self._merged = True
+
+    def _iter_sorted(self) -> Iterator[Tuple[Tuple[int, int, int, int], str, str, dict]]:
+        """Stream the (lazily merged, then cached) single fully sorted
+        run file, unpickling each record only as it is yielded — bounding
+        memory to a single in-flight record at a time."""
+        self._ensure_single_run()
         if not self._run_paths:
             return
-        iterators = [self._iter_run_file(p) for p in self._run_paths]
-        yield from heapq.merge(*iterators, key=lambda item: item[0])
+        for key, rt, sk, payload in self._iter_run_file(self._run_paths[0]):
+            yield key, rt, sk, pickle.loads(payload)
 
     def iter_records(
         self,

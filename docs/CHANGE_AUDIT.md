@@ -93,6 +93,187 @@ An entry may be skipped **only** for:
 - <or "none — task fully completed">
 ```
 
+## 2026-07-27 — fix(converter): bound spool memory by bytes and fan-in, not record count
+
+### Change summary
+- The prior Phase 6 commit (`c131217`) was reviewed and NOT approved: it
+  violated the approved Phase 6 RAM/scratch model in 4 specific ways.
+  This entry is the correction, applied on top of `c131217` (kept, not
+  reverted, not force-pushed).
+- **Violation 1 (fixed)**: `CRYPTO_RECORDER_SPOOL_RUN_SIZE` bounded the
+  in-memory run buffer by *record count*, which does not bound memory
+  bytes — raw depth records vary hugely in size (large nested
+  `bids`/`asks` arrays on `depth_update` vs. tiny `sync_state`/
+  `stream_lifecycle` records). Replaced with a byte budget,
+  `CRYPTO_RECORDER_SPOOL_RUN_BYTES` (default 64 MiB): `insert()` now
+  serializes the record to bytes immediately (`pickle.dumps`) and only
+  those bytes are buffered (`self._buffer_bytes` tracks cumulative
+  size); the buffer flushes to a new sorted run file once the budget is
+  reached. A single record whose own serialized size already exceeds
+  the budget is still accepted as its own one-record run, flushed
+  immediately — never blocking or growing the buffer without bound.
+- **Violation 2 (fixed)**: `heapq.merge(*all_run_iterators)` opened and
+  held one buffered item per run file simultaneously — unbounded fan-in,
+  so memory/file-descriptor usage was proportional to the number of
+  runs (unbounded for large inputs), not to a configured constant.
+  Replaced with a bounded fan-in hierarchical (multi-pass) merge:
+  `CRYPTO_RECORDER_SPOOL_FAN_IN` (default 16); `_merge_batch()` merges
+  at most `fan_in` run files into one new output run; `_ensure_single_run()`
+  repeats merge passes (opening at most `fan_in + 1` file handles per
+  pass) until exactly one fully sorted run remains, then caches the
+  result (`self._merged`) so every subsequent query
+  (`iter_records`/`first_record`/`has_record_before`/`max_record`)
+  reuses the cached single run and never re-triggers a fresh merge or
+  exceeds the same descriptor bound.
+- **Violation 3 (fixed)**: intermediate merge outputs are now written
+  atomically. `_merge_batch()` writes to a temporary `*.run.part` name,
+  flushes and `fsync`'s it, closes it, then atomically renames
+  (`os.replace`) it to its final `*.run` name — a reader can never
+  observe a partially written merge output under its final name. Input
+  run files for a pass are unlinked only in `_ensure_single_run()`
+  *after* `_merge_batch()` has returned successfully (i.e., after the
+  replacement output is durably renamed into place). On any exception
+  raised while writing a merge output, the partial `.part` file is
+  removed and the exception propagates with the pass's input run files
+  left completely untouched. Broader unknown/SIGKILL crash-lifecycle
+  cleanup of stray temp files across process restarts is explicitly out
+  of scope here and remains deferred to the already-planned Phase 11.
+- **Violation 4 (fixed — measured, not merely claimed)**: wrote a
+  one-off benchmark script (`/tmp/bench_spool.py`, NOT added to the
+  repo) that reconstructs the original pre-Phase-6 SQLite-backed
+  `RawRecordSpool` verbatim from commit `59e28d8` for comparison
+  purposes only, and feeds both it and the corrected spool the
+  identical real ADAUSDT 2026-06-12 `depth_v2` raw fixture (412,464
+  records), each in an isolated subprocess, measuring wall time, peak
+  apparent scratch bytes on disk, and `resource.getrusage(...).ru_maxrss`.
+  Results: SQLite (old) — wall 5.68s, peak scratch bytes 259,747,840
+  (247.7 MiB), max RSS 1,187,312 KiB; external-merge (corrected) — wall
+  4.41s, peak scratch bytes 204,063,710 (194.6 MiB), max RSS 1,293,964
+  KiB. Honest caveat recorded: max RSS in this benchmark is dominated by
+  holding all 412K raw records in an in-process Python list before
+  feeding either spool (identical overhead for both variants), so this
+  benchmark does not cleanly isolate the spool's own incremental RSS
+  contribution — only the peak-scratch-bytes-on-disk and wall-time
+  results are cleanly isolated. A full isolated per-spool RSS
+  measurement is deferred to Tier-3 measurement (Phase 7), per the
+  explicit instruction that "Full Tier-3 measurement remains Phase 7."
+- Rewrote `tests/test_spool_external_merge.py` (17 tests, up from 11):
+  removed the 3 tests tied to the now-removed record-count run-size
+  model; added byte-budget flush-boundary prediction (predicts exact
+  run boundaries from directly measured pickle sizes, not tied to a
+  specific pickle-protocol byte count), highly-variable/large-nested-payload
+  handling, oversized-single-record handling, a multi-pass correctness
+  test (small `fan_in` forces >20 runs and multiple merge levels, then
+  re-verifies every existing query method — `iter_records`,
+  `first_record`, `has_record_before`, `max_record` — against the prior
+  SQL-based semantics), a bounded-open-file-descriptor proof (`_OpenTracker`
+  wraps `builtins.open` to empirically prove peak concurrent open files
+  never exceeds `fan_in + 2` across 130+ forced runs, both on the first
+  query pass and on a repeated query pass that must reuse the cached
+  merged run rather than increase peak descriptor usage), a repeated
+  first_record/has_record_before/max_record descriptor-bound test, and a
+  merge-failure-cleanup test (injects a one-shot failure into `os.fsync`,
+  asserts no partial `.run.part` file remains and no input run file was
+  deleted prematurely, then proves the spool recovers and completes
+  correctly on a subsequent attempt). Also updated the live-object-counter
+  bounded-memory test and the env-var-defaults test for the new
+  attribute names.
+
+### Files/packages touched
+- `converter/spool.py`
+- `tests/test_spool_external_merge.py`
+- `CHANGELOG.md`
+- `docs/CHANGE_AUDIT.md`
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] docs/REPO_STRUCTURE.md
+- [x] docs/PROJECT_STATUS.md
+- [ ] docs/IMPLEMENTATION_AUDIT.md
+- [x] relevant feature docs:
+  - docs/FULL_L2_REPLAY_CATALOG_PLAN.md (reviewed; no status-claim
+    changes needed — this is an internal correction to an
+    already-internal-only scratch mechanism)
+
+### Docs updated
+- [x] CHANGELOG.md
+- [ ] README.md
+- [ ] docs/PROJECT_STATUS.md
+- [ ] docs/REPO_STRUCTURE.md
+- [ ] relevant feature docs:
+  - none
+- No docs update required because: this is a correction to an internal
+  scratch-storage mechanism with a byte-for-byte-preserved public
+  interface and zero observable semantic change (proven by an unchanged
+  Tier-2 canonical-gate result); no status claim, consumer contract, or
+  repo structure is affected.
+
+### Status / validation impact
+- Validated status changed: no
+- Deferred status changed: no
+- New claims added: no
+- Evidence for any new validation claim: n/a — this entry proves
+  behavior is still UNCHANGED after correcting the RAM/scratch model.
+
+### Tests run
+```bash
+source .venv/bin/activate
+python -m pytest tests/test_spool_external_merge.py -q
+# 17 passed
+python -m pytest tests/test_streaming_conversion_memory.py tests/test_convert_day_phase2.py \
+  tests/test_convert_integrity_and_readiness.py tests/test_converter_integration.py \
+  tests/test_depth_deterministic.py tests/test_futures_continuity.py \
+  tests/test_gap_and_fence_diagnostics.py tests/test_replay_store.py \
+  tests/test_replay_depth_adapter.py tests/test_replay_memory_bounded.py \
+  tests/test_replay_sync_continuity.py tests/test_replay_catalog_reconstruct.py \
+  tests/test_semantic_equivalence.py tests/test_catalog_equivalence.py \
+  tests/test_catalog_equivalence_full_l2.py -q
+# 165 passed, 1 skipped
+python -m pytest -q
+# 535 passed, 3 skipped (up from 529 in c131217)
+python -m pytest tests/test_repo_structure.py tests/test_agent_infrastructure.py -q
+# 56 passed
+```
+
+### Validation CLIs run
+```bash
+CRYPTO_RECORDER_DATA_ROOT="$(pwd)/data_raw" python -m validation.validate_catalog_equivalence \
+  --date 2026-06-12 --symbols ADAUSDT --venues BINANCE_SPOT --data-root "$(pwd)/data_raw" \
+  --work-root /tmp/phase6b_v0/work --old-catalog-root /tmp/phase6b_v0/old_catalog \
+  --replay-root /tmp/phase6b_v0/replay --new-catalog-root /tmp/phase6b_v0/new_catalog \
+  --profile full_l2 --emit-depth10 --schema-version 0 --overwrite \
+  --report-path /tmp/phase6b_v0/report.json
+# result: passed. All 7 components pass. fenced_ranges: count_old=34,
+# count_new=34, digest_old==digest_new, same digest as before this
+# correction and before Phase 6.
+
+CRYPTO_RECORDER_DATA_ROOT="$(pwd)/data_raw" python -m validation.validate_catalog_equivalence \
+  --date 2026-06-12 --symbols ADAUSDT --venues BINANCE_SPOT --data-root "$(pwd)/data_raw" \
+  --work-root /tmp/phase6b_v1/work --old-catalog-root /tmp/phase6b_v1/old_catalog \
+  --replay-root /tmp/phase6b_v1/replay --new-catalog-root /tmp/phase6b_v1/new_catalog \
+  --profile full_l2 --emit-depth10 --schema-version 1 --overwrite \
+  --report-path /tmp/phase6b_v1/report.json
+# result: passed. Same 7/7 pass, same fenced_ranges digest.
+
+python /tmp/bench_spool.py old   # one-off benchmark, not part of the repo
+python /tmp/bench_spool.py new   # one-off benchmark, not part of the repo
+# see Change summary above for measured wall time / peak scratch bytes / max RSS
+```
+
+### Known limitations / out of scope
+- Phase 7 (full Tier-3 measurement, format-selection sweep for the
+  <5 GiB/day target), broader top50/multi-day validation, production
+  deployment, retention gate, `uv` migration, and KovacsTrader work were
+  NOT started.
+- Phase 11 (broader unknown/SIGKILL crash-lifecycle cleanup of stray
+  temp/scratch files across process restarts) was explicitly deferred,
+  per the user's own scoping instruction — only the atomic-write +
+  caught-exception cleanup path was implemented here.
+- `convert_day.py`, `DedupeSet`, and `ObjectSpool` were not modified.
+- The isolated per-spool RSS delta (as distinct from the shared
+  input-holding overhead measured in this entry's benchmark) is not
+  yet isolated; that level of measurement rigor is deferred to Phase 7.
+
 ## 2026-07-27 — feat(converter): bounded external-merge replay conversion spool
 
 ### Change summary

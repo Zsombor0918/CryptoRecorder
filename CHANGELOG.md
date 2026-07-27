@@ -67,6 +67,90 @@ passes.** Until then, broader full-L2 equivalence stays **deferred** (see
 ## [Unreleased]
 
 ### Added
+- **Issue #20 Phase 6 correction: byte-budgeted buffering + bounded
+  fan-in hierarchical merge** — a review of the first Phase 6 commit
+  (`c131217`, not approved) correctly identified 4 violations of the
+  approved Phase 6 RAM/scratch model, all now fixed on top of `c131217`
+  (which is kept, not reverted):
+  1. `CRYPTO_RECORDER_SPOOL_RUN_SIZE` bounded the run buffer by *record
+     count*, not memory bytes — unsuitable as a 16 GB safety guarantee
+     given how much raw depth records vary in size (a `depth_update`
+     with a large nested `bids`/`asks` array vs. a tiny `sync_state`
+     record). Replaced with `CRYPTO_RECORDER_SPOOL_RUN_BYTES` (default
+     64 MiB): each record is serialized to bytes immediately at
+     `insert()` and only the resulting bytes are buffered; the buffer
+     flushes to a new sorted run file once accumulated serialized bytes
+     reach the budget. A single record whose own serialized size already
+     exceeds the budget is still accepted — it becomes its own
+     one-record run, flushed immediately, so it can never block or grow
+     the buffer without bound.
+  2. `heapq.merge(*all_run_iterators)` had unbounded fan-in — memory and
+     file-descriptor usage were proportional to the number of runs, not
+     bounded. Replaced with a bounded fan-in hierarchical (multi-pass)
+     merge (`CRYPTO_RECORDER_SPOOL_FAN_IN`, default 16): each pass merges
+     at most `fan_in` run files into one new output run file (opening at
+     most `fan_in + 1` file handles at a time), repeated until a single
+     fully sorted run remains. The single merged run is cached
+     (`self._merged`) so repeated queries per partition build (`first_record`/
+     `has_record_before`/`max_record`, each called a small, bounded
+     number of times) never re-trigger a fresh merge or exceed the same
+     descriptor bound.
+  3. Each intermediate merge output is now written atomically: to a
+     temporary `*.run.part` name, flushed and `fsync`'d, closed, then
+     atomically renamed (`os.replace`) to its final `*.run` name — a
+     reader can never observe a partial merge output under its final
+     name. Input run files for a pass are unlinked only *after* their
+     replacement output is durably renamed into place. If an exception
+     is raised while writing a merge output, the partial `.part` file is
+     removed and the not-yet-consumed inputs for that pass are left
+     untouched. Broader unknown/SIGKILL crash-lifecycle cleanup of stray
+     temp files remains explicitly deferred to the already-planned
+     Phase 11.
+  4. **Measured, not merely claimed**: `/tmp/bench_spool.py` (a one-off
+     benchmark script, not part of the repo) fed the identical real
+     ADAUSDT 2026-06-12 `depth_v2` raw fixture (412,464 records) to both
+     the original pre-Phase-6 SQLite-backed spool (reconstructed
+     verbatim from commit `59e28d8` for comparison only) and the
+     corrected external-merge spool, each in an isolated subprocess:
+     - SQLite (old): wall 5.68s, peak apparent scratch bytes on disk
+       259,747,840 (247.7 MiB), max RSS 1,187,312 KiB (1159.5 MiB).
+     - External-merge (corrected): wall 4.41s, peak apparent scratch
+       bytes on disk 204,063,710 (194.6 MiB), max RSS 1,293,964 KiB
+       (1263.6 MiB).
+     - Honest caveat: this benchmark isolates peak scratch bytes on disk
+       and wall time cleanly (new is ~22% faster, ~21% smaller on-disk
+       footprint), but max RSS in this benchmark is dominated by holding
+       all 412K raw records in a Python list in-process before feeding
+       the spool (identical overhead for both variants), so it does not
+       cleanly isolate the spool's own incremental RSS contribution.
+       Full isolated per-spool RSS/Tier-3 measurement remains Phase 7,
+       per the approved plan.
+  - Added 6 new tests to `tests/test_spool_external_merge.py` (now 17
+    total, replacing the 3 record-count-based tests that no longer
+    apply): a byte-budget flush-boundary prediction test, a
+    highly-variable/large-nested-payload test, an oversized-single-record
+    test, a multi-pass correctness test (forces >20 runs and multiple
+    merge levels via a small `fan_in`), a bounded-file-descriptor proof
+    (wraps `builtins.open` to empirically prove peak concurrent open
+    files never exceeds `fan_in + 2` across 130+ runs, including for
+    repeated query passes which reuse the cached merged run), and a
+    merge-failure-cleanup test (injects a failure into `os.fsync`,
+    proves no partial `.part` file remains and no input run file is
+    deleted prematurely, then proves recovery on retry).
+  - **Tier-2 re-run** (canonical `validation.validate_catalog_equivalence`
+    CLI, ADAUSDT, 2026-06-12, real local `data_raw`): both
+    `--schema-version 0` and `--schema-version 1` still pass all 7
+    gating components, `fenced_ranges` still byte-identical (34/34, same
+    canonical digest as before this correction and before Phase 6) —
+    confirming the correction preserves exact semantic behavior.
+  - Full suite: 535 passed, 3 skipped (up from 529 in `c131217`, net +6
+    tests: 17 new − 11 superseded); spool-dependent regression set (15
+    files): 165 passed, 1 skipped; guards: 56 passed.
+  - No change to `convert_day.py`, `DedupeSet`, or `ObjectSpool`. Still
+    strictly out of scope, per the approved checkpoint: Phase 7, Tier 3,
+    production deployment, custom binary format, retention gate, uv,
+    KovacsTrader. Broader crash/SIGKILL lifecycle cleanup remains
+    deferred to Phase 11.
 - **Issue #20 Phase 6: bounded external-merge replacement for the
   SQLite-backed conversion scratch spool** — per the approved plan's
   correction #13 ("scratch-inefficient"), `converter/spool.py`'s
