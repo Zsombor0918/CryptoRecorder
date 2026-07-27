@@ -93,6 +93,240 @@ An entry may be skipped **only** for:
 - <or "none — task fully completed">
 ```
 
+## 2026-07-27 — fix(replay): preserve synchronization continuity events
+
+### Change summary
+- A review of the pushed head (`1fb588d`) correctly rejected the previous
+  round's fenced-range gap as "out of scope because v0 has the same
+  failure" — it proved a pre-existing replay-builder semantic defect,
+  not an acceptable limitation, and the approved plan mandates exact
+  sync/desync/resync and fenced-range reproduction. This entry is the
+  narrowly scoped semantic correction requested, on top of `1fb588d`
+  (not reverted).
+- **Step 1 — inventory (evidence, not guessing)**: directly enumerated
+  every raw `depth_v2` `record_type` value present in the ADAUSDT
+  2026-06-12 fixture via `converter.readers.stream_raw_records()`:
+  `depth_update` (412,332), `sync_state` (68), `stream_lifecycle` (60),
+  `snapshot_seed` (4) — no other record types exist in this fixture.
+  Cross-referenced against `converter.depth_phase2._run_depth_replay_loop()`
+  (the shared engine both `convert_day.py` and the replay-reconstruction
+  path use) to confirm which types it actually reads:
+  `record_type == "sync_state"` is read directly (`rec["state"]`/
+  `rec["reason"]` drive desync/resync state transitions and
+  fenced-range open/close via `_open_fence()`/`_close_fence()`);
+  `record_type == "stream_lifecycle"` triggers only a diagnostic counter
+  and a `continue`, but the engine's session-change detection (which
+  closes/opens fences on a `stream_session_id` change) runs
+  UNCONDITIONALLY before that, using the CURRENT record's timestamp —
+  so `stream_lifecycle` records' PRESENCE and TIMESTAMP matter even
+  though their content does not.
+- **Step 2 — root cause confirmed exactly as described**:
+  `pipeline/build_replay_store.py::_convert_depth_record()`'s
+  `if record_type not in {"snapshot_seed", "depth_update"}: return None`
+  silently dropped `sync_state` (and `stream_lifecycle`) records before
+  any later branch could act on them — verified this is the sole cause
+  by re-running the canonical Tier-2 gate after each incremental fix and
+  observing the fenced-range count/digest converge exactly.
+- **Fix, part A (sync_state)**: `_convert_depth_record()` now accepts
+  `record_type in {"snapshot_seed", "depth_update", "sync_state"}`.
+  `sync_state` records have no book payload and no `U`/`u`/`pu` (they use
+  `last_update_id`/`prev_update_id` instead — distinct fields, never
+  conflated with `U`/`u`/`pu`); their complete state transition
+  (`state`/`previous_state`/`reason`/`last_update_id`/`prev_update_id`)
+  is preserved via the existing, already-nullable `quality_flags` JSON
+  column (`{"sync_state_transition": {...}}`) — no new physical schema
+  field added or changed for either v0 or v1. A pre-existing latent bug
+  was also fixed here: the prior code read `raw_record.get("sync_state")`
+  (a `depth_update` record's own, differently-named, legacy informational
+  field) to determine `is_desync`/`is_resync`, which would never be
+  populated on an actual `sync_state` RECORD (whose transition value is
+  in its `state` field) — now dispatches on record type to read the
+  correct field.
+- **Fix, part B (stream_lifecycle)**: `_convert_depth_record()` also
+  accepts `record_type == "stream_lifecycle"`, preserving `event`/
+  `reason` via `quality_flags` (`{"stream_lifecycle_event": {...}}`) for
+  completeness, even though the shared engine only needs their
+  presence-and-timestamp. This closed 31 of the 34 fenced ranges'
+  `end_ts_ns` mismatches (each off by exactly the raw gap between the
+  dropped `stream_lifecycle` record and the next preserved record — the
+  fence count already matched at 34/34 after part A alone; only the
+  digest, sensitive to exact timestamps, differed).
+- **Fix, part C (cross-day carry recovery)**: after parts A/B, exactly 1
+  of 34 fences still differed — root-caused to a session (session 19)
+  that began on 2026-06-11 (its first record in the 2026-06-12 raw file
+  is `session_seq=54040`, mid-session). `convert_day.py`'s raw path
+  recovers such sessions via its existing, already-implemented
+  cross-day carry-spool mechanism
+  (`converter.depth_phase2._recover_carry_state_from_spool()`/
+  `_emit_synthetic_opening_snapshot()`, invoked from
+  `convert_depth_v2_streaming()`'s `_prime()` callback) — reading the
+  adjacent day's raw partition to find the session's last snapshot and
+  replay forward from it. The replay-reconstruction path
+  (`replay_records_to_depth_streaming()`) had no equivalent mechanism at
+  all, so it fenced immediately at the session's first record in the
+  target day. Added a new, optional `carry_records` parameter to
+  `replay_records_to_depth_streaming()` that, when supplied, reuses the
+  EXACT SAME `_recover_carry_state_from_spool()`/
+  `_emit_synthetic_opening_snapshot()` helpers via two bounded, disk-backed
+  `converter.spool.RawRecordSpool` instances (never a full-day Python
+  list) — identical mechanism to the raw path, applied to
+  already-adapter-normalized replay rows instead of raw records.
+  Omitting `carry_records` (the previous default, and every other
+  existing caller) leaves behavior completely unchanged — verified by a
+  dedicated backward-compatibility test.
+  `validation/replay_catalog_reconstruct.py`'s `_write_depth_for_partition()`
+  now checks whether the previous day's replay partition exists (via
+  `ReplayReader.iter_dates()`) and, if so, supplies its depth rows
+  (via the same `iter_replay_depth_records()` adapter) as
+  `carry_records` — consumed transiently to derive carry state; never
+  copied, persisted, or exposed as part of the requested date's own
+  reconstructed catalog output (the reconstructed date range is derived
+  from the caller's `start`/`end` window, not from what partitions exist
+  in `replay_root`). `validation/validate_catalog_equivalence.py`'s
+  `_run_new_pipeline()` now also builds the previous day's replay
+  partition (same `schema_version`) purely so this carry lookup can find
+  it — this build is not itself part of the requested date's output.
+  This applies identically to v0 and v1 logical replay (same shared
+  engine, same helpers, dispatched only by which schema version's reader
+  produced the adapter-normalized rows).
+- Also updated `validation/validate_catalog_equivalence.py`'s raw-to-
+  replay metadata comparator
+  (`_DEPTH_ACCEPTED_RECORD_TYPES`/`_normalize_raw_depth_record()`) to
+  accept and correctly normalize `sync_state`/`stream_lifecycle` records
+  identically to the writer's new logic, so it compares like-for-like
+  instead of flagging a spurious "extra on the raw side" mismatch now
+  that these types are written to replay.
+- Added `tests/test_replay_sync_continuity.py` (14 tests): proves
+  `_convert_depth_record()` no longer drops `sync_state`/
+  `stream_lifecycle`, an unsupported/non-continuity record type is still
+  deliberately dropped, `sync_state` survives v0 AND v1 writer/reader
+  round-trip with its ordering relative to snapshots/depth_updates
+  preserved exactly, desync/resync flags survive, dropping a
+  `resync_required` `sync_state` record changes reconstructed continuity
+  evidence (`Phase2ReplayMetrics.resync_count`), the candidate
+  reconstructs the expected fenced range from a synthetic
+  desync→resync→re-snapshot sequence, cross-day carry recovery both
+  recovers a session started on a prior day (matching `convert_day.py`'s
+  synthetic-opening-snapshot/`carried_seed_last_update_id` behavior) and
+  remains fully backward-compatible (identical fenced-range output) when
+  `carry_records` is omitted.
+
+### Files/packages touched
+- `pipeline/build_replay_store.py` (`_convert_depth_record()`: accept
+  `sync_state`/`stream_lifecycle`, correct desync/resync field dispatch,
+  preserve state transition via `quality_flags`)
+- `stores/replay_schema.py` (`DEPTH_RECORD_TYPE_CODES`: added
+  `sync_state=2`/`stream_lifecycle=3`, v0 codes unchanged)
+- `stores/replay_depth_adapter.py` (`replay_row_to_depth_record()`:
+  recover `sync_state` transition fields via new
+  `_sync_state_transition()`; docstrings updated)
+- `converter/depth_phase2.py` (`replay_records_to_depth_streaming()`:
+  new optional `carry_records` parameter reusing the raw path's existing
+  carry-recovery helpers)
+- `validation/replay_catalog_reconstruct.py` (`_write_depth_for_partition()`:
+  supply previous-day replay rows as `carry_records` when available;
+  new `_date_shift()` helper)
+- `validation/validate_catalog_equivalence.py`
+  (`_DEPTH_ACCEPTED_RECORD_TYPES`/`_normalize_raw_depth_record()`: accept
+  and normalize `sync_state`/`stream_lifecycle`; `_run_new_pipeline()`:
+  also build the previous day's replay partition for carry lookup)
+- `tests/test_replay_sync_continuity.py` (new — 14 tests)
+- `CHANGELOG.md` (`[Unreleased]` → `Added`)
+- `docs/CHANGE_AUDIT.md` (this entry)
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] docs/REPO_STRUCTURE.md (no folder/file contract change)
+- [x] docs/PROJECT_STATUS.md (reviewed; no validated/deferred status
+  changed — Phase 5 remains not-yet-approved per the user's explicit
+  instruction; this entry does not advance any v2.0.0/full_l2 claim)
+- [x] docs/IMPLEMENTATION_AUDIT.md (reviewed; no contradiction — this
+  entry restores information the Phase 3 matrix never authorized
+  dropping in the first place; it is a correctness fix, not a new
+  compaction decision)
+- [x] relevant feature docs:
+  - docs/FULL_L2_REPLAY_CATALOG_PLAN.md (reviewed; its "Equivalence
+    Boundary (caveats)" section previously listed `sync_state`
+    fenced-range bookkeeping and cross-day carry as NOT reproduced by
+    the replay path — both are now reproduced; no doc text update made
+    in this entry since the checkpoint explicitly limits scope to the
+    code correction, test evidence, and this audit trail, and the ADAUSDT
+    smoke's own documented result already matches this entry's evidence)
+
+### Docs updated
+- [x] CHANGELOG.md
+- No docs update required because: no validated/deferred status claim
+  changed; `docs/FULL_L2_REPLAY_CATALOG_PLAN.md`'s existing ADAUSDT-smoke
+  evidence and caveat list are superseded by, but not contradicted by,
+  this entry's more complete Tier-2 result — a broader documentation
+  pass is out of scope for this narrowly scoped semantic correction per
+  the explicit instruction.
+
+### Status / validation impact
+- Validated status changed: no
+- Deferred status changed: no
+- New claims added: no new *validated* status claim; Phase 5 remains
+  explicitly not-yet-approved (per the user's own instruction) and Phase
+  6 has not begun.
+- Evidence for any new validation claim:
+  - **Tier 2 re-run (canonical `validation.validate_catalog_equivalence`
+    CLI, ADAUSDT, 2026-06-12, real local `data_raw`, `--schema-version 1`
+    then again with `--schema-version 0`)**: for BOTH schema versions,
+    `report["status"] == "passed"` and ALL SEVEN gating components pass:
+    `instrument_ids_match=True`, `instrument_precision.passed=True`,
+    `trade_ticks.passed=True` (124,457/124,457), `order_book_deltas.passed=True`
+    (412,317/412,317), `order_book_depth10.passed=True` (71,341/71,341),
+    `book_checkpoints.passed=True` (7/7), `continuity_diagnostics.passed=True`,
+    `fenced_ranges.passed=True` (`count_old=34`, `count_new=34`,
+    `digest_old == digest_new` byte-for-byte).
+  - Confirmed via `converter.depth_phase2.fence_canonical_key()`-based
+    direct key-by-key diffing (not just the count) that the full 34-fence
+    lists are identical, not merely equal in count — the earlier "1
+    fence differs" case was diagnosed field-by-field (`start_ts_ns`/
+    `reason` differed due to missing cross-day carry) before being fixed.
+
+### Tests run
+```bash
+source .venv/bin/activate
+python -m pytest tests/test_replay_sync_continuity.py -q   # 14 passed
+python -m pytest tests/test_replay_schema_v1.py tests/test_replay_schema_v1_corrections.py \
+  tests/test_replay_store.py tests/test_replay_depth_adapter.py tests/test_replay_memory_bounded.py \
+  tests/test_convert_day_phase2.py tests/test_book_checkpoint_hash_canonicalization.py \
+  tests/test_replay_catalog_reconstruct.py tests/test_replay_sync_continuity.py -q
+  # 170 passed
+python -m pytest tests/test_repo_structure.py tests/test_agent_infrastructure.py -q   # 56 passed
+python -m pytest -q   # 518 passed, 3 skipped
+```
+
+### Validation CLIs run
+```bash
+CRYPTO_RECORDER_DATA_ROOT="$(pwd)/data_raw" python -m validation.validate_catalog_equivalence \
+  --date 2026-06-12 --symbols ADAUSDT --venues BINANCE_SPOT \
+  --data-root "$(pwd)/data_raw" --work-root /tmp/.../work \
+  --old-catalog-root /tmp/.../old_catalog --replay-root /tmp/.../replay \
+  --new-catalog-root /tmp/.../new_catalog --profile full_l2 --emit-depth10 \
+  --schema-version 1 --overwrite --report-path /tmp/.../report.json
+# repeated identically with --schema-version 0
+python -m validation.audit_change_compliance --staged
+```
+
+### Known limitations / out of scope
+- Docs (`docs/FULL_L2_REPLAY_CATALOG_PLAN.md`'s caveat list) were not
+  rewritten in this entry — deliberately out of scope for this narrowly
+  scoped semantic correction; a future documentation pass should update
+  its "Equivalence Boundary" section to remove the now-resolved
+  `sync_state`/cross-day-carry caveats.
+- This Tier-2 re-run covers exactly one symbol (ADAUSDT) and one day
+  (2026-06-12) on BINANCE_SPOT; it does not cover BINANCE_USDTF or any
+  other symbol/day, and remains development evidence, not a Tier-3
+  representative-day claim.
+- Phase 5 remains **not yet approved** (explicit user instruction); Phase
+  6, Tier 3, production deployment, custom format, retention gate, uv
+  migration, and any KovacsTrader change remain out of scope and were not
+  started.
+
+---
+
 ## 2026-07-27 — Issue #20 Phase 5 corrective commit: complete v1 logical and validation contract
 
 ### Change summary

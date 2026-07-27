@@ -88,51 +88,129 @@ def _decimal_pair_to_level(level: object) -> dict:
 def _convert_depth_record(raw_record: dict, venue: str, symbol: str, date: str) -> Optional[dict]:
     """
     Convert raw depth record to replay schema.
-    
+
     Raw schema expected:
         {
             "stream_session_id": uint64,
             "session_seq": uint64,
             "raw_index": uint32,
             "snapshot_seed": {...},  or
-            "depth_update": {...},
+            "depth_update": {...},  or
+            "sync_state": {...},
             ...
         }
+
+    ``sync_state`` and ``stream_lifecycle`` records (inventoried directly
+    against the ADAUSDT 2026-06-12 raw fixture: record_type values present
+    are exactly ``depth_update``, ``sync_state``, ``snapshot_seed``,
+    ``stream_lifecycle``) are the record types — besides the already-
+    handled ``snapshot_seed``/``depth_update`` — that the shared
+    depth-replay engine (``converter.depth_phase2._run_depth_replay_loop``,
+    used identically by both ``convert_day.py`` and the
+    replay-reconstruction path) needs for correct synchronization/desync/
+    resync state and fenced-range construction:
+
+    - ``sync_state`` records (``record_type == "sync_state"`` branch) carry
+      the actual state transition (``state``/``reason``) that opens/closes
+      fences on desync/resync/fenced states.
+    - ``stream_lifecycle`` records are NOT read by any record_type-specific
+      branch (the engine's ``if record_type == "stream_lifecycle": continue``
+      is a no-op after the session-id check) — but the engine's
+      session-change detection (``if state.current_stream_session_id !=
+      session_id: ... close/open fence ...``) runs UNCONDITIONALLY for
+      EVERY record type, before that no-op, using the CURRENT record's
+      timestamp. ``stream_lifecycle`` records are the actual first
+      (``session_start``) and last (``session_end``) record of every
+      session in the raw data (verified: `session_seq=1` for every
+      `session_start`), so dropping them shifts the observed "first
+      record of the new session" to whatever record happens to follow,
+      producing a systematically later fence-close timestamp than the
+      reference — this was confirmed directly by diffing the reference's
+      and (pre-fix) candidate's full fenced-range lists on the ADAUSDT
+      2026-06-12 Tier-2 gate: 31 of 34 fences differed ONLY in
+      `end_ts_ns`, each by exactly the raw gap between the dropped
+      `stream_lifecycle` record and the next preserved record.
+
+    Neither record type carries book payload; ``sync_state`` uses
+    ``last_update_id``/``prev_update_id`` (not ``U``/``u``/``pu``) and
+    ``stream_lifecycle`` carries only ``event``/``reason`` — none of the
+    engine's record_type-specific branches need these values, only their
+    presence-and-timestamp for session-change detection (``stream_lifecycle``)
+    or their state-transition fields (``sync_state``, which the engine DOES
+    read). Both are round-tripped through the existing, already-nullable
+    ``quality_flags`` JSON column so no physical schema field is added or
+    changed for either v0 or v1.
     """
     try:
         record_type = raw_record.get("record_type", "depth_update")
-        if record_type not in {"snapshot_seed", "depth_update"}:
+        if record_type not in {"snapshot_seed", "depth_update", "sync_state", "stream_lifecycle"}:
             return None
 
         session_id = raw_record.get("stream_session_id", 0)
         session_seq = raw_record.get("session_seq", 0)
         raw_index = raw_record.get("raw_index", 0)
 
-        payload = raw_record.get("payload") or {}
-        bids = raw_record.get("bids", payload.get("bids", []))
-        asks = raw_record.get("asks", payload.get("asks", []))
+        is_sync_state = record_type == "sync_state"
+        is_stream_lifecycle = record_type == "stream_lifecycle"
 
-        # Parse bids/asks if they're strings (JSON-encoded)
-        if isinstance(bids, str):
-            bids = json.loads(bids)
-        if isinstance(asks, str):
-            asks = json.loads(asks)
+        if is_sync_state or is_stream_lifecycle:
+            bids_struct: list = []
+            asks_struct: list = []
+        else:
+            payload = raw_record.get("payload") or {}
+            bids = raw_record.get("bids", payload.get("bids", []))
+            asks = raw_record.get("asks", payload.get("asks", []))
 
-        bids_struct = [_decimal_pair_to_level(b) for b in bids]
-        asks_struct = [_decimal_pair_to_level(a) for a in asks]
+            # Parse bids/asks if they're strings (JSON-encoded)
+            if isinstance(bids, str):
+                bids = json.loads(bids)
+            if isinstance(asks, str):
+                asks = json.loads(asks)
+
+            bids_struct = [_decimal_pair_to_level(b) for b in bids]
+            asks_struct = [_decimal_pair_to_level(a) for a in asks]
 
         # Determine flags
         is_snapshot = record_type == "snapshot_seed"
         is_update = record_type == "depth_update"
-        sync_state = raw_record.get("sync_state")
-        is_sync_state = record_type == "sync_state"
-        is_desync = bool(raw_record.get("is_desync", False) or sync_state == "desynced")
-        is_resync = bool(raw_record.get("is_resync", False) or sync_state == "resync_required")
+        # A sync_state RECORD's own transition value lives in its "state"
+        # field; a depth_update RECORD's embedded (legacy, informational)
+        # sync marker lives in a differently-named "sync_state" field. Use
+        # whichever is actually present for this record's type — conflating
+        # them would silently miss real desynced/resync_required
+        # transitions on sync_state records.
+        transition_state = raw_record.get("state") if is_sync_state else raw_record.get("sync_state")
+        is_desync = bool(raw_record.get("is_desync", False) or transition_state == "desynced")
+        is_resync = bool(raw_record.get("is_resync", False) or transition_state == "resync_required")
 
         # Quality flags (JSON-encoded)
         quality_flags = raw_record.get("quality_flags")
         if quality_flags and isinstance(quality_flags, dict):
             quality_flags = json.dumps(quality_flags)
+
+        if is_sync_state:
+            # sync_state records have no payload/U/u/pu; preserve their
+            # full state transition here instead — see the docstring above.
+            quality_flags = json.dumps({
+                "sync_state_transition": {
+                    "state": raw_record.get("state"),
+                    "previous_state": raw_record.get("previous_state"),
+                    "reason": raw_record.get("reason"),
+                    "last_update_id": raw_record.get("last_update_id"),
+                    "prev_update_id": raw_record.get("prev_update_id"),
+                }
+            })
+        elif is_stream_lifecycle:
+            # stream_lifecycle records have no payload/U/u/pu either;
+            # preserve their event/reason for completeness even though the
+            # shared engine only needs their presence-and-timestamp for
+            # session-change fence-close/open detection.
+            quality_flags = json.dumps({
+                "stream_lifecycle_event": {
+                    "event": raw_record.get("event"),
+                    "reason": raw_record.get("reason"),
+                }
+            })
 
         return {
             "venue": venue,

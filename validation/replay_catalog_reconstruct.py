@@ -151,6 +151,11 @@ def _convert_trade_to_nautilus(
         return None
 
 
+def _date_shift(date_str: str, days: int) -> str:
+    base = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    return (base + timedelta(days=days)).strftime("%Y-%m-%d")
+
+
 def _write_depth_for_partition(
     *,
     reader: ReplayReader,
@@ -218,6 +223,21 @@ def _write_depth_for_partition(
                 depth10_ordinal = depth10_spool.insert_many(kept, start_ordinal=depth10_ordinal)
 
         records = iter_replay_depth_records(reader.iter_depths(venue, symbol, date))
+
+        # Cross-day carry recovery (mirrors convert_depth_v2_streaming()'s raw
+        # carry mechanism exactly, reusing the same depth_phase2 helpers): if
+        # the previous day's replay partition exists for this venue/symbol,
+        # its depth rows are consumed transiently (never persisted/copied
+        # into this partition) so a session that began on the prior day can
+        # be recovered from its last snapshot_seed forward, matching the
+        # reference's fenced-range/continuity behavior across a UTC day
+        # boundary. If no such partition exists, carry_records stays None
+        # and behavior is unchanged (no carry recovery attempted).
+        prev_date = _date_shift(date, -1)
+        carry_records = None
+        if prev_date in set(reader.iter_dates(venue, symbol)):
+            carry_records = iter_replay_depth_records(reader.iter_depths(venue, symbol, prev_date))
+
         metrics = replay_records_to_depth_streaming(
             records,
             venue,
@@ -231,6 +251,7 @@ def _write_depth_for_partition(
             emit_depth10=writes_depth10,
             depth10_interval_sec=depth10_interval_sec,
             derived_depth_snapshot_levels=derived_depth_snapshot_levels,
+            carry_records=carry_records,
         )
 
         deltas_written = 0

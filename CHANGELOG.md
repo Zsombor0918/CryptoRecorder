@@ -67,6 +67,101 @@ passes.** Until then, broader full-L2 equivalence stays **deferred** (see
 ## [Unreleased]
 
 ### Added
+- **Issue #20 Phase 5 semantic correction: preserve synchronization
+  continuity events** — the canonical Tier-2 gate correctly reported
+  `continuity_diagnostics`/`fenced_ranges` as failed (reference: 34
+  fenced ranges; candidate: 1) for both `schema_version=0` and `=1`,
+  proving a pre-existing replay-builder semantic defect, not an
+  acceptable v1-specific gap. Root cause, found by direct inventory of
+  the ADAUSDT 2026-06-12 raw fixture (record_type values present:
+  `depth_update`, `sync_state`, `snapshot_seed`, `stream_lifecycle` —
+  no others guessed or assumed): `pipeline/build_replay_store.py`'s
+  `_convert_depth_record()` dropped every record type except
+  `snapshot_seed`/`depth_update`, silently discarding `sync_state`
+  records before the shared depth-replay engine's
+  `record_type == "sync_state"` branch (which drives desync/resync state
+  and fenced-range open/close) could ever see them.
+  - `_convert_depth_record()` now preserves `sync_state` and
+    `stream_lifecycle` records. `sync_state` records carry no book
+    payload and no `U`/`u`/`pu` (they use `last_update_id`/
+    `prev_update_id` instead); their full state transition
+    (`state`/`previous_state`/`reason`/`last_update_id`/`prev_update_id`)
+    is round-tripped through the existing, already-nullable
+    `quality_flags` JSON column — no new physical schema field for
+    either v0 or v1. `stream_lifecycle` records are preserved because the
+    shared engine's session-change fence-close/open detection runs
+    unconditionally for every record type using the CURRENT record's
+    timestamp; since `stream_lifecycle` records are the actual first/
+    last record of every raw session, dropping them shifted the observed
+    fence-close/open timestamp to whatever record happened to follow —
+    confirmed by diffing the reference's and pre-fix candidate's full
+    fenced-range lists: 31 of 34 fences differed ONLY in `end_ts_ns`, by
+    exactly the raw gap between the dropped `stream_lifecycle` record
+    and the next preserved record.
+  - `stores/replay_schema.py`'s `DEPTH_RECORD_TYPE_CODES` v1 enum gained
+    `sync_state=2`/`stream_lifecycle=3` (v0's existing codes for
+    `snapshot_seed`/`depth_update` are unchanged — v0 physical-schema
+    compatibility preserved, `record_type` remains the existing string
+    field).
+  - `stores/replay_depth_adapter.py`'s `replay_row_to_depth_record()`
+    recovers a `sync_state` row's `state`/`reason`/`previous_state`/
+    `last_update_id`/`prev_update_id` from `quality_flags` (via new
+    `_sync_state_transition()`), which is exactly what the shared depth
+    engine's `sync_state` branch reads.
+  - `validation/validate_catalog_equivalence.py`'s raw-to-replay metadata
+    comparator (`_DEPTH_ACCEPTED_RECORD_TYPES`, `_normalize_raw_depth_record()`)
+    was updated identically, so it compares `sync_state`/
+    `stream_lifecycle` records like-for-like instead of flagging a
+    spurious raw-vs-replay mismatch now that they are written to replay.
+  - **Cross-day carry recovery** (a second, distinct gap found while
+    diffing the remaining single fence after the sync_state/
+    stream_lifecycle fix): a session that began on the prior UTC day (its
+    first record in the target day's raw file has no preceding
+    `snapshot_seed` within that day) was immediately fenced from its
+    very first record by the replay reconstruction path, whereas
+    `convert_day.py`'s raw path recovers such sessions via its documented
+    cross-day carry-spool mechanism (reading the adjacent day's raw
+    partition). Added an equivalent, bounded, disk-backed carry mechanism
+    to `converter/depth_phase2.py`'s `replay_records_to_depth_streaming()`
+    (new optional `carry_records` parameter, reusing the exact
+    `_recover_carry_state_from_spool()`/`_emit_synthetic_opening_snapshot()`
+    helpers the raw path already uses — never a full-day Python list;
+    omitting `carry_records`, the previous default, leaves behavior
+    unchanged for any other caller). `validation/replay_catalog_reconstruct.py`
+    now also builds the previous day's replay partition (if raw data for
+    it exists) purely to supply its depth rows as `carry_records` — it is
+    never itself part of the requested date's reconstructed catalog
+    output. This mirrors convert_day.py's behavior for both v0 and v1
+    logical replay identically (same shared engine, same helpers).
+  - Added `tests/test_replay_sync_continuity.py` (14 tests): proves
+    `_convert_depth_record()` no longer drops `sync_state`/
+    `stream_lifecycle`, still deliberately drops unsupported record
+    types, `sync_state` survives v0 and v1 writer/reader round-trip with
+    ordering relative to snapshots/depth_updates preserved,
+    desync/resync flags survive, dropping a `sync_state` record changes
+    reconstructed continuity evidence (`metrics.resync_count`), the
+    candidate reconstructs the expected fenced ranges from a synthetic
+    desync/resync/re-snapshot sequence, and cross-day carry recovery
+    both recovers a session started on a prior day (matching
+    `convert_day.py`'s behavior) and remains fully backward-compatible
+    when `carry_records` is omitted.
+  - **Tier-2 re-run** (canonical `validation.validate_catalog_equivalence`
+    CLI, ADAUSDT, 2026-06-12, real local `data_raw`): **all 7 gating
+    components now pass for both `--schema-version 1` and
+    `--schema-version 0`** — instrument IDs, instrument precision,
+    exhaustive trade_ticks, exhaustive order_book_deltas, book_checkpoints
+    (7/7), Depth10, `continuity_diagnostics`, and `fenced_ranges` (34/34
+    fences, byte-identical canonical digest). Overall report status:
+    `"passed"` for both schema versions.
+  - Full suite: 518 passed, 3 skipped (up from 504); guards 56 passed.
+  - No change to `convert_day.py` or to the fenced-range/continuity
+    comparators' semantics — the reference remains the unweakened
+    behavioral oracle; only the replay-side conversion/reconstruction
+    gained the missing continuity-event preservation and cross-day carry
+    it was previously missing.
+  - Still strictly out of scope, per the approved checkpoint: Phase 6,
+    Tier 3, production deployment, custom format, retention gate, uv,
+    KovacsTrader.
 - **Issue #20 Phase 5 (revised-plan phase numbering) — compact versioned
   replay schema v1 prototype**, implemented after the Phase 0–4 review
   checkpoint (baseline, semantic oracle, raw-retention/traceability/

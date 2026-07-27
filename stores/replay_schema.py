@@ -16,8 +16,9 @@ from compaction levers the checked-in Phase 3 field/consumer/integrity matrix
 
   - ``venue``/``symbol``/``date`` (matrix: partition-constant "Yes") move to
     partition/manifest metadata instead of being repeated on every row.
-  - ``record_type`` (depth: snapshot_seed/depth_update; trade: trade/agg_trade)
-    is stored as a small int8 enum code instead of a string.
+  - ``record_type`` (depth: snapshot_seed/depth_update/sync_state; trade:
+    trade/agg_trade) is stored as a small int8 enum code instead of a
+    string.
   - The 5 depth boolean columns (``is_snapshot_seed``, ``is_depth_update``,
     ``is_sync_state``, ``is_desync``, ``is_resync``) are packed into a single
     int8 bitmask (matrix: "packed flags byte/enum" — proof of lossless
@@ -63,7 +64,7 @@ SUPPORTED_SCHEMA_VERSIONS = (0, 1)
 # v1 enum code maps (record_type / aggressor_side)
 # ============================================================================
 
-DEPTH_RECORD_TYPE_CODES = {"snapshot_seed": 0, "depth_update": 1}
+DEPTH_RECORD_TYPE_CODES = {"snapshot_seed": 0, "depth_update": 1, "sync_state": 2, "stream_lifecycle": 3}
 DEPTH_RECORD_TYPE_CODES_REV = {v: k for k, v in DEPTH_RECORD_TYPE_CODES.items()}
 
 TRADE_RECORD_TYPE_CODES = {"trade": 0, "agg_trade": 1}

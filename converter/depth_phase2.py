@@ -965,15 +965,39 @@ def replay_records_to_depth_streaming(
     emit_depth10: bool = False,
     depth10_interval_sec: float = DEPTH10_INTERVAL_SEC,
     derived_depth_snapshot_levels: int = DERIVED_DEPTH_SNAPSHOT_LEVELS,
+    carry_records: Optional[Iterable[dict]] = None,
+    temp_dir: Optional[str] = None,
 ) -> Phase2ReplayMetrics:
     """Replay adapter-normalized depth records through the shared depth engine.
 
-    Unlike :func:`convert_depth_v2_streaming` this performs NO raw repartitioning
-    and NO cross-day carry recovery: the caller supplies the already-ordered
-    normalized record stream (e.g. adapter-mapped replay_store rows). Edge-case
-    behaviors that depend on raw repartitioning / carry / sync_state records are
-    therefore intentionally NOT reproduced here. See
-    ``docs/FULL_L2_REPLAY_CATALOG_PLAN.md`` for the documented equivalence caveats.
+    Unlike :func:`convert_depth_v2_streaming` this performs NO raw
+    repartitioning: the caller supplies the already-ordered normalized
+    record stream for exactly one target date (e.g. adapter-mapped
+    replay_store rows for that date). Clock-skewed records that a
+    different day's raw partition would have repartitioned into this
+    target window (or out of it) are NOT reproduced here — see
+    ``docs/FULL_L2_REPLAY_CATALOG_PLAN.md`` for that documented caveat.
+
+    ``carry_records``, when supplied, enables the SAME cross-day carry
+    recovery ``convert_depth_v2_streaming()`` performs for the raw path
+    (reusing its exact ``_recover_carry_state_from_spool()``/
+    ``_emit_synthetic_opening_snapshot()`` helpers): if the target
+    session's first record has no preceding ``snapshot_seed`` within the
+    target date itself (i.e. the session began on a prior day), the most
+    recent ``snapshot_seed`` for that session found in ``carry_records``
+    is replayed forward (bounded, disk-backed via
+    ``converter.spool.RawRecordSpool`` — never a full-day Python list) to
+    reconstruct book state/continuity ids, and a synthetic opening
+    snapshot is emitted before the target date's own records — exactly
+    mirroring the raw path's behavior, so a replay-reconstructed
+    fenced-range list matches the reference even when a session spans a
+    UTC day boundary. The caller (``validation.replay_catalog_reconstruct``)
+    supplies the previous day's REPLAY partition's own depth rows (via
+    ``ReplayReader``/the depth adapter) as ``carry_records`` when that
+    partition exists — this consumes it transiently to derive carry
+    state; it is never copied or persisted into the target partition.
+    If ``carry_records`` is omitted (the previous default), behavior is
+    unchanged: no carry recovery is attempted.
     """
     batch_size = max(1, int(batch_size))
     metrics = Phase2ReplayMetrics()
@@ -986,16 +1010,71 @@ def replay_records_to_depth_streaming(
         size_prec=size_prec,
     )
     interval_ns = int(depth10_interval_sec * 1e9)
-    _run_depth_replay_loop(
-        records,
-        venue=venue,
-        symbol=symbol,
-        state=state,
-        metrics=metrics,
-        on_deltas_batch=on_deltas_batch,
-        on_depth10_batch=on_depth10_batch,
-        batch_size=batch_size,
-        emit_depth10=emit_depth10,
-        interval_ns=interval_ns,
-    )
+
+    if carry_records is None:
+        _run_depth_replay_loop(
+            records,
+            venue=venue,
+            symbol=symbol,
+            state=state,
+            metrics=metrics,
+            on_deltas_batch=on_deltas_batch,
+            on_depth10_batch=on_depth10_batch,
+            batch_size=batch_size,
+            emit_depth10=emit_depth10,
+            interval_ns=interval_ns,
+        )
+        return metrics
+
+    with (
+        RawRecordSpool(temp_dir=temp_dir, prefix="cryptorecorder-replay-carrytarget-") as target_spool,
+        RawRecordSpool(temp_dir=temp_dir, prefix="cryptorecorder-replay-carry-") as carry_spool,
+    ):
+        target_index = 0
+        for rec in records:
+            sort_key = _sort_key(target_index, rec)
+            target_spool.insert(rec, sort_key, target_index)
+            target_index += 1
+        target_spool.commit()
+
+        carry_index = 0
+        for rec in carry_records:
+            sort_key = _sort_key(carry_index, rec)
+            carry_spool.insert(rec, sort_key, carry_index)
+            carry_index += 1
+        carry_spool.commit()
+
+        def _prime(
+            delta_batch: List[OrderBookDeltas],
+            depth10_batch: List[OrderBookDepth10],
+        ) -> None:
+            first_update = target_spool.first_record(record_type="depth_update")
+            if first_update is not None and not target_spool.has_record_before(
+                "snapshot_seed",
+                _sort_key(0, first_update),
+            ):
+                if _recover_carry_state_from_spool(state, carry_spool, first_update, metrics):
+                    _emit_synthetic_opening_snapshot(
+                        state,
+                        first_update,
+                        metrics,
+                        delta_batch,
+                        depth10_batch,
+                        emit_depth10=emit_depth10,
+                    )
+
+        _run_depth_replay_loop(
+            target_spool.iter_records(),
+            venue=venue,
+            symbol=symbol,
+            state=state,
+            metrics=metrics,
+            on_deltas_batch=on_deltas_batch,
+            on_depth10_batch=on_depth10_batch,
+            batch_size=batch_size,
+            emit_depth10=emit_depth10,
+            interval_ns=interval_ns,
+            prime=_prime,
+        )
+
     return metrics

@@ -133,6 +133,26 @@ def _run_new_pipeline(
     replay_results = []
     for venue in venues:
         for symbol in symbols:
+            # Also build the previous day's replay partition (if raw data
+            # for it exists) purely so validation.replay_catalog_reconstruct
+            # can use it for cross-day carry recovery (see
+            # converter.depth_phase2.replay_records_to_depth_streaming()'s
+            # carry_records parameter) — it is never itself part of the
+            # requested date's reconstructed catalog output (date range
+            # scanning is derived from `start`/`end` below, not from what
+            # partitions happen to exist in replay_root).
+            prev_date = (datetime.strptime(date, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
+            prev_day_result = build_replay_for_symbol(
+                venue, symbol, prev_date, data_root, replay_root,
+                schema_version=schema_version,
+            )
+            if prev_day_result["status"] not in ("success", "skipped"):
+                logger.info(
+                    f"Previous-day replay build for carry recovery "
+                    f"({venue}/{symbol}/{prev_date}) did not succeed "
+                    f"(status={prev_day_result['status']!r}); proceeding "
+                    "without cross-day carry recovery for this partition."
+                )
             replay_results.append(
                 build_replay_for_symbol(
                     venue, symbol, date, data_root, replay_root,
@@ -308,7 +328,7 @@ def _compare_fenced_ranges_for_symbol(
 # This section replaces it with a streaming, event-identity-keyed comparison
 # via compare_event_metadata_exhaustive().
 
-_DEPTH_ACCEPTED_RECORD_TYPES = {"snapshot_seed", "depth_update"}
+_DEPTH_ACCEPTED_RECORD_TYPES = {"snapshot_seed", "depth_update", "sync_state", "stream_lifecycle"}
 _TRADE_ACCEPTED_RECORD_TYPES = {"trade", "agg_trade"}
 
 _DEPTH_COMPARE_FIELDS = (
@@ -354,9 +374,40 @@ def _canonical_quality_flags(value: Any) -> Any:
 
 def _normalize_raw_depth_record(rec: dict[str, Any]) -> dict[str, Any]:
     record_type = rec.get("record_type", "depth_update")
-    sync_state = rec.get("sync_state")
-    is_desync = bool(rec.get("is_desync", False) or sync_state == "desynced")
-    is_resync = bool(rec.get("is_resync", False) or sync_state == "resync_required")
+    is_sync_state = record_type == "sync_state"
+    # A sync_state RECORD's own transition value lives in its "state"
+    # field; a depth_update RECORD's embedded (legacy, informational) sync
+    # marker lives in a differently-named "sync_state" field. Use whichever
+    # is actually present for this record's type (mirrors
+    # pipeline.build_replay_store._convert_depth_record()'s identical fix).
+    transition_state = rec.get("state") if is_sync_state else rec.get("sync_state")
+    is_desync = bool(rec.get("is_desync", False) or transition_state == "desynced")
+    is_resync = bool(rec.get("is_resync", False) or transition_state == "resync_required")
+    quality_flags = rec.get("quality_flags")
+    if is_sync_state:
+        # sync_state raw records have no quality_flags field at all; build
+        # the SAME transition-blob shape the replay writer persists (see
+        # pipeline.build_replay_store._convert_depth_record()) so this
+        # comparator compares like-for-like instead of flagging a spurious
+        # raw-vs-replay mismatch.
+        quality_flags = {
+            "sync_state_transition": {
+                "state": rec.get("state"),
+                "previous_state": rec.get("previous_state"),
+                "reason": rec.get("reason"),
+                "last_update_id": rec.get("last_update_id"),
+                "prev_update_id": rec.get("prev_update_id"),
+            }
+        }
+    elif record_type == "stream_lifecycle":
+        # Same rationale for stream_lifecycle raw records (no quality_flags
+        # field; event/reason instead).
+        quality_flags = {
+            "stream_lifecycle_event": {
+                "event": rec.get("event"),
+                "reason": rec.get("reason"),
+            }
+        }
     return {
         "channel": "depth_v2",
         "stream_session_id": rec.get("stream_session_id"),
@@ -368,10 +419,10 @@ def _normalize_raw_depth_record(rec: dict[str, Any]) -> dict[str, Any]:
         "pu": None if rec.get("pu") is None else str(rec.get("pu")),
         "is_snapshot_seed": record_type == "snapshot_seed",
         "is_depth_update": record_type == "depth_update",
-        "is_sync_state": record_type == "sync_state",
+        "is_sync_state": is_sync_state,
         "is_desync": is_desync,
         "is_resync": is_resync,
-        "quality_flags": _canonical_quality_flags(rec.get("quality_flags")),
+        "quality_flags": _canonical_quality_flags(quality_flags),
     }
 
 
@@ -419,17 +470,18 @@ def _normalize_replay_trade_record(rec: dict[str, Any]) -> dict[str, Any]:
 def _iter_sorted_raw_depth(data_root: Path, venue: str, symbol: str, date: str):
     """Stream depth_v2 raw records for one venue/symbol/date, filtered to
     only the record types the replay writer actually converts
-    (`snapshot_seed`/`depth_update` — see pipeline/build_replay_store.py's
-    `_convert_depth_record()`; other raw record types such as `sync_state`
-    are intentionally never written to replay and would otherwise show up
-    as spurious "extra on the raw side" mismatches), sorted into the
-    canonical `(stream_session_id, session_seq, raw_index)` order via
-    converter.spool.RawRecordSpool — an existing disk-backed bounded
-    spool, reused here rather than sorting a full-day Python list in
-    memory. The raw hourly files are not guaranteed to already be in this
-    order across file boundaries, so sorting is required for a correct
-    positional comparison against the replay side (which the replay-store
-    contract already guarantees is delivered in this order)."""
+    (`snapshot_seed`/`depth_update`/`sync_state`/`stream_lifecycle` — see
+    pipeline/build_replay_store.py's `_convert_depth_record()`; all four
+    types present in the raw ADAUSDT 2026-06-12 fixture are accepted —
+    there are no other depth_v2 record types to exclude for this
+    inventory), sorted into the canonical `(stream_session_id, session_seq,
+    raw_index)` order via converter.spool.RawRecordSpool — an existing
+    disk-backed bounded spool, reused here rather than sorting a full-day
+    Python list in memory. The raw hourly files are not guaranteed to
+    already be in this order across file boundaries, so sorting is
+    required for a correct positional comparison against the replay side
+    (which the replay-store contract already guarantees is delivered in
+    this order)."""
     with RawRecordSpool(prefix="cr-validate-depth-") as spool:
         raw_index = 0
         for rec in stream_raw_records(venue, symbol, "depth_v2", date, root=data_root):
