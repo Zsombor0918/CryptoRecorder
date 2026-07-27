@@ -43,9 +43,18 @@ def _get_filter(filters: list, filter_type: str) -> dict:
 
 # ── exchangeInfo loading ─────────────────────────────────────────────
 
-def load_exchange_info(venue: str, date_str: str) -> Dict[str, dict]:
-    """Load exchangeInfo and return ``{symbol_str: info_dict}``."""
-    info_dir = DATA_ROOT / venue / "exchangeinfo" / "EXCHANGEINFO" / date_str
+def load_exchange_info(venue: str, date_str: str, data_root: "Path | None" = None) -> Dict[str, dict]:
+    """Load exchangeInfo and return ``{symbol_str: info_dict}``.
+
+    Args:
+        data_root: raw data root to read from. Defaults to
+            ``config.DATA_ROOT`` for backward compatibility with existing
+            callers, but callers that have an explicit, non-global
+            ``data_root`` (e.g. a custom ``--data-root`` build) must pass it
+            here rather than relying on the process-wide default.
+    """
+    root = Path(data_root) if data_root is not None else DATA_ROOT
+    info_dir = root / venue / "exchangeinfo" / "EXCHANGEINFO" / date_str
     if not info_dir.exists():
         return {}
 

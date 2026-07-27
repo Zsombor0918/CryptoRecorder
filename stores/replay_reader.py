@@ -144,7 +144,7 @@ class ReplayReader:
                 for batch in parquet.iter_batches(batch_size=5000, use_threads=False):
                     for row in batch.to_pylist():
                         if row is not None:
-                            yield _decode_depth_row_v1(row, price_scale, qty_scale)
+                            yield _decode_depth_row_v1(row, price_scale, qty_scale, venue, symbol, date)
             else:
                 raise ValueError(
                     f"Unsupported replay schema_version={version!r} for "
@@ -192,7 +192,7 @@ class ReplayReader:
                 for batch in parquet.iter_batches(batch_size=5000, use_threads=False):
                     for row in batch.to_pylist():
                         if row is not None:
-                            yield _decode_trade_row_v1(row, price_scale, qty_scale)
+                            yield _decode_trade_row_v1(row, price_scale, qty_scale, venue, symbol, date)
             else:
                 raise ValueError(
                     f"Unsupported replay schema_version={version!r} for "
@@ -232,10 +232,13 @@ class ReplayReader:
             return None
 
 
-def _decode_depth_row_v1(row: dict, price_scale: int, qty_scale: int) -> dict:
+def _decode_depth_row_v1(row: dict, price_scale: int, qty_scale: int, venue: str, symbol: str, date: str) -> dict:
     """Decode one v1 physical depth row back to the exact v0 logical row
-    shape. Independent of converter/depth_phase2.py and convert_day.py —
-    uses only this module's own fixed-point/flag decode helpers."""
+    shape (including venue/symbol/date, which v0 rows carry per-row and v1
+    physically omits, restoring them from the partition identity passed by
+    the caller — never physically re-added to v1 storage). Independent of
+    converter/depth_phase2.py and convert_day.py — uses only this module's
+    own fixed-point/flag decode helpers."""
     record_type = DEPTH_RECORD_TYPE_CODES_REV[int(row["record_type_code"])]
     (
         is_snapshot_seed,
@@ -257,6 +260,9 @@ def _decode_depth_row_v1(row: dict, price_scale: int, qty_scale: int) -> dict:
 
     hash_bytes = row.get("native_payload_hash")
     return {
+        "venue": venue,
+        "symbol": symbol,
+        "date": date,
         "stream_session_id": row["stream_session_id"],
         "session_seq": row["session_seq"],
         "raw_index": row["raw_index"],
@@ -278,15 +284,20 @@ def _decode_depth_row_v1(row: dict, price_scale: int, qty_scale: int) -> dict:
     }
 
 
-def _decode_trade_row_v1(row: dict, price_scale: int, qty_scale: int) -> dict:
+def _decode_trade_row_v1(row: dict, price_scale: int, qty_scale: int, venue: str, symbol: str, date: str) -> dict:
     """Decode one v1 physical trade row back to the exact v0 logical row
-    shape. Independent of converter/depth_phase2.py and convert_day.py —
-    uses only this module's own fixed-point/enum decode helpers."""
+    shape (including venue/symbol/date, restored from the partition
+    identity passed by the caller). Independent of converter/depth_phase2.py
+    and convert_day.py — uses only this module's own fixed-point/enum
+    decode helpers."""
     record_type = TRADE_RECORD_TYPE_CODES_REV[int(row["record_type_code"])]
     price_str = decode_fixed_point(row["price_mantissa"], price_scale)
     quantity_str = decode_fixed_point(row["quantity_mantissa"], qty_scale)
     hash_bytes = row.get("native_payload_hash")
     return {
+        "venue": venue,
+        "symbol": symbol,
+        "date": date,
         "trade_stream_session_id": row["trade_stream_session_id"],
         "trade_session_seq": row["trade_session_seq"],
         "raw_index": row["raw_index"],

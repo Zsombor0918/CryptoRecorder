@@ -93,6 +93,272 @@ An entry may be skipped **only** for:
 - <or "none — task fully completed">
 ```
 
+## 2026-07-27 — Issue #20 Phase 5 corrective commit: complete v1 logical and validation contract
+
+### Change summary
+- A review of the pushed head (`76a61e5`, the Phase 5 compact replay
+  schema v1 prototype) correctly identified 4 review blockers. The
+  `76a61e5` commit is **not reverted**; this entry is a narrowly scoped
+  corrective commit on top of it, per explicit instruction, and Phase 5
+  remains directionally accepted (the 1.30x local size reduction reported
+  previously is honest prototype evidence, not a failure).
+- **Blocker 1 — complete logical-row contract**: `stores/replay_reader.py`'s
+  `_decode_depth_row_v1()`/`_decode_trade_row_v1()` previously omitted
+  `venue`/`symbol`/`date` from every decoded v1 row despite the module
+  docstring claiming v0/v1 logical parity, and despite v0 rows (as
+  produced by `pipeline/build_replay_store.py`'s
+  `_convert_depth_record()`/`_convert_trade_record()`) always carrying
+  these three fields. Both decode functions now accept the partition
+  identity (threaded through from `ReplayReader.iter_depths()`/
+  `iter_trades()`, which already have `venue`/`symbol`/`date` as method
+  arguments) and include them in every returned row.
+- **Blocker 2 — version-aware partition validation**: `stores/replay_writer.py`'s
+  `validate_partition()` previously validated only `status`/checksums,
+  identically regardless of `schema_version` — an unsupported version, a
+  v1 partition missing required metadata, or a manifest/physical-schema
+  mismatch would all have been silently accepted as valid (and
+  skippable, via `pipeline.build_replay_store`'s skip-if-valid check).
+  Split the version-specific logic into a new
+  `_validate_schema_version_contract()` helper: a manifest with no
+  `schema_version` (legacy v0) or an explicit `schema_version=0` requires
+  the on-disk depth/trades Parquet physical schema to exactly match
+  `DEPTH_REPLAY_SCHEMA`/`TRADE_REPLAY_SCHEMA` (field names + types, via
+  new `_schema_matches()`); an explicit `schema_version=1` additionally
+  requires `format_version == FORMAT_VERSION_V1`, a non-empty
+  `builder_version`, integer `price_scale`/`qty_scale` (rejecting `bool`,
+  which is a `int` subclass in Python, and negative values), a complete
+  `encoding_profile` (`compression`/`compression_level`/
+  `row_group_batch_size` present), and that the physical Parquet schemas
+  match `DEPTH_REPLAY_SCHEMA_V1`/`TRADE_REPLAY_SCHEMA_V1`. An explicit
+  `schema_version` outside `{0, 1}` (`SUPPORTED_SCHEMA_VERSIONS`) fails
+  immediately with a logged warning.
+- **Blocker 3 — explicit non-default v1 path through the canonical
+  builder**: `pipeline/build_replay_store.py`'s `build_replay_for_symbol()`
+  gained `schema_version: int = 0` (plus `price_scale`/`qty_scale`
+  passthrough) — the default preserves exactly today's production
+  behavior for every existing caller (including
+  `pipeline/daily_build.py`, which does not pass this argument). Added a
+  `--schema-version {0,1}` CLI flag to `python -m pipeline.build_replay_store`.
+  No systemd unit or production configuration references this flag; no
+  automatic rebuild/migration of existing partitions was added; an
+  unsupported value fails immediately via `ReplayWriter`'s own
+  constructor check (unchanged from the original Phase 5 commit).
+- **Blocker 4 — source identity bound to the raw root actually
+  consumed**: `stores/replay_writer.py`'s `finalize_staging()` no longer
+  calls `pipeline.raw_manifest.compute_raw_source_identity()` itself (the
+  original Phase 5 commit did, using the global `config.DATA_ROOT`
+  default when no explicit `data_root` was supplied to
+  `compute_raw_source_identity`, which could silently record checksums
+  against a different raw root than a custom `--data-root` build
+  actually consumed). `ReplayWriter` now only ever records
+  `source_identity` if the caller explicitly supplies it (constructor
+  arg or the new `set_source_identity()` method); if not supplied, the
+  manifest honestly records `source_identity` as incomplete
+  (`"error": "source_identity not supplied by caller"`), never a guess.
+  `pipeline/build_replay_store.py`'s `build_replay_for_symbol()` now
+  computes `compute_raw_source_identity(..., data_root=data_root)` — the
+  EXACT `data_root` argument it was called with — immediately after
+  streaming depth/trade records, and calls
+  `writer.set_source_identity(...)` before finalization. Also fixed
+  `converter/instruments.py`'s `load_exchange_info()` and
+  `stores/replay_writer.py`'s `_derive_fixed_point_scales()`/
+  `ReplayWriter.__init__()` to accept an explicit `data_root` parameter
+  (previously both hardcoded to `config.DATA_ROOT`), threaded through
+  from `build_replay_for_symbol()`'s own `data_root`, so a custom
+  `--data-root` build's fixed-point scale derivation reads exchangeInfo
+  from the same root it consumed for depth/trade streaming and source
+  identity — never a different, global default root.
+- **Pre-existing gap fixed while re-running Tier-2 through the canonical
+  builder** (discovered during this correction, NOT specific to
+  `schema_version`): `build_replay_for_symbol()`'s `instrument_metadata`
+  dict never included the raw exchangeInfo `filters` list (only
+  `venue`/`symbol`/`market_type`/`instrument_id`/`raw_symbol`/
+  `quote_asset`/`base_asset`). `validation/replay_catalog_reconstruct.py`'s
+  `_exchange_info_from_replay_metadata()` requires a `filters` key to
+  treat the replay's `instrument.json` as exchangeInfo-shaped; without
+  it, `build_instruments()` silently fell back to
+  `converter.instruments._default_info()`'s generic
+  `PRICE_FILTER.tickSize="0.01000000"`/`LOT_SIZE.stepSize="0.00001000"`
+  defaults — producing a DIFFERENT price/size precision than the
+  reference `convert_day.py` path's real exchangeInfo-derived precision,
+  and failing the canonical instrument-precision comparison
+  (`compare_instruments_semantic()`) for ANY replay-based candidate (v0
+  or v1 alike — confirmed by reproducing the exact same
+  `price_precision`/`size_precision` mismatch for ADAUSDT with
+  `schema_version=0`). Fixed by including `symbol_info.get("filters", [])`
+  in `instrument_metadata`.
+- Also fixed a pre-existing, unrelated bug in
+  `validation/validate_catalog_equivalence.py`'s CLI `main()`: the
+  summary `print()` block referenced stale comparison-dict keys
+  (`comparison["trade_count_old"]`, `comparison["timestamp_range_match"]`)
+  that no longer exist in the current per-instrument (`by_instrument`)
+  report shape, causing a `KeyError` crash immediately after a
+  successful comparison run (the JSON report itself was written
+  correctly before the crash — this was a cosmetic CLI-output bug, not a
+  comparison-logic bug). Rewrote the summary print to walk the actual
+  `by_instrument` structure.
+- Added `tests/test_replay_schema_v1_corrections.py` (20 tests) proving
+  all 4 blockers plus the instrument-metadata regression: complete
+  key-set/value comparison of equivalent v0/v1 rows (not just the
+  manifest), `validate_partition()` acceptance/rejection for valid v0,
+  valid v1, unsupported version, missing `price_scale`, invalid
+  `qty_scale` type, malformed `encoding_profile`, and v0/v1 physical-
+  schema mismatch in both directions, `build_replay_for_symbol()`
+  defaulting to v0 / explicitly producing v1 / failing immediately on an
+  unsupported version / publishing instrument metadata, and
+  `source_identity` reflecting only the actually-consumed root across
+  two different raw roots with different file content (proving no
+  cross-root leakage) plus `ReplayWriter` never recomputing
+  `source_identity` itself.
+
+### Files/packages touched
+- `stores/replay_reader.py` (venue/symbol/date restored in v1 decode)
+- `stores/replay_writer.py` (version-aware `validate_partition()`,
+  `_validate_schema_version_contract()`, `_schema_matches()`,
+  `set_source_identity()`, `data_root` constructor arg, removed internal
+  `compute_raw_source_identity()` call)
+- `converter/instruments.py` (`load_exchange_info()` gained explicit
+  `data_root` parameter)
+- `pipeline/build_replay_store.py` (`schema_version`/`price_scale`/
+  `qty_scale` args + `--schema-version` CLI flag on
+  `build_replay_for_symbol()`/`main()`; explicit `compute_raw_source_identity()`
+  call bound to the actual `data_root`; `instrument_metadata` now
+  includes `filters`)
+- `validation/validate_catalog_equivalence.py` (`schema_version` param
+  threaded through `_run_new_pipeline()`/`validate_catalog_equivalence()`/
+  CLI `--schema-version`; fixed the stale CLI summary print)
+- `tests/test_replay_schema_v1_corrections.py` (new — 20 tests)
+- `tests/test_replay_schema_v1.py` (2 stubs updated for the
+  `load_exchange_info(..., data_root=...)` signature change; 1 test
+  rewritten for the `ReplayWriter` no-longer-self-computing-source-identity
+  contract)
+- `CHANGELOG.md` (`[Unreleased]` → `Added`)
+- `docs/CHANGE_AUDIT.md` (this entry)
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] docs/REPO_STRUCTURE.md (no folder/file contract change)
+- [x] docs/PROJECT_STATUS.md (reviewed; no validated/deferred status
+  changed — the `full_l2`/v2.0.0 gate remains unmet; this correction
+  strengthens the Phase 5 prototype without claiming Tier-3 completion)
+- [x] docs/IMPLEMENTATION_AUDIT.md (reviewed; no contradiction — the
+  Phase 3 matrix's compaction levers are unchanged by this correction,
+  only the completeness/validation/identity-binding bugs around them)
+- [x] relevant feature docs:
+  - docs/FULL_L2_REPLAY_CATALOG_PLAN.md (reviewed; the
+    `sync_state`-fenced-range-bookkeeping caveat this entry's Tier-2
+    re-run confirms is pre-existing and identical for v0 is already
+    documented there — no update needed)
+  - docs/REPLAY_STORE.md (reviewed; the "Versioning (v0 / v1)" section
+    added in the prior Phase 5 entry remains accurate — no update
+    required for this correction)
+
+### Docs updated
+- [x] CHANGELOG.md
+- No docs update required because: the v0/v1 physical-difference
+  description in `docs/REPLAY_STORE.md` remains accurate; no new
+  validated/deferred status claim changed.
+
+### Status / validation impact
+- Validated status changed: no
+- Deferred status changed: no
+- New claims added: no new *validated* status claim. This entry reports
+  an HONEST PARTIAL Tier-2 result (see below), explicitly not claimed as
+  a full Tier-2 pass, and does not alter the `full_l2`/v2.0.0 gate.
+- Evidence for any new validation claim:
+  - **Tier 2 re-run through the canonical builder + canonical validator**
+    (`validation.validate_catalog_equivalence` CLI, `--schema-version 1`,
+    `--profile full_l2 --emit-depth10`, ADAUSDT, BINANCE_SPOT,
+    2026-06-12, real local `data_raw`, normal instrument-metadata
+    publication via the canonical `build_replay_for_symbol()` path — not
+    a manual four-function comparison script):
+    - `instrument_ids_match`: **True**
+    - `instrument_precision` (after the filters fix): **True**
+      (`price_precision`/`size_precision`/`price_increment`/
+      `size_increment` all match; before the fix this was **False**
+      — `price_precision` 4 vs 2, `size_precision` 1 vs 5 — confirming
+      the gap was real and the fix necessary)
+    - `trade_ticks` (exhaustive): **True** (124,457 / 124,457)
+    - `order_book_deltas` (exhaustive): **True** (412,317 / 412,317)
+    - `order_book_depth10` (exhaustive): **True** (71,341 / 71,341)
+    - `book_checkpoints` (streaming, hash-canonicalized): **True**
+      (7/7 checkpoints match)
+    - `raw_to_replay_metadata` (quality/continuity evidence, bounded
+      raw-vs-replay comparison): **True**
+    - `continuity_diagnostics`: **False** (`fenced_range_count`: old 34,
+      new 1)
+    - `fenced_ranges` (digest comparison): **False** (`count_old=34`,
+      `count_new=1`, digest mismatch)
+    - **Re-run the identical canonical validator with `--schema-version 0`
+      against the same raw data**: the exact same
+      `continuity_diagnostics`/`fenced_ranges` result
+      (`fenced_range_count` old 34, new 1) occurs for legacy v0 too —
+      proving this gap is NOT a v1-specific regression but the
+      already-documented `sync_state`-fenced-range-bookkeeping caveat in
+      `docs/FULL_L2_REPLAY_CATALOG_PLAN.md` (the replay builder drops
+      `sync_state` records identically for both schema versions).
+    - **Honest conclusion, per this correction's own instruction**: Tier 2
+      is **6 of 7 canonical gating components pass** for the v1
+      prototype on this single symbol/day. It is explicitly **NOT**
+      reported as "Tier 2 fully passed" — the fenced-range/continuity gap
+      remains open (shared with legacy v0, not newly introduced by v1),
+      and closing it is out of scope for this corrective commit (it is
+      not a v1-specific defect to fix, and reproducing it identically on
+      v0 proves the canonical validator's fenced-range/continuity
+      comparators are functioning correctly, not broken by this
+      correction).
+
+### Tests run
+```bash
+source .venv/bin/activate
+python -m pytest tests/test_replay_schema_v1_corrections.py tests/test_replay_schema_v1.py tests/test_book_checkpoint_hash_canonicalization.py -q
+  # 90 passed
+python -m pytest tests/test_replay_store.py tests/test_replay_depth_adapter.py tests/test_replay_memory_bounded.py tests/test_converter_integration.py tests/test_convert_day_phase2.py tests/test_streaming_gating_bounded_memory.py tests/test_validate_catalog_equivalence_exhaustive_wiring.py tests/test_semantic_oracle_exhaustive_streaming.py tests/test_semantic_oracle_detects_injected_faults.py tests/test_catalog_equivalence.py tests/test_catalog_equivalence_full_l2.py tests/test_windowed_loader_boundaries.py -q
+  # 141 passed, 1 skipped
+python -m pytest tests/test_repo_structure.py tests/test_agent_infrastructure.py -q   # 56 passed
+python -m pytest -q   # 504 passed, 3 skipped
+```
+
+### Validation CLIs run
+```bash
+CRYPTO_RECORDER_DATA_ROOT="$(pwd)/data_raw" python -m validation.validate_catalog_equivalence \
+  --date 2026-06-12 --symbols ADAUSDT --venues BINANCE_SPOT \
+  --data-root "$(pwd)/data_raw" \
+  --work-root /tmp/tier2_v3_work/work \
+  --old-catalog-root /tmp/tier2_v3_work/old_catalog \
+  --replay-root /tmp/tier2_v3_work/replay \
+  --new-catalog-root /tmp/tier2_v3_work/new_catalog \
+  --profile full_l2 --emit-depth10 --schema-version 1 --overwrite \
+  --report-path /tmp/tier2_v3_work/report.json
+# Re-run identically with --schema-version 0 against /tmp/tier2_v0_check/*
+# to confirm the fenced-range gap is pre-existing, not v1-specific.
+python -m validation.audit_change_compliance --staged
+```
+
+### Known limitations / out of scope
+- The `continuity_diagnostics`/`fenced_ranges` gap (34 vs 1 fenced
+  ranges) remains open for BOTH v0 and v1 — this corrective commit does
+  not attempt to close it, since it is a pre-existing, already-documented
+  `sync_state` limitation of the replay builder shared by both schema
+  versions, not a defect introduced by Phase 5 or this correction.
+  Closing it (if ever required) is a separate, future scoped task.
+- The Tier-2 re-run covers exactly one symbol (ADAUSDT) and one day
+  (2026-06-12) on BINANCE_SPOT; it does not cover BINANCE_USDTF or any
+  other symbol, and must not be read as a Tier-3 representative-day
+  result.
+- No real-build peak-RSS/MemoryMax measurement was taken for this
+  corrective commit's Tier-2 re-run (unchanged limitation from the prior
+  Phase 5 entry).
+- Phase 6 (external-merge/SQLite replacement), Tier 3, format-selection
+  Phase 7, a custom binary format, Phase 9 self-contained-replay
+  acceptance, the raw-retention deletion gate, staging lifecycle work,
+  disk-monitor/systemd changes, a selected-reconstruction CLI, production
+  deployment/data cleanup, uv migration, and any KovacsTrader change
+  remain explicitly **not started**, per the approved checkpoint's scope
+  boundary.
+
+---
+
 ## 2026-07-27 — Issue #20 Phase 5 (revised-plan phase numbering): compact versioned replay schema v1 prototype
 
 ### Change summary

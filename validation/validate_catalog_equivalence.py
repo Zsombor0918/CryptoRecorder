@@ -128,12 +128,16 @@ def _run_new_pipeline(
     emit_depth10: bool,
     depth10_interval_sec: float,
     derived_depth_snapshot_levels: int,
+    schema_version: int = 0,
 ) -> dict[str, Any]:
     replay_results = []
     for venue in venues:
         for symbol in symbols:
             replay_results.append(
-                build_replay_for_symbol(venue, symbol, date, data_root, replay_root)
+                build_replay_for_symbol(
+                    venue, symbol, date, data_root, replay_root,
+                    schema_version=schema_version,
+                )
             )
 
     catalog_result = generate_catalog_from_replay(
@@ -533,7 +537,21 @@ def validate_catalog_equivalence(
     depth10_interval_sec: float = DEPTH10_INTERVAL_SEC,
     derived_depth_snapshot_levels: int = DERIVED_DEPTH_SNAPSHOT_LEVELS,
     window_ns: int = DEFAULT_WINDOW_NS,
+    schema_version: int = 0,
 ) -> dict[str, Any]:
+    """Run the canonical semantic-equivalence gate between the reference
+    (data_raw -> convert_day.py) catalog and the replay-reconstructed
+    catalog for one date/symbol/venue set.
+
+    Args:
+        schema_version: replay schema version to build the candidate side
+            with (0 default/legacy, or 1 for the issue #20 Phase 5 compact
+            prototype). This lets the SAME canonical validator gate a v1
+            replay build end-to-end (instruments/precision, exhaustive
+            trades/deltas, book checkpoints, Depth10, fenced-range/
+            continuity/quality-flag evidence) without a separate ad-hoc
+            four-function comparison script.
+    """
     start = _parse_date(date)
     end = start + timedelta(days=1)
     new_catalog_path = new_catalog_root / "job_validation_new"
@@ -594,6 +612,7 @@ def validate_catalog_equivalence(
         emit_depth10=emit_depth10,
         depth10_interval_sec=depth10_interval_sec,
         derived_depth_snapshot_levels=derived_depth_snapshot_levels,
+        schema_version=schema_version,
     )
     report["new_run"] = new_result
     if new_result["catalog_result"].get("status") != "success":
@@ -808,6 +827,15 @@ def main() -> int:
     )
     parser.add_argument("--report-path", type=Path, default=None)
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument(
+        "--schema-version",
+        type=int,
+        default=0,
+        choices=(0, 1),
+        help="Replay schema version to build the candidate side with: 0 "
+             "(default, legacy) or 1 (issue #20 Phase 5 compact prototype, "
+             "for development validation only).",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -833,6 +861,7 @@ def main() -> int:
         depth10_interval_sec=args.depth10_interval_sec,
         derived_depth_snapshot_levels=args.derived_depth_snapshot_levels,
         window_ns=int(args.window_hours * 3_600_000_000_000),
+        schema_version=args.schema_version,
     )
 
     if args.report_path is not None:
@@ -852,17 +881,21 @@ def main() -> int:
     print(f"Catalog equivalence status: {report['status']} (profile={report['profile']})")
     print(f"Report: {report_path}")
     comparison = report.get("comparison") or {}
-    if "trade_count_old" in comparison:
-        print(
-            "Trades old/new: "
-            f"{comparison['trade_count_old']} / {comparison['trade_count_new']}"
-        )
-        print(f"Timestamp range match: {comparison['timestamp_range_match']}")
-        print(f"Sample mismatches: {len(comparison.get('sample_mismatches') or [])}")
-    if "order_book_deltas" in comparison:
-        print(f"OrderBookDeltas match: {comparison['order_book_deltas']['passed']}")
-        print(f"OrderBookDepth10 match: {comparison['order_book_depth10']['passed']}")
-        print(f"Book checkpoints match: {comparison['book_checkpoints']['passed']}")
+    # NOTE: this summary print was previously stale (referenced
+    # "trade_count_old"/"timestamp_range_match" keys that no longer exist
+    # in the per-instrument comparison report shape — fixed here, not a
+    # behavior change to the comparison logic itself, only to what is
+    # printed to stdout).
+    if "instrument_ids_match" in comparison:
+        print(f"Instrument IDs match: {comparison['instrument_ids_match']}")
+    if "instrument_precision" in comparison:
+        print(f"Instrument precision match: {comparison['instrument_precision']['passed']}")
+    for instrument_id, per_instrument in (comparison.get("by_instrument") or {}).items():
+        print(f"--- {instrument_id} ---")
+        for key, value in per_instrument.items():
+            if isinstance(value, dict) and "passed" in value:
+                print(f"  {key} passed: {value['passed']}")
+
 
     if report["status"] == "passed":
         return 0

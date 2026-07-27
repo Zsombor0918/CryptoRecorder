@@ -444,6 +444,9 @@ def build_replay_for_symbol(
     replay_root: Path,
     *,
     force: bool = False,
+    schema_version: int = 0,
+    price_scale: "Optional[int]" = None,
+    qty_scale: "Optional[int]" = None,
 ) -> dict:
     """
     Build replay store for a single venue/symbol/date.
@@ -452,6 +455,19 @@ def build_replay_for_symbol(
     that restarted runs make durable progress without rebuilding earlier work.
     Pass force=True to rebuild even when a valid partition already exists (use
     after raw data has been repaired or backfilled).
+
+    Args:
+        schema_version: 0 (default — legacy v0, unchanged production
+            behavior; every existing caller that omits this argument keeps
+            producing exactly today's output) or 1 (the issue #20 Phase 5
+            compact prototype schema, intended for development validation
+            only — not wired into any systemd unit or production config by
+            this change). Any other value raises immediately via
+            ``ReplayWriter``'s own constructor check — never silently falls
+            back to v0.
+        price_scale / qty_scale: only used when schema_version=1; forwarded
+            to ``ReplayWriter`` (see its docstring for the derivation
+            fallback).
 
     Returns:
         Status dict with counts and errors.
@@ -527,6 +543,10 @@ def build_replay_for_symbol(
 
     writer = ReplayWriter(
         replay_root, venue, symbol, date,
+        schema_version=schema_version,
+        price_scale=price_scale,
+        qty_scale=qty_scale,
+        data_root=data_root,
     )
 
     try:
@@ -562,6 +582,18 @@ def build_replay_for_symbol(
         if trade_batch:
             writer.write_trades_batch(trade_batch)
 
+        if schema_version == 1:
+            # Issue #20 Phase 5 correction: source identity must reflect the
+            # EXACT data_root/channels this build actually consumed above
+            # (depth_v2, trade_v2) — never independently recomputed by
+            # ReplayWriter against the global config.DATA_ROOT, which would
+            # silently record checksums from a different raw root than a
+            # custom --data-root build actually used.
+            from pipeline.raw_manifest import compute_raw_source_identity
+            writer.set_source_identity(compute_raw_source_identity(
+                venue, symbol, date, ["depth_v2", "trade_v2"], data_root=data_root
+            ))
+
         # Load instrument metadata if available
         instrument_metadata = None
         try:
@@ -588,6 +620,20 @@ def build_replay_for_symbol(
                     "raw_symbol": symbol,
                     "quote_asset": symbol_info.get("quoteAsset", "USDT"),
                     "base_asset": symbol_info.get("baseAsset", symbol.replace("USDT", "")),
+                    # Preserve the raw exchangeInfo filters (PRICE_FILTER,
+                    # LOT_SIZE, etc.) so downstream Nautilus instrument
+                    # reconstruction (validation.replay_catalog_reconstruct's
+                    # build_instruments()) derives the SAME price/size
+                    # precision as the reference convert_day.py path,
+                    # instead of silently falling back to
+                    # converter.instruments._default_info()'s generic
+                    # defaults. Not previously included — a pre-existing
+                    # gap in the canonical builder's instrument metadata,
+                    # independent of replay schema_version, fixed here
+                    # because it otherwise blocks the canonical
+                    # instrument-precision gate for ANY replay-based
+                    # candidate (v0 or v1).
+                    "filters": symbol_info.get("filters", []),
                 }
         except Exception as e:
             logger.warning(f"Could not load instrument metadata for {venue}/{symbol}: {e}")
@@ -659,6 +705,16 @@ Examples:
         help="Rebuild partition even if it already has a valid complete manifest "
              "(use after raw data has been repaired or backfilled)",
     )
+    parser.add_argument(
+        "--schema-version",
+        type=int,
+        default=0,
+        choices=(0, 1),
+        help="Replay schema version to build: 0 (default, production legacy "
+             "layout) or 1 (issue #20 Phase 5 compact prototype, for "
+             "development validation only — not used by any systemd unit "
+             "or production configuration).",
+    )
     args = parser.parse_args()
 
     data_root = args.data_root or DATA_ROOT
@@ -694,6 +750,7 @@ Examples:
                 result = build_replay_for_symbol(
                     venue, symbol, date_str, data_root, replay_root,
                     force=args.force,
+                    schema_version=args.schema_version,
                 )
                 results.append(result)
 

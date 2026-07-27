@@ -302,7 +302,7 @@ def test_fixed_point_null_and_zero_boundary_values():
 # ---------------------------------------------------------------------------
 
 def test_derive_fixed_point_scales_uses_exchange_filters(tmp_path, monkeypatch):
-    def _fake_load_exchange_info(venue, date):
+    def _fake_load_exchange_info(venue, date, data_root=None):
         if "USDTF" in venue:
             return {"BTCUSDT": {"filters": [
                 {"filterType": "PRICE_FILTER", "tickSize": "0.10000000"},
@@ -326,7 +326,7 @@ def test_derive_fixed_point_scales_uses_exchange_filters(tmp_path, monkeypatch):
 
 
 def test_derive_fixed_point_scales_raises_clearly_when_exchange_info_missing(monkeypatch):
-    monkeypatch.setattr("converter.instruments.load_exchange_info", lambda venue, date: {})
+    monkeypatch.setattr("converter.instruments.load_exchange_info", lambda venue, date, data_root=None: {})
     with pytest.raises(ValueError, match="exchangeInfo"):
         _derive_fixed_point_scales("BINANCE_SPOT", "UNKNOWNUSDT", "2026-06-10")
 
@@ -524,34 +524,47 @@ def test_native_payload_hash_physically_32_bytes_not_64_char_hex(tmp_path):
     assert str(field.type) == "fixed_size_binary[32]"
 
 
-def test_source_identity_recorded_when_raw_available(tmp_path, monkeypatch):
-    # Point config.DATA_ROOT-equivalent lookup at a fake raw tree with real files.
-    raw_root = tmp_path / "data_raw"
-    depth_dir = raw_root / "BINANCE_SPOT" / "depth_v2" / "BTCUSDT" / "2026-06-10"
-    depth_dir.mkdir(parents=True)
-    (depth_dir / "part.jsonl").write_text('{"x": 1}\n')
-    trade_dir = raw_root / "BINANCE_SPOT" / "trade_v2" / "BTCUSDT" / "2026-06-10"
-    trade_dir.mkdir(parents=True)
-    (trade_dir / "part.jsonl").write_text('{"y": 2}\n')
+def test_source_identity_recorded_when_explicitly_supplied(tmp_path):
+    """ReplayWriter no longer computes source_identity itself (issue #20
+    Phase 5 correction — see test_replay_schema_v1_corrections.py for the
+    full bound-to-actual-data-root proof); this test only proves an
+    explicitly-supplied identity is faithfully recorded in the manifest."""
+    supplied_identity = {
+        "channels": {
+            "depth_v2": [{"path": "x", "sha256": "aa", "size_bytes": 1}],
+            "trade_v2": [{"path": "y", "sha256": "bb", "size_bytes": 1}],
+        },
+        "complete": True,
+        "missing_channels": [],
+    }
 
-    monkeypatch.setattr("stores.replay_writer.compute_raw_source_identity",
-                         lambda venue, symbol, date, channels: {
-                             "channels": {
-                                 "depth_v2": [{"path": "x", "sha256": "aa", "size_bytes": 1}],
-                                 "trade_v2": [{"path": "y", "sha256": "bb", "size_bytes": 1}],
-                             },
-                             "complete": True,
-                             "missing_channels": [],
-                         })
+    replay_root = tmp_path / "replay_store"
+    writer = ReplayWriter(
+        replay_root, "BINANCE_SPOT", "BTCUSDT", "2026-06-10",
+        schema_version=1, price_scale=2, qty_scale=5,
+        source_identity=supplied_identity,
+    )
+    writer.write_depth_batch([_depth_row(session_seq=1, raw_index=0)])
+    writer.write_trades_batch([_trade_row(session_seq=1, raw_index=0)])
+    writer.finalize_staging()
+    writer.publish()
 
-    depth_rows = [_depth_row(session_seq=1, raw_index=0)]
-    trade_rows = [_trade_row(session_seq=1, raw_index=0)]
-    _build_v1_partition(tmp_path, depth_rows=depth_rows, trade_rows=trade_rows)
-
-    reader = ReplayReader(tmp_path / "replay_store")
+    reader = ReplayReader(replay_root)
     manifest = reader.load_manifest("BINANCE_SPOT", "BTCUSDT", "2026-06-10")
     assert manifest["source_identity"]["complete"] is True
     assert manifest["source_identity"]["channels"]["depth_v2"][0]["sha256"] == "aa"
+
+
+def test_source_identity_honestly_incomplete_when_not_supplied(tmp_path):
+    _build_v1_partition(
+        tmp_path,
+        depth_rows=[_depth_row(session_seq=1, raw_index=0)],
+        trade_rows=[_trade_row(session_seq=1, raw_index=0)],
+    )
+    reader = ReplayReader(tmp_path / "replay_store")
+    manifest = reader.load_manifest("BINANCE_SPOT", "BTCUSDT", "2026-06-10")
+    assert manifest["source_identity"]["complete"] is False
+    assert "error" in manifest["source_identity"]
 
 
 # ---------------------------------------------------------------------------

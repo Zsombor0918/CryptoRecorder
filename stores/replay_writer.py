@@ -35,7 +35,6 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from converter.spool import RawRecordSpool
-from pipeline.raw_manifest import compute_raw_source_identity
 from .replay_schema import (
     DEPTH_REPLAY_SCHEMA,
     TRADE_REPLAY_SCHEMA,
@@ -45,6 +44,7 @@ from .replay_schema import (
     FORMAT_VERSION_V1,
     SCHEMA_VERSION_V1,
     BUILDER_VERSION_V1,
+    SUPPORTED_SCHEMA_VERSIONS,
     DEPTH_RECORD_TYPE_CODES,
     TRADE_RECORD_TYPE_CODES,
     pack_depth_flags,
@@ -60,12 +60,23 @@ _DEFAULT_PARQUET_BATCH = int(
 )
 
 
-def _derive_fixed_point_scales(venue: str, symbol: str, date: str) -> "tuple[int, int]":
+def _derive_fixed_point_scales(
+    venue: str, symbol: str, date: str, data_root: "Path | None" = None
+) -> "tuple[int, int]":
     """Derive (price_scale, qty_scale) from date-specific Binance exchangeInfo
     filters (``PRICE_FILTER.tickSize`` / ``LOT_SIZE.stepSize`` /
     ``MARKET_LOT_SIZE.stepSize`` where present), per the checked-in Phase 3
     field/consumer/integrity matrix. Spot and futures are treated
     independently because ``load_exchange_info`` is looked up per ``venue``.
+
+    Args:
+        data_root: raw data root to read exchangeInfo from. Defaults to
+            ``config.DATA_ROOT`` (via ``load_exchange_info``'s own default)
+            for backward compatibility, but the canonical builder
+            (``pipeline.build_replay_store.build_replay_for_symbol``) always
+            passes its own ``data_root`` explicitly, so a custom
+            ``--data-root`` build derives its scale from the SAME raw root
+            it consumed for everything else.
 
     Raises ``ValueError`` with a clear message (never guesses a scale) if the
     required filters are not available for this venue/symbol/date — a v1
@@ -73,7 +84,7 @@ def _derive_fixed_point_scales(venue: str, symbol: str, date: str) -> "tuple[int
     """
     from converter.instruments import load_exchange_info, _get_filter, _precision_from_str
 
-    exchange_info = load_exchange_info(venue, date)
+    exchange_info = load_exchange_info(venue, date, data_root=data_root)
     info = exchange_info.get(symbol)
     if info is None:
         raise ValueError(
@@ -172,12 +183,24 @@ def _compute_sha256(file_path: Path) -> str:
 
 
 def validate_partition(partition_dir: Path) -> bool:
-    """Return True only if partition_dir is a complete, checksum-valid replay partition.
+    """Return True only if partition_dir is a complete, checksum-valid,
+    schema-version-valid replay partition.
 
     This is the single source of truth for partition validity, shared by
     ReplayWriter.publish() (post-publication validation) and
     pipeline.build_replay_store (skip-if-valid / crash-recovery checks) so
     that both call sites can never disagree about what "valid" means.
+
+    Version-aware (issue #20 Phase 5 correction): a partition is valid only
+    when EITHER
+      - the manifest has no ``schema_version`` field (legacy v0) and the
+        physical depth/trades Parquet files satisfy the legacy v0 schema; OR
+      - the manifest has an explicit, supported ``schema_version`` and all
+        required version-specific metadata/physical-schema checks for that
+        version pass.
+    An unsupported ``schema_version``, missing required v1 metadata, or a
+    physical-schema mismatch for the declared version all return False —
+    never treated as a valid, skippable partition.
     """
     manifest_path = partition_dir / "manifest.json"
     depth_path = partition_dir / "depth.parquet"
@@ -196,10 +219,102 @@ def validate_partition(partition_dir: Path) -> bool:
             if _compute_sha256(path) != expected:
                 logger.warning(f"Checksum mismatch for {partition_dir} ({key})")
                 return False
-        return True
+        return _validate_schema_version_contract(partition_dir, manifest, depth_path, trades_path)
     except Exception as e:
         logger.warning(f"Partition validation failed for {partition_dir}: {e}")
         return False
+
+
+def _validate_schema_version_contract(
+    partition_dir: Path,
+    manifest: dict,
+    depth_path: Path,
+    trades_path: Path,
+) -> bool:
+    """Version-specific completeness/physical-schema checks, split out of
+    validate_partition() for clarity. Called only after status/checksum
+    checks already passed."""
+    if "schema_version" not in manifest:
+        # Legacy v0: physical files must match the legacy v0 schema exactly
+        # (catches a partition whose manifest was stripped of
+        # schema_version but whose physical files are actually v1, or vice
+        # versa — an unsupported/ambiguous state must fail, not be
+        # silently accepted as v0).
+        return (
+            _schema_matches(depth_path, DEPTH_REPLAY_SCHEMA)
+            and _schema_matches(trades_path, TRADE_REPLAY_SCHEMA)
+        )
+
+    version = manifest["schema_version"]
+    if version not in SUPPORTED_SCHEMA_VERSIONS:
+        logger.warning(
+            f"Unsupported schema_version={version!r} for {partition_dir} "
+            f"(supported: {SUPPORTED_SCHEMA_VERSIONS})"
+        )
+        return False
+
+    if version == 0:
+        return (
+            _schema_matches(depth_path, DEPTH_REPLAY_SCHEMA)
+            and _schema_matches(trades_path, TRADE_REPLAY_SCHEMA)
+        )
+
+    if version == 1:
+        if manifest.get("format_version") != FORMAT_VERSION_V1:
+            logger.warning(
+                f"Partition {partition_dir} has schema_version=1 but "
+                f"format_version={manifest.get('format_version')!r} "
+                f"(expected {FORMAT_VERSION_V1!r})"
+            )
+            return False
+        if not manifest.get("builder_version"):
+            logger.warning(f"Partition {partition_dir} (v1) missing builder_version")
+            return False
+
+        price_scale = manifest.get("price_scale")
+        qty_scale = manifest.get("qty_scale")
+        if not isinstance(price_scale, int) or isinstance(price_scale, bool) or price_scale < 0:
+            logger.warning(f"Partition {partition_dir} (v1) has invalid price_scale: {price_scale!r}")
+            return False
+        if not isinstance(qty_scale, int) or isinstance(qty_scale, bool) or qty_scale < 0:
+            logger.warning(f"Partition {partition_dir} (v1) has invalid qty_scale: {qty_scale!r}")
+            return False
+
+        encoding_profile = manifest.get("encoding_profile")
+        if not isinstance(encoding_profile, dict):
+            logger.warning(f"Partition {partition_dir} (v1) missing encoding_profile")
+            return False
+        for required_key in ("compression", "compression_level", "row_group_batch_size"):
+            if required_key not in encoding_profile:
+                logger.warning(
+                    f"Partition {partition_dir} (v1) encoding_profile missing "
+                    f"required key {required_key!r}"
+                )
+                return False
+
+        return (
+            _schema_matches(depth_path, DEPTH_REPLAY_SCHEMA_V1)
+            and _schema_matches(trades_path, TRADE_REPLAY_SCHEMA_V1)
+        )
+
+    # Unreachable given the SUPPORTED_SCHEMA_VERSIONS check above, but fail
+    # closed rather than silently accept.
+    return False
+
+
+def _schema_matches(parquet_path: Path, expected_schema: pa.Schema) -> bool:
+    """Return True only if parquet_path's on-disk Arrow schema has exactly
+    the same field names and types as expected_schema (order-independent;
+    Parquet round-tripping may reorder metadata but must not change the
+    logical field set)."""
+    try:
+        actual = pq.ParquetFile(parquet_path).schema_arrow
+    except Exception as e:
+        logger.warning(f"Could not read schema of {parquet_path}: {e}")
+        return False
+    actual_fields = {f.name: f.type for f in actual}
+    expected_fields = {f.name: f.type for f in expected_schema}
+    return actual_fields == expected_fields
 
 
 def _write_channel_incremental(
@@ -296,6 +411,8 @@ class ReplayWriter:
         schema_version: int = 0,
         price_scale: "Optional[int]" = None,
         qty_scale: "Optional[int]" = None,
+        source_identity: "Optional[dict]" = None,
+        data_root: "Optional[Path]" = None,
     ):
         """
         Args:
@@ -310,6 +427,28 @@ class ReplayWriter:
                 first time a schema_version=1 partition is finalized. Tests
                 may pass these explicitly to avoid depending on on-disk
                 exchangeInfo fixtures.
+            source_identity: only used when schema_version=1. The caller
+                (e.g. ``pipeline.build_replay_store.build_replay_for_symbol``)
+                must compute this itself via
+                ``pipeline.raw_manifest.compute_raw_source_identity()`` using
+                the EXACT ``data_root`` and channels it actually streamed
+                from, and pass the result here — ``ReplayWriter`` never
+                independently recomputes source identity against the global
+                ``config.DATA_ROOT`` (issue #20 Phase 5 correction: doing so
+                could silently record checksums from a different raw root
+                than the one actually consumed by this build, e.g. under a
+                custom ``--data-root``). If omitted for a schema_version=1
+                partition, the manifest honestly records
+                ``source_identity`` as incomplete/not computed rather than
+                guessing a root.
+            data_root: raw data root used ONLY for automatic price/qty scale
+                derivation (exchangeInfo lookup) when schema_version=1 and
+                price_scale/qty_scale are not explicitly given. Defaults to
+                ``config.DATA_ROOT`` for backward compatibility, but the
+                canonical builder always passes its own ``data_root``
+                explicitly so a custom ``--data-root`` build derives its
+                scale from the exact same raw root it consumed for
+                everything else — never a different, global default root.
         """
         if schema_version not in (0, 1):
             raise ValueError(
@@ -324,6 +463,8 @@ class ReplayWriter:
         self.schema_version = schema_version
         self._price_scale = price_scale
         self._qty_scale = qty_scale
+        self._source_identity = source_identity
+        self._data_root = data_root
 
         self.output_dir = (
             self.replay_root
@@ -346,6 +487,16 @@ class ReplayWriter:
 
         self._depth_spool: "RawRecordSpool | None" = None
         self._trade_spool: "RawRecordSpool | None" = None
+
+    def set_source_identity(self, source_identity: dict) -> None:
+        """Explicitly supply the raw source-identity dict for this
+        partition (only meaningful for ``schema_version=1``). The caller
+        must have computed this against the exact ``data_root``/channels it
+        actually consumed (e.g. via
+        ``pipeline.raw_manifest.compute_raw_source_identity()``) — see the
+        constructor's ``source_identity`` docstring for why ``ReplayWriter``
+        never computes this itself."""
+        self._source_identity = source_identity
 
     # ------------------------------------------------------------------
     # Lazy spool init
@@ -421,7 +572,7 @@ class ReplayWriter:
         if self.schema_version == 1:
             if self._price_scale is None or self._qty_scale is None:
                 derived_price_scale, derived_qty_scale = _derive_fixed_point_scales(
-                    self.venue, self.symbol, self.date
+                    self.venue, self.symbol, self.date, data_root=self._data_root
                 )
                 if self._price_scale is None:
                     self._price_scale = derived_price_scale
@@ -523,24 +674,21 @@ class ReplayWriter:
             }
             manifest["price_scale"] = self._price_scale
             manifest["qty_scale"] = self._qty_scale
-            try:
-                manifest["source_identity"] = compute_raw_source_identity(
-                    self.venue, self.symbol, self.date, ["depth_v2", "trade_v2"]
-                )
-            except Exception as exc:
-                # Source-identity capture is provenance evidence, not a
-                # correctness requirement for reconstruction (the replay
-                # partition itself is self-contained) — record the failure
-                # honestly rather than failing the whole build.
-                logger.warning(
-                    f"Could not compute raw source_identity for "
-                    f"{self.venue}/{self.symbol}/{self.date}: {exc}"
-                )
+            if self._source_identity is not None:
+                manifest["source_identity"] = self._source_identity
+            else:
+                # No source_identity was passed by the caller (issue #20
+                # Phase 5 correction: ReplayWriter must never independently
+                # recompute this against the global config.DATA_ROOT, since
+                # that could silently record checksums from a different raw
+                # root than the one actually consumed for this build, e.g.
+                # under a custom --data-root). Record honestly as not
+                # computed rather than guessing a root.
                 manifest["source_identity"] = {
                     "channels": {},
                     "complete": False,
                     "missing_channels": ["depth_v2", "trade_v2"],
-                    "error": str(exc),
+                    "error": "source_identity not supplied by caller",
                 }
 
         self._manifest = manifest
