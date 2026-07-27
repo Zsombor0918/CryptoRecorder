@@ -132,7 +132,66 @@ Each partition contains a `manifest.json` with metadata:
 - `depth_checksum` / `trades_checksum`: SHA256 hashes for integrity verification
 - `ts_range_start_ns` / `ts_range_end_ns`: Min/max server timestamps in UTC nanoseconds
 
-## ReplayReader API
+## Versioning (v0 / v1)
+
+**Status: v1 is an implemented prototype (issue #20 Phase 5 — the revised
+plan's phase numbering), not yet run at representative-day (Tier 3) scale.**
+
+A manifest with no `schema_version` field is legacy **v0** — exactly the
+schema shown above, produced by every `ReplayWriter` call that does not pass
+`schema_version=1` explicitly (the default). `ReplayReader` treats a missing
+`schema_version` as v0 unconditionally; this is never reinterpreted.
+
+A manifest with an explicit `schema_version` is dispatched to the matching
+versioned reader. Today only `schema_version=1` is implemented, alongside
+`format_version`, `builder_version`, and `encoding_profile` fields. An
+explicit `schema_version` outside `{0, 1}` raises `ValueError` naming the
+found and supported versions — `ReplayReader` never silently misreads an
+unsupported version.
+
+**v1 physical differences from v0** (all restored to the exact v0 logical
+row shape by `ReplayReader.iter_depths()`/`iter_trades()` — downstream code,
+including `stores/replay_depth_adapter.py` and
+`validation/validate_catalog_equivalence.py`, requires no changes to read
+either version):
+
+- `venue`/`symbol`/`date` are removed from every row and read from the
+  manifest/partition path instead (see the checked-in Phase 3 field matrix
+  in `docs/IMPLEMENTATION_AUDIT.md`).
+- `record_type` is stored as an `int8` enum code (`record_type_code`)
+  instead of a string.
+- The 5 depth boolean columns (`is_snapshot_seed`, `is_depth_update`,
+  `is_sync_state`, `is_desync`, `is_resync`) are packed into a single `int8`
+  bitmask (`flags`).
+- `price`/`size`/`quantity` are stored as an exact fixed-point integer
+  mantissa (`int64`) instead of `float64` + lexical string columns. The
+  scale is derived once per partition from date-specific Binance
+  `PRICE_FILTER.tickSize`/`LOT_SIZE.stepSize` (spot and futures
+  independently) and recorded in the manifest (`price_scale`/`qty_scale`).
+  Encoding/decoding uses `Decimal` only — never a binary float
+  intermediate.
+- `native_payload_hash` is stored as 32 raw bytes (`fixed_size_binary[32]`)
+  instead of a 64-character hex string — the hash itself is retained (the
+  Phase 2 Section 3 traceability replacement remains design-only, so hash
+  removal is not authorized), only its physical encoding is compacted.
+- v1 manifests additionally carry a best-effort `source_identity` field
+  (per-file SHA-256 + size for the raw files that produced the partition,
+  via `pipeline.raw_manifest.compute_raw_source_identity`) — provenance
+  evidence only, not a substitute for the per-event hash and not required
+  for reconstruction (a v1 partition remains fully self-contained without
+  it).
+
+**Not compacted in v1** (deferred — the matrix marks these "pending proof"/
+"benchmark-needed", not overlooked): `U`/`u`/`pu` continuity ids,
+`trade_id`/`agg_trade_id`, `market_type`, and `quality_flags` remain in
+their v0 lexical/JSON representations.
+
+**Local development-evidence measurements** (ADAUSDT, 2026-06-12, single
+symbol/day — development evidence only, not a Tier-3 representative-day
+claim): see `docs/CHANGE_AUDIT.md`'s Phase 5 entry for the exact byte counts
+and semantic-comparison result.
+
+
 
 Load and query replay_store data via the [ReplayReader](../stores/replay_reader.py) interface.
 

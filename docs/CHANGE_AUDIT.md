@@ -93,6 +93,242 @@ An entry may be skipped **only** for:
 - <or "none — task fully completed">
 ```
 
+## 2026-07-27 — Issue #20 Phase 5 (revised-plan phase numbering): compact versioned replay schema v1 prototype
+
+### Change summary
+- Implemented the smallest viable versioned compact replay-schema v1
+  prototype, per the approved Phase 0–4 review checkpoint (baseline,
+  semantic oracle + failure-injection proof, raw-retention/legacy/
+  traceability/versioning design, field/consumer/integrity matrix,
+  repo-boundary alignment — all previously completed and approved; not
+  repeated or re-hardened here). Legacy v0 is completely unchanged and
+  remains the default; v1 is strictly additive and opt-in.
+- **Versioning**: added `format_version`/`schema_version`/
+  `builder_version`/`SUPPORTED_SCHEMA_VERSIONS = (0, 1)` to
+  `stores/replay_schema.py`. A manifest with no `schema_version` field is
+  legacy v0 (unchanged behavior). `ReplayReader.get_schema_version()`
+  dispatches on the manifest's `schema_version`; an explicit version
+  outside `{0, 1}` raises `ValueError` naming the found and supported
+  versions — never silently misread. `ReplayWriter(..., schema_version=1)`
+  is required to opt in; `schema_version` outside `{0, 1}` raises
+  immediately at construction. v0 and v1 partitions may coexist under the
+  same `replay_store/` root; no existing partition is migrated or
+  rewritten in place.
+- **Partition constants**: `venue`/`symbol`/`date` are removed from every
+  v1 physical row (matrix: proven partition-constant, path-derivable) and
+  restored by the reader from the manifest/partition path — proven via
+  `tests/test_replay_schema_v1.py::test_partition_constants_*`.
+- **Exact fixed-point representation**: `stores/replay_schema.py` adds
+  `encode_fixed_point()`/`decode_fixed_point()` (`Decimal` only, never a
+  float intermediate; raises if a value cannot be represented exactly at
+  the given scale). `stores/replay_writer.py::_derive_fixed_point_scales()`
+  derives `(price_scale, qty_scale)` from date-specific Binance
+  `PRICE_FILTER.tickSize`/`LOT_SIZE.stepSize`/`MARKET_LOT_SIZE` via the
+  existing `converter.instruments.load_exchange_info()`/`_get_filter()`
+  (spot and futures looked up independently, since `load_exchange_info` is
+  keyed by `venue`); raises a clear `ValueError` (never guesses) if the
+  required filters are unavailable. Scales are recorded once per partition
+  in the manifest (`price_scale`/`qty_scale`) — the replay partition
+  itself, not `data_raw`, carries everything needed to reconstruct exact
+  values. `price_str`/`quantity_str`/float64 duplication is dropped in v1
+  in favor of a single int64 mantissa per field.
+- **Compact flags/quality/continuity**: the 5 depth boolean columns
+  (`is_snapshot_seed`, `is_depth_update`, `is_sync_state`, `is_desync`,
+  `is_resync`) are packed into one int8 bitmask
+  (`pack_depth_flags()`/`unpack_depth_flags()`); `record_type` becomes an
+  int8 enum code (`DEPTH_RECORD_TYPE_CODES`/`TRADE_RECORD_TYPE_CODES`).
+  Per the matrix's explicit "pending proof"/"benchmark-needed" status,
+  `U`/`u`/`pu`, `trade_id`/`agg_trade_id`, `market_type`, and
+  `quality_flags` are deliberately left in their v0 lexical/JSON form in
+  this prototype — not compacted, not removed.
+- **Integrity/traceability**: `native_payload_hash` is stored as 32 raw
+  bytes (`pa.binary(32)`) instead of a 64-character hex string — the hash
+  value itself is retained (the Phase 2 Section 3 traceability
+  replacement design remains unimplemented, so hash removal is not
+  authorized; only its physical encoding is compacted). Added
+  `pipeline/raw_manifest.py::compute_raw_source_identity()` (bounded-
+  memory streaming SHA-256 per raw file) and wired it into v1 manifests as
+  a best-effort `source_identity` field — provenance evidence only, not
+  required for reconstruction (failure to compute it is logged and
+  recorded honestly in the manifest, never a build failure).
+- **Reader/writer boundary**: `stores/replay_reader.py`'s
+  `_decode_depth_row_v1()`/`_decode_trade_row_v1()` decode v1 physical rows
+  back to the exact v0 logical row shape (independent of, and importing
+  nothing from, `convert_day.py`/`converter/depth_phase2.py`), so every
+  existing downstream consumer (`stores/replay_depth_adapter.py`,
+  `validation/validate_catalog_equivalence.py`,
+  `validation/replay_catalog_reconstruct.py`) requires zero changes to
+  read either schema version. KovacsTrader was not touched; compact
+  physical columns remain internal to CryptoRecorder.
+- **RAM/scope boundary**: v1 writing reuses the existing bounded
+  `RawRecordSpool`-backed batch write path unchanged (row-by-row
+  projection via `_project_depth_row_v1()`/`_project_trade_row_v1()`
+  applied inside the existing bounded batch loop — no new full-day
+  in-memory collection). No Phase 6 external-merge/SQLite-replacement work
+  was started.
+- **Oracle correction discovered during the Tier-2 gate** (not a schema or
+  reference-route change): the real ADAUSDT run below found
+  `compare_book_checkpoints_streaming()`'s book-state comparison/hash was
+  literal-string-sensitive to fractional-digit padding — v1 formats
+  prices/quantities at the instrument's exact required scale (e.g. 4
+  decimals, from `PRICE_FILTER.tickSize`) while legacy v0 preserves
+  Binance's literal 8-decimal wire-format string; both represent the exact
+  same numeric value (`Decimal("0.1713") == Decimal("0.17130000")`).
+  Added `_canonical_decimal_str()`/`_canonical_book_state()` to
+  `validation/catalog_compare.py` — `Decimal`-only, never a float
+  intermediate, strips only numerically insignificant zero-padding and
+  never rounds/quantizes genuinely different values into equality — and
+  applied them to `compare_book_checkpoints_streaming()`'s `match`/hash
+  computation. This is confined entirely to the validation oracle; no
+  change was made to `convert_day.py`, the reference converter, replay
+  physical encoding, or Nautilus catalog behavior.
+
+### Files/packages touched
+- `stores/replay_schema.py` (v1 pyarrow schemas, version constants, enum
+  maps, flag bitmask helpers, fixed-point encode/decode helpers)
+- `stores/replay_writer.py` (`schema_version`/`price_scale`/`qty_scale`
+  constructor args, `_derive_fixed_point_scales()`,
+  `_project_depth_row_v1()`/`_project_trade_row_v1()`, `row_transform`
+  param on `_write_channel_incremental()`, v1 manifest fields)
+- `stores/replay_reader.py` (`get_schema_version()`, v0/v1 dispatch in
+  `iter_depths()`/`iter_trades()`, `_decode_depth_row_v1()`/
+  `_decode_trade_row_v1()`)
+- `pipeline/raw_manifest.py` (`compute_raw_source_identity()`)
+- `validation/catalog_compare.py` (`_canonical_decimal_str()`,
+  `_canonical_book_state()`, wired into
+  `compare_book_checkpoints_streaming()`)
+- `tests/test_replay_schema_v1.py` (new — 46 tests)
+- `tests/test_book_checkpoint_hash_canonicalization.py` (new — 22 tests)
+- `docs/REPLAY_STORE.md` (new "Versioning (v0 / v1)" section)
+- `CHANGELOG.md` (`[Unreleased]` → `Added`)
+- `docs/CHANGE_AUDIT.md` (this entry)
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] docs/REPO_STRUCTURE.md (no folder/file contract change — all new
+  code lives in the already-approved `stores/`/`pipeline/`/`validation/`
+  packages)
+- [x] docs/PROJECT_STATUS.md (reviewed; no validated/deferred status
+  changed by this entry — the `full_l2`/v2.0.0 gate remains unmet;
+  v1 remains an unvalidated-at-Tier-3-scale prototype)
+- [x] docs/IMPLEMENTATION_AUDIT.md (reviewed; this entry implements
+  exactly the compaction levers that document's Phase 3 matrix approved,
+  and does not contradict any "pending proof"/"unresolved" item — items
+  still pending proof were deliberately left uncompacted)
+- [x] relevant feature docs:
+  - docs/REPLAY_STORE.md (updated — see Docs updated)
+  - docs/FULL_L2_REPLAY_CATALOG_PLAN.md (reviewed; describes the
+    replay-reconstruction path, which is schema-version-agnostic per this
+    entry's reader change — no update required)
+
+### Docs updated
+- [x] CHANGELOG.md
+- [x] docs/REPLAY_STORE.md
+- No further docs update required because: no other documented CLI, flag,
+  or status claim changed; `docs/PROJECT_STATUS.md` correctly still shows
+  no validated Tier-3 full_l2 claim, which this entry does not alter.
+
+### Status / validation impact
+- Validated status changed: no
+- Deferred status changed: no
+- New claims added: no new *validated* status claim. This entry records
+  a real Tier-2 (single-symbol/single-day, local, development-evidence)
+  semantic-equivalence PASS for the v1 prototype against the
+  `convert_day.py` reference on ADAUSDT/2026-06-12, and real local size
+  measurements — both are reported honestly as development evidence, not
+  as a Tier-3 representative-day or production claim.
+- Evidence for any new validation claim:
+  - **Tier 1 (synthetic round-trip)**: `pytest tests/test_replay_schema_v1.py
+    tests/test_book_checkpoint_hash_canonicalization.py -q` → 46 + 22 = 68
+    passed.
+  - **Tier 2 (local real data, ADAUSDT, 2026-06-12)**: built the reference
+    catalog via `convert_day.py --date 2026-06-12 --symbols ADAUSDT
+    --venues BINANCE_SPOT --staging --catalog-root /tmp/tier2_ref_catalog`
+    (166.4s; 124,457 trades, 412,317 delta_events, 71,341 depth10, 34
+    fenced ranges). Built a real v1 replay partition directly from
+    `data_raw` via `ReplayWriter(..., schema_version=1)` with scales
+    derived from the real 2026-06-12 exchangeInfo (`price_scale=4,
+    qty_scale=1` for ADAUSDT) — 412,336 depth records, 124,457 trade
+    records, 59.5s. Built the candidate catalog via
+    `validation.replay_catalog_reconstruct.generate_catalog_from_replay(
+    profile="full_l2", emit_depth10=True)` from that v1 partition — 590.4s;
+    124,457 trade_ticks, 412,317 order_book_deltas, 71,341 depth10 (exact
+    count match with the reference). Ran the exhaustive, order-preserving,
+    gating semantic oracle directly
+    (`compare_trade_ticks_exhaustive`, `compare_order_book_deltas_exhaustive`,
+    `compare_book_checkpoints_streaming`,
+    `compare_order_book_depth10_exhaustive`) over the full UTC day
+    (closed 1-hour windows): all four passed
+    (`trades_cmp["passed"]=True`, `deltas_cmp["passed"]=True`,
+    `checkpoints_cmp["passed"]=True` — 7/7 checkpoints hash-matching after
+    the canonicalization fix, `depth10_cmp["passed"]=True`). Runtimes:
+    trades 4.0s, deltas 28.3s, checkpoints 18.6s, depth10 19.0s.
+  - **Local old-v0 vs new-v1 size measurement** (ADAUSDT, 2026-06-12,
+    single symbol/day — development evidence only, not a Tier-3 claim):
+    - v0 `depth.parquet`: 38,997,712 bytes (94.58 bytes/depth event over
+      412,336 events)
+    - v1 `depth.parquet`: 29,071,749 bytes (70.50 bytes/depth event) —
+      1.341x reduction
+    - v0 `trades.parquet`: 7,347,664 bytes (59.04 bytes/trade over
+      124,457 trades)
+    - v1 `trades.parquet`: 6,538,715 bytes (52.54 bytes/trade) —
+      1.124x reduction
+    - Combined: 46,345,376 bytes (v0) vs 35,610,464 bytes (v1) —
+      1.301x reduction
+    - Peak-memory evidence: not separately profiled in this session (no
+      `MemoryMax`/RSS sampling tool was run against the real ADAUSDT
+      build); the bounded-memory *behavior* is proven structurally (v1
+      reuses the unchanged, already-bounded `RawRecordSpool`/batch-write
+      path) and empirically at synthetic scale (20,000-row live-object-
+      counter proof in `tests/test_replay_schema_v1.py`), but no
+      real-build peak-RSS number is reported here — this is an explicit
+      limitation of this entry, not a claim of "well under X".
+
+### Tests run
+```bash
+source .venv/bin/activate
+python -m pytest tests/test_replay_schema_v1.py -q                        # 46 passed
+python -m pytest tests/test_book_checkpoint_hash_canonicalization.py -q   # 22 passed
+python -m pytest tests/test_streaming_gating_bounded_memory.py tests/test_validate_catalog_equivalence_exhaustive_wiring.py tests/test_semantic_oracle_exhaustive_streaming.py tests/test_catalog_equivalence.py tests/test_catalog_equivalence_full_l2.py -q
+  # 47 passed, 1 skipped
+python -m pytest tests/test_repo_structure.py tests/test_agent_infrastructure.py -q   # 56 passed
+python -m pytest -q   # 482 passed, 3 skipped
+```
+
+### Validation CLIs run
+```bash
+CRYPTO_RECORDER_DATA_ROOT="$(pwd)/data_raw" python3 convert_day.py --date 2026-06-12 \
+  --staging --catalog-root /tmp/tier2_ref_catalog --symbols ADAUSDT \
+  --venues BINANCE_SPOT --allow-partial-overwrite
+# (v1 replay build and candidate catalog build were driven via direct Python calls
+# into stores.replay_writer.ReplayWriter(schema_version=1) and
+# validation.replay_catalog_reconstruct.generate_catalog_from_replay(); the exhaustive
+# oracle comparison was driven directly via validation.catalog_compare's public
+# functions — see "Evidence for any new validation claim" above for exact calls.)
+```
+
+### Known limitations / out of scope
+- Phase 6 (external-merge/SQLite-replacement ordering), a full Tier-3
+  representative production-day build, format-selection Phase 7, a custom
+  binary format, Phase 9 self-contained-replay acceptance, the
+  raw-retention deletion gate, staging lifecycle/locking/quarantine/
+  backlog reconciliation, disk-monitor/systemd changes, a selected-
+  reconstruction CLI, production deployment/data cleanup, uv migration,
+  and any KovacsTrader change are all explicitly **not** started, per the
+  approved checkpoint's scope boundary.
+- No real-build peak-RSS/MemoryMax measurement was taken against the real
+  ADAUSDT v1 build in this session (see above) — only structural/
+  synthetic bounded-memory evidence is reported.
+- `U`/`u`/`pu`, `trade_id`/`agg_trade_id`, `market_type`, and
+  `quality_flags` remain uncompacted in v1, per the matrix's own
+  "pending proof"/"benchmark-needed" status — not an oversight.
+- The Tier-2 result covers exactly one symbol (ADAUSDT) and one day
+  (2026-06-12) on BINANCE_SPOT; it does not cover BINANCE_USDTF (futures)
+  or any other symbol, and must not be read as satisfying the later,
+  explicitly separate Tier-3 representative-day gate.
+
+---
+
 ## 2026-07-24 — Issue #20 Phase 1 second follow-up correction: gating book checkpoints/Depth10, complete fenced-range digest, RAM-bounded raw-to-replay metadata comparison
 
 ### Change summary

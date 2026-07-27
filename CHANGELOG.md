@@ -67,6 +67,123 @@ passes.** Until then, broader full-L2 equivalence stays **deferred** (see
 ## [Unreleased]
 
 ### Added
+- **Issue #20 Phase 5 (revised-plan phase numbering) — compact versioned
+  replay schema v1 prototype**, implemented after the Phase 0–4 review
+  checkpoint (baseline, semantic oracle, raw-retention/traceability/
+  versioning design, field/consumer/integrity matrix, repo-boundary
+  alignment — all previously completed and approved). Legacy v0 remains
+  fully intact, unchanged, and the default; v1 is opt-in via
+  `ReplayWriter(..., schema_version=1)`.
+  - `stores/replay_schema.py`: added `DEPTH_REPLAY_SCHEMA_V1`/
+    `TRADE_REPLAY_SCHEMA_V1` plus `format_version`/`schema_version`/
+    `builder_version` constants, enum-code maps, a packed depth-flags
+    bitmask, and `Decimal`-only fixed-point mantissa encode/decode
+    helpers — every compaction lever is justified inline against the
+    checked-in Phase 3 field/consumer/integrity matrix
+    (`docs/IMPLEMENTATION_AUDIT.md`). Compacted: `venue`/`symbol`/`date`
+    (moved to manifest — matrix: partition-constant), `record_type` (int8
+    enum), the 5 depth boolean columns (packed into one int8 bitmask),
+    `price`/`size`/`quantity` (exact fixed-point int64 mantissa, scale
+    derived once per partition from date-specific Binance
+    `PRICE_FILTER.tickSize`/`LOT_SIZE.stepSize`/`MARKET_LOT_SIZE`, spot and
+    futures independently, parsed via `Decimal` only), and
+    `native_payload_hash` (32 raw bytes instead of 64-character hex — the
+    hash itself is retained, since the Phase 2 Section 3 traceability
+    replacement remains design-only and hash removal is not authorized).
+    Deliberately NOT compacted (matrix: "pending proof"/"benchmark-needed"):
+    `U`/`u`/`pu`, `trade_id`/`agg_trade_id`, `market_type`,
+    `quality_flags`.
+  - `stores/replay_writer.py`: `ReplayWriter` gained `schema_version`
+    (0 default / 1), `price_scale`, `qty_scale` constructor args;
+    `_derive_fixed_point_scales()` derives exact scales from exchangeInfo
+    filters (raises clearly, never guesses, if filters are missing);
+    `_project_depth_row_v1()`/`_project_trade_row_v1()` project a v0-shaped
+    spooled record down to the compact v1 physical row, one record at a
+    time (bounded memory, unchanged from v0's batch-bounded write path).
+    v1 manifests additionally carry `format_version`, `schema_version`,
+    `builder_version`, `encoding_profile`, `price_scale`, `qty_scale`, and a
+    best-effort `source_identity` (per-file SHA-256 + size for the raw
+    files that produced the partition, via the new
+    `pipeline.raw_manifest.compute_raw_source_identity()` — provenance
+    evidence only, not required for reconstruction).
+  - `stores/replay_reader.py`: `ReplayReader.get_schema_version()`
+    dispatches on the manifest's `schema_version` (missing = v0; explicit
+    version outside `{0, 1}` raises `ValueError` naming found vs
+    supported); `iter_depths()`/`iter_trades()` decode v1 physical rows
+    (via new `_decode_depth_row_v1()`/`_decode_trade_row_v1()`) back to the
+    exact v0 logical row shape, so every existing downstream consumer
+    (`stores/replay_depth_adapter.py`,
+    `validation/validate_catalog_equivalence.py`) requires zero changes to
+    read either version. This decode logic is independent of, and does not
+    import, `convert_day.py`/`converter/depth_phase2.py`.
+  - `pipeline/raw_manifest.py`: added `compute_raw_source_identity()`
+    (bounded-memory streaming SHA-256 over raw files, per the Phase 2
+    traceability design's item 1).
+  - Added `tests/test_replay_schema_v1.py` (46 tests): version dispatch,
+    unsupported-version failure, v0-fixture-unaffected, exact fixed-point
+    round trips (including values not exactly representable as float64),
+    spot/futures filter-derived scale independence, depth/trade record
+    types and packed flags round-trip, null/optional ID handling, int64
+    boundary mantissas, partition constants restored via the manifest (not
+    physically present in rows), quality/continuity survival,
+    integrity/source-identity fields, canonical ordering preservation,
+    writer/reader bounded-memory proofs (live-object-counter pattern and a
+    `pq.ParquetFile.iter_batches` batch-size spy), and a physical-size
+    development-evidence assertion (v1 depth.parquet smaller than v0 for
+    identical logical rows).
+  - **Oracle correction discovered during the Tier-2 gate**: the real
+    ADAUSDT 2026-06-12 comparison (see Tier-2 results below) found that
+    `compare_book_checkpoints_streaming()`'s book-state hash/comparison
+    was literal-string-sensitive — v1 formats prices/quantities at the
+    instrument's exact required scale (e.g. 4 decimals) while legacy v0
+    preserves Binance's literal 8-decimal wire-format padding; both
+    represent the exact same numeric value. Added
+    `_canonical_decimal_str()`/`_canonical_book_state()` to
+    `validation/catalog_compare.py` (`Decimal`-only, never a float
+    intermediate, never rounds/quantizes genuinely different values into
+    equality — only strips numerically insignificant zero-padding) and
+    applied them to `compare_book_checkpoints_streaming()`'s comparison
+    and hash. Added `tests/test_book_checkpoint_hash_canonicalization.py`
+    (22 tests) proving: equal-value-different-padding strings canonicalize
+    identically; genuinely different values remain distinct; no scientific
+    notation; no float intermediate (including a value beyond 2**53);
+    whole-book-state and hash-level equivalence. This is an oracle
+    (validation-only) correction — no change to `convert_day.py`, the
+    reference converter, replay encoding, or Nautilus catalog behavior.
+  - `docs/REPLAY_STORE.md`: added a "Versioning (v0 / v1)" section
+    describing the v0/v1 contract and every v1 physical difference
+    honestly, including local ADAUSDT development-evidence size
+    measurements (see `docs/CHANGE_AUDIT.md` for exact figures).
+  - **Tier 1 (synthetic)**: all 46 + 22 new tests pass; full suite 482
+    passed, 3 skipped (up from 460); repo-structure/agent-infrastructure
+    guards 56 passed.
+  - **Tier 2 (local real data, ADAUSDT, 2026-06-12, single symbol/day —
+    development evidence only, not a Tier-3 representative-day claim)**:
+    reference (`data_raw -> convert_day.py -> temporary Nautilus catalog`)
+    vs candidate (`data_raw -> compact replay v1 -> existing replay
+    reconstruction path -> temporary Nautilus catalog`), compared via the
+    exhaustive, order-preserving, gating semantic oracle
+    (`compare_trade_ticks_exhaustive`, `compare_order_book_deltas_exhaustive`,
+    `compare_book_checkpoints_streaming`,
+    `compare_order_book_depth10_exhaustive`) — all four passed
+    (124,457 trades; 412,317 order_book_deltas; 71,341 depth10 records;
+    7 book checkpoints, all hash-matching after the canonicalization fix).
+    Local size comparison: v0 depth.parquet 38,997,712 bytes
+    (94.58 bytes/depth event) vs v1 29,071,749 bytes
+    (70.50 bytes/depth event) — 1.34x; v0 trades.parquet 7,347,664 bytes
+    (59.04 bytes/trade) vs v1 6,538,715 bytes (52.54 bytes/trade) — 1.12x;
+    combined 1.30x. This is single-symbol/single-day development evidence
+    only — it is not, and must not be read as, a 5 GiB/2 GiB complete-day
+    Tier-3 target claim, which remains a later, explicitly out-of-scope
+    gate.
+  - Strictly out of scope for this entry (per the approved checkpoint) and
+    **not started**: Phase 6 external-merge/SQLite replacement, full
+    Tier-3 production-day build, format-selection Phase 7, a custom binary
+    format, Phase 9 self-contained-replay acceptance, raw-retention
+    deletion-gate implementation, staging lifecycle/locking/quarantine/
+    backlog reconciliation, disk-monitor/systemd changes, a selected-
+    reconstruction CLI, production deployment/data cleanup, uv migration,
+    and any KovacsTrader change.
 - **Issue #20 Phase 1 second follow-up correction: gating book checkpoints,
   Depth10, complete fenced-range digest, and RAM-bounded raw-to-replay
   metadata comparison** — the previous correction wired exhaustive

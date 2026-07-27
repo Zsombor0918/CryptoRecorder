@@ -5,6 +5,7 @@ import hashlib
 import itertools
 import json
 import math
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Iterable, Iterator
 
@@ -1056,6 +1057,36 @@ def _book_state_hash(book: dict[str, list[list[str]]]) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def _canonical_decimal_str(value_str: str) -> str:
+    """Return the exact decimal value of ``value_str`` with insignificant
+    lexical padding (trailing/leading zeros) removed, never through a float
+    intermediate and never rounding/quantizing to a different numeric value
+    — only its zero-padding is normalized. E.g. ``"0.17130000"`` and
+    ``"0.1713"`` both canonicalize to ``"0.1713"``; ``"0.17131"`` remains
+    distinct from both. Used only to make the book-checkpoint comparison/
+    hash value-aware instead of literal-string-aware — different physical
+    schemas (v0's literal Binance wire-format strings vs v1's
+    instrument-required-scale fixed-point strings) may format the exact
+    same numeric value with a different, but numerically irrelevant,
+    number of fractional digits."""
+    if not value_str:
+        return value_str
+    normalized = Decimal(value_str).normalize()
+    return format(normalized, "f")
+
+
+def _canonical_book_state(book: dict[str, list[list[str]]]) -> dict[str, list[list[str]]]:
+    """Apply :func:`_canonical_decimal_str` to every price/size string in a
+    top-N book snapshot (as produced by
+    :func:`reconstruct_book_checkpoints_streaming`/
+    :func:`reconstruct_book_checkpoints_from_deltas`), leaving level order
+    and level count untouched."""
+    return {
+        side: [[_canonical_decimal_str(price), _canonical_decimal_str(size)] for price, size in book.get(side, [])]
+        for side in ("bids", "asks")
+    }
+
+
 def reconstruct_book_checkpoints_streaming(
     objects: Iterable[Any],
     checkpoint_tss: Iterable[int],
@@ -1124,6 +1155,17 @@ def compare_book_checkpoints_streaming(
     remains available for other callers/tests but must not be used by
     validation.validate_catalog_equivalence, since it requires full-day
     list materialization of both delta streams.
+
+    The comparison and hash are computed over the *canonical* Decimal value
+    of each price/size string (see :func:`_canonical_decimal_str`), not the
+    literal formatted string — two physical replay schemas may format the
+    exact same numeric value with a different (but numerically
+    irrelevant) number of fractional digits (e.g. v0 preserves Binance's
+    literal 8-decimal wire padding, v1 formats at the instrument's exact
+    required scale), and that must not be treated as a semantic mismatch.
+    A genuinely different value (e.g. "0.17131" vs "0.1713") still compares
+    and hashes as different. This canonicalization never rounds/quantizes
+    unequal values into equality and never uses a float intermediate.
     """
     labeled = _checkpoint_labels(start_ns, end_ns)
     checkpoint_tss = [ts for _, ts in labeled]
@@ -1141,9 +1183,11 @@ def compare_book_checkpoints_streaming(
     for label, ts in labeled:
         old_book = old_snaps.get(ts, empty_book)
         new_book = new_snaps.get(ts, empty_book)
-        old_hash = _book_state_hash(old_book)
-        new_hash = _book_state_hash(new_book)
-        match = old_book == new_book
+        old_book_canonical = _canonical_book_state(old_book)
+        new_book_canonical = _canonical_book_state(new_book)
+        old_hash = _book_state_hash(old_book_canonical)
+        new_hash = _book_state_hash(new_book_canonical)
+        match = old_book_canonical == new_book_canonical
         if not match:
             all_match = False
         results.append(

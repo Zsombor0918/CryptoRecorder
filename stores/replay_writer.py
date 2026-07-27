@@ -29,13 +29,28 @@ import os
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 
 from converter.spool import RawRecordSpool
-from .replay_schema import DEPTH_REPLAY_SCHEMA, TRADE_REPLAY_SCHEMA, MANIFEST_SCHEMA
+from pipeline.raw_manifest import compute_raw_source_identity
+from .replay_schema import (
+    DEPTH_REPLAY_SCHEMA,
+    TRADE_REPLAY_SCHEMA,
+    MANIFEST_SCHEMA,
+    DEPTH_REPLAY_SCHEMA_V1,
+    TRADE_REPLAY_SCHEMA_V1,
+    FORMAT_VERSION_V1,
+    SCHEMA_VERSION_V1,
+    BUILDER_VERSION_V1,
+    DEPTH_RECORD_TYPE_CODES,
+    TRADE_RECORD_TYPE_CODES,
+    pack_depth_flags,
+    encode_fixed_point,
+    encode_aggressor_side,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +58,109 @@ logger = logging.getLogger(__name__)
 _DEFAULT_PARQUET_BATCH = int(
     os.environ.get("CRYPTO_RECORDER_REPLAY_PARQUET_BATCH", "5000")
 )
+
+
+def _derive_fixed_point_scales(venue: str, symbol: str, date: str) -> "tuple[int, int]":
+    """Derive (price_scale, qty_scale) from date-specific Binance exchangeInfo
+    filters (``PRICE_FILTER.tickSize`` / ``LOT_SIZE.stepSize`` /
+    ``MARKET_LOT_SIZE.stepSize`` where present), per the checked-in Phase 3
+    field/consumer/integrity matrix. Spot and futures are treated
+    independently because ``load_exchange_info`` is looked up per ``venue``.
+
+    Raises ``ValueError`` with a clear message (never guesses a scale) if the
+    required filters are not available for this venue/symbol/date — a v1
+    build must not proceed without an exact, source-derived scale.
+    """
+    from converter.instruments import load_exchange_info, _get_filter, _precision_from_str
+
+    exchange_info = load_exchange_info(venue, date)
+    info = exchange_info.get(symbol)
+    if info is None:
+        raise ValueError(
+            f"Cannot build schema_version=1 replay for {venue}/{symbol}/{date}: "
+            "no exchangeInfo entry found for this venue/symbol/date. The v1 "
+            "fixed-point encoding requires date-specific PRICE_FILTER.tickSize/"
+            "LOT_SIZE.stepSize and refuses to guess a scale."
+        )
+    filters = info.get("filters", [])
+    pf = _get_filter(filters, "PRICE_FILTER")
+    lf = _get_filter(filters, "LOT_SIZE")
+    mlf = _get_filter(filters, "MARKET_LOT_SIZE")
+    tick_size = pf.get("tickSize")
+    step_size = lf.get("stepSize")
+    if not tick_size or not step_size:
+        raise ValueError(
+            f"Cannot build schema_version=1 replay for {venue}/{symbol}/{date}: "
+            "exchangeInfo is missing PRICE_FILTER.tickSize or LOT_SIZE.stepSize."
+        )
+    price_scale = _precision_from_str(tick_size)
+    qty_scale = _precision_from_str(step_size)
+    market_step = mlf.get("stepSize")
+    if market_step:
+        qty_scale = max(qty_scale, _precision_from_str(market_step))
+    return price_scale, qty_scale
+
+
+def _project_depth_row_v1(row: dict, price_scale: int, qty_scale: int) -> dict:
+    """Project a v0-shaped depth record dict (as produced by
+    ``pipeline.build_replay_store._convert_depth_record`` — unchanged) down to
+    the compact v1 physical row shape. Pure function; no I/O."""
+    record_type = row.get("record_type", "depth_update")
+
+    def _level(lv: dict) -> dict:
+        return {
+            "price_mantissa": encode_fixed_point(lv["price_str"], price_scale),
+            "size_mantissa": encode_fixed_point(lv["size_str"], qty_scale),
+        }
+
+    hash_hex = row.get("native_payload_hash")
+    return {
+        "stream_session_id": int(row.get("stream_session_id", 0)),
+        "session_seq": int(row.get("session_seq", 0)),
+        "raw_index": int(row.get("raw_index", 0)),
+        "record_type_code": DEPTH_RECORD_TYPE_CODES[record_type],
+        "U": row.get("U"),
+        "u": row.get("u"),
+        "pu": row.get("pu"),
+        "ts_exchange_ns": int(row.get("ts_exchange_ns") or 0),
+        "ts_receive_ns": int(row.get("ts_receive_ns") or 0),
+        "bids": [_level(lv) for lv in (row.get("bids") or [])],
+        "asks": [_level(lv) for lv in (row.get("asks") or [])],
+        "flags": pack_depth_flags(
+            bool(row.get("is_snapshot_seed", False)),
+            bool(row.get("is_depth_update", False)),
+            bool(row.get("is_sync_state", False)),
+            bool(row.get("is_desync", False)),
+            bool(row.get("is_resync", False)),
+        ),
+        "quality_flags": row.get("quality_flags"),
+        "native_payload_hash": bytes.fromhex(hash_hex) if hash_hex else None,
+    }
+
+
+def _project_trade_row_v1(row: dict, price_scale: int, qty_scale: int) -> dict:
+    """Project a v0-shaped trade record dict (as produced by
+    ``pipeline.build_replay_store._convert_trade_record`` — unchanged) down to
+    the compact v1 physical row shape. Pure function; no I/O."""
+    record_type = row.get("record_type", "trade")
+    hash_hex = row.get("native_payload_hash")
+    return {
+        "trade_stream_session_id": int(row.get("trade_stream_session_id", 0)),
+        "trade_session_seq": int(row.get("trade_session_seq", 0)),
+        "raw_index": int(row.get("raw_index", 0)),
+        "record_type_code": TRADE_RECORD_TYPE_CODES[record_type],
+        "market_type": row.get("market_type", "spot"),
+        "trade_id": row.get("trade_id"),
+        "agg_trade_id": row.get("agg_trade_id"),
+        "ts_exchange_ns": int(row.get("ts_exchange_ns") or 0),
+        "ts_receive_ns": int(row.get("ts_receive_ns") or 0),
+        "price_mantissa": encode_fixed_point(str(row["price_str"]), price_scale),
+        "quantity_mantissa": encode_fixed_point(str(row["quantity_str"]), qty_scale),
+        "buyer_maker": bool(row.get("buyer_maker", False)),
+        "aggressor_side_code": encode_aggressor_side(row.get("aggressor_side")),
+        "quality_flags": row.get("quality_flags"),
+        "native_payload_hash": bytes.fromhex(hash_hex) if hash_hex else None,
+    }
 
 
 def _compute_sha256(file_path: Path) -> str:
@@ -89,8 +207,14 @@ def _write_channel_incremental(
     out_path: Path,
     schema: pa.Schema,
     parquet_batch_size: int,
+    row_transform: "Optional[Callable[[dict], dict]]" = None,
 ) -> "tuple[int, int, int]":
     """Write all spool records to out_path in bounded batches.
+
+    ``row_transform``, when given, is applied to each record (one at a time,
+    not buffered) before it joins the current batch — used to project a
+    v0-shaped spooled record dict down to the compact v1 physical row shape
+    without ever materializing more than one row-group's worth of rows.
 
     Returns (record_count, ts_min_ns, ts_max_ns).
     An empty channel produces a schema-bearing empty Parquet file.
@@ -103,8 +227,9 @@ def _write_channel_incremental(
     try:
         batch: list = []
         for record in spool.iter_records():
-            batch.append(record)
             ts = int(record.get("ts_exchange_ns") or 0)
+            row = row_transform(record) if row_transform is not None else record
+            batch.append(row)
             if ts_min is None or ts < ts_min:
                 ts_min = ts
             if ts_max is None or ts > ts_max:
@@ -168,12 +293,37 @@ class ReplayWriter:
         date: str,
         *,
         parquet_batch_size: int = _DEFAULT_PARQUET_BATCH,
+        schema_version: int = 0,
+        price_scale: "Optional[int]" = None,
+        qty_scale: "Optional[int]" = None,
     ):
+        """
+        Args:
+            schema_version: 0 (default, unchanged legacy physical layout —
+                every existing caller that does not pass this argument keeps
+                producing exactly today's v0 output) or 1 (the issue #20
+                Phase 5 compact prototype schema). Any other value raises
+                immediately — never silently falls back to v0.
+            price_scale / qty_scale: only used when schema_version=1. If not
+                given, derived automatically from date-specific Binance
+                exchangeInfo filters (see ``_derive_fixed_point_scales``) the
+                first time a schema_version=1 partition is finalized. Tests
+                may pass these explicitly to avoid depending on on-disk
+                exchangeInfo fixtures.
+        """
+        if schema_version not in (0, 1):
+            raise ValueError(
+                f"Unsupported schema_version={schema_version!r} for ReplayWriter "
+                "(supported: 0 (legacy), 1 (issue #20 Phase 5 compact prototype))"
+            )
         self.replay_root = Path(replay_root)
         self.venue = venue
         self.symbol = symbol
         self.date = date
         self._parquet_batch_size = parquet_batch_size
+        self.schema_version = schema_version
+        self._price_scale = price_scale
+        self._qty_scale = qty_scale
 
         self.output_dir = (
             self.replay_root
@@ -263,11 +413,32 @@ class ReplayWriter:
         depth_path = self.staging_dir / "depth.parquet"
         trades_path = self.staging_dir / "trades.parquet"
 
+        row_transform_depth = None
+        row_transform_trade = None
+        depth_schema = DEPTH_REPLAY_SCHEMA
+        trade_schema = TRADE_REPLAY_SCHEMA
+
+        if self.schema_version == 1:
+            if self._price_scale is None or self._qty_scale is None:
+                derived_price_scale, derived_qty_scale = _derive_fixed_point_scales(
+                    self.venue, self.symbol, self.date
+                )
+                if self._price_scale is None:
+                    self._price_scale = derived_price_scale
+                if self._qty_scale is None:
+                    self._qty_scale = derived_qty_scale
+            price_scale = self._price_scale
+            qty_scale = self._qty_scale
+            depth_schema = DEPTH_REPLAY_SCHEMA_V1
+            trade_schema = TRADE_REPLAY_SCHEMA_V1
+            row_transform_depth = lambda rec: _project_depth_row_v1(rec, price_scale, qty_scale)
+            row_transform_trade = lambda rec: _project_trade_row_v1(rec, price_scale, qty_scale)
+
         # --- Depth ---
         depth_spool = self._get_depth_spool()
         depth_spool.commit()
         depth_count, ts_d_min, ts_d_max = _write_channel_incremental(
-            depth_spool, depth_path, DEPTH_REPLAY_SCHEMA, self._parquet_batch_size
+            depth_spool, depth_path, depth_schema, self._parquet_batch_size, row_transform_depth
         )
         depth_spool.close()
         self._depth_spool = None
@@ -277,7 +448,7 @@ class ReplayWriter:
         trade_spool = self._get_trade_spool()
         trade_spool.commit()
         trade_count, ts_t_min, ts_t_max = _write_channel_incremental(
-            trade_spool, trades_path, TRADE_REPLAY_SCHEMA, self._parquet_batch_size
+            trade_spool, trades_path, trade_schema, self._parquet_batch_size, row_transform_trade
         )
         trade_spool.close()
         self._trade_spool = None
@@ -335,6 +506,43 @@ class ReplayWriter:
             "created_at_utc": datetime.now(timezone.utc).isoformat(),
             "errors": [],
         }
+
+        if self.schema_version == 1:
+            # Explicit version identity (issue #20 Phase 5): a manifest with
+            # no schema_version field is legacy v0 by definition, so v0 never
+            # gains these keys — only schema_version=1 manifests carry them.
+            manifest["format_version"] = FORMAT_VERSION_V1
+            manifest["schema_version"] = SCHEMA_VERSION_V1
+            manifest["builder_version"] = BUILDER_VERSION_V1
+            manifest["encoding_profile"] = {
+                "compression": "zstd",
+                "compression_level": 3,
+                "row_group_batch_size": self._parquet_batch_size,
+                "depth_schema_version": SCHEMA_VERSION_V1,
+                "trade_schema_version": SCHEMA_VERSION_V1,
+            }
+            manifest["price_scale"] = self._price_scale
+            manifest["qty_scale"] = self._qty_scale
+            try:
+                manifest["source_identity"] = compute_raw_source_identity(
+                    self.venue, self.symbol, self.date, ["depth_v2", "trade_v2"]
+                )
+            except Exception as exc:
+                # Source-identity capture is provenance evidence, not a
+                # correctness requirement for reconstruction (the replay
+                # partition itself is self-contained) — record the failure
+                # honestly rather than failing the whole build.
+                logger.warning(
+                    f"Could not compute raw source_identity for "
+                    f"{self.venue}/{self.symbol}/{self.date}: {exc}"
+                )
+                manifest["source_identity"] = {
+                    "channels": {},
+                    "complete": False,
+                    "missing_channels": ["depth_v2", "trade_v2"],
+                    "error": str(exc),
+                }
+
         self._manifest = manifest
         return manifest
 
