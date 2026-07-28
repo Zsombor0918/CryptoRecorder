@@ -14,6 +14,20 @@ from config import DATA_ROOT
 
 logger = logging.getLogger(__name__)
 
+# Raw channels that make a directory entry a genuine tradable market-data
+# symbol partition. Everything else under a venue (currently only
+# "exchangeinfo", whose single pseudo-"symbol" directory is literally named
+# "EXCHANGEINFO") is venue-level metadata, never a tradable symbol — it must
+# never be surfaced as a candidate venue/symbol partition by
+# ``scan_raw_coverage``, for either schema_version. This is intentionally a
+# small, explicit allow-list (not a broad "ignore anything unfamiliar" rule):
+# any future new raw channel must be added here deliberately before its
+# directories can ever be treated as symbols, and any genuinely malformed
+# market-data directory (e.g. a stray file where a symbol dir was expected)
+# still surfaces via the existing per-venue error collection below rather
+# than being silently hidden.
+ELIGIBLE_MARKET_CHANNELS = frozenset({"depth_v2", "trade_v2"})
+
 
 def _sha256_file(path: Path) -> str:
     """Stream a file through SHA-256 in bounded (64 KiB) chunks — never reads
@@ -87,6 +101,18 @@ def scan_raw_coverage(
     """
     Scan raw data directory for available venues/symbols/channels on a given date.
 
+    Only ``depth_v2``/``trade_v2`` directory entries can ever contribute a
+    tradable venue/symbol partition to the returned ``data`` mapping (see
+    ``ELIGIBLE_MARKET_CHANNELS``) — venue-level metadata channels (currently
+    only ``exchangeinfo``, whose sole "symbol" directory is literally named
+    "EXCHANGEINFO") are scanned on disk (so genuinely malformed directories
+    still surface as errors below) but are never treated as symbols. A
+    symbol present under only one of ``depth_v2``/``trade_v2`` is still
+    reported honestly in ``data`` (with only that one channel key set to
+    True) — this function does not silently drop or hide partial channel
+    coverage; callers that require both channels decide that policy
+    themselves (e.g. ``pipeline.daily_build``).
+
     Args:
         date_str: Date string (YYYY-MM-DD)
         data_root: Optional custom data_root. If None, uses config.DATA_ROOT.
@@ -139,6 +165,12 @@ def scan_raw_coverage(
                         continue
 
                     channel = channel_dir.name
+                    if channel not in ELIGIBLE_MARKET_CHANNELS:
+                        # Venue-level metadata (e.g. "exchangeinfo"), not a
+                        # market-data channel — its directory entries (e.g.
+                        # the single "EXCHANGEINFO" pseudo-symbol) must never
+                        # be surfaced as a tradable venue/symbol partition.
+                        continue
 
                     # List symbols for this channel/date
                     for symbol_dir in sorted(channel_dir.iterdir()):

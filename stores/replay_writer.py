@@ -50,6 +50,7 @@ from .replay_schema import (
     pack_depth_flags,
     encode_fixed_point,
     encode_aggressor_side,
+    normalized_decimal_scale,
 )
 
 logger = logging.getLogger(__name__)
@@ -466,6 +467,15 @@ class ReplayWriter:
         self._source_identity = source_identity
         self._data_root = data_root
 
+        # Running maximum observed normalized decimal scale (issue #20
+        # Phase 7 correction), updated incrementally as each batch is
+        # spooled — never by rescanning a partition. Only meaningful (and
+        # only ever updated) for schema_version=1; kept at 0 for v0 so the
+        # legacy path performs zero extra work. See write_depth_batch/
+        # write_trades_batch and finalize_staging.
+        self._observed_price_scale = 0
+        self._observed_qty_scale = 0
+
         self.output_dir = (
             self.replay_root
             / f"venue={venue}"
@@ -525,6 +535,7 @@ class ReplayWriter:
     def write_depth_batch(self, records: list) -> None:
         """Spool depth records to disk (O(batch) memory, not O(day))."""
         spool = self._get_depth_spool()
+        track_scale = self.schema_version == 1
         for r in records:
             sort_key = (
                 int(r.get("stream_session_id", 0)),
@@ -532,11 +543,24 @@ class ReplayWriter:
                 int(r.get("raw_index", 0)),
             )
             spool.insert(r, sort_key=sort_key, raw_index=int(r.get("raw_index", 0)))
+            if track_scale:
+                # Bounded incremental scan of this single record's levels
+                # only (never a rescan of the spool/partition) — updates a
+                # small running maximum, not a growing collection.
+                for side in ("bids", "asks"):
+                    for level in (r.get(side) or ()):
+                        ps = normalized_decimal_scale(level["price_str"])
+                        if ps > self._observed_price_scale:
+                            self._observed_price_scale = ps
+                        ss = normalized_decimal_scale(level["size_str"])
+                        if ss > self._observed_qty_scale:
+                            self._observed_qty_scale = ss
         self.depth_count += len(records)
 
     def write_trades_batch(self, records: list) -> None:
         """Spool trade records to disk (O(batch) memory, not O(day))."""
         spool = self._get_trade_spool()
+        track_scale = self.schema_version == 1
         for r in records:
             sort_key = (
                 int(r.get("trade_stream_session_id", 0)),
@@ -544,6 +568,13 @@ class ReplayWriter:
                 int(r.get("raw_index", 0)),
             )
             spool.insert(r, sort_key=sort_key, raw_index=int(r.get("raw_index", 0)))
+            if track_scale:
+                ps = normalized_decimal_scale(r["price_str"])
+                if ps > self._observed_price_scale:
+                    self._observed_price_scale = ps
+                qs = normalized_decimal_scale(r["quantity_str"])
+                if qs > self._observed_qty_scale:
+                    self._observed_qty_scale = qs
         self.trade_count += len(records)
 
     # ------------------------------------------------------------------
@@ -568,16 +599,63 @@ class ReplayWriter:
         row_transform_trade = None
         depth_schema = DEPTH_REPLAY_SCHEMA
         trade_schema = TRADE_REPLAY_SCHEMA
+        declared_price_scale: "Optional[int]" = None
+        declared_qty_scale: "Optional[int]" = None
 
         if self.schema_version == 1:
+            # Only compute the declared (exchangeInfo-derived) scale when at
+            # least one of price_scale/qty_scale was not explicitly supplied
+            # by the caller — an explicit override (as tests use, precisely
+            # to avoid depending on on-disk exchangeInfo fixtures) must never
+            # trigger an exchangeInfo lookup it doesn't need.
             if self._price_scale is None or self._qty_scale is None:
-                derived_price_scale, derived_qty_scale = _derive_fixed_point_scales(
+                declared_price_scale, declared_qty_scale = _derive_fixed_point_scales(
                     self.venue, self.symbol, self.date, data_root=self._data_root
                 )
-                if self._price_scale is None:
-                    self._price_scale = derived_price_scale
-                if self._qty_scale is None:
-                    self._qty_scale = derived_qty_scale
+
+            # issue #20 Phase 7 correction: the exchange's declared
+            # PRICE_FILTER.tickSize/LOT_SIZE.stepSize/MARKET_LOT_SIZE.stepSize
+            # is not always sufficient — real recorded values on a given day
+            # can carry finer precision than the exchange's own declared
+            # filters (observed directly on 5 real BINANCE_USDTF symbols on
+            # 2026-06-11: e.g. declared PRICE_FILTER.tickSize scale 5 for
+            # BTWUSDT vs. an actual observed depth/trade price scale of 6).
+            # The automatically-derived scale is therefore
+            # max(declared, observed-this-partition), never declared alone.
+            #
+            # An EXPLICITLY supplied scale (test fixtures, or any future
+            # caller that wants full manual control) is never silently
+            # enlarged to accommodate observed data — instead, observed data
+            # exceeding an explicit override fails clearly, so a caller is
+            # never surprised by silently-changed encoding behavior.
+            if self._price_scale is not None:
+                if self._observed_price_scale > self._price_scale:
+                    raise ValueError(
+                        f"Cannot build schema_version=1 replay for "
+                        f"{self.venue}/{self.symbol}/{self.date}: explicitly "
+                        f"supplied price_scale={self._price_scale} is "
+                        f"insufficient — observed depth/trade price data "
+                        f"requires scale >= {self._observed_price_scale} to "
+                        "be represented exactly. Refusing to silently "
+                        "enlarge an explicit override."
+                    )
+            else:
+                self._price_scale = max(declared_price_scale, self._observed_price_scale)
+
+            if self._qty_scale is not None:
+                if self._observed_qty_scale > self._qty_scale:
+                    raise ValueError(
+                        f"Cannot build schema_version=1 replay for "
+                        f"{self.venue}/{self.symbol}/{self.date}: explicitly "
+                        f"supplied qty_scale={self._qty_scale} is "
+                        f"insufficient — observed depth/trade size/quantity "
+                        f"data requires scale >= {self._observed_qty_scale} "
+                        "to be represented exactly. Refusing to silently "
+                        "enlarge an explicit override."
+                    )
+            else:
+                self._qty_scale = max(declared_qty_scale, self._observed_qty_scale)
+
             price_scale = self._price_scale
             qty_scale = self._qty_scale
             depth_schema = DEPTH_REPLAY_SCHEMA_V1
@@ -671,6 +749,19 @@ class ReplayWriter:
                 "row_group_batch_size": self._parquet_batch_size,
                 "depth_schema_version": SCHEMA_VERSION_V1,
                 "trade_schema_version": SCHEMA_VERSION_V1,
+                # issue #20 Phase 7 correction: record the declared
+                # (exchangeInfo-derived) and observed (streamed-record-scan)
+                # scale components separately from the final selected
+                # scale, so an anomalous partition (declared scale
+                # insufficient for real recorded precision, or an explicit
+                # override) remains explainable from the manifest alone.
+                # declared_*_scale is None only when both price_scale and
+                # qty_scale were supplied explicitly (no exchangeInfo
+                # lookup was performed/needed).
+                "price_scale_declared": declared_price_scale,
+                "price_scale_observed": self._observed_price_scale,
+                "qty_scale_declared": declared_qty_scale,
+                "qty_scale_observed": self._observed_qty_scale,
             }
             manifest["price_scale"] = self._price_scale
             manifest["qty_scale"] = self._qty_scale

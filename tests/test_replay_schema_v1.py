@@ -285,9 +285,15 @@ def test_fixed_point_no_float_intermediate():
 
     # A value whose float64 representation is NOT exact must still encode to
     # the exact intended mantissa, not the nearest float64 double's decimal
-    # expansion.
-    value_str = "9007199254740993.12345678"  # > 2**53, would lose bits as float
-    scale = 8
+    # expansion. Scale kept small enough that the resulting mantissa still
+    # fits the physical int64 mantissa field (issue #20 Phase 7 correction
+    # added an explicit int64-range check to encode_fixed_point — a mantissa
+    # that could never fit int64 was never usable in the real Parquet
+    # schema anyway, so this test uses the largest value/scale combination
+    # that both exceeds 2**53 exactly-representable-float precision AND
+    # fits int64).
+    value_str = "9007199254740993.12"  # > 2**53 (9007199254740992), would lose bits as float
+    scale = 2
     mantissa = encode_fixed_point(value_str, scale)
     assert decode_fixed_point(mantissa, scale) == value_str
 

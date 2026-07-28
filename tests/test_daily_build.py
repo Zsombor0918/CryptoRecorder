@@ -253,14 +253,18 @@ def test_all_partitions_failed_reports_failed_status(
 def test_exchangeinfo_only_date_reports_no_data(tmp_path: Path) -> None:
     """A date with only a raw exchangeinfo partition (no depth_v2/trade_v2)
     must report 'no_data' and attempt zero replay partitions — EXCHANGEINFO
-    must never be derived/attempted as a market symbol."""
+    must never be derived/attempted as a market symbol. Issue #20 Phase 7
+    correction: pipeline.raw_manifest.scan_raw_coverage() now excludes
+    EXCHANGEINFO at the source, so it never appears in raw_result['data']
+    at all (previously it appeared there and was filtered out only by a
+    downstream ELIGIBLE_REPLAY_CHANNELS check)."""
     data_root = tmp_path / "raw"
     replay_root = tmp_path / "replay"
     report_root = tmp_path / "reports"
     _write_exchangeinfo_raw_data(data_root, VENUE, DATE)
 
     raw_result = daily_build.run_raw_manifest(DATE, data_root)
-    assert "EXCHANGEINFO" in raw_result["data"][VENUE]
+    assert "EXCHANGEINFO" not in raw_result["data"].get(VENUE, {})
 
     all_symbols = sorted(
         {s for venue_data in raw_result["data"].values() for s in venue_data}
@@ -310,7 +314,10 @@ def test_exchangeinfo_plus_one_valid_symbol_only_attempts_valid_symbol(
 ) -> None:
     """A date with both an exchangeinfo partition and one valid depth/trade
     symbol must attempt only the valid symbol; EXCHANGEINFO must never be
-    attempted, and the eligible symbol's success must still be reported."""
+    attempted, and the eligible symbol's success must still be reported.
+    Issue #20 Phase 7 correction: EXCHANGEINFO is now excluded by
+    scan_raw_coverage() itself, so it never appears in raw_result['data']
+    in the first place."""
     data_root = tmp_path / "raw"
     replay_root = tmp_path / "replay"
     report_root = tmp_path / "reports"
@@ -321,7 +328,7 @@ def test_exchangeinfo_plus_one_valid_symbol_only_attempts_valid_symbol(
     all_symbols = sorted(
         {s for venue_data in raw_result["data"].values() for s in venue_data}
     )
-    assert "EXCHANGEINFO" in all_symbols
+    assert "EXCHANGEINFO" not in all_symbols
     assert "ADAUSDT" in all_symbols
 
     replay_result = daily_build.run_build_replay_store(

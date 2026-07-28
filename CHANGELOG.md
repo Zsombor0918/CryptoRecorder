@@ -67,6 +67,103 @@ passes.** Until then, broader full-L2 equivalence stays **deferred** (see
 ## [Unreleased]
 
 ### Added
+- **Issue #20 Phase 7 blocking correction: observed-scale-aware v1
+  fixed-point encoding + EXCHANGEINFO eligibility fix** — discovered
+  during the first real full-production-day (2026-06-11, 100% local
+  symbol coverage, 150 real venue/symbol partitions) Phase 7 build: the
+  v1 compact schema's automatic `price_scale`/`qty_scale` derivation
+  used the exchange's *declared* `PRICE_FILTER.tickSize`/`LOT_SIZE.stepSize`
+  alone, and 5 of 78 real BINANCE_USDTF futures symbols
+  (`BTWUSDT`/`GUAUSDT`/`HOMEUSDT`/`IRYSUSDT`/`LABUSDT`) failed to build
+  with "cannot be represented exactly at scale N" — the exchange's
+  actual recorded tick granularity on that day was finer than its own
+  declared filter (e.g. `BTWUSDT` declared price scale 5, real observed
+  depth/trade values like `0.0795760` require scale 6). This is a
+  genuine data anomaly, not a benchmark artifact, and blocks any v1
+  complete-day candidate from being valid.
+  - `stores/replay_schema.py`: added `normalized_decimal_scale()` (exact
+    `Decimal`-based minimum-fractional-digits computation, insignificant
+    trailing zeros stripped via `.normalize()` — never lexical string
+    length, never `float`). `encode_fixed_point()` now also validates the
+    resulting mantissa fits a signed int64 (the physical
+    `*_mantissa` field type), raising clearly instead of silently
+    overflowing.
+  - `stores/replay_writer.py`: `ReplayWriter` now tracks a small running
+    maximum observed price/qty scale incrementally as each depth/trade
+    batch is spooled (`write_depth_batch`/`write_trades_batch`) — never
+    by rescanning a partition or materializing a full-day list. The
+    automatically-derived `price_scale`/`qty_scale` (when not explicitly
+    supplied) becomes `max(declared exchangeInfo scale, observed scale)`.
+    An *explicitly* supplied scale is never silently enlarged: if
+    observed data would require more precision than an explicit
+    override, `finalize_staging()` raises clearly instead. The
+    manifest's `encoding_profile` now separately records
+    `price_scale_declared`/`price_scale_observed`/`qty_scale_declared`/
+    `qty_scale_observed` so any anomalous partition remains explainable
+    from the manifest alone. `BUILDER_VERSION_V1` bumped to
+    `v1.1.0` (the deterministic scale-selection algorithm changed); the
+    physical schema/format version is unchanged (the reader contract
+    did not change).
+  - `pipeline/raw_manifest.py`: `scan_raw_coverage()` now only derives
+    tradable venue/symbol partitions from genuine market channels
+    (`depth_v2`/`trade_v2`, via the new `ELIGIBLE_MARKET_CHANNELS`
+    allow-list) — the venue-level `exchangeinfo` metadata channel's
+    single `EXCHANGEINFO` pseudo-"symbol" directory can no longer leak
+    into the eligible-symbol universe for either schema version (it
+    previously did, and v0 silently "succeeded" building a meaningless
+    partition for it while v1 correctly refused). Real symbols missing
+    one of the two channels are still reported honestly (not hidden).
+  - Added `tests/test_replay_scale_selection_and_eligibility.py` (22
+    tests): the exact real failing value (`0.0795760`, declared scale 5)
+    selects encoding scale 6 (not 7, the naive lexical-length count) and
+    round-trips exactly; insignificant trailing zeros never inflate
+    scale; observed scale below declared retains the declared floor;
+    mixed depth+trade values select the true maximum; qty_scale
+    considers depth size, trade quantity, `LOT_SIZE`, and
+    `MARKET_LOT_SIZE` together; scientific-notation/zero/negative-exponent
+    decimal strings are handled exactly; an explicit insufficient scale
+    fails clearly instead of being silently enlarged; int64 mantissa
+    overflow fails clearly; `EXCHANGEINFO` is excluded from eligible
+    symbols for both venues and both schema versions end-to-end; real
+    symbol/channel coverage and missing-single-channel reporting remain
+    correct and honest; a malformed non-directory venue entry still
+    surfaces safely rather than crashing.
+  - Updated 3 pre-existing tests whose expectations were tied to the
+    fixed behavior: `tests/test_replay_schema_v1.py::test_fixed_point_no_float_intermediate`
+    (adjusted its float-imprecision-boundary test value to one that also
+    fits the newly-enforced int64 mantissa range — the original test
+    value could never have fit the real Parquet int64 field anyway) and
+    `tests/test_daily_build.py`'s two `EXCHANGEINFO`-exclusion tests
+    (updated to assert `EXCHANGEINFO` is now excluded at
+    `scan_raw_coverage()`'s source, not merely filtered downstream by
+    `pipeline.daily_build`'s pre-existing `ELIGIBLE_REPLAY_CHANNELS`
+    check).
+  - **Rebuilt the complete real 2026-06-11 universe** (150 real
+    venue/symbol partitions: 72 BINANCE_SPOT + 78 BINANCE_USDTF, into
+    fresh isolated candidate roots) with the fix: **v0: 150/150
+    succeeded; v1: 150/150 succeeded** (up from 145/150 before this
+    fix), including all 5 previously-failing futures symbols. Every
+    manifest (300 total) validates via `stores.replay_writer.validate_partition()`.
+    Focused semantic proof: every sampled raw price/size string for each
+    of the 5 corrected symbols encodes and decodes exactly at its
+    selected scale (50,000+ depth levels sampled for `LABUSDT` alone,
+    zero precision-loss failures).
+  - **Tier-2 re-run** (canonical `validation.validate_catalog_equivalence`
+    CLI, ADAUSDT, 2026-06-12, real local `data_raw`): both
+    `--schema-version 0` and `--schema-version 1` still pass all 7
+    gating components, `fenced_ranges` still byte-identical (34/34, same
+    canonical digest as every prior Phase 6 result) — confirming this
+    correction has zero effect on already-correct partitions.
+  - Full suite: 561 passed, 3 skipped (up from 539, +22 new); guards: 56
+    passed.
+  - No change to `convert_day.py`. This is a Phase 7 prerequisite
+    correction only — the Parquet format-selection/optimization sweep
+    itself has not yet started (that work explicitly requires this fix
+    first, since a v1 complete-day candidate could not previously be
+    built at all). Still strictly out of scope: Phase 8, self-contained/
+    raw-retention work, lifecycle hardening, reconstruction CLI,
+    monitoring, deterministic-rebuild phase, `uv`, deployment,
+    KovacsTrader, final documentation.
 - **Issue #20 Phase 6 correction #2: transactionally retryable spool
   merge state** — a review of `bc00b1e` (accepted the byte-budget/
   bounded-fan-in/atomic-write/descriptor fixes) found one remaining

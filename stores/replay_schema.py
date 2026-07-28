@@ -52,7 +52,16 @@ import pyarrow as pa
 
 FORMAT_VERSION_V1 = 1
 SCHEMA_VERSION_V1 = 1
-BUILDER_VERSION_V1 = "cryptorecorder-replay-writer-v1.0.0"
+# v1.1.0: issue #20 Phase 7 correction — automatic price_scale/qty_scale
+# selection now takes max(declared exchangeInfo scale, observed normalized
+# scale across depth+trades), not declared scale alone (fixes real-symbol
+# precision-loss failures where the exchange's actual tick granularity was
+# finer than its own declared PRICE_FILTER/LOT_SIZE on a given day). The
+# physical schema (DEPTH_REPLAY_SCHEMA_V1/TRADE_REPLAY_SCHEMA_V1,
+# FORMAT_VERSION_V1, SCHEMA_VERSION_V1) is unchanged — only the deterministic
+# algorithm that selects the scale value stored in the manifest changed, so
+# only the builder version is bumped, not the schema/format version.
+BUILDER_VERSION_V1 = "cryptorecorder-replay-writer-v1.1.0"
 
 # The only schema_version values ReplayReader/ReplayWriter know how to
 # produce/consume. A manifest with schema_version outside this set (or an
@@ -133,13 +142,49 @@ def unpack_depth_flags(code: int) -> "tuple[bool, bool, bool, bool, bool]":
 # v1 exact fixed-point mantissa encode/decode (Decimal only, never float)
 # ============================================================================
 
+# int64 range (Parquet/Arrow int64, matching DEPTH_REPLAY_SCHEMA_V1's/
+# TRADE_REPLAY_SCHEMA_V1's *_mantissa field types).
+_INT64_MIN = -(2 ** 63)
+_INT64_MAX = 2 ** 63 - 1
+
+
+def normalized_decimal_scale(value_str: str) -> int:
+    """Return the minimum number of fractional decimal digits required to
+    represent ``value_str`` *exactly* — i.e. its true decimal scale with
+    insignificant trailing zeros removed.
+
+    Uses ``Decimal`` exclusively (never ``float``, never lexical string
+    length) so the result is exact for any valid decimal string Binance can
+    emit, including plain fixed-point ("0.0795760"), integer ("100"), zero
+    ("0", "0.000"), and scientific-notation forms ("1.23E-4"). The naive
+    "count characters after the decimal point" approach is deliberately NOT
+    used: it would treat an insignificant trailing zero (e.g. the trailing
+    "0" in "0.0795760", which encodes the exact same value as "0.079576")
+    as if it added real precision, silently inflating the required scale.
+
+    Raises ``ValueError`` for non-finite values (``NaN``/``Infinity``),
+    which can never be valid instrument prices/sizes/quantities.
+    """
+    d = Decimal(value_str)
+    normalized = d.normalize()
+    exponent = normalized.as_tuple().exponent
+    if not isinstance(exponent, int):
+        # Decimal encodes NaN/sNaN/Infinity as a non-integer exponent
+        # sentinel ('n'/'N'/'F') — never a valid price/size/quantity value.
+        raise ValueError(f"value {value_str!r} is not a finite decimal number")
+    return max(0, -exponent)
+
+
 def encode_fixed_point(value_str: str, scale: int) -> int:
     """Convert an exact decimal string to an integer mantissa at ``scale``.
 
     Raises ``ValueError`` if ``value_str`` carries more fractional precision
     than ``scale`` allows (i.e. the value cannot be represented exactly at
-    this scale) — this must never silently truncate. Never uses a binary
-    float intermediate.
+    this scale) — this must never silently truncate. Also raises
+    ``ValueError`` if the resulting mantissa does not fit in a signed int64
+    (the physical Parquet/Arrow field type for every ``*_mantissa`` column) —
+    this must fail clearly rather than silently wrap/overflow. Never uses a
+    binary float intermediate.
     """
     d = Decimal(value_str)
     scaled = d.scaleb(scale)
@@ -148,7 +193,14 @@ def encode_fixed_point(value_str: str, scale: int) -> int:
             f"value {value_str!r} cannot be represented exactly at scale "
             f"{scale} (would lose precision)"
         )
-    return int(scaled)
+    mantissa = int(scaled)
+    if mantissa < _INT64_MIN or mantissa > _INT64_MAX:
+        raise ValueError(
+            f"value {value_str!r} at scale {scale} produces mantissa "
+            f"{mantissa}, which does not fit in a signed int64 "
+            f"[{_INT64_MIN}, {_INT64_MAX}]"
+        )
+    return mantissa
 
 
 def decode_fixed_point(mantissa: int, scale: int) -> str:

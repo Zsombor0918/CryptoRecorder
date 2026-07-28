@@ -93,6 +93,213 @@ An entry may be skipped **only** for:
 - <or "none — task fully completed">
 ```
 
+## 2026-07-28 — fix(stores): select v1 fixed-point scale from declared and observed precision
+
+### Change summary
+- Phase 6 was approved and verified (`4f84b051858f866e54cc493a1eb5edf205bdfc2e`
+  confirmed matching `origin/refactor/recorder-replay-only`). This entry
+  is a blocking Phase 7 prerequisite correction, discovered while
+  attempting the first real full-production-day (2026-06-11, the only
+  local raw day with 100% symbol coverage: 72/72 BINANCE_SPOT + 78/78
+  BINANCE_USDTF) Phase 7 measurement build.
+- **Root cause**: the v1 compact schema's automatic `price_scale`/
+  `qty_scale` derivation (`_derive_fixed_point_scales()`) used only the
+  exchange's *declared* `PRICE_FILTER.tickSize`/`LOT_SIZE.stepSize`/
+  `MARKET_LOT_SIZE.stepSize`. 5 of 78 real BINANCE_USDTF futures symbols
+  (`BTWUSDT`, `GUAUSDT`, `HOMEUSDT`, `IRYSUSDT`, `LABUSDT`) failed the
+  full-universe v1 build with `"value '0.0795760' cannot be represented
+  exactly at scale 5 (would lose precision)"` — confirmed by direct
+  evidence gathering (exact `Decimal` parsing of every raw depth/trade
+  price and quantity for these 5 symbols on 2026-06-11): the exchange's
+  actual recorded tick granularity that day was finer than its own
+  declared filter for all 5 symbols (e.g. `BTWUSDT` declared price scale
+  5 vs. real observed max scale 6, appearing in both `snapshot_seed` and
+  `depth_update` depth record types as well as `trade` records). This is
+  a genuine data anomaly present in real production data, not a
+  benchmark artifact — a complete-day v1 candidate could not be built at
+  all until this was fixed.
+- **Fix**:
+  - `stores/replay_schema.py`: added `normalized_decimal_scale(value_str)`
+    — the exact minimum number of fractional decimal digits required to
+    represent a value exactly, computed via `Decimal(...).normalize()`
+    (strips insignificant trailing zeros) — never lexical string length,
+    never `float`. `encode_fixed_point()` now also validates the
+    resulting mantissa fits within signed int64 range (the physical
+    Parquet/Arrow type of every `*_mantissa` field), raising a clear
+    `ValueError` instead of silently overflowing/wrapping.
+  - `stores/replay_writer.py`: `ReplayWriter.write_depth_batch()`/
+    `write_trades_batch()` now update two small running-maximum counters
+    (`self._observed_price_scale`/`self._observed_qty_scale`) as each
+    batch is spooled — bounded, incremental, never a rescan of a
+    partition or a full-day Python list. `finalize_staging()`'s
+    automatic scale selection (when `price_scale`/`qty_scale` were not
+    explicitly supplied) is now `max(declared exchangeInfo scale,
+    observed scale)` for each of price and quantity independently. An
+    *explicitly* supplied scale is never silently enlarged: if observed
+    data would require more precision than an explicit override,
+    `finalize_staging()` raises a clear `ValueError` naming the exact
+    insufficient value instead. The v1 manifest's `encoding_profile` now
+    separately records `price_scale_declared`/`price_scale_observed`/
+    `qty_scale_declared`/`qty_scale_observed` (in addition to the
+    selected `price_scale`/`qty_scale` at the top level) so any
+    anomalous partition remains fully explainable from the manifest
+    alone. `stores/replay_schema.py`'s `BUILDER_VERSION_V1` bumped from
+    `v1.0.0` to `v1.1.0` (the deterministic scale-selection algorithm
+    changed); `FORMAT_VERSION_V1`/`SCHEMA_VERSION_V1` (the physical
+    schema/reader contract) are unchanged, since the reader's decode
+    logic did not change — only which scale value ends up recorded in
+    the manifest changed.
+  - `pipeline/raw_manifest.py`: added `ELIGIBLE_MARKET_CHANNELS =
+    frozenset({"depth_v2", "trade_v2"})` and used it in
+    `scan_raw_coverage()`'s channel-scanning loop so only genuine
+    market-data channel directories can ever contribute a venue/symbol
+    entry to the returned coverage — the venue-level `exchangeinfo`
+    metadata channel's single `EXCHANGEINFO` pseudo-"symbol" directory
+    can no longer leak into the eligible-symbol universe for either
+    schema version (previously it did: v0 silently "succeeded" building
+    a meaningless replay partition for the literal string
+    `"EXCHANGEINFO"`, while v1 correctly refused with "no exchangeInfo
+    entry found" — an inconsistency that also inflated the naive
+    eligible-partition count from 150 real symbols to 152). This is a
+    small, explicit allow-list, not a broad "ignore anything unfamiliar"
+    rule: a genuinely malformed market-data directory still surfaces via
+    the pre-existing per-venue error collection, and a real symbol
+    missing one of the two channels is still reported honestly (with
+    only the present channel key set) rather than hidden.
+- Added `tests/test_replay_scale_selection_and_eligibility.py` (22
+  tests, listed in full in the CHANGELOG entry) covering: the exact real
+  failing value selecting the correct (not naively inflated) scale and
+  round-tripping exactly; insignificant-trailing-zero handling;
+  declared-scale-as-floor retention; mixed depth+trade maximum
+  selection; qty_scale considering all four sources
+  (`LOT_SIZE`/`MARKET_LOT_SIZE`/observed depth/observed trade);
+  scientific-notation/zero/negative-exponent exactness;
+  explicit-override-never-silently-enlarged failure behavior; int64
+  overflow failure; end-to-end `EXCHANGEINFO` exclusion for both venues
+  and both schema versions; and honest missing-single-channel reporting.
+  Updated 3 pre-existing tests whose fixed expectations were tied to the
+  behavior being corrected (`tests/test_replay_schema_v1.py`'s
+  float-intermediate test needed a value that also fits the newly
+  int64-checked mantissa range; `tests/test_daily_build.py`'s two
+  `EXCHANGEINFO`-exclusion tests now assert exclusion happens at
+  `scan_raw_coverage()`'s source, matching the corrected behavior,
+  rather than only via `pipeline.daily_build`'s pre-existing downstream
+  `ELIGIBLE_REPLAY_CHANNELS` filter).
+- **Rebuilt the complete real 2026-06-11 universe** into fresh isolated
+  candidate roots (`/tmp/phase7/replay_v0`, `/tmp/phase7/replay_v1` —
+  never touching the production `replay_store`) with the fix applied:
+  v0 150/150 succeeded (unchanged — v0 was never affected by this bug);
+  **v1 150/150 succeeded (up from 145/150 before this fix)**, including
+  all 5 previously-failing futures symbols. Every one of the 300
+  resulting manifests (150 v0 + 150 v1) validates via
+  `stores.replay_writer.validate_partition()`. Direct focused semantic
+  proof for the 5 corrected symbols: every sampled raw price/size string
+  encodes and decodes exactly at its manifest-recorded selected scale
+  (50,000+ depth levels sampled for `LABUSDT` alone; zero precision-loss
+  failures for any of the 5).
+
+### Files/packages touched
+- `stores/replay_schema.py`
+- `stores/replay_writer.py`
+- `pipeline/raw_manifest.py`
+- `tests/test_replay_scale_selection_and_eligibility.py` (new)
+- `tests/test_replay_schema_v1.py`
+- `tests/test_daily_build.py`
+- `CHANGELOG.md`
+- `docs/CHANGE_AUDIT.md`
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] docs/REPO_STRUCTURE.md
+- [x] docs/PROJECT_STATUS.md
+- [ ] docs/IMPLEMENTATION_AUDIT.md
+- [x] relevant feature docs:
+  - docs/FULL_L2_REPLAY_CATALOG_PLAN.md (reviewed; no status-claim
+    changes needed — this is a v1-internal correctness correction, not
+    a change to the full-L2/v0 equivalence claim)
+
+### Docs updated
+- [x] CHANGELOG.md
+- [ ] README.md
+- [ ] docs/PROJECT_STATUS.md
+- [ ] docs/REPO_STRUCTURE.md
+- [ ] relevant feature docs:
+  - none
+- No docs update required because: this is an internal v1 encoding
+  correctness fix and an eligibility-scan bug fix; it does not change
+  any validated/deferred status claim (v1 remains an unreleased,
+  development-only prototype), does not affect `convert_day.py` or the
+  v0 production path, and does not change the repo structure contract.
+
+### Status / validation impact
+- Validated status changed: no
+- Deferred status changed: no
+- New claims added: no
+- Evidence for any new validation claim: n/a — this fixes a real defect
+  that blocked v1 from being a valid complete-day candidate at all; it
+  does not newly validate v1 for production use.
+
+### Tests run
+```bash
+source .venv/bin/activate
+python -m pytest tests/test_replay_scale_selection_and_eligibility.py -q
+# 22 passed
+python -m pytest tests/test_replay_schema_v1.py tests/test_replay_schema_v1_corrections.py \
+  tests/test_replay_store.py tests/test_replay_depth_adapter.py tests/test_replay_memory_bounded.py \
+  tests/test_replay_sync_continuity.py tests/test_replay_catalog_reconstruct.py \
+  tests/test_daily_build.py tests/test_pipeline_validation.py \
+  tests/test_replay_scale_selection_and_eligibility.py -q
+# 182 passed, 1 skipped
+python -m pytest -q
+# 561 passed, 3 skipped (up from 539)
+python -m pytest tests/test_repo_structure.py tests/test_agent_infrastructure.py -q
+# 56 passed
+```
+
+### Validation CLIs run
+```bash
+# Canonical Tier-2 gate, both schema versions, ADAUSDT (unaffected regression check):
+CRYPTO_RECORDER_DATA_ROOT="$(pwd)/data_raw" python -m validation.validate_catalog_equivalence \
+  --date 2026-06-12 --symbols ADAUSDT --venues BINANCE_SPOT --data-root "$(pwd)/data_raw" \
+  --work-root /tmp/phase7fix_v0/work --old-catalog-root /tmp/phase7fix_v0/old_catalog \
+  --replay-root /tmp/phase7fix_v0/replay --new-catalog-root /tmp/phase7fix_v0/new_catalog \
+  --profile full_l2 --emit-depth10 --schema-version 0 --overwrite \
+  --report-path /tmp/phase7fix_v0/report.json
+# result: passed, 7/7, fenced_ranges 34/34 byte-identical to every prior Phase 6 result.
+
+CRYPTO_RECORDER_DATA_ROOT="$(pwd)/data_raw" python -m validation.validate_catalog_equivalence \
+  --date 2026-06-12 --symbols ADAUSDT --venues BINANCE_SPOT --data-root "$(pwd)/data_raw" \
+  --work-root /tmp/phase7fix_v1/work --old-catalog-root /tmp/phase7fix_v1/old_catalog \
+  --replay-root /tmp/phase7fix_v1/replay --new-catalog-root /tmp/phase7fix_v1/new_catalog \
+  --profile full_l2 --emit-depth10 --schema-version 1 --overwrite \
+  --report-path /tmp/phase7fix_v1/report.json
+# result: passed, 7/7, same fenced_ranges digest.
+
+# Complete real 2026-06-11 full-universe rebuild (isolated candidate roots, never
+# touching production replay_store), both schema versions:
+CRYPTO_RECORDER_CONVERTER_TEMP_DIR=/tmp/phase7/scratch python -m pipeline.build_replay_store \
+  --date 2026-06-11 --symbols all --data-root "$(pwd)/data_raw" \
+  --replay-root /tmp/phase7/replay_v0 --schema-version 0
+# result: 150 successful, 0 failed.
+
+CRYPTO_RECORDER_CONVERTER_TEMP_DIR=/tmp/phase7/scratch2 python -m pipeline.build_replay_store \
+  --date 2026-06-11 --symbols all --data-root "$(pwd)/data_raw" \
+  --replay-root /tmp/phase7/replay_v1 --schema-version 1
+# result: 150 successful, 0 failed (up from 145 successful, 7 failed before this fix).
+```
+
+### Known limitations / out of scope
+- The Parquet format-selection/optimization sweep itself (row-group
+  sizing, ZSTD level tuning, alternative encodings, nested-vs-split
+  depth layout comparison, per-column size attribution) has NOT started
+  — this correction is a blocking prerequisite for it, not the sweep
+  itself.
+- Phase 8, self-contained/raw-retention work, lifecycle hardening,
+  reconstruction CLI, monitoring, deterministic-rebuild phase, `uv`,
+  deployment, KovacsTrader changes, and final documentation were NOT
+  started.
+- `convert_day.py` was not modified.
+
 ## 2026-07-27 — fix(converter): make spool merge state transactionally retryable
 
 ### Change summary
