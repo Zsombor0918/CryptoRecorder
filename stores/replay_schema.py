@@ -52,16 +52,17 @@ import pyarrow as pa
 
 FORMAT_VERSION_V1 = 1
 SCHEMA_VERSION_V1 = 1
-# v1.1.0: issue #20 Phase 7 correction — automatic price_scale/qty_scale
-# selection now takes max(declared exchangeInfo scale, observed normalized
-# scale across depth+trades), not declared scale alone (fixes real-symbol
-# precision-loss failures where the exchange's actual tick granularity was
-# finer than its own declared PRICE_FILTER/LOT_SIZE on a given day). The
-# physical schema (DEPTH_REPLAY_SCHEMA_V1/TRADE_REPLAY_SCHEMA_V1,
-# FORMAT_VERSION_V1, SCHEMA_VERSION_V1) is unchanged — only the deterministic
-# algorithm that selects the scale value stored in the manifest changed, so
-# only the builder version is bumped, not the schema/format version.
-BUILDER_VERSION_V1 = "cryptorecorder-replay-writer-v1.1.0"
+# v1.2.0: issue #20 Phase 7 measured Parquet encoding profile -- ZSTD level
+# 6 (was 3), dictionary encoding disabled (was enabled), DELTA_BINARY_PACKED
+# for monotonic session/sequence/timestamp integer columns, and
+# BYTE_STREAM_SPLIT for the int64 fixed-point mantissa columns (including
+# the nested bids/asks list-of-struct mantissas), plus larger measured
+# row-group batch sizes. Selected via a representative-symbol sweep (see
+# docs/CHANGE_AUDIT.md for the full measured comparison). Purely a physical
+# Parquet encoding change -- every field's logical type/nullability/meaning
+# is unchanged, so FORMAT_VERSION_V1/SCHEMA_VERSION_V1 (the reader contract)
+# are unchanged; only the builder version is bumped.
+BUILDER_VERSION_V1 = "cryptorecorder-replay-writer-v1.2.0"
 
 # The only schema_version values ReplayReader/ReplayWriter know how to
 # produce/consume. A manifest with schema_version outside this set (or an

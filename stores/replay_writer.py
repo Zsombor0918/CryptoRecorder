@@ -55,10 +55,86 @@ from .replay_schema import (
 
 logger = logging.getLogger(__name__)
 
-# Number of spool rows read per Parquet row-group.
+# Number of spool rows read per Parquet row-group. Unchanged default for v0
+# (and for v1 unless overridden) -- issue #20 Phase 7 measured format
+# optimization uses larger, schema_version=1-only batch sizes below instead
+# of changing this shared default, so v0's physical output is byte-for-byte
+# unchanged.
 _DEFAULT_PARQUET_BATCH = int(
     os.environ.get("CRYPTO_RECORDER_REPLAY_PARQUET_BATCH", "5000")
 )
+
+# ============================================================================
+# issue #20 Phase 7: measured v1-only Parquet encoding profile
+# ============================================================================
+#
+# Selected via a representative-symbol sweep (ADAUSDT/BTCUSDT/ETHUSDT spot,
+# BTCUSDT/ETHUSDT/VELVETUSDT/LABUSDT futures -- the two highest-local-volume
+# symbols and one of the five scale-corrected anomalous futures symbols),
+# testing row-group targets (~64/128/256 MiB), ZSTD levels (3/6/9),
+# dictionary on/off, DELTA_BINARY_PACKED for monotonic session/sequence/
+# timestamp integer columns, and BYTE_STREAM_SPLIT for the int64 fixed-point
+# mantissa columns (including the nested bids/asks list-of-struct mantissas).
+# ZSTD level 6 + no dictionary + delta-encoded monotonic integers +
+# byte-stream-split mantissas measured consistently smaller than every other
+# tested combination across all 7 representative symbols (see
+# docs/CHANGE_AUDIT.md for the full measured comparison table). This is a
+# pure Parquet *physical encoding* change: every field's logical type,
+# nullability, and semantic meaning are completely unchanged, so any reader
+# using standard Parquet/Arrow decoding (unaware of these encoding choices)
+# reads back byte-for-byte identical logical values.
+#
+# v0 is completely unaffected: none of these constants are read unless
+# schema_version == 1.
+V1_COMPRESSION_LEVEL = int(os.environ.get("CRYPTO_RECORDER_REPLAY_V1_ZSTD_LEVEL", "6"))
+
+# Larger row groups measurably reduce size (row-group/dictionary-page
+# overhead amortized over more rows), but batches are held fully in memory
+# before being flushed as one row group -- so these are deliberately modest
+# multiples of the v0 default (5000), not an aggressive byte-target-driven
+# size (which would require knowing per-row serialized size in advance,
+# violating the bounded/streaming design). Independently configurable so an
+# operator can tune for a specific machine's RAM headroom without touching
+# v0's batch size.
+V1_DEPTH_PARQUET_BATCH = int(os.environ.get("CRYPTO_RECORDER_REPLAY_V1_DEPTH_BATCH", "20000"))
+V1_TRADE_PARQUET_BATCH = int(os.environ.get("CRYPTO_RECORDER_REPLAY_V1_TRADE_BATCH", "50000"))
+
+# Disabling dictionary encoding entirely (rather than per-column) measured
+# smaller on every representative symbol, including for already-low-
+# cardinality repeated string columns (e.g. trades' `market_type`, which
+# only ever takes 2 distinct values) -- verified directly at scale
+# (VELVETUSDT, 11.3M trade rows): `market_type` compressed to 49,578 bytes
+# with dictionary disabled vs. 32,522 bytes with it enabled, a negligible
+# ~17 KB difference against an overall ~8 MB smaller total file, because
+# ZSTD's own repetition detection compresses a page of near-identical short
+# strings almost as well as RLE-dictionary-then-ZSTD would. No column
+# needed a manually-preserved dictionary exception.
+V1_USE_DICTIONARY = False
+
+# Monotonic (or near-monotonic within a session) integer/timestamp columns
+# -- safe, lossless DELTA_BINARY_PACKED candidates per the Phase 7 sweep.
+V1_DEPTH_COLUMN_ENCODING = {
+    "session_seq": "DELTA_BINARY_PACKED",
+    "raw_index": "DELTA_BINARY_PACKED",
+    "ts_exchange_ns": "DELTA_BINARY_PACKED",
+    "ts_receive_ns": "DELTA_BINARY_PACKED",
+    # Nested list<struct> fixed-point mantissa columns -- BYTE_STREAM_SPLIT
+    # measured a further ~20% reduction on top of delta-encoded integers
+    # alone for large futures symbols (e.g. BINANCE_USDTF/BTCUSDT depth:
+    # 325,308,871 -> 255,321,595 bytes, ~21.5% smaller).
+    "bids.list.element.price_mantissa": "BYTE_STREAM_SPLIT",
+    "bids.list.element.size_mantissa": "BYTE_STREAM_SPLIT",
+    "asks.list.element.price_mantissa": "BYTE_STREAM_SPLIT",
+    "asks.list.element.size_mantissa": "BYTE_STREAM_SPLIT",
+}
+V1_TRADE_COLUMN_ENCODING = {
+    "trade_session_seq": "DELTA_BINARY_PACKED",
+    "raw_index": "DELTA_BINARY_PACKED",
+    "ts_exchange_ns": "DELTA_BINARY_PACKED",
+    "ts_receive_ns": "DELTA_BINARY_PACKED",
+    "price_mantissa": "BYTE_STREAM_SPLIT",
+    "quantity_mantissa": "BYTE_STREAM_SPLIT",
+}
 
 
 def _derive_fixed_point_scales(
@@ -324,6 +400,10 @@ def _write_channel_incremental(
     schema: pa.Schema,
     parquet_batch_size: int,
     row_transform: "Optional[Callable[[dict], dict]]" = None,
+    *,
+    compression_level: int = 3,
+    use_dictionary=True,
+    column_encoding: "Optional[dict]" = None,
 ) -> "tuple[int, int, int]":
     """Write all spool records to out_path in bounded batches.
 
@@ -332,6 +412,13 @@ def _write_channel_incremental(
     v0-shaped spooled record dict down to the compact v1 physical row shape
     without ever materializing more than one row-group's worth of rows.
 
+    ``compression_level``/``use_dictionary``/``column_encoding`` default to
+    the original, unchanged v0 behavior (ZSTD level 3, dictionary enabled,
+    no explicit per-column encoding) — only ``finalize_staging()``'s
+    schema_version=1 call site overrides these (issue #20 Phase 7 measured
+    Parquet encoding profile; see the ``V1_*`` constants above), so v0's
+    physical output is completely unaffected.
+
     Returns (record_count, ts_min_ns, ts_max_ns).
     An empty channel produces a schema-bearing empty Parquet file.
     """
@@ -339,6 +426,17 @@ def _write_channel_incremental(
     ts_min: "int | None" = None
     ts_max: "int | None" = None
     writer: "pq.ParquetWriter | None" = None
+
+    def _new_writer() -> pq.ParquetWriter:
+        kwargs: dict = dict(
+            schema=schema,
+            compression="zstd",
+            compression_level=compression_level,
+            use_dictionary=use_dictionary,
+        )
+        if column_encoding:
+            kwargs["column_encoding"] = column_encoding
+        return pq.ParquetWriter(str(out_path), **kwargs)
 
     try:
         batch: list = []
@@ -354,12 +452,7 @@ def _write_channel_incremental(
             if len(batch) >= parquet_batch_size:
                 tbl = pa.Table.from_pylist(batch, schema=schema)
                 if writer is None:
-                    writer = pq.ParquetWriter(
-                        str(out_path),
-                        schema=schema,
-                        compression="zstd",
-                        compression_level=3,
-                    )
+                    writer = _new_writer()
                 writer.write_table(tbl)
                 del tbl, batch
                 batch = []
@@ -367,12 +460,7 @@ def _write_channel_incremental(
         # Flush remainder (or write empty schema-bearing file)
         tbl = pa.Table.from_pylist(batch, schema=schema)
         if writer is None:
-            writer = pq.ParquetWriter(
-                str(out_path),
-                schema=schema,
-                compression="zstd",
-                compression_level=3,
-            )
+            writer = _new_writer()
         writer.write_table(tbl)
         del tbl, batch
     finally:
@@ -666,9 +754,17 @@ class ReplayWriter:
         # --- Depth ---
         depth_spool = self._get_depth_spool()
         depth_spool.commit()
-        depth_count, ts_d_min, ts_d_max = _write_channel_incremental(
-            depth_spool, depth_path, depth_schema, self._parquet_batch_size, row_transform_depth
-        )
+        if self.schema_version == 1:
+            depth_count, ts_d_min, ts_d_max = _write_channel_incremental(
+                depth_spool, depth_path, depth_schema, V1_DEPTH_PARQUET_BATCH, row_transform_depth,
+                compression_level=V1_COMPRESSION_LEVEL,
+                use_dictionary=V1_USE_DICTIONARY,
+                column_encoding=V1_DEPTH_COLUMN_ENCODING,
+            )
+        else:
+            depth_count, ts_d_min, ts_d_max = _write_channel_incremental(
+                depth_spool, depth_path, depth_schema, self._parquet_batch_size, row_transform_depth
+            )
         depth_spool.close()
         self._depth_spool = None
         logger.info(f"Wrote staging depth: {depth_path} ({depth_count} records)")
@@ -676,9 +772,17 @@ class ReplayWriter:
         # --- Trades ---
         trade_spool = self._get_trade_spool()
         trade_spool.commit()
-        trade_count, ts_t_min, ts_t_max = _write_channel_incremental(
-            trade_spool, trades_path, trade_schema, self._parquet_batch_size, row_transform_trade
-        )
+        if self.schema_version == 1:
+            trade_count, ts_t_min, ts_t_max = _write_channel_incremental(
+                trade_spool, trades_path, trade_schema, V1_TRADE_PARQUET_BATCH, row_transform_trade,
+                compression_level=V1_COMPRESSION_LEVEL,
+                use_dictionary=V1_USE_DICTIONARY,
+                column_encoding=V1_TRADE_COLUMN_ENCODING,
+            )
+        else:
+            trade_count, ts_t_min, ts_t_max = _write_channel_incremental(
+                trade_spool, trades_path, trade_schema, self._parquet_batch_size, row_transform_trade
+            )
         trade_spool.close()
         self._trade_spool = None
         logger.info(f"Wrote staging trades: {trades_path} ({trade_count} records)")
@@ -745,8 +849,20 @@ class ReplayWriter:
             manifest["builder_version"] = BUILDER_VERSION_V1
             manifest["encoding_profile"] = {
                 "compression": "zstd",
-                "compression_level": 3,
-                "row_group_batch_size": self._parquet_batch_size,
+                "compression_level": V1_COMPRESSION_LEVEL,
+                # issue #20 Phase 7: depth and trades now use independently
+                # tunable batch/row-group sizes (measured larger row groups
+                # to be smaller); "row_group_batch_size" retained for
+                # backward-compatible manifest-reader expectations
+                # (validate_partition() only checks the key is present) and
+                # set to the depth batch size, with the exact per-channel
+                # values also recorded explicitly.
+                "row_group_batch_size": V1_DEPTH_PARQUET_BATCH,
+                "depth_row_group_batch_size": V1_DEPTH_PARQUET_BATCH,
+                "trade_row_group_batch_size": V1_TRADE_PARQUET_BATCH,
+                "use_dictionary": V1_USE_DICTIONARY,
+                "depth_column_encoding": V1_DEPTH_COLUMN_ENCODING,
+                "trade_column_encoding": V1_TRADE_COLUMN_ENCODING,
                 "depth_schema_version": SCHEMA_VERSION_V1,
                 "trade_schema_version": SCHEMA_VERSION_V1,
                 # issue #20 Phase 7 correction: record the declared

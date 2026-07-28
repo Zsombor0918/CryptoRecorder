@@ -93,6 +93,269 @@ An entry may be skipped **only** for:
 - <or "none — task fully completed">
 ```
 
+## 2026-07-29 — perf(stores): measured v1 Parquet encoding optimization (Phase 7 Stage A)
+
+### Change summary
+- Phase 6 (`4f84b05`) and the Phase 7 blocking correction (`b5a3555`) are
+  both approved and unmodified. This entry is Phase 7 Stage A: format
+  selection using the complete real local 2026-06-11 universe (150/150
+  valid partitions for both v0 and v1) as development/Tier-2 evidence —
+  explicitly NOT a Tier-3 production-day storage-gate claim.
+- **Baseline** (exact, from the existing `/tmp/phase7/replay_v0` and
+  `/tmp/phase7/replay_v1` roots, Parquet-footer-metadata-only analysis,
+  no data re-scan): v0 = 17,004,186,427 bytes (15.836 GiB; depth
+  11.271 GiB `equiv.` — actually 11,271,259,512 bytes = 10.497 GiB depth,
+  5,732,655,997 bytes = 5.339 GiB trades). v1 (corrected scale, `b5a3555`
+  default encoding) = 11,942,275,817 bytes (11.122 GiB; depth
+  6,817,371,311 bytes = 6.349 GiB, trades 5,123,435,355 bytes = 4.772
+  GiB). v1/v0 ratio 70.2%. Both: 45,036,499 depth rows, 103,254,133
+  trade rows, 1,090,289,773 total depth levels (v1). v0 bytes/depth-event
+  250.27, v1 bytes/depth-event (pre-optimization) 151.37, bytes/trade
+  55.52 (v0) vs 49.62 (v1 pre-optimization).
+- **Per-column attribution (v1 pre-optimization) identified the dominant
+  physical columns** before changing anything: depth —
+  `native_payload_hash` 14.1%, `bids`/`asks` `size_mantissa` 18.98%/17.23%,
+  `price_mantissa` 10.81%/9.93%, `U`/`u`/`pu` continuity ids ~9-10%
+  combined, `ts_exchange_ns`/`ts_receive_ns` ~7% combined,
+  `session_seq`/`raw_index` ~4% combined; trades — `native_payload_hash`
+  dominant at 67.75%, `ts_receive_ns` 9.65%, `raw_index` 8.22%,
+  `trade_session_seq` 5.32%.
+- **Representative-symbol sweep** (ADAUSDT/BTCUSDT/ETHUSDT spot,
+  BTCUSDT/ETHUSDT/VELVETUSDT/LABUSDT futures — the two
+  highest-local-volume symbols by trade count and one of the five
+  scale-corrected anomalous futures symbols), one-off analysis script
+  (not committed), varying one dimension at a time then testing the
+  best combination:
+  - Row-group target (~64/128/256 MiB) x ZSTD level (3/6/9): larger row
+    groups and higher ZSTD levels both monotonically reduced size on
+    every symbol (diminishing returns above ~128 MiB / level 6-9); e.g.
+    `BINANCE_SPOT/BTCUSDT` depth: 171,127,843 (source) →
+    146,327,089 bytes at 256 MiB/zstd9.
+  - Dictionary encoding disabled entirely measured smaller on every
+    representative symbol than dictionary enabled at the same row-group/
+    level, including for already-low-cardinality repeated string columns
+    — verified directly at scale on `VELVETUSDT` (11,387,310 trade rows):
+    `market_type` compressed to 49,578 bytes with dictionary disabled vs.
+    32,522 bytes enabled (a ~17 KB difference) against an ~8,174,885 byte
+    (8 MB) smaller overall trades.parquet file with dictionary disabled;
+    `trade_id`/`agg_trade_id`/`quality_flags` similarly showed negligible
+    (<1 KB) differences. No column required a manually-preserved
+    dictionary exception.
+  - `DELTA_BINARY_PACKED` for `session_seq`/`trade_session_seq`/
+    `raw_index`/`ts_exchange_ns`/`ts_receive_ns` (all monotonic or
+    near-monotonic within a session) measured substantial additional
+    reduction on top of ZSTD alone — e.g. `BINANCE_USDTF/BTCUSDT` trades:
+    169,921,400 (256 MiB/zstd9, no delta) → 148,426,438 bytes
+    (delta + no-dictionary combined).
+  - `BYTE_STREAM_SPLIT` for the int64 fixed-point mantissa columns
+    (`price_mantissa`/`quantity_mantissa` for trades; the nested
+    `bids`/`asks` `price_mantissa`/`size_mantissa` for depth — confirmed
+    directly that `column_encoding` accepts dotted nested-field paths,
+    e.g. `bids.list.element.price_mantissa`) measured a further
+    reduction beyond delta-encoded integers alone on large symbols:
+    `BINANCE_USDTF/BTCUSDT` depth, delta-ints-only 325,308,871 bytes →
+    delta-ints + BSS-mantissas 255,321,595 bytes (21.5% additional
+    reduction); `BINANCE_SPOT/BTCUSDT` depth 136,068,640 → 126,986,602
+    (6.7%); `BINANCE_USDTF/LABUSDT` depth 113,251,076 → 106,245,880 (6.2%).
+  - Nested fixed-point depth layout vs. an alternative split/flat depth
+    candidate: NOT tested as a separate candidate, because nested depth
+    was not the dominant remaining size driver after the above
+    combination was applied (see per-column evidence below) — per the
+    Stage A instructions ("if depth remains the dominant cost"), this
+    comparison was correctly skipped as unnecessary given the actual
+    measured column breakdown.
+  - Remaining exact ID/sequence compaction: not pursued further beyond
+    delta encoding of the already-planned integer columns — `U`/`u`/`pu`
+    (string continuity ids) and `trade_id`/`agg_trade_id` remain
+    deliberately uncompacted lexical strings, matching the existing v1
+    prototype's Phase 5 scope decision (their partition-constancy/safe-
+    numeric-packing was marked "pending proof"/"benchmark-needed" in the
+    Phase 3 field/consumer/integrity matrix and this entry did not
+    attempt to resolve that).
+- **Selected candidate**: ZSTD level 6, dictionary disabled, larger
+  row-group batch sizes (depth 20,000 rows, trades 50,000 rows,
+  independently configurable via `CRYPTO_RECORDER_REPLAY_V1_DEPTH_BATCH`/
+  `CRYPTO_RECORDER_REPLAY_V1_TRADE_BATCH` env vars; ZSTD level itself via
+  `CRYPTO_RECORDER_REPLAY_V1_ZSTD_LEVEL`), `DELTA_BINARY_PACKED` for the
+  monotonic integer columns, `BYTE_STREAM_SPLIT` for all fixed-point
+  mantissa columns including the nested depth-level ones. Implemented in
+  `stores/replay_writer.py` (`V1_COMPRESSION_LEVEL`/
+  `V1_DEPTH_PARQUET_BATCH`/`V1_TRADE_PARQUET_BATCH`/`V1_USE_DICTIONARY`/
+  `V1_DEPTH_COLUMN_ENCODING`/`V1_TRADE_COLUMN_ENCODING` module constants;
+  `_write_channel_incremental()` gained optional `compression_level`/
+  `use_dictionary`/`column_encoding` parameters, defaulting to the
+  original unchanged v0 behavior — only `finalize_staging()`'s
+  `schema_version == 1` branch passes the new v1-specific values, so v0's
+  physical writer call path and output are completely unaffected).
+  `stores/replay_schema.py`'s `BUILDER_VERSION_V1` bumped to `v1.2.0`
+  (encoding profile changed); `FORMAT_VERSION_V1`/`SCHEMA_VERSION_V1`
+  (the reader contract) unchanged, since `stores/replay_reader.py` reads
+  via standard `pq.ParquetFile`/`pq.read_table` and required zero code
+  changes — any Parquet-aware reader decodes the new encoding
+  transparently to the identical logical values. The v1 manifest's
+  `encoding_profile` now also records `use_dictionary`,
+  `depth_column_encoding`, `trade_column_encoding`, and per-channel
+  `depth_row_group_batch_size`/`trade_row_group_batch_size` so a built
+  partition's exact physical format is self-describing from its
+  manifest alone.
+- **Full-universe rebuild** (2026-06-11, all 150 real partitions, into a
+  fresh isolated candidate root `/tmp/phase7/replay_v1_optimized` — the
+  production `replay_store` was never touched): **150/150 succeeded**
+  (0 failed — no partition, large or small, was omitted from the
+  reported total). Every one of the 150 manifests validates via
+  `stores.replay_writer.validate_partition()`.
+  - **Size**: 8,783,383,810 bytes = **8.180 GiB** total (depth
+    4,948,962,336 bytes = 4.609 GiB; trades 3,832,818,373 bytes = 3.570
+    GiB; manifests 1,407,110 bytes = 1.342 MiB; instrument metadata
+    195,991 bytes = 0.187 MiB).
+  - **Ratio vs. baselines**: 48.3% reduction vs. v0 (8.180/15.836 GiB =
+    51.65%); 26.5% further reduction vs. the corrected-scale v1 baseline
+    before this optimization (8.180/11.122 GiB = 73.55%).
+  - **bytes/trade**: 37.12 (down from 49.62 pre-optimization, 55.52 for
+    v0). **bytes/depth-event**: 109.89 (down from 151.37 pre-optimization,
+    250.27 for v0).
+  - **Wall time**: 2:53:55 (up from 2:40:58 for the corrected-but-
+    unoptimized v1 build — ZSTD level 6 + delta/BSS encoding costs more
+    CPU than level 3 with plain encoding, a measured, accepted tradeoff
+    for the size reduction, still well within acceptable daily-build
+    time budgets). **Max RSS**: 2,410,720 KiB = 2.30 GiB (up from
+    1,110,976 KiB for the unoptimized build — larger row-group batches
+    held fully in memory before each Parquet row-group write account for
+    the increase; still far below the 16 GB machine-safety ceiling).
+  - **Per-column evidence AFTER optimization**: `native_payload_hash` is
+    now the dominant remaining cost driver — 28.09% of depth
+    (1,390,370,085 bytes = 1.295 GiB) and 86.23% of trades
+    (3,304,924,644 bytes = 3.078 GiB), **54.0% of the entire candidate's
+    total size** (4,695,294,729 of 8,783,383,810 bytes). This is a
+    32-byte SHA-256 hash recorded per event; being cryptographically
+    high-entropy, it is not meaningfully compressible or delta/
+    dictionary-encodable by any Parquet physical encoding — its
+    reduction is explicitly flagged "Unresolved" in
+    `docs/IMPLEMENTATION_AUDIT.md`, pending the (not-yet-implemented)
+    Phase 2 Section 3 traceability design, and is out of scope for this
+    Stage A Parquet-encoding-only sweep (changing what is stored per
+    event, rather than how it is physically encoded, would be a
+    different kind of change requiring separate explicit scoping).
+    Remaining depth drivers after `native_payload_hash`: `bids`/`asks`
+    `size_mantissa` 19.03%/17.23%, `price_mantissa` 11.52%/10.47%; the
+    `U`/`u`/`pu` continuity-id strings collectively remain ~9% (deferred,
+    per the matrix's own "pending proof" caveat — not overlooked).
+- **Tier-2 re-run** (canonical `validation.validate_catalog_equivalence`
+  CLI, ADAUSDT, 2026-06-12, real local `data_raw`), both schema
+  versions, with the new v1 encoding in effect: all 7 gating components
+  pass; `fenced_ranges` still byte-identical (34/34, same canonical
+  digest as every prior Phase 6/7 result) — confirming the encoding
+  change is purely physical, with zero effect on any semantic
+  comparison (every trade, every depth update/level, exact
+  prices/quantities, ordering, IDs/sequences, timestamps, snapshots,
+  sync_state/stream_lifecycle, desync/resync, fenced ranges, source
+  identity, and deterministic integrity are all unchanged).
+
+### Files/packages touched
+- `stores/replay_writer.py`
+- `stores/replay_schema.py`
+- `CHANGELOG.md`
+- `docs/CHANGE_AUDIT.md`
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] docs/REPO_STRUCTURE.md
+- [x] docs/PROJECT_STATUS.md
+- [x] docs/IMPLEMENTATION_AUDIT.md (reviewed specifically for
+  `native_payload_hash`'s documented "Unresolved" status — confirmed
+  this entry does not attempt to resolve it, and does not claim it as
+  resolved)
+- [x] relevant feature docs:
+  - docs/FULL_L2_REPLAY_CATALOG_PLAN.md (reviewed; no status-claim
+    changes needed — v1 remains an unreleased development prototype;
+    this entry does not change the full-L2/v0 equivalence claim)
+
+### Docs updated
+- [x] CHANGELOG.md
+- [ ] README.md
+- [ ] docs/PROJECT_STATUS.md
+- [ ] docs/REPO_STRUCTURE.md
+- [ ] relevant feature docs:
+  - none
+- No docs update required because: this is a v1-internal Parquet
+  physical-encoding optimization with a byte-for-byte-preserved reader
+  contract and zero observable semantic change (proven by an unchanged
+  Tier-2 canonical-gate result); v1 remains an unreleased development
+  prototype (not a validated production claim), so no
+  validated/deferred status claim changes.
+
+### Status / validation impact
+- Validated status changed: no
+- Deferred status changed: no
+- New claims added: no
+- Evidence for any new validation claim: n/a — this entry is explicitly
+  local development/Tier-2 evidence, not a Tier-3 production storage-gate
+  claim. The best measured candidate (8.18 GiB) remains above the 5 GiB
+  hard target.
+
+### Tests run
+```bash
+source .venv/bin/activate
+python -m pytest tests/test_replay_schema_v1.py tests/test_replay_schema_v1_corrections.py \
+  tests/test_replay_scale_selection_and_eligibility.py tests/test_replay_store.py \
+  tests/test_replay_depth_adapter.py tests/test_replay_memory_bounded.py \
+  tests/test_replay_sync_continuity.py tests/test_replay_catalog_reconstruct.py -q
+# 163 passed
+python -m pytest -q
+# 561 passed, 3 skipped (unchanged from before this entry -- no new tests
+# were required since stores/replay_reader.py needed zero changes and
+# existing v1 round-trip tests already exercise real Parquet decode)
+python -m pytest tests/test_repo_structure.py tests/test_agent_infrastructure.py -q
+# 56 passed
+```
+
+### Validation CLIs run
+```bash
+# Canonical Tier-2 gate, both schema versions, ADAUSDT (regression check
+# against the new v1 encoding):
+CRYPTO_RECORDER_DATA_ROOT="$(pwd)/data_raw" python -m validation.validate_catalog_equivalence \
+  --date 2026-06-12 --symbols ADAUSDT --venues BINANCE_SPOT --data-root "$(pwd)/data_raw" \
+  --work-root /tmp/phase7opt_v0/work --old-catalog-root /tmp/phase7opt_v0/old_catalog \
+  --replay-root /tmp/phase7opt_v0/replay --new-catalog-root /tmp/phase7opt_v0/new_catalog \
+  --profile full_l2 --emit-depth10 --schema-version 0 --overwrite \
+  --report-path /tmp/phase7opt_v0/report.json
+# result: passed, 7/7, fenced_ranges 34/34 byte-identical.
+
+CRYPTO_RECORDER_DATA_ROOT="$(pwd)/data_raw" python -m validation.validate_catalog_equivalence \
+  --date 2026-06-12 --symbols ADAUSDT --venues BINANCE_SPOT --data-root "$(pwd)/data_raw" \
+  --work-root /tmp/phase7opt_v1/work --old-catalog-root /tmp/phase7opt_v1/old_catalog \
+  --replay-root /tmp/phase7opt_v1/replay --new-catalog-root /tmp/phase7opt_v1/new_catalog \
+  --profile full_l2 --emit-depth10 --schema-version 1 --overwrite \
+  --report-path /tmp/phase7opt_v1/report.json
+# result: passed, 7/7, same fenced_ranges digest, with the new v1 encoding in effect.
+
+# Full-universe optimized-candidate rebuild (isolated candidate root, never
+# touching production replay_store):
+CRYPTO_RECORDER_CONVERTER_TEMP_DIR=/tmp/phase7/scratch3 python -m pipeline.build_replay_store \
+  --date 2026-06-11 --symbols all --data-root "$(pwd)/data_raw" \
+  --replay-root /tmp/phase7/replay_v1_optimized --schema-version 1
+# result: 150 successful, 0 failed. Total 8,783,383,810 bytes (8.180 GiB).
+```
+
+### Known limitations / out of scope
+- The best measured local Parquet candidate (8.18 GiB) remains above
+  the 5 GiB hard target. `native_payload_hash` (54% of total size) is
+  the dominant remaining driver and its reduction is explicitly
+  out-of-scope/unresolved (Phase 2 Section 3 traceability design, not
+  yet implemented) — this was NOT attempted here.
+- Stage B (running this finalized candidate against a real production
+  day, e.g. 2026-07-22/23, on an isolated production-server candidate
+  root) has NOT been performed. The June 2026-06-11 results are local
+  development/Tier-2 evidence only, explicitly not a Tier-3 production
+  storage-gate claim.
+- Custom binary format (Phase 8) was NOT started and requires explicit
+  user approval before any work begins on it.
+- Phase 8, self-contained/raw-retention work, lifecycle hardening,
+  reconstruction CLI, monitoring, deterministic-rebuild phase, `uv`,
+  deployment, KovacsTrader changes, and final documentation were NOT
+  started.
+- `convert_day.py` was not modified.
+
 ## 2026-07-28 — fix(stores): select v1 fixed-point scale from declared and observed precision
 
 ### Change summary

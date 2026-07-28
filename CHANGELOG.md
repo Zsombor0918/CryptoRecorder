@@ -67,6 +67,89 @@ passes.** Until then, broader full-L2 equivalence stays **deferred** (see
 ## [Unreleased]
 
 ### Added
+- **Issue #20 Phase 7 Stage A: measured v1 Parquet encoding optimization
+  (local development evidence, NOT a final production storage-gate
+  claim)** — using the complete real 2026-06-11 local universe (150/150
+  valid partitions for both v0 and v1, corrected at `b5a3555`) as the
+  Stage A development baseline. A representative-symbol sweep (ADAUSDT/
+  BTCUSDT/ETHUSDT spot, BTCUSDT/ETHUSDT/VELVETUSDT/LABUSDT futures —
+  the two highest-local-volume symbols and one of the five
+  scale-corrected anomalous futures symbols) measured row-group target
+  (~64/128/256 MiB), ZSTD level (3/6/9), dictionary on/off,
+  `DELTA_BINARY_PACKED` (monotonic session/sequence/timestamp integer
+  columns), and `BYTE_STREAM_SPLIT` (int64 fixed-point mantissa columns,
+  including the nested `bids`/`asks` list-of-struct mantissas)
+  combinations before any full-universe rebuild.
+  - **Selected encoding** (`stores/replay_writer.py`, `schema_version=1`
+    only — v0's physical output is completely unaffected): ZSTD level 6
+    (was 3), dictionary encoding disabled entirely (measured smaller on
+    every representative symbol, including already-low-cardinality
+    repeated strings like trades' `market_type` — verified directly at
+    scale on `VELVETUSDT`'s 11.3M trade rows: a negligible ~17 KB
+    difference against an ~8 MB smaller overall file), larger measured
+    row-group batch sizes (depth: 20,000 rows; trades: 50,000 rows, both
+    configurable via new env vars), `DELTA_BINARY_PACKED` for
+    `session_seq`/`raw_index`/`ts_exchange_ns`/`ts_receive_ns` (depth)
+    and `trade_session_seq`/`raw_index`/`ts_exchange_ns`/`ts_receive_ns`
+    (trades), and `BYTE_STREAM_SPLIT` for `price_mantissa`/
+    `quantity_mantissa` (trades) and the nested `bids`/`asks`
+    `price_mantissa`/`size_mantissa` (depth). Combining delta-encoded
+    integers with byte-stream-split mantissas measured a further ~20%
+    reduction beyond delta-alone on large futures symbols (e.g.
+    `BINANCE_USDTF/BTCUSDT` depth: 325,308,871 → 255,321,595 bytes,
+    ~21.5% smaller). This is a pure Parquet *physical encoding* change:
+    every field's logical type, nullability, and semantic meaning is
+    completely unchanged, so any standard Parquet/Arrow reader
+    (`stores/replay_reader.py` needed zero changes) reads back
+    byte-for-byte identical logical values.
+  - `stores/replay_schema.py`'s `BUILDER_VERSION_V1` bumped to `v1.2.0`
+    (the encoding profile changed); `FORMAT_VERSION_V1`/`SCHEMA_VERSION_V1`
+    (the reader contract) unchanged — no schema/reader change occurred.
+  - The v1 manifest's `encoding_profile` now records the exact selected
+    encoding (`use_dictionary`, `depth_column_encoding`,
+    `trade_column_encoding`, per-channel row-group batch sizes) so any
+    built partition's physical format is self-describing.
+  - **Full-universe rebuild** (2026-06-11, all 150 real partitions, into
+    a fresh isolated candidate root — production `replay_store` never
+    touched): **150/150 succeeded**. Total size: **8.18 GiB** (8,783,383,810
+    bytes) — down from the corrected-scale v1 baseline's 11.12 GiB
+    (26.4% further reduction) and from v0's 15.84 GiB (48.3%
+    reduction). Wall time 2:53:55, max RSS 2,410,720 KiB (2.30 GiB).
+    Every one of the 150 manifests validates via
+    `stores.replay_writer.validate_partition()`.
+  - **Per-column evidence after this optimization**: `native_payload_hash`
+    (a 32-byte SHA-256 hash per event, explicitly unresolved/out of
+    scope per `docs/IMPLEMENTATION_AUDIT.md`'s Phase 2 Section 3
+    traceability design) is now the single dominant remaining cost
+    driver — 28.1% of depth (1.39 GiB) and 86.2% of trades (3.30 GiB),
+    **54% of the total candidate size** — because a cryptographic hash
+    is high-entropy and therefore not meaningfully compressible by any
+    Parquet encoding. No further *encoding-only* lever can materially
+    reduce this without changing what is stored per event, which is an
+    explicitly out-of-scope architectural decision here.
+  - **Tier-2 re-run** (canonical `validation.validate_catalog_equivalence`
+    CLI, ADAUSDT, 2026-06-12, real local `data_raw`): both
+    `--schema-version 0` and `--schema-version 1` (with the new encoding)
+    still pass all 7 gating components, `fenced_ranges` still
+    byte-identical (34/34, same canonical digest as every prior Phase 6/7
+    result) — confirming the encoding change is purely physical with zero
+    semantic effect.
+  - Full suite: 561 passed, 3 skipped (unchanged — no new tests were
+    needed since `stores/replay_reader.py` required zero changes and
+    existing v1 tests already exercise round-trip decode correctness
+    with real Parquet files); guards: 56 passed.
+  - **Decision (per Stage A instructions)**: the best measured local
+    Parquet candidate (8.18 GiB) remains above the 5 GiB hard target.
+    This is recorded as strong local development evidence, NOT a claim
+    that the final Tier-3 production storage gate has passed — Stage B
+    (running the finalized candidate against a real production day,
+    e.g. 2026-07-22/23, in an isolated production-server candidate
+    root) remains a separate, deferred step. Custom binary format
+    (Phase 8) has NOT been started and requires explicit approval.
+  - No change to `convert_day.py`. Still strictly out of scope: Phase 8,
+    self-contained/raw-retention work, lifecycle hardening,
+    reconstruction CLI, monitoring, deterministic-rebuild phase, `uv`,
+    deployment, KovacsTrader, final documentation.
 - **Issue #20 Phase 7 blocking correction: observed-scale-aware v1
   fixed-point encoding + EXCHANGEINFO eligibility fix** — discovered
   during the first real full-production-day (2026-06-11, 100% local
