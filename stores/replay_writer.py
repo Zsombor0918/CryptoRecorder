@@ -49,6 +49,7 @@ from .replay_schema import (
     FORMAT_VERSION_V2,
     SCHEMA_VERSION_V2,
     BUILDER_VERSION_V2,
+    SUPPORTED_BUILDER_VERSIONS_V2,
     SUPPORTED_SCHEMA_VERSIONS,
     DEPTH_RECORD_TYPE_CODES,
     TRADE_RECORD_TYPE_CODES,
@@ -965,11 +966,11 @@ def _validate_schema_version_contract(
                 f"(expected {FORMAT_VERSION_V2!r})"
             )
             return False
-        if manifest.get("builder_version") != BUILDER_VERSION_V2:
+        if manifest.get("builder_version") not in SUPPORTED_BUILDER_VERSIONS_V2:
             logger.warning(
                 f"Partition {partition_dir} has schema_version=2 but "
                 f"builder_version={manifest.get('builder_version')!r} "
-                f"(expected {BUILDER_VERSION_V2!r})"
+                f"(expected one of {SUPPORTED_BUILDER_VERSIONS_V2!r})"
             )
             return False
 
@@ -1820,7 +1821,24 @@ class ReplayWriter:
         self.depth_count += len(records)
 
     def write_trades_batch(self, records: list) -> None:
-        """Spool trade records to disk (O(batch) memory, not O(day))."""
+        """Spool identified trade records to disk (O(batch), not O(day)).
+
+        ``trade_id`` and ``agg_trade_id`` are the only replay identifiers
+        reconstruction can publish as a Nautilus ``TradeId``. Reject a row
+        which has neither before it reaches any physical replay schema. This
+        protects direct ``ReplayWriter`` callers as well as the canonical raw
+        normalizer and prevents a complete manifest from describing
+        semantically unusable anonymous trades.
+        """
+        for r in records:
+            identifiers = (r.get("trade_id"), r.get("agg_trade_id"))
+            if not any(value is not None and str(value) != "" for value in identifiers):
+                raise ValueError(
+                    "Replay trade row has no supported identifier "
+                    "(trade_id or agg_trade_id); refusing to publish an "
+                    "anonymous trade"
+                )
+
         spool = self._get_trade_spool()
         track_scale = self.schema_version in (1, 2)
         for r in records:

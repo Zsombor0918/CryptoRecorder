@@ -257,8 +257,8 @@ convert report, and freshly recomputed target raw-source identity. The
 candidate composite covers the reconstructed catalog tree, normalized
 reconstruction manifest, exact target replay manifest, and either the exact
 carry manifest or verified pre-listing marker. Replay manifests must be
-`status=complete`, `schema_version=2`, `format_version=2`, built by
-`cryptorecorder-replay-writer-v2.0.0`, and carry a complete, structurally valid
+`status=complete`, `schema_version=2`, `format_version=2`, built by the current
+`cryptorecorder-replay-writer-v2.0.1`, and carry a complete, structurally valid
 source identity which exactly matches its integrity copy. The target replay
 identity must also exactly equal the fresh raw identity.
 

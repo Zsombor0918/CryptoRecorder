@@ -67,6 +67,32 @@ passes.** Until then, broader full-L2 equivalence stays **deferred** (see
 ## [Unreleased]
 
 ### Added
+- **Issue #20 Phase 7 BTWUSDT trade-identifier normalization correction** —
+  replay normalization now matches the unchanged reference converter's
+  Binance identifier precedence: existing normalized top-level identifiers
+  remain authoritative, legacy native `trade` payloads recover exact field
+  `t`, and native `aggTrade` payloads recover exact aggregate field `a`.
+  Anonymous supported trade events now fail before replay publication, and
+  replay reconstruction independently refuses an anonymous `TradeTick`
+  instead of succeeding with a shorter catalog. The physical replay schemas
+  remain unchanged; builder identities advance to v1.2.1/v2.0.1. Existing
+  compact partitions remain readable/auditable under their recorded physical
+  contracts, but older builders cannot be silently reused as current output;
+  known v2.0.0 partitions are not accepted by the current artifact-bound gate.
+  The fresh external corrected BTWUSDT futures gate reused the preserved
+  reference catalog, rebuilt only replay/candidate artifacts, and passed all
+  nine components: 1,371,172/1,371,172 exhaustive TradeTicks,
+  11,507,066/11,507,066 flattened deltas, 40,398/40,398 Depth10, 7/7
+  checkpoints, continuity and 249/249 fences exact, metadata/source identity
+  exact, and routine/deep integrity passed. All 1,371,217 replay trade rows
+  carry `trade_id` recovered from `native_payload.t`; 45 zero-quantity rows
+  are identically excluded by both reconstructions. Final report SHA-256:
+  `2ae29713f09dd10988566c10c3bb040ec55a0252d936a5e60e08032295af4d85`.
+  Focused verification passed and the full ordinary suite is 745 passed,
+  3 skipped.
+  This is one corrected futures representative, not a completed
+  representative matrix, top50/multi-day validation, or production
+  promotion.
 - **Issue #20 Phase 7 Round 5 reader hardening and completed BTCUSDT
   semantic report** — the validation-only exhaustive catalog reader now has
   a fail-closed, exactly pinned `nautilus_trader==1.225.0` compatibility

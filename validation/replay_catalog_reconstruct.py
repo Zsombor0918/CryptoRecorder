@@ -129,19 +129,35 @@ def _window_from_date(date_str: str) -> tuple[datetime, datetime]:
     return start, start + timedelta(days=1)
 
 
+class ReplayTradeIdentifierError(ValueError):
+    """A replay row cannot produce a semantically identified TradeTick."""
+
+
 def _convert_trade_to_nautilus(
     trade: dict,
     instrument_id: InstrumentId,
     venue: str,
 ) -> Optional[TradeTick]:
-    """Convert replay trade record to Nautilus TradeTick."""
+    """Convert an identified replay trade record to Nautilus TradeTick.
+
+    A missing identifier is a replay contract violation, not an ordinary
+    invalid market value which may be counted and skipped. Raise so injected
+    or historical anonymous rows cannot turn into a successful shorter
+    catalog.
+    """
     if not NAUTILUS_AVAILABLE:
         return None
 
     try:
-        trade_id = trade.get("trade_id") or trade.get("agg_trade_id")
-        if not trade_id:
-            return None
+        trade_id = trade.get("trade_id")
+        if trade_id is None or str(trade_id) == "":
+            trade_id = trade.get("agg_trade_id")
+        if trade_id is None or str(trade_id) == "":
+            raise ReplayTradeIdentifierError(
+                "Replay trade row has no supported identifier "
+                "(trade_id or agg_trade_id); refusing to reconstruct an "
+                "anonymous TradeTick"
+            )
 
         price = trade.get("price_str") or trade.get("price", 0)
         quantity = trade.get("quantity_str") or trade.get("quantity", 0)
@@ -163,6 +179,8 @@ def _convert_trade_to_nautilus(
             ts_init=ts_recv_ns,
         )
         return tick
+    except ReplayTradeIdentifierError:
+        raise
     except Exception as e:
         logger.warning(f"Error converting trade: {e}")
         return None

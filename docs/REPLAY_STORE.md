@@ -132,22 +132,24 @@ Each partition contains a `manifest.json` with metadata:
 - `depth_checksum` / `trades_checksum`: SHA256 hashes for integrity verification
 - `ts_range_start_ns` / `ts_range_end_ns`: Min/max server timestamps in UTC nanoseconds
 
-## Versioning (v0 / v1)
+## Versioning (v0 / v1 / v2)
 
-**Status: v1 is an implemented prototype (issue #20 Phase 5 — the revised
-plan's phase numbering), not yet run at representative-day (Tier 3) scale.**
+Legacy **v0** is accepted without a `schema_version` only when both physical
+Parquet channels exactly match the recognized v0 schemas above, including the
+required exact decimal-string fields. A missing/malformed manifest, a compact
+fixed-point layout without an explicit version, an unsupported version, or a
+manifest/physical-schema contradiction fails before decoding. There is no
+compact-to-v0 fallback.
 
-A manifest with no `schema_version` field is legacy **v0** — exactly the
-schema shown above, produced by every `ReplayWriter` call that does not pass
-`schema_version=1` explicitly (the default). `ReplayReader` treats a missing
-`schema_version` as v0 unconditionally; this is never reinterpreted.
-
-A manifest with an explicit `schema_version` is dispatched to the matching
-versioned reader. Today only `schema_version=1` is implemented, alongside
-`format_version`, `builder_version`, and `encoding_profile` fields. An
-explicit `schema_version` outside `{0, 1}` raises `ValueError` naming the
-found and supported versions — `ReplayReader` never silently misreads an
-unsupported version.
+Explicit `schema_version` values 0, 1, and 2 dispatch to their matching
+physical readers. v1 and v2 manifests also carry `format_version`,
+`builder_version`, and `encoding_profile`. The current builders are
+`cryptorecorder-replay-writer-v1.2.1` and
+`cryptorecorder-replay-writer-v2.0.1`. Those patch increments identify a
+trade-normalization correction; they do not change either physical schema or
+format version. Existing schema-v1 manifests with a non-empty recorded
+builder remain readable/auditable under the existing physical contract, but
+the canonical builder does not silently reuse them as v1.2.1 output.
 
 **v1 physical differences from v0** (all restored to the exact v0 logical
 row shape by `ReplayReader.iter_depths()`/`iter_trades()` — downstream code,
@@ -186,10 +188,27 @@ either version):
 `trade_id`/`agg_trade_id`, `market_type`, and `quality_flags` remain in
 their v0 lexical/JSON representations.
 
-**Local development-evidence measurements** (ADAUSDT, 2026-06-12, single
-symbol/day — development evidence only, not a Tier-3 representative-day
-claim): see `docs/CHANGE_AUDIT.md`'s Phase 5 entry for the exact byte counts
-and semantic-comparison result.
+**v2** retains v1's compact fixed-point physical rows but replaces the
+per-event payload hash with the manifest-level source/file/block integrity
+hierarchy documented in `docs/IMPLEMENTATION_AUDIT.md`. New v2 builds use the
+current v2.0.1 builder. Existing v2.0.0 partitions remain physically readable
+and auditable under their recorded digest method, but the canonical builder
+will not silently reuse them as current output and the current artifact-bound
+semantic gate requires v2.0.1. An intentional rebuild is therefore required
+before an old v2.0.0 partition can provide final-checkpoint evidence under the
+corrected normalization.
+
+Across every physical version, replay publication now requires each supported
+trade row to contain a non-empty `trade_id` or `agg_trade_id`. Canonical raw
+normalization preserves existing top-level identifiers; if every top-level
+identifier is absent it recovers Binance native `trade.t` or `aggTrade.a`
+exactly. No sequence, row index, hash, or synthetic identifier is substituted.
+Reconstruction independently raises on an anonymous replay row so corrupt or
+historical unusable data cannot produce a successful shorter comparison.
+
+Local development measurements and semantic evidence remain scoped to the
+specific symbols/days recorded in `docs/PROJECT_STATUS.md` and
+`docs/CHANGE_AUDIT.md`; they are not a production or full-universe claim.
 
 
 

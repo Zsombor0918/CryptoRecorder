@@ -29,6 +29,58 @@ replay_store -> validation.replay_catalog_reconstruct (validation-only, no CLI)
   vs convert_day.py. Broader top50/multi-day validation pending.
 ```
 
+## Issue #20 Phase 7 — BTWUSDT trade-identifier correction
+
+The preserved `BINANCE_USDTF/BTWUSDT/2026-06-11` failure isolated one replay
+normalization defect. All 1,371,217 raw trade events had null normalized
+top-level identifiers because the futures recorder had switched to Binance's
+ordinary `trade` stream, whose native identifier is `native_payload.t`.
+The unchanged reference converter already falls back from
+`exchange_trade_id` to that exact native `t`; replay normalization previously
+did not, so its catalog reconstruction skipped every trade.
+
+The correction is deliberately narrow:
+
+- existing top-level `trade_id`, `agg_trade_id`, and `exchange_trade_id`
+  values remain authoritative;
+- only when every supported top-level identifier is absent, native Binance
+  `trade` recovers exact `t` and native `aggTrade` recovers exact aggregate
+  `a`;
+- identifier text is preserved (`str(integer)` for integer input, exact
+  lexical content for string input); no ordering key, index, hash, rounding,
+  or synthetic value is substituted;
+- `ReplayWriter.write_trades_batch()` rejects a row lacking both replay
+  identifiers for every physical schema before it can be published, while
+  reconstruction independently raises rather than treating the same defect
+  as an invalid-row skip.
+
+This is a normalization/builder change, not a physical schema change.
+`BUILDER_VERSION_V1` is v1.2.1 and `BUILDER_VERSION_V2` is v2.0.1;
+format/schema versions remain 1/1 and 2/2. Existing v1 compact partitions
+remain readable/auditable under their recorded physical contract, and known
+v2.0.0 partitions remain readable/auditable because their physical contract
+is unchanged. Neither older builder is silently reused as current output;
+current artifact-bound schema-v2 semantic validation requires v2.0.1.
+
+Fresh external corrected-attempt evidence reused the preserved raw source and
+unchanged reference catalog, rebuilt only the BTW replay/candidate, and passed:
+1,371,172/1,371,172 exhaustive ordered TradeTicks;
+11,507,066/11,507,066 flattened OrderBookDelta rows;
+40,398/40,398 Depth10; 7/7 checkpoints; continuity exact (61 seeds, 3
+resyncs, 0 desyncs, 249 fences); 249/249 fenced ranges with identical digest;
+350,157 depth and 1,371,217 trade metadata rows exact; live source identity
+equal to both manifest copies; routine and deep integrity. The rebuilt replay
+has 1,371,217 non-null `trade_id` values, zero non-null `agg_trade_id` values,
+zero anonymous rows, and all identifiers derive from native `trade.t`.
+The 45 zero-quantity replay rows are preserved and both catalog paths exclude
+them, yielding the exact 1,371,172 TradeTicks. Peak cgroup memory was
+2,371,661,824 bytes with zero OOM/OOM-kill; final report SHA-256 is
+`2ae29713f09dd10988566c10c3bb040ec55a0252d936a5e60e08032295af4d85`.
+
+This is one corrected futures representative. The remaining futures matrix,
+broader representative/top50 and multi-day gates, the 150-partition final v2
+build, Phase 8, deployment, retention, uv, and KovacsTrader remain pending.
+
 ## What Works
 
 Replay store:

@@ -93,6 +93,161 @@ An entry may be skipped **only** for:
 - <or "none — task fully completed">
 ```
 
+## 2026-07-30 — fix(replay): recover native Binance trade identifiers
+
+### Change summary
+- Matched the unchanged reference converter's Binance trade-identifier
+  precedence without changing `convert_day.py`: preserve normalized top-level
+  identifiers, otherwise recover native `trade.t` or aggregate `aggTrade.a`
+  exactly. No identifier is rounded, hashed, renumbered, or synthesized.
+- Made anonymous supported trades fail before any replay schema is spooled or
+  atomically published. Replay catalog reconstruction independently raises on
+  the same invalid row instead of silently producing a shorter catalog.
+- Advanced the normalization-only builder identities to v1.2.1/v2.0.1 while
+  leaving format and physical schema versions unchanged. Known v2.0.0
+  partitions remain readable/auditable, but are not silently reused as
+  current-builder artifacts.
+- Added focused normalization, writer-publication, reconstruction-oracle,
+  scale-stability, and builder-compatibility tests.
+- Reused the preserved BTWUSDT raw source and unchanged reference catalog,
+  rebuilt only the schema-v2 replay/candidate in a fresh external directory,
+  and passed the complete artifact-bound nine-component corrected gate.
+
+### Files/packages touched
+- `pipeline/build_replay_store.py`
+- `stores/replay_schema.py`
+- `stores/replay_reader.py`
+- `stores/replay_writer.py`
+- `validation/replay_catalog_reconstruct.py`
+- `tests/test_replay_trade_identifier_normalization.py`
+- `tests/test_stage_runner_cli.py`
+- `CHANGELOG.md`
+- `docs/PROJECT_STATUS.md`
+- `docs/IMPLEMENTATION_AUDIT.md`
+- `docs/REPLAY_STORE.md`
+- `docs/VALIDATION.md`
+- `docs/CHANGE_AUDIT.md`
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] docs/REPO_STRUCTURE.md
+- [x] docs/PROJECT_STATUS.md
+- [x] docs/IMPLEMENTATION_AUDIT.md
+- [x] relevant feature docs:
+  - `docs/FULL_L2_REPLAY_CATALOG_PLAN.md`
+  - `docs/OPERATIONS.md`
+  - `docs/AI_WORKFLOW.md`
+  - `docs/REPLAY_STORE.md`
+  - `docs/VALIDATION.md`
+  - `CHANGELOG.md`
+
+### Docs updated
+- [x] CHANGELOG.md
+- [ ] README.md — no new operator interface, repository layout, or production
+  status; its existing deferred-scope statement remains accurate
+- [x] docs/PROJECT_STATUS.md
+- [ ] docs/REPO_STRUCTURE.md — no path or supported-module inventory change
+- [x] relevant feature docs:
+  - `docs/IMPLEMENTATION_AUDIT.md`
+  - `docs/REPLAY_STORE.md`
+  - `docs/VALIDATION.md`
+
+### Status / validation impact
+- Validated status changed: yes — one corrected BTWUSDT futures representative
+  now has current-builder local development evidence
+- Deferred status changed: no
+- New claims added: yes
+- Evidence for any new validation claim:
+  - Fresh `BINANCE_USDTF/BTWUSDT/2026-06-11` external corrected attempt:
+    reference/candidate TradeTicks 1,371,172/1,371,172 exact; flattened
+    OrderBookDelta rows 11,507,066/11,507,066 exact; Depth10
+    40,398/40,398 exact; checkpoints 7/7; continuity exact; fences 249/249
+    with identical digest; metadata/source identity exact; routine/deep
+    integrity passed.
+  - Replay trades contain 1,371,217 non-null `trade_id` values recovered from
+    native `trade.t`, zero anonymous rows, and 45 preserved zero-quantity rows
+    identically excluded by both catalog paths.
+  - Artifact identity SHA-256:
+    `efeadc689dbf799afe5d1ce77295c1377329c6c87ebf3dae3cc96b3b7c3e8a44`.
+    Final report SHA-256:
+    `2ae29713f09dd10988566c10c3bb040ec55a0252d936a5e60e08032295af4d85`.
+  - All substantial stages ran serially in separate effective 10 GiB,
+    zero-swap cgroups with valid nonzero telemetry and zero OOM/OOM-kill.
+    Peak cgroup memory was 2,371,661,824 bytes; peak scratch was
+    2,256,375,339 bytes; build/candidate wall time was 409.933 seconds.
+
+### Tests run
+```bash
+git diff --check
+.venv/bin/python -m py_compile pipeline/build_replay_store.py \
+  stores/replay_reader.py stores/replay_schema.py stores/replay_writer.py \
+  validation/replay_catalog_reconstruct.py tests/test_stage_runner_cli.py \
+  tests/test_replay_trade_identifier_normalization.py
+# No configured Ruff executable was installed; no dependency was installed.
+
+.venv/bin/python -m pytest -q tests/test_replay_trade_identifier_normalization.py
+# 17 passed
+.venv/bin/python -m pytest -q tests/test_replay_store.py \
+  tests/test_replay_schema_v1.py tests/test_replay_schema_v1_corrections.py \
+  tests/test_replay_hierarchical_integrity_v2.py \
+  tests/test_replay_fail_closed_hardening.py \
+  tests/test_replay_catalog_reconstruct.py \
+  tests/test_bounded_catalog_reader.py tests/test_catalog_reader_boundaries.py
+# 180 passed
+.venv/bin/python -m pytest -q tests/test_native_trades_ingest.py \
+  tests/test_trade_deterministic.py tests/test_converter_integration.py \
+  tests/test_convert_day_phase2.py tests/test_futures_continuity.py \
+  tests/test_replay_sync_continuity.py \
+  tests/test_replay_depth_repartitioning.py tests/test_daily_build.py
+# 109 passed
+.venv/bin/python -m pytest -q tests/test_semantic_equivalence.py \
+  tests/test_semantic_oracle_detects_injected_faults.py \
+  tests/test_semantic_oracle_exhaustive_streaming.py \
+  tests/test_validate_catalog_equivalence_exhaustive_wiring.py \
+  tests/test_catalog_equivalence.py tests/test_catalog_equivalence_full_l2.py
+# 63 passed, 1 skipped
+.venv/bin/python -m pytest -q tests/test_artifact_identity.py \
+  tests/test_stage_runner_cli.py tests/test_serial_gate.py \
+  tests/test_cgroup_wrapper.py
+# 51 passed
+.venv/bin/python -m pytest -q tests/test_repo_structure.py \
+  tests/test_agent_infrastructure.py
+# 56 passed
+set -o pipefail
+.venv/bin/python -m pytest -q | tail -n 15
+# 745 passed, 3 skipped
+```
+
+### Validation CLIs run
+```bash
+env PYTHONPATH="$REPO" "$REPO/.venv/bin/python" \
+  "$CORRECTED_ROOT/tools/run_corrected_attempt.py"
+# Reused reference; rebuilt replay/candidate; all nine components passed.
+# Every substantial child used scripts/run_under_cgroup.sh 10G with no retry.
+
+bash scripts/run_under_cgroup.sh 10G env PYTHONPATH="$REPO" \
+  "$REPO/.venv/bin/python" -m validation.audit_replay_store \
+  --replay-root "$CORRECTED_ROOT/replay/replay_store" \
+  --venue BINANCE_USDTF --symbol BTWUSDT --date 2026-06-11
+# One complete valid schema-v2 partition; counts/checksums/order passed.
+
+.venv/bin/python -m validation.audit_change_compliance --staged
+# PASS
+```
+
+### Known limitations / out of scope
+- Evidence is representative local development validation for one futures
+  symbol/day. It is not a completed representative matrix, top50/full-universe,
+  multi-day, Tier-3, production, or v2.0.0 declaration.
+- The previous ADA/BTC/ETH/ZEC spot reports remain valid for their exact
+  v2.0.0-builder artifacts, but final-checkpoint evidence under v2.0.1 still
+  requires intentional replay/candidate revalidation. No spot case was rebuilt.
+- The stopped futures supervisor was not restarted; VELVETUSDT and later cases
+  were not started. The 150-partition build, Phase 8, deployment, retention,
+  uv, and KovacsTrader remain pending.
+- No raw-side, ordering, timestamps, fixed-point scale, continuity, carry,
+  fence, compact-layout, or production-service semantics changed.
+
 ## 2026-07-30 — fix(validation): checkpoint hardened Phase 7 semantic validation
 
 ### Change summary

@@ -63,7 +63,11 @@ SCHEMA_VERSION_V1 = 1
 # Parquet encoding change -- every field's logical type/nullability/meaning
 # is unchanged, so FORMAT_VERSION_V1/SCHEMA_VERSION_V1 (the reader contract)
 # are unchanged; only the builder version is bumped.
-BUILDER_VERSION_V1 = "cryptorecorder-replay-writer-v1.2.0"
+# v1.2.1: replay trade normalization now recovers the exact Binance native
+# identifier used by the unchanged reference converter when normalized
+# top-level identifiers are absent, and refuses anonymous trade rows before
+# publication. The physical schema and Parquet encoding are unchanged.
+BUILDER_VERSION_V1 = "cryptorecorder-replay-writer-v1.2.1"
 
 # ============================================================================
 # Schema v2 (issue #20 Phase 7 hierarchical-integrity candidate)
@@ -93,7 +97,16 @@ BUILDER_VERSION_V1 = "cryptorecorder-replay-writer-v1.2.0"
 # and threat/integrity matrix.
 FORMAT_VERSION_V2 = 2
 SCHEMA_VERSION_V2 = 2
-BUILDER_VERSION_V2 = "cryptorecorder-replay-writer-v2.0.0"
+# v2.0.1: same normalization-only correction as v1.2.1. This does not change
+# FORMAT_VERSION_V2 or SCHEMA_VERSION_V2 because the physical row layout is
+# identical. The prior builder remains readable/auditable as a known physical
+# producer, but current artifact-bound gates require the current builder.
+BUILDER_VERSION_V2_LEGACY = "cryptorecorder-replay-writer-v2.0.0"
+BUILDER_VERSION_V2 = "cryptorecorder-replay-writer-v2.0.1"
+SUPPORTED_BUILDER_VERSIONS_V2 = (
+    BUILDER_VERSION_V2_LEGACY,
+    BUILDER_VERSION_V2,
+)
 
 # The only schema_version values ReplayReader/ReplayWriter know how to
 # produce/consume. A manifest with schema_version outside this set (or an

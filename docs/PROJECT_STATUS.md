@@ -1,7 +1,7 @@
 # Project Status
 
 **Version:** `v1.1.0-dev`
-**Last updated:** 2026-07-29
+**Last updated:** 2026-07-30
 
 This document is the single source of truth for **what is validated** vs **what is
 deferred** in CryptoRecorder. Keep it honest. Do not promote a deferred item to
@@ -107,6 +107,38 @@ This is strong high-volume, single-symbol/single-day local development
 evidence. It does **not** satisfy or narrow the broader top50/multi-day
 `v2.0.0` gate, does not make schema v2 a production default, and does not
 replace `convert_day.py` as the production reference.
+
+**Full-L2 catalog equivalence (BTWUSDT corrected schema-v2 futures case)**
+
+```
+2026-06-11 BINANCE_USDTF/BTWUSDT full_l2:
+  replay trade rows       1371217 (all identified; 45 zero-quantity)
+  trade_ticks             old 1371172   new 1371172   exhaustive exact
+  order_book_deltas       old 11507066  new 11507066  exhaustive exact
+  order_book_depth10      old 40398     new 40398     exhaustive exact
+  book checkpoints        7/7 canonical hashes match
+  continuity/fences       exact (61 seeds, 3 resyncs, 0 desyncs, 249 fences)
+  raw/replay metadata     exact (350157 depth, 1371217 trades)
+  source identity         current raw = manifest = integrity copy
+  routine/deep integrity  passed
+  status                  passed
+```
+
+This result corrects the replay normalization defect exposed by the preserved
+first BTW attempt: its raw native `trade.t` identifiers are now recovered
+exactly, while anonymous trades fail before replay publication. The preserved
+reference catalog was reused; only replay/candidate artifacts were rebuilt in
+a fresh external directory. Peak cgroup memory was 2,371,661,824 bytes with
+zero OOM/OOM-kill. Final report SHA-256:
+`2ae29713f09dd10988566c10c3bb040ec55a0252d936a5e60e08032295af4d85`.
+
+This is representative local development evidence for one futures
+symbol/day, not a completed representative matrix, top50/full-universe,
+multi-day, Tier-3, or production validation. The old v2.0.0 spot reports
+remain valid historical evidence for their exact artifacts, but final
+checkpoint evidence under the corrected v2.0.1 builder will require
+intentional spot replay/candidate revalidation; those large spot cases were
+not rebuilt in this correction round.
 
 ---
 

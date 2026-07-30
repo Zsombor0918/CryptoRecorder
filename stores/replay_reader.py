@@ -32,7 +32,7 @@ from typing import Generator, Optional
 import pyarrow.parquet as pq
 
 from .replay_schema import (
-    BUILDER_VERSION_V2,
+    SUPPORTED_BUILDER_VERSIONS_V2,
     DEPTH_RECORD_TYPE_CODES_REV,
     DEPTH_REPLAY_SCHEMA,
     DEPTH_REPLAY_SCHEMA_V1,
@@ -223,10 +223,11 @@ class ReplayReader:
                     raise ValueError(
                         "Replay manifest builder_version is required for schema_version=1"
                     )
-            elif manifest.get("builder_version") != BUILDER_VERSION_V2:
+            elif manifest.get("builder_version") not in SUPPORTED_BUILDER_VERSIONS_V2:
                 raise ValueError(
                     f"Replay manifest builder_version={manifest.get('builder_version')!r} "
-                    f"contradicts schema_version=2; expected {BUILDER_VERSION_V2!r}"
+                    "contradicts schema_version=2; expected one of "
+                    f"{SUPPORTED_BUILDER_VERSIONS_V2!r}"
                 )
         return int(version), manifest
 

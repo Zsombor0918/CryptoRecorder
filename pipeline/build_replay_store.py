@@ -33,6 +33,7 @@ from stores.replay_writer import (
     validate_partition,
     validate_v2_source_identity,
 )
+from stores.replay_schema import BUILDER_VERSION_V1, BUILDER_VERSION_V2
 
 logger = logging.getLogger(__name__)
 
@@ -607,6 +608,64 @@ def _as_optional_str(value: object) -> str | None:
     return None if value is None else str(value)
 
 
+class ReplayTradeIdentifierError(ValueError):
+    """A supported raw trade event has no reconstructable exchange ID."""
+
+
+def _identifier_str(value: object) -> str | None:
+    """Return an identifier without numeric or lexical transformation."""
+    if value is None:
+        return None
+    identifier = str(value)
+    return identifier if identifier != "" else None
+
+
+def _resolve_trade_identifiers(
+    raw_record: dict,
+    *,
+    record_type: str,
+) -> tuple[str | None, str | None]:
+    """Resolve replay trade identifiers with reference-compatible precedence.
+
+    Existing normalized top-level fields are authoritative. In particular,
+    ``exchange_trade_id`` has the same precedence over native payload fields
+    as ``converter.trades._trade_id_for_report``. When every top-level
+    identifier is absent, native Binance ``trade`` events recover ``t`` (the
+    exact fallback used by the unchanged reference converter), while native
+    ``aggTrade``/normalized ``agg_trade`` events recover aggregate id ``a``.
+    No sequence/index surrogate is ever synthesized.
+    """
+    trade_id = _identifier_str(raw_record.get("trade_id"))
+    agg_trade_id = _identifier_str(raw_record.get("agg_trade_id"))
+
+    if trade_id is None:
+        trade_id = _identifier_str(raw_record.get("exchange_trade_id"))
+
+    if trade_id is None and agg_trade_id is None:
+        native = raw_record.get("native_payload")
+        native = native if isinstance(native, dict) else {}
+        native_event = native.get("e")
+        if native_event == "aggTrade" or record_type == "agg_trade":
+            agg_trade_id = _identifier_str(native.get("a"))
+        else:
+            # Includes the exact legacy BTW futures shape:
+            # record_type="trade", native_payload.e="trade", t=<id>.
+            trade_id = _identifier_str(native.get("t"))
+
+    if trade_id is None and agg_trade_id is None:
+        native = raw_record.get("native_payload")
+        native_event = native.get("e") if isinstance(native, dict) else None
+        raise ReplayTradeIdentifierError(
+            "Supported replay trade record has no reconstructable identifier: "
+            "expected a non-empty top-level trade_id, agg_trade_id, or "
+            "exchange_trade_id, native_payload.t for trade events, or "
+            "native_payload.a for aggTrade events "
+            f"(record_type={record_type!r}, native_event={native_event!r})"
+        )
+
+    return trade_id, agg_trade_id
+
+
 def _decimal_pair_to_level(level: object) -> dict:
     price = level[0]  # type: ignore[index]
     size = level[1]  # type: ignore[index]
@@ -799,9 +858,12 @@ def _convert_trade_record(raw_record: dict, venue: str, symbol: str, date: str) 
         if record_type not in {"trade", "agg_trade"}:
             return None
 
-        # Trade IDs
-        trade_id = raw_record.get("trade_id") or raw_record.get("exchange_trade_id")
-        agg_trade_id = raw_record.get("agg_trade_id")
+        # Trade IDs. This is fail-closed: a supported trade event may not
+        # disappear later as an anonymous replay row.
+        trade_id, agg_trade_id = _resolve_trade_identifiers(
+            raw_record,
+            record_type=record_type,
+        )
 
         # Trade details
         price_str = str(raw_record.get("price", "0"))
@@ -825,8 +887,8 @@ def _convert_trade_record(raw_record: dict, venue: str, symbol: str, date: str) 
             "raw_index": raw_index,
             "record_type": record_type,
             "market_type": market_type,
-            "trade_id": _as_optional_str(trade_id),
-            "agg_trade_id": _as_optional_str(agg_trade_id),
+            "trade_id": trade_id,
+            "agg_trade_id": agg_trade_id,
             "ts_exchange_ns": _trade_event_ts_ns(raw_record),
             "ts_receive_ns": _receive_ts_ns(raw_record),
             "price": price,
@@ -838,6 +900,8 @@ def _convert_trade_record(raw_record: dict, venue: str, symbol: str, date: str) 
             "quality_flags": quality_flags,
             "native_payload_hash": raw_record.get("native_payload_hash") or _native_payload_hash(raw_record),
         }
+    except ReplayTradeIdentifierError:
+        raise
     except Exception as e:
         logger.warning(f"Error converting trade record for {venue}/{symbol}: {e}")
         return None
@@ -1183,6 +1247,26 @@ def build_replay_for_symbol(
                 f"requested schema_version={schema_version!r}. Refusing to "
                 "reuse or overwrite it implicitly; use force=True for an "
                 "intentional replacement."
+            )
+            logger.error(status["errors"][-1])
+            return status
+
+        expected_builder = {
+            1: BUILDER_VERSION_V1,
+            2: BUILDER_VERSION_V2,
+        }.get(schema_version)
+        if (
+            expected_builder is not None
+            and existing_manifest.get("builder_version") != expected_builder
+        ):
+            status["status"] = "failed"
+            status["errors"].append(
+                f"Existing valid partition {venue}/{symbol}/{date} uses "
+                f"builder_version={existing_manifest.get('builder_version')!r}, "
+                f"but the current schema_version={schema_version} builder is "
+                f"{expected_builder!r}. Refusing to reuse a partition built "
+                "under different normalization semantics; use force=True for "
+                "an intentional replacement."
             )
             logger.error(status["errors"][-1])
             return status

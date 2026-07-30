@@ -14,6 +14,7 @@ from nautilus_trader.model.objects import Price, Quantity
 from nautilus_trader.persistence.catalog import ParquetDataCatalog
 
 from converter.instruments import build_instruments
+from stores.replay_schema import BUILDER_VERSION_V2
 from validation.artifact_identity import (
     COMPOSITE_HASH_ALGORITHM,
     IDENTITY_SCHEMA,
@@ -479,7 +480,7 @@ def _write_artifact_identity(path: Path) -> None:
                         "status": "complete",
                         "schema_version": 2,
                         "format_version": 2,
-                        "builder_version": "cryptorecorder-replay-writer-v2.0.0",
+                        "builder_version": BUILDER_VERSION_V2,
                         "source_identity_complete": True,
                     },
                     "carry": {
