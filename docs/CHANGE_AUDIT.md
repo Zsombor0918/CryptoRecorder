@@ -93,6 +93,300 @@ An entry may be skipped **only** for:
 - <or "none — task fully completed">
 ```
 
+## 2026-07-30 — fix(validation): checkpoint hardened Phase 7 semantic validation
+
+### Change summary
+- Audited both validation catalog writers and proved that every successfully
+  produced reference/replay validation catalog under Nautilus 1.225.0 has
+  internally non-decreasing files and strictly disjoint closed `ts_init`
+  intervals. The proof is scoped to these CryptoRecorder writers, not arbitrary
+  Nautilus catalogs. Recorded the separate equal-singleton writer-skip caveat.
+- Hardened the direct Parquet validation reader with an exact
+  `nautilus_trader==1.225.0` pin and runtime check around the private
+  `ParquetDataCatalog._query_files()` method. There is no DataFusion fallback.
+  Full-selection preflight now verifies the exact pinned physical class schema,
+  instrument, filename/content bounds, row-group/internal order, and strict
+  non-overlap before the first yield. Each bounded decoded batch is validated
+  in full against Arrow row order/timestamps and instrument identity before its
+  first object is yielded.
+- Added focused real-Parquet coverage for non-overlapping/overlapping/equal
+  boundary files, internal disorder, equal ties within one file, wrong
+  class/instrument, multiple instruments, exact endpoints, many-file resource
+  bounds, decoded reorder, and changed/missing/extra/reordered events near the
+  end. Tests prove one open file, bounded decode batches, prior-batch release at
+  the next decode and after exhaustion, and no `from_pyo3_list()` input
+  retention.
+- Retained reusable process-isolated `trades`, `deltas`, `depth10`,
+  `checkpoints`, `continuity`, `fences`, `metadata`, `integrity`, and `report`
+  stages. Removed build/transform commands from `validation/`, the obsolete
+  combined `depth` alias, no-op time-window options, and misleading reader
+  names. Stage/report fragments now share an explicit
+  date/venue/symbol/source/candidate scope and fail closed if mixed.
+- Removed the one-off DataFusion memory probes, stress benchmark, and real-gate
+  driver. Kept the reusable serial runner and cgroup wrapper with tests,
+  overwrite guards, fragment-size/pass checks, sanitized paths, and no retry.
+- Tightened replay schema dispatch so versionless historical manifests are v0
+  only when both exact legacy physical schemas confirm that contract; compact
+  layouts without an explicit supported version and all manifest/physical
+  contradictions fail before decoding.
+- Added canonical artifact-document SHA-256 binding to every isolated stage.
+  Each stage now revalidates exact input content before and after execution,
+  and aggregation independently recomputes the identity and rejects copied,
+  mixed-build, mutated, label-only, missing, duplicate, or unexpected
+  fragments.
+- Added the length-framed `arrow_canonical_v2` method for new schema-v2 block
+  digests, including primitive/list/struct validity. Existing manifests
+  recording `arrow_canonical_v1` retain the unchanged legacy verifier, so
+  accepted artifacts remain auditable without reinterpretation or rebuild.
+  Complete-file SHA-256 remains the separate routine integrity layer.
+- Tightened existing schema-v2 validation with exact physical schema/version
+  contracts, structural block metadata, boundary-key verification,
+  file-handle closure, and honest source-contribution boundaries. Offline
+  equivalence builds now require a closed full D+1 scope and abort on a failed
+  non-empty carry build.
+- Corrected the replay-store audit so schema-v1/v2 fixed-point mantissa fields
+  are recognized as their exact compact representation; the audit no longer
+  reports missing legacy decimal-string fields for a valid schema-v2
+  partition.
+- Reused the preserved BTCUSDT reference/replay/trade results. Because the
+  actual reader algorithm changed, reran only deltas; then ran only the five
+  remaining stages, each serially under its own 10 GiB cgroup. All passed with
+  zero OOM events. Aggregated the required nine fragments into the new external
+  `gate_report_hardened.json` without overwriting the stale failure report.
+
+### Files/packages touched
+- `validation/catalog_compare.py`
+- `validation/artifact_identity.py`
+- `validation/audit_replay_store.py`
+- `validation/replay_catalog_reconstruct.py`
+- `validation/stage_runner_cli.py`
+- `validation/validate_catalog_equivalence.py`
+- `validation/serial_gate.py`
+- `pipeline/build_replay_store.py`
+- `pipeline/daily_build.py`
+- `pipeline/raw_manifest.py`
+- `stores/replay_reader.py`
+- `stores/replay_schema.py`
+- `stores/replay_writer.py`
+- `scripts/run_under_cgroup.sh`
+- `scripts/README.md`
+- `tests/test_bounded_catalog_reader.py`
+- `tests/test_artifact_identity.py`
+- `tests/test_catalog_reader_boundaries.py`
+- `tests/test_cgroup_wrapper.py`
+- `tests/test_replay_depth_repartitioning.py`
+- `tests/test_replay_hierarchical_integrity_v2.py`
+- `tests/test_replay_fail_closed_hardening.py`
+- `tests/test_catalog_equivalence.py`
+- `tests/test_daily_build.py`
+- `tests/test_replay_schema_v1.py`
+- `tests/test_serial_gate.py`
+- `tests/test_stage_runner_cli.py`
+- `tests/test_validate_catalog_equivalence_exhaustive_wiring.py`
+- `requirements.txt`
+- `docs/FULL_L2_REPLAY_CATALOG_PLAN.md`
+- `docs/VALIDATION.md`
+- `docs/IMPLEMENTATION_AUDIT.md`
+- `docs/PROJECT_STATUS.md`
+- `CHANGELOG.md`
+- `docs/CHANGE_AUDIT.md`
+
+Catalogs, replay partitions, raw data, large logs, and cgroup sample streams
+remain external. A path-sanitized machine-readable summary was generated at
+`validation_reports/issue20_phase7_btcusdt_spot_2026-06-11.json`; repository
+policy keeps that runtime-report directory gitignored.
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] docs/REPO_STRUCTURE.md
+- [x] docs/PROJECT_STATUS.md
+- [x] docs/IMPLEMENTATION_AUDIT.md
+- [x] relevant feature docs:
+  - `docs/FULL_L2_REPLAY_CATALOG_PLAN.md`
+  - `docs/OPERATIONS.md`
+  - `docs/AI_WORKFLOW.md`
+  - `docs/VALIDATION.md`
+
+### Docs updated
+- [x] CHANGELOG.md
+- [ ] README.md
+- [x] docs/PROJECT_STATUS.md
+- [x] docs/REPO_STRUCTURE.md
+- [x] relevant feature docs:
+  - `docs/VALIDATION.md`
+  - `docs/IMPLEMENTATION_AUDIT.md`
+  - `docs/FULL_L2_REPLAY_CATALOG_PLAN.md`
+- README update was not required because this is internal validation-only
+  hardening with its operator contract documented in `docs/VALIDATION.md`.
+- REPO_STRUCTURE was updated to inventory the supported validation identity
+  and serial-stage modules and the thin cgroup wrapper.
+
+### Status / validation impact
+- Validated status changed: no — `convert_day.py` remains the production
+  reference and the top50/multi-day `v2.0.0` gate remains deferred.
+- Deferred status changed: no.
+- New claims added: yes — one representative high-volume
+  BINANCE_SPOT/BTCUSDT schema-v2 day completed the full semantic report.
+- Evidence for the new validation claim:
+  - Preserved reference and replay construction fragments passed; preserved
+    exhaustive trades matched 3,418,712/3,418,712 exactly.
+  - Hardened deltas matched 30,009,655/30,009,655 exactly with zero
+    mismatches. Its SHA-256
+    `4f437172ee3bafaf4d2f3059a5c04cf4af21d85d83dc7c3415f576376e98033e`
+    is identical to the accepted Round 5 fragment. Cgroup exit 0, zero OOM
+    events, sampled peak 137,437,184 bytes; `/usr/bin/time` max RSS
+    275,856 KiB. The preserved pre-hardening cgroup peak evidence
+    (1,351,847,936 bytes, approximately 1.29 GiB) was retained.
+  - Depth10 matched 84,066/84,066 exactly. All 7 checkpoint canonical hashes
+    matched. Continuity matched (7 seeds, 0 resyncs, 0 desyncs, 25 fences).
+    All 25 fence ranges had identical canonical digest
+    `71a88f880d393f9c078f20aff2f653546a08005c54aa072d88c3a888fdf60cf3`.
+  - Raw/replay metadata matched exhaustively for 846,430 depth records and
+    3,419,004 trade records. Fresh source identity matched both manifest
+    copies exactly for 25 depth and 24 trade files. Metadata cgroup exit 0,
+    zero OOM events, transient sampled peak 5,308,530,688 bytes, max process
+    RSS 587,064 KiB.
+  - Final report passed with the exact nine required stages and no
+    missing/duplicate/unexpected fragments (SHA-256
+    `69c4466d1a6cb4206110f07def6f9d9c2b751a65f6923bd270ac16956668c281`).
+
+### Tests run
+```bash
+git diff --check
+# passed
+
+source .venv/bin/activate
+git ls-files -m -o --exclude-standard -- '*.py' |
+  while read -r path; do test ! -f "$path" || python -m py_compile "$path"; done
+# passed for every existing changed Python module
+# No configured linter executable was installed; none was installed ad hoc.
+
+pytest -q tests/test_replay_fail_closed_hardening.py \
+  tests/test_replay_schema_v1.py tests/test_replay_schema_v1_corrections.py
+# 104 passed
+
+pytest -q tests/test_replay_hierarchical_integrity_v2.py
+# 45 passed
+
+pytest -q tests/test_artifact_identity.py tests/test_stage_runner_cli.py
+# 30 passed
+
+pytest -q tests/test_bounded_catalog_reader.py \
+  tests/test_catalog_reader_boundaries.py
+# 24 passed
+
+pytest -q tests/test_stage_runner_cli.py tests/test_serial_gate.py \
+  tests/test_cgroup_wrapper.py
+# 41 passed
+
+pytest -q tests/test_replay_depth_repartitioning.py tests/test_daily_build.py
+# 25 passed
+
+pytest -q tests/test_semantic_oracle_exhaustive_streaming.py \
+  tests/test_semantic_oracle_detects_injected_faults.py \
+  tests/test_validate_catalog_equivalence_exhaustive_wiring.py
+# 56 passed
+
+pytest -q tests/test_repo_structure.py tests/test_agent_infrastructure.py
+# 56 passed
+
+source .venv/bin/activate && \
+  python -m pytest -q tests/test_bounded_catalog_reader.py \
+  tests/test_catalog_reader_boundaries.py
+# 24 passed
+
+source .venv/bin/activate && \
+  python -m pytest -q tests/test_replay_schema_v1.py \
+  tests/test_replay_schema_v1_corrections.py \
+  tests/test_replay_hierarchical_integrity_v2.py \
+  tests/test_replay_depth_repartitioning.py \
+  tests/test_replay_sync_continuity.py tests/test_replay_store.py \
+  tests/test_replay_catalog_reconstruct.py tests/test_daily_build.py
+# 154 passed
+
+source .venv/bin/activate && \
+  python -m pytest -q tests/test_semantic_oracle_exhaustive_streaming.py \
+  tests/test_semantic_oracle_detects_injected_faults.py \
+  tests/test_validate_catalog_equivalence_exhaustive_wiring.py \
+  tests/test_catalog_equivalence.py tests/test_catalog_equivalence_full_l2.py
+# 61 passed, 1 skipped
+
+source .venv/bin/activate && \
+  python -m pytest -q tests/test_repo_structure.py \
+  tests/test_agent_infrastructure.py tests/test_stage_runner_cli.py \
+  tests/test_serial_gate.py tests/test_cgroup_wrapper.py
+# 82 passed
+
+source .venv/bin/activate && \
+  python -m pytest -q tests/test_replay_store.py \
+  tests/test_replay_hierarchical_integrity_v2.py
+# 44 passed
+
+source .venv/bin/activate && pytest
+# 728 passed, 3 skipped
+```
+
+### Validation CLIs run
+```bash
+# Each substantial command below was run once, serially, through:
+# bash scripts/run_under_cgroup.sh 10G <logs> <unique-unit> -- /usr/bin/time -v ...
+
+python -m validation.stage_runner_cli deltas \
+  --config <gate-root>/configs/deltas.json \
+  --out <gate-root>/fragments/deltas_hardened.json
+# passed: 30,009,655/30,009,655 exact; zero OOM events
+
+python -m validation.stage_runner_cli depth10 \
+  --config <gate-root>/configs/depth10.json \
+  --out <gate-root>/fragments/depth10.json
+python -m validation.stage_runner_cli checkpoints \
+  --config <gate-root>/configs/checkpoints.json \
+  --out <gate-root>/fragments/checkpoints.json
+python -m validation.stage_runner_cli continuity \
+  --config <gate-root>/configs/continuity.json \
+  --out <gate-root>/fragments/continuity.json
+python -m validation.stage_runner_cli fences \
+  --config <gate-root>/configs/fences.json \
+  --out <gate-root>/fragments/fences.json
+python -m validation.stage_runner_cli metadata \
+  --config <gate-root>/configs/metadata.json \
+  --out <gate-root>/fragments/metadata.json
+# all passed; each cgroup recorded exit_code=0 and oom_kill=0
+
+python -m validation.stage_runner_cli report \
+  --config <gate-root>/configs/report_hardened.json \
+  --out <gate-root>/gate_report_hardened.json
+# passed; exact required stage set present
+
+python -m validation.audit_replay_store \
+  --replay-root <external-ADA-canary>/replay_store \
+  --date 2026-06-12 --symbols ADAUSDT --venues BINANCE_SPOT \
+  --report-path <external-ADA-canary>/checkpoint_replay_audit_v2_20260729.json
+# completed: schema_version=2; counts/checksums/order exact; zero duplicate
+# sequence keys; fixed-point level fields recognized; no partition missing
+
+python -m validation.audit_change_compliance --staged
+# PASS
+```
+
+The monolithic `validation.validate_catalog_equivalence` CLI was deliberately
+not run because it would rebuild and rerun the preserved reference, replay, and
+trade stages, which this task explicitly prohibited. Its semantic components
+were instead executed through the isolated CLIs above against the preserved
+artifacts.
+
+### Known limitations / out of scope
+- Did not modify `convert_day.py`, recorder/raw ingestion, replay-v2 semantics,
+  schema, or integrity rules.
+- Did not rebuild any preserved catalog or replay partition and did not rerun
+  reference, replay, or trades.
+- Did not weaken exhaustive comparison or treat crossed-book diagnostics as a
+  side-to-side mismatch when both sides and all checkpoint hashes matched.
+- Did not start the 150-partition build, deployment, retention, KovacsTrader,
+  Phase 8, or later work.
+- Did not promote the single BTCUSDT day to broader top50/multi-day validation.
+- Did not rewrite remote history or force-push.
+
 ## 2026-07-29 — perf(stores): measured v1 Parquet encoding optimization (Phase 7 Stage A)
 
 ### Change summary

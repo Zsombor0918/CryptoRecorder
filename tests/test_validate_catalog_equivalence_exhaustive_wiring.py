@@ -439,6 +439,33 @@ def _write_clean_raw_day(data_root: Path) -> None:
              "is_buyer_maker": False, "exchange_trade_id": 102, "native_payload": {"t": 102}},
         ],
     )
+    _jsonl(
+        data_root
+        / VENUE
+        / "depth_v2"
+        / SYMBOL
+        / "2026-06-13"
+        / "2026-06-13T00.jsonl",
+        [],
+    )
+    _jsonl(
+        data_root
+        / VENUE
+        / "depth_v2"
+        / SYMBOL
+        / "2026-06-13"
+        / "2026-06-13T23.jsonl",
+        [],
+    )
+    _jsonl(
+        data_root
+        / VENUE
+        / "depth_v2"
+        / SYMBOL
+        / "2026-06-14"
+        / "2026-06-14T00.jsonl",
+        [],
+    )
 
 
 def _run_real_pipeline_with_corrupted_old_depth(monkeypatch, tmp_path: Path, corrupt_fn) -> dict:
@@ -538,6 +565,57 @@ def test_real_pipeline_passes_on_unmodified_clean_day(monkeypatch, tmp_path: Pat
     assert report["status"] == "passed", json.dumps(report, indent=2, default=str)
 
 
+def test_new_pipeline_refuses_failed_nonempty_previous_day_carry(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    calls: list[dict] = []
+    monkeypatch.setattr(
+        vce,
+        "replay_partition_has_source_records",
+        lambda *args, **kwargs: True,
+    )
+
+    def _failed_build(*args, **kwargs):
+        calls.append(kwargs)
+        return {"status": "failed", "errors": ["injected failure"]}
+
+    monkeypatch.setattr(vce, "build_replay_for_symbol", _failed_build)
+    monkeypatch.setattr(
+        vce,
+        "generate_catalog_from_replay",
+        lambda **kwargs: pytest.fail(
+            "candidate catalog must not be written after carry failure"
+        ),
+    )
+
+    result = vce._run_new_pipeline(
+        date=DATE,
+        symbols=[SYMBOL],
+        venues=[VENUE],
+        data_root=tmp_path / "raw",
+        replay_root=tmp_path / "replay",
+        new_catalog_root=tmp_path / "new",
+        start=datetime(2026, 6, 12, tzinfo=timezone.utc),
+        end=datetime(2026, 6, 13, tzinfo=timezone.utc),
+        profile="full_l2",
+        overwrite=True,
+        emit_depth10=True,
+        depth10_interval_sec=1.0,
+        derived_depth_snapshot_levels=10,
+        schema_version=2,
+    )
+
+    assert result["catalog_result"]["status"] == "failed"
+    assert calls == [
+        {
+            "schema_version": 2,
+            "check_repartition_readiness": True,
+            "require_complete_next_day": True,
+        }
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Regression guards
 # ---------------------------------------------------------------------------
@@ -567,9 +645,9 @@ def test_regression_production_path_uses_exhaustive_not_sampled_or_multiset_comp
         "compare_order_book_deltas_exhaustive",
         "compare_order_book_depth10_exhaustive",
         "compare_book_checkpoints_streaming",
-        "iter_trade_ticks_windowed",
-        "iter_order_book_deltas_windowed",
-        "iter_order_book_depth10_windowed",
+        "iter_trade_ticks_bounded",
+        "iter_order_book_deltas_bounded",
+        "iter_order_book_depth10_bounded",
         "compare_instruments_semantic",
         "load_instruments",
         "compare_continuity_diagnostics_semantic",

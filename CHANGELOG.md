@@ -67,6 +67,75 @@ passes.** Until then, broader full-L2 equivalence stays **deferred** (see
 ## [Unreleased]
 
 ### Added
+- **Issue #20 Phase 7 Round 5 reader hardening and completed BTCUSDT
+  semantic report** — the validation-only exhaustive catalog reader now has
+  a fail-closed, exactly pinned `nautilus_trader==1.225.0` compatibility
+  boundary around the private `ParquetDataCatalog._query_files()` selector.
+  It preflights every selected real Parquet file before yielding: exact
+  data-class physical schema, instrument metadata, filename/content
+  timestamp bounds, explicit row-group order, internal non-decreasing
+  `ts_init`, and strictly disjoint closed file intervals (including
+  rejection of equal timestamp boundaries). Each bounded decoded batch is
+  also checked in full against its Arrow `ts_init` rows and instrument before
+  its first object can escape. Version/signature/layout incompatibility fails
+  clearly and can never fall back to the memory-unbounded DataFusion global
+  sort. Focused real-Parquet tests cover non-overlap, deliberate overlap,
+  equal boundaries/ties, internal disorder, wrong class/instrument,
+  multi-instrument selection, exact endpoints, many-file file/batch lifetime,
+  decoder reorder, and changed/missing/extra/reordered near-end events.
+- Writer-path audit proved strict file-range non-overlap for every
+  successfully produced CryptoRecorder reference/replay validation catalog
+  under the pinned Nautilus version: both writers feed
+  `(ts_init, ordinal)`-sorted `ObjectSpool` batches to ordinary
+  `write_data()` and do not bypass the disjointness check. The scope is not
+  generalized to arbitrary Nautilus catalogs. A separate pinned-writer
+  limitation remains explicit: a second identical singleton interval can be
+  skipped before Nautilus checks overlap, which a reader cannot recover.
+- Production-day checks have honest isolated subcommands: `depth10`,
+  `checkpoints`, `continuity`, `fences`, `metadata` (exhaustive event-keyed
+  raw/replay metadata plus fresh source identity), and `integrity` (routine
+  plus deep replay-partition verification). Required-stage report aggregation fails for missing,
+  duplicate, unexpected, or cross-artifact fragments; the obsolete combined
+  `depth` compatibility command was removed.
+- Replay reader schema dispatch now accepts a versionless historical manifest
+  only when both physical Parquet channels exactly match the legacy-v0 schema
+  (including exact decimal-string fields). Missing/malformed manifests,
+  compact v1/v2 files without an explicit version, and every declared-version
+  versus physical-schema contradiction fail before decoding.
+- Every semantic-stage fragment is now cryptographically bound to the
+  canonical artifact-identity document and its exact component hashes. Each
+  stage performs full content verification before and after execution; final
+  aggregation independently recomputes the identity and rejects label-only,
+  copied, mixed-build, mutated, missing, duplicate, or unexpected fragments.
+- New schema-v2 builds record the length-framed `arrow_canonical_v2` block
+  digest, including primitive/list/struct validity. Tests prove null-list
+  versus empty-list and null-struct versus valid-struct separation. Existing
+  `arrow_canonical_v1` artifacts retain their recorded verifier and remain
+  auditable without reinterpretation or rebuild; complete-file SHA-256
+  remains the separate routine integrity layer.
+- The replay-store audit now interprets schema-v1/v2 fixed-point mantissa
+  fields as the compact schemas' exact numeric representation instead of
+  falsely reporting that only legacy schema-v0 decimal-string fields are
+  exact.
+- Preserved BTCUSDT 2026-06-11 reference/replay/trade artifacts were not
+  rebuilt or rerun. The algorithm-changing reader hardening triggered only
+  the required delta rerun under 10 GiB: 30,009,655/30,009,655 rows matched
+  exactly, zero mismatches, and its fragment SHA-256 is identical to the
+  accepted Round 5 fragment. Remaining results: Depth10
+  84,066/84,066 exact; 7/7 checkpoint hashes match; continuity 7 seeds,
+  0 resyncs, 0 desyncs, 25 fences on both sides; 25/25 canonical fence
+  digest match; raw/replay metadata exact for 846,430 depth and 3,419,004
+  trade records; current raw source identity exactly matches both manifest
+  copies (25 depth files, 24 trade files). Every substantial new stage ran
+  serially in its own 10 GiB cgroup and recorded zero OOM events. The accepted
+  external report SHA-256 is
+  `69c4466d1a6cb4206110f07def6f9d9c2b751a65f6923bd270ac16956668c281`;
+  a compact sanitized local summary is generated under the gitignored
+  `validation_reports/` structure.
+  Full suite: 728 passed, 3 skipped. This is single-symbol/single-day local
+  evidence only; top50/multi-day validation, the 150-partition build,
+  deployment, retention, KovacsTrader, Phase 8+, and any production-status
+  promotion remain out of scope.
 - **Issue #20 Phase 7 Stage A: measured v1 Parquet encoding optimization
   (local development evidence, NOT a final production storage-gate
   claim)** — using the complete real 2026-06-11 local universe (150/150

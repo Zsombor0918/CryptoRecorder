@@ -1,15 +1,25 @@
 """Semantic comparison utilities for Nautilus ParquetDataCatalog outputs."""
 from __future__ import annotations
 
+import calendar
 import hashlib
+import importlib.metadata
+import inspect
 import itertools
 import json
 import math
+import re
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Iterable, Iterator
 
+import pyarrow as pa
+import pyarrow.compute as pc
+import pyarrow.parquet as pq
 from nautilus_trader.persistence.catalog import ParquetDataCatalog
+from nautilus_trader.model.data import TradeTick
 
 from converter.depth_phase2 import canonical_fence_digest
 
@@ -17,6 +27,605 @@ from converter.depth_phase2 import canonical_fence_digest
 # length divergence via itertools.zip_longest without confusing a genuine
 # `None` field value for "this stream ran out of events here".
 _MISSING = object()
+
+
+# ---------------------------------------------------------------------------
+# Batch-bounded catalog reader
+# ---------------------------------------------------------------------------
+#
+# Nautilus 1.225.0's catalog query adds a global ``ORDER BY ts_init`` before
+# yielding query results. A full-day, multi-file DataFusion query therefore
+# cannot provide a hard streaming-memory bound. The bounded reader bypasses
+# that query path:
+# it selects candidate files, validates the complete selected layout, then
+# reads one file and one row group at a time with PyArrow. This relies on a
+# deliberately narrow compatibility boundary:
+#
+# - `ParquetDataCatalog._query_files(...)` is PRIVATE Nautilus API (the
+#   leading underscore is significant). It is used because it applies the
+#   catalog's own class/instrument/time filename pruning without invoking the
+#   memory-unbounded DataFusion query. There is no supported public Nautilus
+#   API in 1.225.0 which exposes this file selection while avoiding the
+#   unconditional global `ORDER BY ts_init`.
+# - This code is tested only against, and the project dependency is pinned
+#   to, nautilus_trader==1.225.0. Runtime version and private-method signature
+#   checks run before file selection. An incompatible version raises
+#   `CatalogStreamingCompatibilityError`; there is intentionally NO fallback
+#   to `catalog.query()`, `_query_rust()`, or `backend_session()`.
+# - Both CryptoRecorder validation catalog writers pass ts_init/ordinal-sorted
+#   ObjectSpool batches to `ParquetDataCatalog.write_data()`. In Nautilus
+#   1.225.0, `_objects_to_table()` rejects internally decreasing ts_init and
+#   `_write_chunk()` rejects overlapping CLOSED file intervals. No caller in
+#   either validation path opts out with `skip_disjoint_check=True`.
+# - The reader does not merely trust those private writer details. Before it
+#   yields one object, it checks every selected file's class/instrument,
+#   schema, filename-vs-content range, row-group order, and full internal
+#   non-decreasing ts_init order, then rejects any adjacent closed intervals
+#   for which `next.first_ts <= previous.last_ts`. Equality at a file
+#   boundary is therefore an unsupported overlap and fails closed. Equal
+#   ts_init values inside one file retain their physical row order because
+#   row groups and batches are traversed by ascending numeric index.
+#
+# The preflight and decode passes each keep at most one Parquet file open and
+# one bounded Arrow batch live. The second pass filters objects with inclusive
+# `start <= ts_init <= end`, matching Nautilus's existing query contract.
+DEFAULT_STREAM_BATCH_SIZE = 10_000
+TESTED_NAUTILUS_VERSION = "1.225.0"
+
+
+class CatalogStreamingCompatibilityError(RuntimeError):
+    """The pinned private Nautilus file-selection contract is unavailable."""
+
+
+class CatalogFileLayoutError(ValueError):
+    """A selected catalog file layout cannot be streamed in canonical order."""
+
+
+@dataclass(frozen=True)
+class _ValidatedCatalogFile:
+    path: Path
+    first_ts: int
+    last_ts: int
+    row_count: int
+    stat_identity: tuple[int, int, int, int]
+
+
+_CATALOG_DIRECTORY_BY_CLASS = {
+    "OrderBookDelta": "order_book_deltas",
+    "OrderBookDepth10": "order_book_depths",
+    "TradeTick": "trade_tick",
+}
+
+_CATALOG_FILENAME_RE = re.compile(
+    r"^(?P<sy>\d{4})-(?P<smo>\d{2})-(?P<sd>\d{2})T"
+    r"(?P<sh>\d{2})-(?P<smi>\d{2})-(?P<ss>\d{2})-(?P<sn>\d{9})Z_"
+    r"(?P<ey>\d{4})-(?P<emo>\d{2})-(?P<ed>\d{2})T"
+    r"(?P<eh>\d{2})-(?P<emi>\d{2})-(?P<es>\d{2})-(?P<en>\d{9})Z\.parquet$"
+)
+
+
+def _catalog_filename_interval_ns(path: Path) -> tuple[int, int]:
+    match = _CATALOG_FILENAME_RE.fullmatch(path.name)
+    if match is None:
+        raise CatalogFileLayoutError(
+            f"Selected catalog file has an unsupported Nautilus timestamp filename: {path}. "
+            "Refusing lexical/path-order guesses."
+        )
+
+    def to_ns(prefix: str) -> int:
+        try:
+            dt = datetime(
+                int(match.group(f"{prefix}y")),
+                int(match.group(f"{prefix}mo")),
+                int(match.group(f"{prefix}d")),
+                int(match.group(f"{prefix}h")),
+                int(match.group(f"{prefix}mi")),
+                int(match.group(f"{prefix}s")),
+                tzinfo=timezone.utc,
+            )
+        except ValueError as exc:
+            raise CatalogFileLayoutError(
+                f"Selected catalog file has an invalid timestamp filename: {path}: {exc}"
+            ) from exc
+        whole_seconds = calendar.timegm(dt.utctimetuple())
+        return whole_seconds * 1_000_000_000 + int(match.group(f"{prefix}n"))
+
+    return to_ns("s"), to_ns("e")
+
+
+def _file_stat_identity(path: Path) -> tuple[int, int, int, int]:
+    stat = path.stat()
+    return (int(stat.st_dev), int(stat.st_ino), int(stat.st_size), int(stat.st_mtime_ns))
+
+
+def _expected_catalog_schema(data_cls: type) -> pa.Schema:
+    """Return the exact pinned Nautilus 1.225.0 physical schema for a class."""
+    fixed_decimal = pa.binary(16)
+    if data_cls.__name__ == "TradeTick":
+        field_specs = [
+            ("price", fixed_decimal),
+            ("size", fixed_decimal),
+            ("aggressor_side", pa.uint8()),
+            ("trade_id", pa.string()),
+            ("ts_event", pa.uint64()),
+            ("ts_init", pa.uint64()),
+        ]
+    elif data_cls.__name__ == "OrderBookDelta":
+        field_specs = [
+            ("action", pa.uint8()),
+            ("side", pa.uint8()),
+            ("price", fixed_decimal),
+            ("size", fixed_decimal),
+            ("order_id", pa.uint64()),
+            ("flags", pa.uint8()),
+            ("sequence", pa.uint64()),
+            ("ts_event", pa.uint64()),
+            ("ts_init", pa.uint64()),
+        ]
+    elif data_cls.__name__ == "OrderBookDepth10":
+        field_specs = [
+            *[(f"bid_price_{index}", fixed_decimal) for index in range(10)],
+            *[(f"ask_price_{index}", fixed_decimal) for index in range(10)],
+            *[(f"bid_size_{index}", fixed_decimal) for index in range(10)],
+            *[(f"ask_size_{index}", fixed_decimal) for index in range(10)],
+            *[(f"bid_count_{index}", pa.uint32()) for index in range(10)],
+            *[(f"ask_count_{index}", pa.uint32()) for index in range(10)],
+            ("flags", pa.uint8()),
+            ("sequence", pa.uint64()),
+            ("ts_event", pa.uint64()),
+            ("ts_init", pa.uint64()),
+        ]
+    else:
+        raise CatalogStreamingCompatibilityError(
+            f"Bounded catalog reader does not support data class {data_cls.__name__!r}."
+        )
+    return pa.schema(
+        [pa.field(name, field_type, nullable=False) for name, field_type in field_specs]
+    )
+
+
+def _require_pinned_nautilus_file_api(catalog: ParquetDataCatalog) -> None:
+    try:
+        installed = importlib.metadata.version("nautilus_trader")
+    except importlib.metadata.PackageNotFoundError as exc:
+        raise CatalogStreamingCompatibilityError(
+            "Cannot verify the Nautilus version required by the bounded catalog reader. "
+            "Refusing to fall back to the DataFusion query."
+        ) from exc
+
+    if installed != TESTED_NAUTILUS_VERSION:
+        raise CatalogStreamingCompatibilityError(
+            "The bounded catalog reader uses private "
+            "ParquetDataCatalog._query_files() behavior tested only with "
+            f"nautilus_trader=={TESTED_NAUTILUS_VERSION}; found {installed}. "
+            "Refusing to use an unverified private API and refusing to fall back "
+            "to the memory-unbounded DataFusion query."
+        )
+
+    method = getattr(type(catalog), "_query_files", None)
+    if not callable(method):
+        raise CatalogStreamingCompatibilityError(
+            "nautilus_trader=="
+            f"{TESTED_NAUTILUS_VERSION} does not expose the expected private "
+            "ParquetDataCatalog._query_files() method. Refusing the "
+            "memory-unbounded DataFusion fallback."
+        )
+    try:
+        parameter_names = list(inspect.signature(method).parameters)
+    except (TypeError, ValueError) as exc:
+        raise CatalogStreamingCompatibilityError(
+            "Could not verify the private ParquetDataCatalog._query_files() "
+            "signature. Refusing the memory-unbounded DataFusion fallback."
+        ) from exc
+    expected_parameters = ["self", "data_cls", "identifiers", "start", "end", "files"]
+    if parameter_names[: len(expected_parameters)] != expected_parameters:
+        raise CatalogStreamingCompatibilityError(
+            "Private ParquetDataCatalog._query_files() has an incompatible "
+            f"signature {parameter_names}; expected prefix {expected_parameters}. "
+            "Refusing the memory-unbounded DataFusion fallback."
+        )
+
+    if getattr(catalog, "fs_protocol", None) != "file":
+        raise CatalogStreamingCompatibilityError(
+            "The bounded catalog reader is validated only for local file-backed "
+            "ParquetDataCatalog instances. Refusing an unverified remote-filesystem "
+            "path and refusing the memory-unbounded DataFusion fallback."
+        )
+
+
+def _validate_catalog_file(
+    *,
+    catalog: ParquetDataCatalog,
+    file_path: str,
+    query_data_cls: type,
+    instrument_id: str,
+    batch_size: int,
+) -> _ValidatedCatalogFile:
+    try:
+        catalog_root = Path(catalog.path).resolve(strict=True)
+        path = Path(file_path).resolve(strict=True)
+        relative = path.relative_to(catalog_root)
+    except (OSError, ValueError) as exc:
+        raise CatalogFileLayoutError(
+            f"Selected catalog file is missing or outside catalog root {catalog.path!r}: "
+            f"{file_path!r}"
+        ) from exc
+
+    expected_directory = _CATALOG_DIRECTORY_BY_CLASS.get(query_data_cls.__name__)
+    if expected_directory is None:
+        raise CatalogStreamingCompatibilityError(
+            f"Bounded catalog reader does not support data class {query_data_cls.__name__!r}."
+        )
+    if (
+        len(relative.parts) != 4
+        or relative.parts[0] != "data"
+        or relative.parts[1] != expected_directory
+        or relative.suffix != ".parquet"
+    ):
+        raise CatalogFileLayoutError(
+            f"Selected file {path} does not belong to requested data class "
+            f"{query_data_cls.__name__}; expected catalog layout "
+            f"data/{expected_directory}/<instrument>/<timestamps>.parquet."
+        )
+
+    stat_before = _file_stat_identity(path)
+    parquet_file = pq.ParquetFile(path)
+    try:
+        schema = parquet_file.schema_arrow
+        metadata = schema.metadata or {}
+        encoded_instrument = metadata.get(b"instrument_id")
+        try:
+            file_instrument_id = (
+                encoded_instrument.decode("utf-8") if encoded_instrument is not None else None
+            )
+        except UnicodeDecodeError as exc:
+            raise CatalogFileLayoutError(
+                f"Selected file {path} has invalid UTF-8 instrument_id schema metadata."
+            ) from exc
+        if file_instrument_id != instrument_id:
+            raise CatalogFileLayoutError(
+                f"Selected file {path} belongs to instrument {file_instrument_id!r}, "
+                f"not requested instrument {instrument_id!r}."
+            )
+
+        expected_schema = _expected_catalog_schema(query_data_cls)
+        if not schema.equals(expected_schema, check_metadata=False):
+            raise CatalogFileLayoutError(
+                f"Selected file {path} physical Arrow schema does not match "
+                f"requested data class {query_data_cls.__name__} under the pinned "
+                f"Nautilus {TESTED_NAUTILUS_VERSION} contract. "
+                f"Expected fields {expected_schema.names}; found {schema.names}."
+            )
+
+        ts_field_index = schema.get_field_index("ts_init")
+        if ts_field_index < 0:
+            raise CatalogFileLayoutError(f"Selected file {path} has no ts_init column.")
+        ts_type = schema.field(ts_field_index).type
+        if not pa.types.is_integer(ts_type):
+            raise CatalogFileLayoutError(
+                f"Selected file {path} has non-integer ts_init type {ts_type}."
+            )
+
+        row_count = 0
+        first_ts: int | None = None
+        previous_ts: int | None = None
+        # Numeric row-group order is explicit; no filesystem/footer ordering
+        # assumption is used.
+        for row_group_index in range(parquet_file.num_row_groups):
+            for batch in parquet_file.iter_batches(
+                batch_size=batch_size,
+                row_groups=[row_group_index],
+                columns=["ts_init"],
+                use_threads=False,
+            ):
+                ts_values = batch.column(0)
+                if ts_values.null_count:
+                    raise CatalogFileLayoutError(
+                        f"Selected file {path} row group {row_group_index} "
+                        "contains null ts_init values."
+                    )
+                if len(ts_values) == 0:
+                    continue
+                batch_first = int(ts_values[0].as_py())
+                batch_last = int(ts_values[-1].as_py())
+                if previous_ts is not None and batch_first < previous_ts:
+                    raise CatalogFileLayoutError(
+                        f"Selected file {path} is internally unsorted by ts_init "
+                        f"across a batch/row-group boundary: {batch_first} < {previous_ts}."
+                    )
+                if len(ts_values) > 1:
+                    has_decrease = pc.any(
+                        pc.less(ts_values.slice(1), ts_values.slice(0, len(ts_values) - 1))
+                    ).as_py()
+                    if has_decrease:
+                        raise CatalogFileLayoutError(
+                            f"Selected file {path} is internally unsorted by ts_init "
+                            f"inside row group {row_group_index}."
+                        )
+                if first_ts is None:
+                    first_ts = batch_first
+                previous_ts = batch_last
+                row_count += len(ts_values)
+                del ts_values, batch
+
+        expected_rows = int(parquet_file.metadata.num_rows)
+        if row_count == 0 or first_ts is None or previous_ts is None:
+            raise CatalogFileLayoutError(f"Selected catalog file is empty: {path}.")
+        if row_count != expected_rows:
+            raise CatalogFileLayoutError(
+                f"Selected file {path} yielded {row_count} ts_init rows but its "
+                f"Parquet footer declares {expected_rows}."
+            )
+    finally:
+        parquet_file.close()
+
+    stat_after = _file_stat_identity(path)
+    if stat_after != stat_before:
+        raise CatalogFileLayoutError(
+            f"Selected catalog file changed while its layout was being validated: {path}."
+        )
+
+    filename_start, filename_end = _catalog_filename_interval_ns(path)
+    if (filename_start, filename_end) != (first_ts, previous_ts):
+        raise CatalogFileLayoutError(
+            f"Selected file {path} filename interval "
+            f"[{filename_start}, {filename_end}] does not match actual ts_init "
+            f"range [{first_ts}, {previous_ts}]."
+        )
+
+    return _ValidatedCatalogFile(
+        path=path,
+        first_ts=first_ts,
+        last_ts=previous_ts,
+        row_count=row_count,
+        stat_identity=stat_after,
+    )
+
+
+def _select_and_validate_catalog_files(
+    catalog: ParquetDataCatalog,
+    query_data_cls: type,
+    identifiers: list[str],
+    start: int | None,
+    end: int | None,
+    *,
+    batch_size: int,
+) -> list[_ValidatedCatalogFile]:
+    _require_pinned_nautilus_file_api(catalog)
+    if len(identifiers) != 1 or not isinstance(identifiers[0], str) or not identifiers[0]:
+        raise CatalogFileLayoutError(
+            "The bounded catalog reader requires exactly one non-empty instrument "
+            "identifier per stream; multi-instrument file concatenation is not ordered."
+        )
+    if batch_size <= 0:
+        raise ValueError(f"batch_size must be positive, got {batch_size}")
+    if start is not None and end is not None and end < start:
+        return []
+
+    try:
+        selected = catalog._query_files(  # noqa: SLF001 - pinned private compatibility boundary
+            query_data_cls,
+            identifiers,
+            start,
+            end,
+        )
+    except Exception as exc:
+        raise CatalogStreamingCompatibilityError(
+            "Private ParquetDataCatalog._query_files() failed under the pinned "
+            f"nautilus_trader=={TESTED_NAUTILUS_VERSION} contract: "
+            f"{type(exc).__name__}: {exc}. Refusing the memory-unbounded "
+            "DataFusion fallback."
+        ) from exc
+    if not isinstance(selected, list) or not all(isinstance(path, str) for path in selected):
+        raise CatalogStreamingCompatibilityError(
+            "Private ParquetDataCatalog._query_files() returned an incompatible "
+            f"value {type(selected).__name__}; expected list[str]. Refusing the "
+            "memory-unbounded DataFusion fallback."
+        )
+    if len(selected) != len(set(selected)):
+        raise CatalogFileLayoutError(
+            "Private ParquetDataCatalog._query_files() returned duplicate file paths."
+        )
+
+    validated = [
+        _validate_catalog_file(
+            catalog=catalog,
+            file_path=file_path,
+            query_data_cls=query_data_cls,
+            instrument_id=identifiers[0],
+            batch_size=batch_size,
+        )
+        for file_path in selected
+    ]
+    if len({item.path for item in validated}) != len(validated):
+        raise CatalogFileLayoutError(
+            "Selected catalog paths resolve to duplicate physical files."
+        )
+
+    # Actual timestamp ranges, not glob order, mtimes, or unverified lexical
+    # filename order, define deterministic file traversal.
+    validated.sort(key=lambda item: (item.first_ts, item.last_ts, item.path.as_posix()))
+    for item in validated:
+        if start is not None and item.last_ts < start:
+            raise CatalogStreamingCompatibilityError(
+                f"Private _query_files selected non-intersecting file {item.path} "
+                f"ending at {item.last_ts} before inclusive start {start}."
+            )
+        if end is not None and item.first_ts > end:
+            raise CatalogStreamingCompatibilityError(
+                f"Private _query_files selected non-intersecting file {item.path} "
+                f"starting at {item.first_ts} after inclusive end {end}."
+            )
+
+    for previous, current in zip(validated, validated[1:]):
+        if current.first_ts <= previous.last_ts:
+            relationship = (
+                "equal ts_init file boundary"
+                if current.first_ts == previous.last_ts
+                else "overlapping ts_init ranges"
+            )
+            raise CatalogFileLayoutError(
+                f"Cannot stream selected catalog files in canonical order: {relationship}: "
+                f"{previous.path}=[{previous.first_ts}, {previous.last_ts}], "
+                f"{current.path}=[{current.first_ts}, {current.last_ts}]. "
+                "CryptoRecorder validation catalogs require strictly disjoint closed "
+                "file intervals; refusing silent concatenation."
+            )
+    return validated
+
+
+# Nautilus's own pyo3->Cython conversion table (mirrors
+# ParquetDataCatalog._handle_table_nautilus()'s identical mapping) — needed
+# because ArrowSerializer.deserialize() always returns nautilus_pyo3
+# objects, and the rest of this codebase (comparators, tests, fixtures)
+# consistently uses the Cython classes.
+def _pyo3_to_cython_cls(data_cls: type) -> type | None:
+    from nautilus_trader.model.data import (
+        Bar,
+        OrderBookDelta,
+        OrderBookDeltas,
+        OrderBookDepth10,
+        QuoteTick,
+        TradeTick,
+    )
+
+    return {
+        "OrderBookDelta": OrderBookDelta,
+        "OrderBookDeltas": OrderBookDelta,
+        "OrderBookDepth10": OrderBookDepth10,
+        "QuoteTick": QuoteTick,
+        "TradeTick": TradeTick,
+        "Bar": Bar,
+    }.get(data_cls.__name__)
+
+
+def _iter_catalog_files_bounded(
+    catalog: ParquetDataCatalog,
+    data_cls: type,
+    identifiers: list[str],
+    start: int,
+    end: int,
+    *,
+    batch_size: int = DEFAULT_STREAM_BATCH_SIZE,
+) -> Iterator[Any]:
+    """Yield one instrument/class stream in canonical ts_init order.
+
+    ``batch_size`` bounds each PyArrow ``RecordBatch`` row count (an
+    effective PyArrow reader bound) — peak live decoded-object count is
+    bounded by this batch size, never by total file/day size or event
+    count. This implementation never invokes the Rust/DataFusion global
+    query.
+
+    For ``OrderBookDeltas`` requests this yields individual, ungrouped
+    ``OrderBookDelta`` objects. Both bounded consumers flatten either shape
+    identically, so materializing grouped containers would add no semantic
+    value.
+    """
+    from nautilus_trader.model.data import OrderBookDelta, OrderBookDeltas
+    from nautilus_trader.serialization.arrow.serializer import ArrowSerializer
+
+    query_data_cls = OrderBookDelta if data_cls is OrderBookDeltas else data_cls
+    cython_cls = _pyo3_to_cython_cls(query_data_cls)
+    files = _select_and_validate_catalog_files(
+        catalog,
+        query_data_cls,
+        identifiers,
+        start,
+        end,
+        batch_size=batch_size,
+    )
+
+    previous_decoded_ts: int | None = None
+    for validated_file in files:
+        if _file_stat_identity(validated_file.path) != validated_file.stat_identity:
+            raise CatalogFileLayoutError(
+                f"Selected catalog file changed after layout preflight: {validated_file.path}."
+            )
+        parquet_file = pq.ParquetFile(validated_file.path)
+        try:
+            # Row-group traversal order is numeric and explicit. PyArrow may
+            # split one row group into several bounded RecordBatches, whose
+            # physical order is retained.
+            for row_group_index in range(parquet_file.num_row_groups):
+                for batch in parquet_file.iter_batches(
+                    batch_size=batch_size,
+                    row_groups=[row_group_index],
+                    use_threads=False,
+                ):
+                    ts_column: pa.Array | None = None
+                    pyo3_decoded = ArrowSerializer.deserialize(
+                        data_cls=query_data_cls,
+                        batch=batch,
+                    )
+                    if (
+                        cython_cls is not None
+                        and pyo3_decoded
+                        and "nautilus_pyo3" in pyo3_decoded[0].__class__.__module__
+                    ):
+                        decoded = cython_cls.from_pyo3_list(pyo3_decoded)
+                        del pyo3_decoded
+                    else:
+                        decoded = pyo3_decoded
+                    try:
+                        if len(decoded) != batch.num_rows:
+                            raise CatalogFileLayoutError(
+                                f"Nautilus deserialized {len(decoded)} "
+                                f"{query_data_cls.__name__} objects from a "
+                                f"{batch.num_rows}-row Arrow batch in "
+                                f"{validated_file.path}. Refusing partial output."
+                            )
+
+                        # Validate the entire bounded decoded batch before
+                        # yielding its first object. This prevents a decoder
+                        # regression such as [1, 3, 2] from leaking the first
+                        # two objects before the inversion is noticed.
+                        ts_column = batch.column(batch.schema.get_field_index("ts_init"))
+                        batch_previous_ts = previous_decoded_ts
+                        for index, obj in enumerate(decoded):
+                            ts = int(obj.ts_init)
+                            arrow_ts = int(ts_column[index].as_py())
+                            if ts != arrow_ts:
+                                raise CatalogFileLayoutError(
+                                    "Nautilus deserializer changed Arrow row order or "
+                                    f"ts_init in {validated_file.path} at batch index "
+                                    f"{index}: Arrow ts_init={arrow_ts}, decoded "
+                                    f"ts_init={ts}."
+                                )
+                            if batch_previous_ts is not None and ts < batch_previous_ts:
+                                raise CatalogFileLayoutError(
+                                    "Catalog order changed after preflight while decoding "
+                                    f"{validated_file.path}: {ts} < {batch_previous_ts}."
+                                )
+                            if str(obj.instrument_id) != identifiers[0]:
+                                raise CatalogFileLayoutError(
+                                    "Nautilus deserializer returned the wrong instrument "
+                                    f"from {validated_file.path} at batch index {index}: "
+                                    f"{obj.instrument_id!s} != {identifiers[0]}."
+                                )
+                            batch_previous_ts = ts
+                        previous_decoded_ts = batch_previous_ts
+
+                        for obj in decoded:
+                            ts = int(obj.ts_init)
+                            if start is not None and ts < start:
+                                continue
+                            if end is not None and ts > end:
+                                continue
+                            yield obj
+                        if decoded:
+                            del obj
+                    finally:
+                        if ts_column is not None:
+                            del ts_column
+                        del decoded
+                    del batch
+        finally:
+            parquet_file.close()
+        if _file_stat_identity(validated_file.path) != validated_file.stat_identity:
+            raise CatalogFileLayoutError(
+                f"Selected catalog file changed while it was being decoded: "
+                f"{validated_file.path}."
+            )
 
 
 def load_instrument_ids(catalog_root: Path) -> list[str]:
@@ -107,58 +716,30 @@ def load_trade_ticks(
     return list(ticks or [])
 
 
-def iter_trade_ticks_windowed(
+def iter_trade_ticks_bounded(
     catalog_root: Path,
     instrument_id: str,
     start_ns: int,
     end_ns: int,
-    *,
-    window_ns: int = 3_600_000_000_000,  # 1 hour
 ) -> Iterator[Any]:
     """Yield TradeTick objects for one instrument across the half-open
-    caller range [start_ns, end_ns) in bounded time windows (default:
-    1 hour; configurable via `window_ns` for both testing and production
-    tuning), so that at most one window's worth of ticks is materialized by
-    the Nautilus catalog query at a time, rather than the full requested
-    range up front like load_trade_ticks() does.
+    caller range [start_ns, end_ns), streamed directly from validated
+    Parquet files in bounded PyArrow batches (see
+    `_iter_catalog_files_bounded()`).
 
-    IMPORTANT — Nautilus's own `catalog.trade_ticks(start=a, end=b)` query
-    is INCLUSIVE on both `a` and `b` (verified directly against a real
-    on-disk catalog in tests/test_windowed_loader_boundaries.py — an event
-    at exactly `ts == b` is returned by that query, not excluded). Naively
-    chaining windows with `next_start = previous_end` therefore yields any
-    event that lands exactly on an internal window boundary TWICE (once as
-    the inclusive `end` of one window, once as the inclusive `start` of the
-    next). To honor the caller's half-open [start_ns, end_ns) contract
-    while querying Nautilus's inclusive-both-ends interface without
-    duplication, this function partitions the range into non-overlapping
-    CLOSED sub-windows: each window's query uses
-    `end = min(window_start + window_ns - 1, end_ns - 1)`, and the next
-    window starts at exactly `end + 1`. Since all Nautilus event
-    timestamps are integer nanoseconds, `+1`/`-1` unambiguously identifies
-    "the next/previous distinct representable instant" with no possible
-    event landing in the gap between two adjacent closed windows.
+    Peak live objects is bounded by the configured PyArrow batch size and
+    is independent of total requested time range or event count.
 
-    IMPORTANT — this bounds the query result size per window, which is a
-    reasonable proxy for reduced peak memory versus loading the whole day
-    in one call, but a fixed *time* window does not by itself guarantee a
-    fixed *event-count* (and therefore RSS) bound: an unusually active
-    window (e.g. a volatility spike) can still contain far more events than
-    a quiet window of the same duration. Treat `window_ns` as a tuning knob
-    to be validated against measured per-window RSS on real production data
-    (issue #20 Tier 3), not as a proven strict memory ceiling from time
-    alone."""
+    `catalog.trade_ticks(start=a, end=b)` is INCLUSIVE on both `a` and `b`
+    (verified in tests/test_catalog_reader_boundaries.py); this function
+    queries the caller's half-open range as the single closed range
+    `[start_ns, end_ns - 1]`, matching that inclusive interface exactly
+    (no internal sub-windowing is needed because the file reader itself is
+    batch-bounded)."""
     if end_ns <= start_ns:
         return
     catalog = ParquetDataCatalog(str(catalog_root))
-    last_inclusive_ns = end_ns - 1
-    window_start = start_ns
-    while window_start <= last_inclusive_ns:
-        window_end = min(window_start + window_ns - 1, last_inclusive_ns)
-        ticks = catalog.trade_ticks(instrument_ids=[instrument_id], start=window_start, end=window_end)
-        for tick in ticks or []:
-            yield tick
-        window_start = window_end + 1
+    yield from _iter_catalog_files_bounded(catalog, TradeTick, [instrument_id], start_ns, end_ns - 1)
 
 
 def _enum_name(value: Any) -> str:
@@ -352,7 +933,7 @@ def compare_trade_ticks_exhaustive(
       both `old_ticks` and `new_ticks` and never materializes either into a
       list internally, so memory use is independent of total event count —
       suitable for a complete production day's tens/hundreds of millions of
-      trades when paired with iter_trade_ticks_windowed() as the loader,
+      trades when paired with iter_trade_ticks_bounded() as the loader,
       and runs in O(N) time (a single pass, no per-event bookkeeping
       structure beyond position counters), so it remains practical at
       200M+ events.
@@ -452,37 +1033,35 @@ def load_order_book_deltas(
     return list(deltas or [])
 
 
-def iter_order_book_deltas_windowed(
+def iter_order_book_deltas_bounded(
     catalog_root: Path,
     instrument_id: str,
     start_ns: int,
     end_ns: int,
-    *,
-    window_ns: int = 3_600_000_000_000,  # 1 hour
 ) -> Iterator[Any]:
-    """Yield OrderBookDeltas group objects for one instrument across the
-    half-open caller range [start_ns, end_ns) in bounded (configurable)
-    time windows; see iter_trade_ticks_windowed() for the discovered
-    Nautilus inclusive-both-ends query semantics, the closed-window
-    partitioning this function uses to avoid double-yielding a boundary
-    event, and the explicit caveat that a fixed time window bounds query
-    result size per window but is not by itself a proven strict
-    event-count/RSS bound — it must be tuned against measured per-window
-    memory on real production data (issue #20 Tier 3). Pass the result
-    directly to compare_order_book_deltas_exhaustive(), which flattens the
-    grouped objects internally without materializing the full flattened
-    stream."""
+    """Yield individual (ungrouped) OrderBookDelta objects for one
+    instrument across the half-open caller range [start_ns, end_ns),
+    streamed directly via `_iter_catalog_files_bounded()` (see that
+    function's docstring for the file/row-group-bounded reader this uses).
+    Peak live objects is bounded by the configured batch size, not by day
+    length, window size, or total event count.
+
+    This matches the PREVIOUS default behavior exactly (both before and
+    after the round-1/round-2/round-5 memory-bounding corrections):
+    `catalog.order_book_deltas(...)` defaults to `batched=False`, i.e. a
+    flat individual-`OrderBookDelta` stream, not grouped `OrderBookDeltas`
+    objects — grouping was never part of this loader's contract. Pass the
+    result directly to compare_order_book_deltas_exhaustive() /
+    compare_book_checkpoints_streaming(), both of which flatten either
+    shape (flat `OrderBookDelta` or grouped `OrderBookDeltas`) identically
+    via `_iter_flatten_deltas()`, so this is a distinction without a
+    difference for those comparators."""
     if end_ns <= start_ns:
         return
     catalog = ParquetDataCatalog(str(catalog_root))
-    last_inclusive_ns = end_ns - 1
-    window_start = start_ns
-    while window_start <= last_inclusive_ns:
-        window_end = min(window_start + window_ns - 1, last_inclusive_ns)
-        deltas = catalog.order_book_deltas(instrument_ids=[instrument_id], start=window_start, end=window_end)
-        for obj in deltas or []:
-            yield obj
-        window_start = window_end + 1
+    from nautilus_trader.model.data import OrderBookDelta
+
+    yield from _iter_catalog_files_bounded(catalog, OrderBookDelta, [instrument_id], start_ns, end_ns - 1)
 
 
 def _flatten_deltas(objects: Iterable[Any]) -> list[Any]:
@@ -674,7 +1253,7 @@ def compare_order_book_deltas_exhaustive(
     materializes the flattened delta stream into a list), so memory is
     bounded and independent of total event count — suitable for a complete
     production day's tens/hundreds of millions of depth events when paired
-    with iter_order_book_deltas_windowed() as the loader, and runs in O(N)
+    with iter_order_book_deltas_bounded() as the loader, and runs in O(N)
     time (a single pass, no per-event bookkeeping structure), remaining
     practical at 200M+ events.
 
@@ -1096,20 +1675,18 @@ def reconstruct_book_checkpoints_streaming(
 ) -> dict[int, dict[str, list[list[str]]]]:
     """Bounded-memory equivalent of reconstruct_book_checkpoints_from_deltas():
     processes `objects` (an iterable/generator of OrderBookDeltas, e.g. from
-    iter_order_book_deltas_windowed()) sequentially, one flattened delta at
+    iter_order_book_deltas_bounded()) sequentially, one flattened delta at
     a time via _iter_flatten_deltas(), retaining only the current top-N
     book state (`bids`/`asks` dicts) plus the handful of already-captured
     checkpoint snapshots — never the full-day delta list.
 
-    This relies on `objects` arriving in non-decreasing `ts_field` order,
-    which Nautilus's own ParquetDataCatalog already enforces at write time
-    (`_objects_to_table()` raises ValueError otherwise — verified directly;
-    see tests/test_windowed_loader_boundaries.py) and which
-    iter_order_book_deltas_windowed()'s closed, non-overlapping windows
-    preserve across window boundaries. It does not perform the original
-    function's extra `(ts, sequence, read_index)` sort — that additional
-    sort assumed an unordered input; it is unneeded and would itself
-    require full materialization, defeating the point of this function.
+    This relies on `objects` arriving in non-decreasing `ts_field` order.
+    The active file reader proves that order with a whole-selection preflight
+    before yielding and rejects internally unsorted or overlapping files.
+    It does not perform the original function's extra
+    `(ts, sequence, read_index)` sort — that additional sort assumed an
+    unordered input; it is unneeded and would itself require full
+    materialization, defeating the point of this function.
     """
     sorted_cps = sorted(set(int(ts) for ts in checkpoint_tss))
     snapshots: dict[int, dict[str, list[list[str]]]] = {}
@@ -1221,36 +1798,27 @@ def compare_book_checkpoints_streaming(
 
 
 # ---------------------------------------------------------------------------
-# OrderBookDepth10 — windowed loader + exhaustive comparator
+# OrderBookDepth10 — bounded reader + exhaustive comparator
 # ---------------------------------------------------------------------------
 
 
-def iter_order_book_depth10_windowed(
+def iter_order_book_depth10_bounded(
     catalog_root: Path,
     instrument_id: str,
     start_ns: int,
     end_ns: int,
-    *,
-    window_ns: int = 3_600_000_000_000,  # 1 hour
 ) -> Iterator[Any]:
     """Yield OrderBookDepth10 objects for one instrument across the
-    half-open caller range [start_ns, end_ns) using the same closed-window
-    partitioning as iter_trade_ticks_windowed()/iter_order_book_deltas_windowed()
-    (see the former's docstring for the discovered Nautilus inclusive-
-    both-ends query semantics this avoids double-yielding on). Depth10
-    volume is normally small relative to raw deltas, but the acceptance
-    path should still avoid an unnecessary full-day materialization."""
+    half-open caller range [start_ns, end_ns), streamed from preflighted
+    Parquet files via `_iter_catalog_files_bounded()`. Depth10 volume is
+    normally small relative to raw deltas, but the acceptance path still
+    avoids an unbounded materialization."""
     if end_ns <= start_ns:
         return
     catalog = ParquetDataCatalog(str(catalog_root))
-    last_inclusive_ns = end_ns - 1
-    window_start = start_ns
-    while window_start <= last_inclusive_ns:
-        window_end = min(window_start + window_ns - 1, last_inclusive_ns)
-        depths = catalog.order_book_depth10(instrument_ids=[instrument_id], start=window_start, end=window_end)
-        for obj in depths or []:
-            yield obj
-        window_start = window_end + 1
+    from nautilus_trader.model.data import OrderBookDepth10
+
+    yield from _iter_catalog_files_bounded(catalog, OrderBookDepth10, [instrument_id], start_ns, end_ns - 1)
 
 
 def compare_order_book_depth10_exhaustive(

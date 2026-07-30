@@ -59,13 +59,30 @@ WRITE_BATCH_SIZE = 5000
 SUPPORTED_PROFILES = ("trades_only", "full_l2", "depth_only", "depth10")
 
 # Documented equivalence caveats for the replay-based full_l2 reconstruction.
-# These stem from replay_store v0 NOT persisting sync_state/stream_lifecycle
-# records and NOT performing cross-day repartitioning/carry recovery. See
-# docs/FULL_L2_REPLAY_CATALOG_PLAN.md for the full equivalence boundary.
+# See docs/FULL_L2_REPLAY_CATALOG_PLAN.md for the full equivalence boundary.
+#
+# issue #20 Phase 7: "UTC-boundary repartitioning of clock-skewed records is
+# not applied" and "cross-day carry / synthetic opening snapshot is not
+# reproduced (no prev/next repartitioning)" were REMOVED from this list only
+# after implementation and evidence: depth_v2 raw records are now
+# repartitioned across D-1/D/D+1 by canonical event time in
+# ``pipeline.build_replay_store._stream_repartitioned_depth_records``,
+# reusing convert_day.py's own reference rule
+# (``converter.depth_phase2._spool_repartitioned_records``) exactly — proven
+# via the full exhaustive `validate_catalog_equivalence` gate (TradeTicks,
+# OrderBookDeltas, OrderBookDepth10, book checkpoints, continuity
+# diagnostics, fenced ranges, raw-to-replay metadata — all 8 components) on
+# BINANCE_SPOT/ADAUSDT for 2026-06-10, 2026-06-11 (the specific day that
+# exposed a 47-event OrderBookDeltas gap before this correction — now
+# old=new=1,071,997 exactly), and 2026-06-12, for both schema_version=0 and
+# schema_version=2. See ``pipeline.build_replay_store.check_depth_repartition_readiness``
+# for the readiness dependency: offline equivalence construction requires a
+# closed full D+1 scope, while the production 01:00 build uses a narrower
+# closed-first-hour operational policy documented there.
+# ``sync_state``/``stream_lifecycle`` records are preserved by current replay
+# schemas and the accepted ADA/BTC gates proved continuity and canonical
+# fenced-range results exact; they are therefore not listed as caveats.
 FULL_L2_CAVEATS = [
-    "sync_state-driven fenced ranges are not regenerated (replay v0 drops sync_state records)",
-    "cross-day carry / synthetic opening snapshot is not reproduced (no prev/next repartitioning)",
-    "UTC-boundary repartitioning of clock-skewed records is not applied",
     "duplicate depth suppression relies on the replay builder, not the converter spool",
 ]
 
@@ -497,33 +514,66 @@ def generate_catalog_from_replay(
 
                     # Stream and convert trades
                     if writes_trades:
-                        trade_batch = []
-                        for trade in reader.iter_trades(venue, symbol, date):
-                            status["records_read"]["trades"] += 1
-                            ts_init_ns = int(trade.get("ts_receive_ns") or trade.get("ts_exchange_ns", 0))
+                        # issue #20 Phase 7 semantic-oracle diagnosis fix:
+                        # TradeTick objects must be buffered through a
+                        # ts_init-sorted ObjectSpool before being written to
+                        # the catalog, exactly like convert_day.py's own
+                        # _write_object_spool() does and exactly like this
+                        # same function already does for deltas/depth10 in
+                        # _write_depth_for_partition() below. Writing
+                        # directly from reader.iter_trades()'s physical
+                        # replay order (sorted by
+                        # (trade_stream_session_id, trade_session_seq,
+                        # raw_index)) is CORRECT for that layer but is not
+                        # chronological: trade_stream_session_id is a
+                        # simple in-process counter (native_trades.py)
+                        # that resets on every recorder process restart, so
+                        # a session started late in the day after a restart
+                        # can have a SMALLER session id than an
+                        # earlier-in-the-day session from a longer-running
+                        # process — session-key order is intentionally not
+                        # wall-clock order (this is what the whole
+                        # replay/convert_day stack relies on for per-session
+                        # continuity/fencing). Nautilus's ParquetDataCatalog
+                        # requires a stream to be ts_init-monotonic, so the
+                        # FINAL write order must be re-sorted by ts_init —
+                        # bounded memory via ObjectSpool's disk-backed
+                        # SQLite `ORDER BY ts_init, ordinal` (see
+                        # converter/spool.py), never a full-day in-RAM sort.
+                        # TradeTicks have no sequential book-state
+                        # dependency (unlike deltas), so re-sorting them by
+                        # ts_init before writing changes only their
+                        # on-disk/write order, never their values, counts,
+                        # or any other content.
+                        trade_ordinal = 0
+                        with ObjectSpool(prefix="cryptorecorder-gc-trade-") as trade_spool:
+                            for trade in reader.iter_trades(venue, symbol, date):
+                                status["records_read"]["trades"] += 1
+                                ts_init_ns = int(trade.get("ts_receive_ns") or trade.get("ts_exchange_ns", 0))
 
-                            # Nautilus catalog bounded reads are based on ts_init.
-                            if ts_init_ns < start_ns:
-                                status["records_skipped"]["outside_window"] += 1
-                                continue
-                            if ts_init_ns >= end_ns:
-                                status["records_skipped"]["outside_window"] += 1
-                                continue
+                                # Nautilus catalog bounded reads are based on ts_init.
+                                if ts_init_ns < start_ns:
+                                    status["records_skipped"]["outside_window"] += 1
+                                    continue
+                                if ts_init_ns >= end_ns:
+                                    status["records_skipped"]["outside_window"] += 1
+                                    continue
 
-                            trade_tick = _convert_trade_to_nautilus(
-                                trade, instrument_id, venue
-                            )
-                            if trade_tick:
-                                trade_batch.append(trade_tick)
-                                status["records_written"]["trade_ticks"] += 1
-                                if len(trade_batch) >= 5000:
-                                    catalog.write_data(trade_batch)
-                                    trade_batch = []
-                            else:
-                                status["records_skipped"]["invalid_trade"] += 1
-                                status["skipped_invalid_records"] += 1
-                        if trade_batch:
-                            catalog.write_data(trade_batch)
+                                trade_tick = _convert_trade_to_nautilus(
+                                    trade, instrument_id, venue
+                                )
+                                if trade_tick:
+                                    trade_ordinal = trade_spool.insert_many(
+                                        [trade_tick], start_ordinal=trade_ordinal
+                                    )
+                                    status["records_written"]["trade_ticks"] += 1
+                                else:
+                                    status["records_skipped"]["invalid_trade"] += 1
+                                    status["skipped_invalid_records"] += 1
+                            if trade_spool.count:
+                                trade_spool.commit()
+                                for spool_batch in trade_spool.iter_batches(5000):
+                                    catalog.write_data(spool_batch)
 
                     # Depth records (OrderBookDeltas / OrderBookDepth10) via the
                     # shared, validated converter engine + replay adapter.

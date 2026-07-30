@@ -212,13 +212,15 @@ def test_unsupported_schema_version_fails_clearly(tmp_path):
         reader.get_schema_version("BINANCE_SPOT", "BTCUSDT", "2026-06-10")
 
 
-def test_supported_schema_versions_constant_is_0_and_1():
-    assert set(SUPPORTED_SCHEMA_VERSIONS) == {0, 1}
+def test_supported_schema_versions_constant_is_0_1_and_2():
+    # issue #20 Phase 7 hierarchical-integrity candidate added
+    # schema_version=2 alongside 0 (legacy) and 1 (compact prototype).
+    assert set(SUPPORTED_SCHEMA_VERSIONS) == {0, 1, 2}
 
 
 def test_writer_rejects_unsupported_schema_version(tmp_path):
     with pytest.raises(ValueError, match="Unsupported schema_version"):
-        ReplayWriter(tmp_path / "replay_store", "BINANCE_SPOT", "BTCUSDT", "2026-06-10", schema_version=2)
+        ReplayWriter(tmp_path / "replay_store", "BINANCE_SPOT", "BTCUSDT", "2026-06-10", schema_version=3)
 
 
 # ---------------------------------------------------------------------------

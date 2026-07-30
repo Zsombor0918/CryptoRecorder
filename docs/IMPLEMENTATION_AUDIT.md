@@ -767,7 +767,9 @@ doesn't need it.
 4. Canonical published-file checksums (already exist today via
    `depth_checksum`/`trades_checksum` in the manifest).
 5. A deterministic mapping function from a replay event (partition + row
-   ordinal) back to its exact source raw record.
+   contribution ordinal) back to its exact source raw file. For
+   event-time-repartitioned depth, the ordinal is among that file's accepted
+   records; locating a physical JSON line requires replaying the same filter.
 6. Corruption detection at all four levels: raw, build-time (spool/merge),
    block, and published-file.
 
@@ -775,9 +777,208 @@ Per-event hash removal is permitted only if this design, once implemented, is
 shown to provide **equivalent or stronger** integrity/traceability than
 today's per-row hex hash. If a per-event hash remains judged necessary after
 implementation, a 32-byte binary representation must be benchmarked against
-the current 64-character hex column before being adopted. **None of this
-hierarchy has been implemented yet** — this section is a design record, and
-the schema (Phase 5+) is not started.
+the current 64-character hex column before being adopted.
+
+**Status update (issue #20 Phase 7, uncommitted prototype):** the hierarchy
+above is now implemented as a `schema_version=2` candidate on the
+`refactor/recorder-replay-only` branch (`stores/replay_writer.py`,
+`stores/replay_reader.py`, `pipeline/raw_manifest.py`,
+`pipeline/build_replay_store.py`), gated behind an explicit,
+mandatory-`source_identity`, fail-closed contract — **not yet committed, not
+yet benchmarked at scale, and not a production claim**. The threat/integrity
+matrix below was written and used to audit that prototype before any
+representative-symbol or full-universe benchmarking began, per the review
+checklist that gated this work.
+
+**Validation-tier correction (issue #20 Phase 7, second review round):** the
+first prototype performed block-level digest re-verification inside EVERY
+`validate_partition()` call, using a per-row Python/JSON digest
+(`_canonical_row_bytes`/`_update_block_digest_with_row`, since removed).
+Measured on the representative VELVETUSDT partition (11.4M trade rows,
+2026-06-11): a single `validate_partition()` call took **~582 seconds**, and
+the deep self-contained check took **~1097 seconds** — a production blocker
+for routine skip-if-valid/publication checks across a multi-hundred-symbol
+universe. This was corrected by splitting validation into two explicit
+tiers:
+
+- **Routine** (`validate_partition`, unchanged call sites — see 3b below):
+  manifest/schema/builder contract, expected files, Parquet readability and
+  exact physical schema, integrity-metadata STRUCTURAL shape, and the
+  COMPLETE-FILE SHA-256 checksum — never deserializes/hashes individual
+  rows. Measured: **~0.2s** on the same VELVETUSDT partition (vs. v1's own
+  routine check at ~0.5s — materially comparable).
+- **Deep** (`audit_partition_deep`,
+  explicitly requested only): re-verifies every block's digest, now using a
+  vectorized, Arrow-native canonical encoding (`_canon_array`/
+  `_canon_table_hash`) instead of per-row Python/JSON — measured at **~35s**
+  for the same VELVETUSDT partition, a ~17x-31x speedup over the original
+  per-row approach. The current `arrow_canonical_v2` method remains
+  deterministic and round-trip-stable
+  (verified for nested `list<struct>` bids/asks columns specifically, which
+  do NOT survive a naive raw-Arrow-IPC-buffer hash unchanged across a real
+  Parquet write+read cycle — see `_canon_array`'s docstring), length-frames
+  variable-width components, and includes primitive/list/struct validity.
+  Tests distinguish null list from empty list and null struct from a valid
+  struct with identical null children. Full benchmark gate results in
+  `docs/CHANGE_AUDIT.md`.
+
+Existing artifacts whose manifests record `arrow_canonical_v1` remain
+auditable with that unchanged legacy method. It is deterministic for the
+historically produced non-null nested replay rows, but it is not a general
+collision-proof Arrow serialization: strings/names are not length framed and
+nested validity is omitted. New artifacts record `arrow_canonical_v2`;
+verifiers dispatch on the manifest method rather than silently reinterpreting
+old block digests. Exact physical-schema validation and complete-file SHA-256
+remain separate integrity layers: routine validation checks the latter over
+the complete Parquet bytes, while deep validation checks logical row-group
+content under the recorded canonical method.
+
+Offline equivalence construction now fails closed until the complete D+1 raw
+depth scope is proven closed (a closed final-hour file), and a failed non-empty
+previous-day carry build aborts catalog reconstruction. The production 01:00
+daily build retains the narrower closed-T00 readiness policy: that is an
+explicit operational latency assumption, not a code-enforced maximum-delay
+invariant.
+
+**Semantic-gate catalog reader boundary (issue #20 Phase 7, BTCUSDT OOM
+forensics and hardening):** the exhaustive catalog comparator no longer uses
+Nautilus/DataFusion for full-day event streams. Nautilus 1.225.0 appends a
+global `ORDER BY ts_init`, which was proven to materialize the full
+multi-file BTCUSDT delta result natively before yielding. The replacement in
+`validation/catalog_compare.py` reads selected Parquet files directly in
+bounded PyArrow batches.
+
+This reader has a deliberately fail-closed compatibility contract:
+
+- `ParquetDataCatalog._query_files()` is a **private** method. It is used only
+  because Nautilus 1.225.0 has no supported public file-pruning API that
+  avoids the DataFusion query. `requirements.txt` pins
+  `nautilus_trader==1.225.0`; runtime version/signature mismatches raise
+  clearly, with no DataFusion fallback.
+- The reference writer (`convert_day.py` via `ObjectSpool`) and replay
+  reconstruction writer (`validation/replay_catalog_reconstruct.py`, also via
+  `ObjectSpool`) both order by `(ts_init, ordinal)` and call ordinary
+  `ParquetDataCatalog.write_data()` without `skip_disjoint_check`. Under the
+  pinned Nautilus version, every successfully written distinct file is
+  internally non-decreasing and adjacent closed file ranges are strictly
+  disjoint. This is a CryptoRecorder validation-output invariant, not a
+  general Nautilus-catalog guarantee.
+- Before yielding, the reader scans `ts_init` for every selected file one
+  file/row group/batch at a time, validates class/instrument/schema identity,
+  including exact pinned physical field order/types/nullability, actual range
+  against the filename, deterministic row-group/file order, and strict
+  non-overlap. Equal timestamps at a file boundary are rejected as overlap;
+  equal timestamps inside one file retain physical ordinal order.
+- `ArrowSerializer.deserialize()` and the relevant
+  `from_pyo3_list()` conversion operate only on the current Arrow batch.
+  Before yielding any object from a bounded decoded batch, the reader validates
+  decoded count, Arrow-to-object `ts_init` identity/order, monotonicity, and
+  instrument identity for the whole batch. Focused real-Parquet tests verify
+  at most one file is open, decoded batch size stays at or below the configured
+  bound, prior Arrow batch wrappers are released at the next decode and after
+  exhaustion, and conversion does not retain its input list.
+
+One separate writer limitation was found and is not hidden: Nautilus 1.225.0
+checks whether a timestamp-derived filename already exists before it performs
+the disjointness check. A later write chunk with the exact same singleton
+interval can therefore be skipped. The reader can reject overlap among files
+which exist but cannot recover a chunk already omitted by the writer.
+Non-overlap proves the supported layout, not arbitrary writer completeness.
+The preserved BTCUSDT artifacts have strictly disjoint files and their
+exhaustive trade/delta streams match exactly, so this finding does not require
+a rebuild of those accepted artifacts.
+
+The remaining full-day semantic components can run as separate
+`validation.stage_runner_cli` subprocesses: `depth10`, `checkpoints`,
+`continuity`, `fences`, `metadata`, and `integrity`. Metadata combines the bounded
+event-keyed raw-to-replay metadata comparison with a fresh raw source-identity
+recomputation and requires equality with both `manifest.source_identity` and
+`manifest.integrity.source_identity`; integrity separately runs routine and
+deep replay-partition verification. Report aggregation can require an exact
+stage set and a shared date/venue/symbol/source/candidate scope, preventing a
+missing or cross-artifact fragment from being reported as a pass. The obsolete
+combined `depth` compatibility command was removed; Depth10 and checkpoints
+are explicit isolated stages.
+
+#### 3a. Threat/integrity matrix: per-event hash (v1) vs. hierarchical
+     traceability (v2 prototype)
+
+Both designs are **unsigned** (SHA-256 only, no asymmetric signing/HMAC with
+a secret key never present in this repository or its build environment).
+Neither design, alone or together, can prevent a sufficiently privileged
+attacker from rewriting both the data and every checksum that describes it
+consistently — this is stated plainly in the final row and must not be
+overclaimed as "prevented."
+
+Note (routine vs. deep): rows 4-8 below distinguish which tier of v2
+validation catches each scenario. **Routine** validation (always run, on
+every publish/skip-valid/daily-build check) catches whole-file-level
+corruption via the unchanged complete-file SHA-256 mechanism. **Deep**
+audit (explicitly requested only, never automatic) additionally catches
+sub-file (block-level) corruption/tampering that a whole-file checksum
+alone cannot localize — e.g. a value changed AND the whole-file checksum
+recomputed to match, which routine validation cannot detect by design (see
+`test_routine_validate_partition_does_not_catch_stale_block_checksum` and
+its paired `test_deep_audit_catches_changed_value_via_stale_block_checksum`).
+
+| # | Threat / corruption scenario | Old design: per-event `native_payload_hash` (v1) | New design: manifest-level hierarchy (v2 prototype) | Verdict |
+|---|---|---|---|---|
+| 1 | Changed raw bytes (a single byte flipped in a `data_raw` file after ingestion) | Not detected at all — the hash is computed from the CONVERTED replay row, never re-derived from or compared against the raw byte stream; nothing in v1 re-reads or checksums `data_raw`. | Detected: `compute_raw_source_identity`'s per-file `sha256` (over the raw file's on-disk, i.e. compressed, bytes) changes; any later re-verification against a stored `source_identity` catches it. Requires a stored/prior `source_identity` to compare against — a single ad hoc read of `data_raw` with no baseline cannot detect it. | v2 strictly stronger — v1 provides **zero** raw-tamper detection. |
+| 2 | Wrong source file (a replay event's declared/implied provenance points at the wrong raw file, e.g. after a rename/reshuffle) | Not detected — v1 has no source-file linkage of any kind; the per-event hash says nothing about *which* raw file produced a row. | Detected/preventable: `resolve_source_record` gives an exact source-file path plus contribution ordinal for every `raw_index`, derived from `record_range`. For non-repartitioned trades this is also the parsed-record ordinal; for event-time-repartitioned depth it is the ordinal among that file's accepted contribution, and exact physical-line location requires rescanning the filter/dedupe rule. A wrong-file claim remains falsifiable from the stored path/checksum identity. | v2 strictly stronger for source-file identity — a capability v1 never had — without overstating physical-line resolution for repartitioned depth. |
+| 3 | Missing/extra/reordered raw records (a raw file loses, gains, or reorders lines before/at conversion time) | Not detected — v1's hash is per converted-row and carries no raw-side record-count or ordering information. | Detected, via two independent mechanisms that together cover both count and order changes: (a) **ordinary reordering of records within an unchanged raw file changes that file's SHA-256** (`compute_raw_source_identity`'s per-file `sha256` is computed over the file's exact on-disk byte sequence, so reordering the lines inside it — even with no line added/removed — produces different bytes and therefore a different hash); (b) a missing/extra raw record additionally changes `record_count`/`record_range` (a file's count and every subsequent file's cumulative range). Both (a) and (b) require comparison against a previously-recorded, trusted `source_identity` snapshot — a single fresh scan of already-mutated raw data with no baseline cannot itself prove a prior state existed, only that today's scan disagrees with a stored one. | v2 strictly stronger — raw-file SHA-256 already catches *any* byte-level reordering/edit (not merely a count change), and `record_count`/`record_range` additionally localizes count changes to a specific file, given a baseline to compare against. |
+| 4 | Changed replay value (one field of one already-converted row is altered in place) | Detected: the per-event hash was computed from the original row's native payload; if a consumer recomputes and compares that same hash, a changed value is caught. In practice, no internal consumer ever recomputes/compares it (see the consumer-inventory finding above), so this detection capability, while structurally present, has never been exercised by anything in this codebase. | **DEEP tier only**: the containing Parquet row-group's block SHA-256 (vectorized canonical Arrow encoding — see `_canon_array`) changes; `verify_block_integrity`, invoked by `audit_partition_deep`, recomputes and compares it — proven by `test_deep_audit_catches_changed_value_via_stale_block_checksum`, which changes one logical value, updates only the whole-file checksum, leaves the block checksum stale, and shows deep audit still reports a problem (while ROUTINE `validate_partition()` does NOT catch this exact scenario by design — see `test_routine_validate_partition_does_not_catch_stale_block_checksum` — routine validation instead catches an *ordinary* corruption where the whole-file checksum is NOT separately recomputed to match, per row 7). | Materially equivalent detection capability at the deep tier, actively exercised by real tests (v1's per-event hash was never read/compared by anything internal). |
+| 5 | Missing/extra/reordered replay rows (a row is dropped, duplicated, or reordered within/across a partition) | Not detected — a per-event hash says nothing about how many other rows exist or their order; a dropped row simply has its hash silently disappear along with it. | Detected via two layers: **whole-file level (ROUTINE tier, always run)** — the existing `depth_checksum`/`trades_checksum` (unchanged mechanism from v0/v1) changes for any row addition/removal/reordering that isn't separately recomputed into the manifest, since it covers the complete Parquet file's bytes; **block level (DEEP tier, explicit only)** — `verify_block_integrity` additionally checks `num_rows` per block AND the row-group count against `len(blocks)`, and ordinary reordering of replay rows (even preserving count) changes the block's vectorized canonical digest, localizing the exact affected block. | v2 strictly stronger at both tiers — v1 provides **zero** row-count/order detection at either level. |
+| 6 | Damaged replay block (one Parquet row-group's bytes are corrupted, e.g. bad disk sector, partial write) | Only detected indirectly, and only if the whole-file `depth_checksum`/`trades_checksum` (unchanged from v0, already present in both v1 and v2) happens to be recomputed and compared — the per-event hash itself gives no finer-grained (sub-file) localization of the damage. | **ROUTINE tier** catches it via the unchanged whole-file checksum (same as v1/v0, no localization). **DEEP tier** additionally localizes: `verify_block_integrity` reads and re-verifies each row-group independently, reporting exactly which block index failed and why (row-count mismatch vs. checksum mismatch vs. unreadable row-group). | v2 at least as strong at routine tier (parity with v1/v0), strictly stronger at deep tier (adds localization neither v1 nor v0 ever had). |
+| 7 | Damaged complete Parquet file (whole-file corruption/truncation) | Detected only via the existing whole-file `depth_checksum`/`trades_checksum` (identical mechanism already present pre-v2; the per-event hash adds nothing here). | **ROUTINE tier**: same whole-file checksum mechanism (unchanged) — this is routine validation's primary, cheap defense, proven directly by `test_routine_validation_detects_ordinary_file_corruption_via_complete_checksum`. **DEEP tier** additionally fails per-block with a specific "could not read row-group"/row-count-mismatch message for a truncated file, giving strictly more diagnostic detail. | v2 at least as strong at routine tier, with better diagnostics available at the deep tier. |
+| 8 | Changed/missing manifest (the `manifest.json` itself is edited or deleted) | `validate_partition` already rejects a manifest with a missing/invalid `depth_checksum`/`trades_checksum` field, or a missing file entirely (pre-existing v0/v1 behavior, unrelated to the per-event hash). | **ROUTINE tier**: same manifest-presence/checksum-field checks, PLUS `_validate_schema_version_contract`'s v2 branch requires a well-formed `integrity` dict (`source_identity`, `depth_blocks`, `trade_blocks` all present and correctly typed) — a manifest edited to strip or malform the integrity hierarchy is explicitly rejected by ROUTINE validation alone (`test_both_modes_reject_missing_integrity_metadata`, `test_both_modes_reject_malformed_integrity_metadata` — both tiers fail closed, deep tier never needed for this check). | v2 strictly stronger — adds a structural check v1 never had, and it is cheap enough to be part of the always-run routine tier. |
+| 9 | Raw data no longer locally present (`data_raw` pruned/archived/moved, e.g. after Syncthing rotation) | v1's per-event hash lives entirely inside the replay row itself and was never raw-dependent to begin with — trivially "unaffected," but this was never a meaningful integrity guarantee in the first place (see rows 1-3: v1 detects nothing raw-side regardless of whether raw is present). | Explicitly designed for this: both `validate_partition` (routine) and `audit_partition_deep` (deep) use ONLY `manifest.json`/`depth.parquet`/`trades.parquet` — never touch `data_raw` — and are proven to keep passing after raw is deleted (`test_replay_integrity_verification_self_contained_after_raw_removed`, `test_self_contained_reconstruction_requires_neither_raw_nor_deep_audit`). Only the raw-dependent *cross-check* (comparing a fresh `data_raw` scan against the stored `source_identity`) becomes unavailable, and is reported as `complete: False`/`missing_channels`, never silently treated as a pass. | v2 strictly stronger for what it actually claims (replay-side integrity, at both tiers), and honest about the one thing that becomes genuinely unavailable (raw cross-verification) rather than papering over it. |
+| 10 | Coordinated malicious rewrite with recomputed, self-consistent (but unsigned) checksums (an attacker with write access to both `data_raw` and `replay_store` rewrites data and recomputes every SHA-256/manifest field to match) | **Not prevented.** A per-event hash is just another unsigned SHA-256 that the same attacker can recompute and overwrite alongside the row it "protects." | **Not prevented either, at either tier.** Every checksum in the v2 hierarchy (raw file sha256, block sha256, whole-file checksum, manifest `integrity` dict) is unsigned SHA-256 computed and stored by the same trust domain that would need to be compromised to rewrite the data in the first place — an attacker capable of rewriting `replay_store` files can trivially recompute and rewrite every one of them (including block digests, if they run the deep tier's own digest function) to stay internally consistent. | **Neither design prevents this, at any tier.** This is stated here explicitly and must not be overclaimed: SHA-256 (signed by nothing) proves *accidental* corruption and *unintentional* mismatch, never protects against a privileged adversary who controls the storage. A genuine defense against this threat (detached signing with a key never co-located with the data, WORM/immutable storage, or an independent out-of-band audit trail) is out of scope for this issue #20 Phase 7 candidate and is not claimed. |
+
+**Conclusion drawn from this matrix:** the v2 hierarchy is equivalent-or-
+stronger than the removed per-event hash for every scenario. Ordinary raw-
+record reordering is caught by the raw-file SHA-256 (row 3); ordinary
+replay-row reordering is caught by both the block checksum and the
+whole-file checksum (row 5) — v1 detected neither. No scenario exists where
+v1 detects something v2 cannot. The one universally-unprevented scenario
+(row 10, a privileged, coordinated rewrite that recomputes all unsigned
+checksums to stay internally consistent) is common to both designs and is
+not a regression introduced by removing the per-event hash — it is stated
+plainly and is not claimed as covered by either.
+
+#### 3b. Routine vs. deep validation contract
+
+Two explicit, separately-named tiers (issue #20 Phase 7 second review round
+— see the "Validation-tier correction" note above for the measured
+performance problem this fixes):
+
+- **Routine — `stores.replay_writer.validate_partition(partition_dir) ->
+  bool`.** Called automatically and unconditionally at every: (a)
+  `ReplayWriter.publish()` post-publish check; (b)
+  `pipeline.build_replay_store`'s skip-if-valid check (before deciding to
+  skip a partition that already looks complete); (c)
+  `pipeline.build_replay_store`'s crash-recovery check (deciding whether a
+  possibly-interrupted prior build's output is safe to keep or must be
+  rebuilt). Bounded cost: manifest/schema/builder contract validity,
+  expected-files presence, Parquet-footer-only physical schema match,
+  integrity-metadata structural shape (never its row content), and the
+  COMPLETE-FILE SHA-256 checksum. Never deserializes or hashes individual
+  rows/blocks.
+- **Deep — `stores.replay_writer.audit_partition_deep(partition_dir) ->
+  list[str]`** (and its self-contained-focused sibling entry point
+  `audit_partition_deep`, identical behavior, documented
+  separately for the "data_raw absent" proof). Never called automatically
+  by any of the three call sites above — only invoked when explicitly
+  requested (e.g. a dedicated audit CLI/script, an ad hoc investigation, or
+  a test). Recomputes every block's digest via the vectorized
+  `_canon_table_hash`, localizing any row-count or content mismatch to a
+  specific block index, in addition to everything routine validation
+  checks (it calls routine validation first).
+
+This split is enforced by
+`tests/test_replay_hierarchical_integrity_v2.py::test_publish_and_skip_valid_call_routine_not_deep`,
+which monkeypatches `audit_partition_deep` to raise if invoked and confirms
+both a fresh build and a repeat (skip-valid) build over the same partition
+complete successfully without ever calling it.
 
 ### 4. Versioning and `encoding_profile` design
 

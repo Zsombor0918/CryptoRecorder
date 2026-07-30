@@ -5,10 +5,14 @@ Scans raw directory to determine available venues, symbols, and channels.
 """
 from __future__ import annotations
 
+import gzip
 import hashlib
+import json
 import logging
 from pathlib import Path
 from typing import Optional
+
+import zstandard as zstd
 
 from config import DATA_ROOT
 
@@ -29,6 +33,57 @@ logger = logging.getLogger(__name__)
 ELIGIBLE_MARKET_CHANNELS = frozenset({"depth_v2", "trade_v2"})
 
 
+def _iter_consumed_raw_files(channel_dir: Path) -> "list[Path]":
+    """Return raw files in the exact deterministic order consumed by
+    ``converter.readers.stream_raw_records``.
+
+    Source identity must never describe a broader directory listing than the
+    build actually reads. In particular, regular diagnostic/sidecar files are
+    not replay inputs merely because they happen to live beside the JSONL
+    files.
+    """
+    return [
+        path
+        for path in sorted(channel_dir.glob("*.jsonl*"))
+        if path.is_file()
+    ]
+
+
+def _assert_no_compression_variants(
+    files: "list[Path]",
+    *,
+    context: str,
+) -> None:
+    """Reject simultaneous plain/compressed siblings of one logical JSONL.
+
+    The raw reader would consume every matching sibling. For schema-v2
+    provenance that layout is ambiguous (and commonly means compression is
+    still in progress), so strict identity collection must fail closed.
+    """
+    variants: dict[str, list[str]] = {}
+    for path in files:
+        name = path.name
+        if name.endswith(".jsonl.zst"):
+            logical_name = name[:-4]
+        elif name.endswith(".jsonl.gz"):
+            logical_name = name[:-3]
+        elif name.endswith(".jsonl"):
+            logical_name = name
+        else:
+            continue
+        variants.setdefault(logical_name, []).append(name)
+    conflicts = {
+        logical_name: sorted(names)
+        for logical_name, names in variants.items()
+        if len(names) > 1
+    }
+    if conflicts:
+        raise RuntimeError(
+            f"Ambiguous coexisting raw compression variants in {context}: "
+            f"{conflicts!r}"
+        )
+
+
 def _sha256_file(path: Path) -> str:
     """Stream a file through SHA-256 in bounded (64 KiB) chunks — never reads
     a whole raw file into memory at once."""
@@ -39,12 +94,43 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _count_parsed_records(path: Path) -> int:
+    """Count successfully-JSON-parsed lines in one raw file, streaming line
+    by line (bounded memory, one line in flight at a time) — mirrors
+    ``converter.readers.stream_raw_records``'s own per-file opener/parse
+    logic exactly, so the resulting count matches the number of records
+    that file actually contributes to the enumerated ``raw_index`` stream
+    (malformed lines that ``stream_raw_records`` silently skips are not
+    counted here either, for the same reason)."""
+    count = 0
+    if path.suffix == ".zst":
+        opener = lambda: zstd.open(path, "rt", errors="ignore")
+    elif path.suffix == ".gz":
+        opener = lambda: gzip.open(path, "rt", errors="ignore")
+    else:
+        opener = lambda: open(path, "r", errors="ignore")
+    with opener() as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            count += 1
+    return count
+
+
 def compute_raw_source_identity(
     venue: str,
     symbol: str,
     date_str: str,
     channels: "list[str]",
     data_root: Optional[Path] = None,
+    *,
+    include_record_counts: bool = False,
+    strict: bool = False,
 ) -> dict:
     """Record per-file identity (path + SHA-256 + size) for the raw files that
     back one venue/symbol/date/channel set.
@@ -53,44 +139,119 @@ def compute_raw_source_identity(
     the issue #20 Phase 2 traceability design (docs/IMPLEMENTATION_AUDIT.md,
     "Traceability design") requires new replay manifests to carry (item 1 of
     its planned hierarchy: "Raw file/chunk identity + SHA-256 checksum,
-    recorded per partition in the manifest"). It does NOT implement the full
-    planned hierarchy (block-level checksums, deterministic event->source
-    mapping, etc. remain design-only / not implemented) and does NOT replace
-    the per-event ``native_payload_hash`` retained in the v1 replay schema.
+    recorded per partition in the manifest").
+
+    ``include_record_counts`` (issue #20 Phase 7 hierarchical-integrity
+    candidate, schema_version=2 only): when True, also computes each file's
+    ``record_count`` (number of successfully-parsed JSON lines, matching
+    exactly how many records that file contributes to the enumerated
+    ``raw_index`` stream — see ``_count_parsed_records``) and a cumulative,
+    deterministic ``record_range`` ``[start, end)`` per file, in the same
+    sorted-filename order ``converter.readers.stream_raw_records`` reads
+    them in. This is what makes
+    ``stores.replay_writer.resolve_source_record`` possible: a bounded (one
+    entry per file, not per event) mapping from a replay event's
+    ``raw_index`` back to its exact source raw file and contribution
+    ordinal. For this non-repartitioned helper the contribution ordinal is
+    also the parsed-record ordinal in the file. Adds one
+    additional bounded, streaming read pass per raw file (never loads a
+    whole file into memory) — left ``False`` by default so schema_version=1
+    (and any other caller) pays zero extra I/O cost for this.
+
+    ``strict=True`` makes any selected ``*.jsonl*`` file that cannot be
+    checksummed or decoded an immediate error. The schema-v2 builder uses
+    this mode so a reader-side log-and-continue cannot be mistaken for a
+    complete source snapshot. In best-effort mode, such a failure still marks
+    the channel/source identity incomplete even when another file succeeded.
+
+    Checksum scope (issue #20 Phase 7 review — precise, not left implicit):
+      - ``sha256``/``size_bytes`` cover the raw file's ON-DISK bytes exactly
+        as stored (i.e. the COMPRESSED bytes for ``.zst``/``.gz`` files, not
+        the decompressed record stream) — this is what ``_sha256_file``
+        streams. It detects any change to the stored artifact itself
+        (recompression with different settings included), independent of
+        whether the decoded record content also changed.
+      - ``record_count``/``record_range`` describe only the DECOMPRESSED,
+        successfully decoded JSON-line count/order (via
+        ``_count_parsed_records``). They localize missing/extra-record count
+        changes but do not detect a same-count value edit; the stored-byte
+        SHA-256 is the content-integrity layer. Recompressing identical
+        decoded content can change ``sha256`` without changing the count.
+      - ``path`` is always POSIX-relative to ``data_root`` (via
+        ``Path.relative_to`` + ``.as_posix()``) — never absolute, and never
+        includes mtime/inode/owner or any other machine-specific metadata.
+        This is required so that independent machines and Syncthing-synced
+        copies of the same raw bytes at different local paths (or different
+        OS path separators) produce and consume byte-identical
+        ``source_identity`` dicts.
 
     Returns:
         {
-            "channels": {"depth_v2": [{"path": "<file>", "sha256": "<hex>",
-                                        "size_bytes": <int>}, ...], ...},
+            "venue": "<venue>", "symbol": "<symbol>", "date": "<date_str>",
+            "channels": {"depth_v2": [{"path": "<posix-relative-file>",
+                                        "sha256": "<hex>",
+                                        "size_bytes": <int>,
+                                        "record_count": <int>,       # only if include_record_counts
+                                        "record_range": [<start>, <end>]}, ...], ...},
             "complete": bool,  # True only if every requested channel had at
-                                # least one raw file found on disk
-            "missing_channels": [<channel names with no raw files found>],
+                                # least one readable selected raw file and no
+                                # selected file failed identity collection
+            "missing_channels": [<channel names missing usable complete input>],
         }
     """
     if data_root is None:
         data_root = DATA_ROOT
     data_root = Path(data_root)
 
-    result: dict = {"channels": {}, "complete": True, "missing_channels": []}
+    result: dict = {
+        "venue": venue,
+        "symbol": symbol,
+        "date": date_str,
+        "channels": {},
+        "complete": True,
+        "missing_channels": [],
+    }
     for channel in channels:
         channel_dir = data_root / venue / channel / symbol / date_str
         entries: "list[dict]" = []
+        cumulative = 0
+        channel_failed = False
         if channel_dir.exists():
-            for fpath in sorted(channel_dir.iterdir()):
-                if not fpath.is_file():
-                    continue
+            selected_files = _iter_consumed_raw_files(channel_dir)
+            if strict:
+                _assert_no_compression_variants(
+                    selected_files,
+                    context=f"{venue}/{channel}/{symbol}/{date_str}",
+                )
+            for fpath in selected_files:
                 try:
-                    entries.append({
-                        "path": str(fpath.relative_to(data_root)),
+                    entry = {
+                        # POSIX-relative, canonical, machine-independent —
+                        # never an absolute path, mtime, inode, or owner.
+                        "path": fpath.relative_to(data_root).as_posix(),
                         "sha256": _sha256_file(fpath),
                         "size_bytes": fpath.stat().st_size,
-                    })
+                    }
+                    if include_record_counts:
+                        record_count = _count_parsed_records(fpath)
+                        entry["record_count"] = record_count
+                        entry["record_range"] = [cumulative, cumulative + record_count]
+                        cumulative += record_count
+                    entries.append(entry)
                 except Exception as exc:
+                    channel_failed = True
                     logger.warning(f"Could not checksum raw file {fpath}: {exc}")
+                    if strict:
+                        raise RuntimeError(
+                            f"Could not read selected raw input {fpath} while "
+                            f"computing source identity for "
+                            f"{venue}/{symbol}/{date_str}/{channel}: {exc}"
+                        ) from exc
         result["channels"][channel] = entries
-        if not entries:
+        if channel_failed or not entries:
             result["complete"] = False
-            result["missing_channels"].append(channel)
+            if channel not in result["missing_channels"]:
+                result["missing_channels"].append(channel)
     return result
 
 

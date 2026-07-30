@@ -5,11 +5,12 @@ Defines deterministic normalized replay layer schemas for depth and trade events
 Uses Parquet nested structures for bids/asks lists.
 
 Versioning (issue #20 Phase 5 — revised-plan phase numbering, see
-docs/CHANGE_AUDIT.md): a manifest with no ``schema_version`` field is legacy
-v0 (the original schemas below, unchanged, still fully supported). A manifest
-carrying an explicit ``schema_version`` is dispatched to the matching
-versioned schema; unsupported explicit versions must fail clearly rather than
-being silently reinterpreted. v1 (``DEPTH_REPLAY_SCHEMA_V1`` /
+docs/CHANGE_AUDIT.md): a manifest with no ``schema_version`` field is accepted
+as historical v0 only when both physical Parquet channels exactly match the
+original schemas below, including their exact-string fields. A compact layout
+always requires an explicit supported ``schema_version``; missing/malformed
+manifests and manifest/physical-schema contradictions fail before decoding.
+v1 (``DEPTH_REPLAY_SCHEMA_V1`` /
 ``TRADE_REPLAY_SCHEMA_V1``) is the first compact prototype schema, built only
 from compaction levers the checked-in Phase 3 field/consumer/integrity matrix
 (``docs/IMPLEMENTATION_AUDIT.md``) explicitly approves:
@@ -64,11 +65,41 @@ SCHEMA_VERSION_V1 = 1
 # are unchanged; only the builder version is bumped.
 BUILDER_VERSION_V1 = "cryptorecorder-replay-writer-v1.2.0"
 
+# ============================================================================
+# Schema v2 (issue #20 Phase 7 hierarchical-integrity candidate)
+# ============================================================================
+#
+# Replaces the per-event native_payload_hash column (a 32-byte SHA-256 hash
+# recorded on every row, ~54% of the measured optimized-v1 candidate's total
+# size, per docs/CHANGE_AUDIT.md) with the manifest-level traceability
+# hierarchy already documented as "planned" in docs/IMPLEMENTATION_AUDIT.md's
+# Phase 2 Section 3 ("Traceability design"):
+#   1. raw file/chunk identity + SHA-256 checksum per partition (manifest
+#      ``integrity.source_identity``, extended with a per-file record_count
+#      so a replay event's raw_index can be mapped back to its source file
+#      deterministically without a per-event value);
+#   2. bounded per-block (Parquet row-group) first/last sort key, row count,
+#      and SHA-256 of the block's canonical row content (manifest
+#      ``integrity.depth_blocks``/``integrity.trade_blocks``);
+#   3. the existing whole-file ``depth_checksum``/``trades_checksum``
+#      (unchanged, still mandatory);
+#   4. a documented, deterministic raw_index -> source-file mapping method
+#      (see ``stores.replay_writer.resolve_source_record``).
+# This was proven safe to remove per-event by directly verifying zero
+# internal consumers read the hash's *value* anywhere in the codebase
+# (writer/reader only round-trip it; validation/audit_replay_store.py checks
+# only whole-file checksums, never the per-event hash) -- see the
+# corresponding docs/CHANGE_AUDIT.md entry for the full consumer inventory
+# and threat/integrity matrix.
+FORMAT_VERSION_V2 = 2
+SCHEMA_VERSION_V2 = 2
+BUILDER_VERSION_V2 = "cryptorecorder-replay-writer-v2.0.0"
+
 # The only schema_version values ReplayReader/ReplayWriter know how to
 # produce/consume. A manifest with schema_version outside this set (or an
 # unrecognized value) must fail with a clear "found vs supported" error, not
 # be silently misread.
-SUPPORTED_SCHEMA_VERSIONS = (0, 1)
+SUPPORTED_SCHEMA_VERSIONS = (0, 1, 2)
 
 # ============================================================================
 # v1 enum code maps (record_type / aggressor_side)
@@ -302,6 +333,34 @@ DEPTH_REPLAY_SCHEMA_V1 = pa.schema([
 
 
 # ============================================================================
+# Depth Replay Schema — v2 (issue #20 Phase 7 hierarchical-integrity
+# candidate: identical to v1 except native_payload_hash is removed and
+# replaced by the manifest-level traceability hierarchy — see the module
+# docstring near FORMAT_VERSION_V2 above)
+# ============================================================================
+
+DEPTH_REPLAY_SCHEMA_V2 = pa.schema([
+    pa.field("stream_session_id", pa.uint64(), nullable=False),
+    pa.field("session_seq", pa.uint64(), nullable=False),
+    pa.field("raw_index", pa.uint32(), nullable=False),
+
+    pa.field("record_type_code", pa.int8(), nullable=False),
+    pa.field("U", pa.string(), nullable=True),
+    pa.field("u", pa.string(), nullable=True),
+    pa.field("pu", pa.string(), nullable=True),
+
+    pa.field("ts_exchange_ns", pa.int64(), nullable=False),
+    pa.field("ts_receive_ns", pa.int64(), nullable=False),
+
+    pa.field("bids", pa.list_(_bid_ask_struct_v1), nullable=False),
+    pa.field("asks", pa.list_(_bid_ask_struct_v1), nullable=False),
+
+    pa.field("flags", pa.int8(), nullable=False),
+    pa.field("quality_flags", pa.string(), nullable=True),
+])
+
+
+# ============================================================================
 # Trade Replay Schema
 # ============================================================================
 
@@ -372,6 +431,36 @@ TRADE_REPLAY_SCHEMA_V1 = pa.schema([
 
     pa.field("quality_flags", pa.string(), nullable=True),
     pa.field("native_payload_hash", pa.binary(32), nullable=True),
+])
+
+
+# ============================================================================
+# Trade Replay Schema — v2 (issue #20 Phase 7 hierarchical-integrity
+# candidate: identical to v1 except native_payload_hash is removed and
+# replaced by the manifest-level traceability hierarchy — see the module
+# docstring near FORMAT_VERSION_V2 above)
+# ============================================================================
+
+TRADE_REPLAY_SCHEMA_V2 = pa.schema([
+    pa.field("trade_stream_session_id", pa.uint64(), nullable=False),
+    pa.field("trade_session_seq", pa.uint64(), nullable=False),
+    pa.field("raw_index", pa.uint32(), nullable=False),
+
+    pa.field("record_type_code", pa.int8(), nullable=False),
+    pa.field("market_type", pa.string(), nullable=False),
+
+    pa.field("trade_id", pa.string(), nullable=True),
+    pa.field("agg_trade_id", pa.string(), nullable=True),
+
+    pa.field("ts_exchange_ns", pa.int64(), nullable=False),
+    pa.field("ts_receive_ns", pa.int64(), nullable=False),
+
+    pa.field("price_mantissa", pa.int64(), nullable=False),
+    pa.field("quantity_mantissa", pa.int64(), nullable=False),
+    pa.field("buyer_maker", pa.bool_(), nullable=False),
+    pa.field("aggressor_side_code", pa.int8(), nullable=True),
+
+    pa.field("quality_flags", pa.string(), nullable=True),
 ])
 
 

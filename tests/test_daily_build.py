@@ -142,7 +142,7 @@ def test_all_success_reports_success_status(tmp_path: Path) -> None:
 
     raw_result = daily_build.run_raw_manifest(DATE, data_root)
     replay_result = daily_build.run_build_replay_store(
-        DATE, ["ADAUSDT", "BTCUSDT"], data_root, replay_root
+        DATE, ["ADAUSDT", "BTCUSDT"], data_root, replay_root, check_repartition_readiness=False
     )
     assert replay_result["status"] == "success"
     assert replay_result["symbols_total"] == 2
@@ -169,7 +169,7 @@ def test_partial_failure_preserves_partial_status(
 
     real_build = build_replay_store_module.build_replay_for_symbol
 
-    def _fake_build(venue, symbol, date, data_root_, replay_root_):
+    def _fake_build(venue, symbol, date, data_root_, replay_root_, **kwargs):
         if symbol == "BTCUSDT":
             return {
                 "venue": venue,
@@ -180,13 +180,13 @@ def test_partial_failure_preserves_partial_status(
                 "trade_count": 0,
                 "errors": ["simulated failure"],
             }
-        return real_build(venue, symbol, date, data_root_, replay_root_)
+        return real_build(venue, symbol, date, data_root_, replay_root_, **kwargs)
 
     monkeypatch.setattr(build_replay_store_module, "build_replay_for_symbol", _fake_build)
 
     raw_result = daily_build.run_raw_manifest(DATE, data_root)
     replay_result = daily_build.run_build_replay_store(
-        DATE, ["ADAUSDT", "BTCUSDT"], data_root, replay_root
+        DATE, ["ADAUSDT", "BTCUSDT"], data_root, replay_root, check_repartition_readiness=False
     )
     assert replay_result["status"] == "partial"
     assert replay_result["symbols_processed"] == 1
@@ -214,7 +214,7 @@ def test_all_partitions_failed_reports_failed_status(
 
     import pipeline.build_replay_store as build_replay_store_module
 
-    def _fake_build_all_fail(venue, symbol, date, data_root_, replay_root_):
+    def _fake_build_all_fail(venue, symbol, date, data_root_, replay_root_, **kwargs):
         return {
             "venue": venue,
             "symbol": symbol,
@@ -231,7 +231,7 @@ def test_all_partitions_failed_reports_failed_status(
 
     raw_result = daily_build.run_raw_manifest(DATE, data_root)
     replay_result = daily_build.run_build_replay_store(
-        DATE, ["ADAUSDT", "BTCUSDT"], data_root, replay_root
+        DATE, ["ADAUSDT", "BTCUSDT"], data_root, replay_root, check_repartition_readiness=False
     )
     assert replay_result["status"] == "failed"
     assert replay_result["symbols_processed"] == 0
@@ -332,7 +332,7 @@ def test_exchangeinfo_plus_one_valid_symbol_only_attempts_valid_symbol(
     assert "ADAUSDT" in all_symbols
 
     replay_result = daily_build.run_build_replay_store(
-        DATE, all_symbols, data_root, replay_root
+        DATE, all_symbols, data_root, replay_root, check_repartition_readiness=False
     )
 
     assert replay_result["status"] == "success"

@@ -6,6 +6,7 @@ Converts raw JSONL.zst data to normalized deterministic Parquet replay_store.
 from __future__ import annotations
 
 import argparse
+import gzip
 import hashlib
 import json
 import logging
@@ -15,14 +16,548 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+import zstandard as zstd
+
 from config import DATA_ROOT, REPLAY_ROOT
 from converter.readers import stream_raw_records
-from stores.replay_writer import ReplayWriter, validate_partition
+from converter.spool import DedupeSet
+from converter.depth_phase2 import (
+    _date_shift as _depth_date_shift,
+    _dedupe_key as _depth_dedupe_key,
+    _is_epoch_like_ns as _depth_is_epoch_like_ns,
+    _target_bounds_ns as _depth_target_bounds_ns,
+    _ts_event_ns as _depth_ts_event_ns,
+)
+from stores.replay_writer import (
+    ReplayWriter,
+    validate_partition,
+    validate_v2_source_identity,
+)
 
 logger = logging.getLogger(__name__)
 
 # Suppress verbose library logs
 logging.getLogger("pyarrow").setLevel(logging.WARNING)
+
+
+# ============================================================================
+# issue #20 Phase 7 semantic-oracle correction: depth_v2 cross-day event-time
+# repartitioning.
+#
+# convert_day.py's reference route (converter.depth_phase2._spool_repartitioned_records)
+# does NOT read a UTC calendar day's depth_v2 raw data from that day's raw
+# directory alone. The recorder writes hourly-rotated raw files keyed by
+# WALL-CLOCK RECEIVE time; a depth_update whose EXCHANGE event time is late on
+# day D (e.g. 23:59:56Z) can be physically written into day D+1's first hourly
+# file if the record was received/flushed a few seconds after local midnight
+# (ordinary network/processing latency, not a defect). convert_day.py corrects
+# for this by scanning D-1, D, and D+1's raw depth_v2 directories and assigning
+# every record to whichever UTC day its EVENT time (not its physical storage
+# location) falls in — see converter.depth_phase2._spool_repartitioned_records,
+# reused here via the imports above so this module applies the EXACT SAME
+# rule, never an invented one. This does NOT apply to trade_v2 records:
+# convert_day.py's convert_trades_streaming() reads only the single requested
+# date's trade_v2 directory, with no cross-day repartitioning at all — trades
+# in this raw dataset do not exhibit event-time skew across the hourly file
+# boundary in a way the reference route corrects for, so this module must not
+# invent trade repartitioning either (see REPARTITIONING CONTRACT below).
+#
+# Applies identically to schema_version 0, 1, and 2 — this is a raw INPUT
+# SELECTION correction (which raw records populate one date's replay
+# partition), not a physical replay schema or storage-format change.
+# ============================================================================
+
+
+def check_depth_repartition_readiness(
+    venue: str,
+    symbol: str,
+    date: str,
+    data_root: Path,
+    *,
+    require_complete_next_day: bool = False,
+) -> "Optional[str]":
+    """Return a reason if the selected raw-readiness policy is not met.
+
+    ``None`` means the target is ready under the selected production or
+    offline-validation policy; the policies' different proof boundaries are
+    explicit below.
+
+    The production daily-build timer builds "yesterday" (date D) at
+    01:00 UTC. The recorder names the first D+1 depth file exactly
+    ``{D+1}T00.jsonl`` and, before opening a later hourly path, closes
+    that handle and queues it for compression. Therefore readiness
+    requires both the exact first-hour file and positive evidence that it
+    is no longer active: either only its completed compressed form remains
+    or a later D+1 hourly file exists. An arbitrary D+1 file, or a bare
+    uncompressed T00 file with no later hour, is not sufficient.
+
+    The default is the production-timer readiness policy. It assumes the live
+    websocket receive delay cannot span beyond D+1's first hour; the recorder
+    does not enforce a formal maximum delay, so this is an operational
+    assumption rather than a source-completeness proof.
+
+    Offline semantic validation passes ``require_complete_next_day=True``.
+    That stricter mode requires proof D+1's last hour has closed, so the full
+    adjacent-day scope scanned by the reference converter is immutable before
+    candidate construction.
+
+    D-1 is not required to exist (the very first day of a venue/symbol's
+    recorded history has no prior day) — matching
+    ``_spool_repartitioned_records``'s own behavior of scanning a missing
+    prior-day directory as an empty source (``stream_raw_records`` yields
+    nothing for a nonexistent date directory; no exception is raised).
+    """
+    next_date = _depth_date_shift(date, 1)
+    next_dir = data_root / venue / "depth_v2" / symbol / next_date
+    if not next_dir.exists():
+        return (
+            f"depth_v2 raw directory for the next UTC day ({next_date}) does "
+            f"not exist yet at {next_dir} -- cannot yet prove no late-{date} "
+            "event-time-skewed record is still pending under it. Defer this "
+            "partition until at least the next day's first hourly raw file "
+            "is written."
+        )
+    first_hour_base = next_dir / f"{next_date}T00.jsonl"
+    first_hour_variants = [
+        path
+        for path in (
+            first_hour_base,
+            Path(f"{first_hour_base}.zst"),
+            Path(f"{first_hour_base}.gz"),
+        )
+        if path.is_file()
+    ]
+    if not first_hour_variants:
+        return (
+            f"depth_v2 raw directory for the next UTC day ({next_date}) "
+            f"exists at {next_dir} but does not contain the required first "
+            f"hour file ({next_date}T00.jsonl[.zst|.gz]) -- defer this "
+            "partition; an arbitrary later-hour file does not prove the "
+            "cross-day input is complete."
+        )
+
+    # CompressionManager writes the compressed sibling before removing the
+    # closed .jsonl source. Seeing both variants can mean compression is
+    # still in progress (or failed part-way), and stream_raw_records() would
+    # select both. Refuse that ambiguous layout.
+    if len(first_hour_variants) != 1:
+        return (
+            f"depth_v2 first-hour raw file for {next_date} has multiple "
+            f"coexisting variants at {next_dir}: "
+            f"{[path.name for path in first_hour_variants]}. Compression "
+            "may still be active or incomplete; defer until exactly one "
+            "stable variant remains."
+        )
+
+    first_hour_path = first_hour_variants[0]
+    first_hour_closed = first_hour_path.suffix in {".zst", ".gz"}
+    if first_hour_closed:
+        # The recorder removes the .jsonl source only after the compressed
+        # writer has closed successfully, so a sole compressed variant is
+        # positive closed-file evidence.
+        pass
+    else:
+        later_hour_exists = any(
+            path.is_file()
+            for hour in range(1, 24)
+            for path in (
+                next_dir / f"{next_date}T{hour:02d}.jsonl",
+                next_dir / f"{next_date}T{hour:02d}.jsonl.zst",
+                next_dir / f"{next_date}T{hour:02d}.jsonl.gz",
+            )
+        )
+        first_hour_closed = later_hour_exists
+    if not first_hour_closed:
+        return (
+            f"depth_v2 first-hour raw file {first_hour_path} exists but is "
+            "still the latest uncompressed hourly path, so the recorder may "
+            "still have it open. Defer until its completed compressed form "
+            "is the sole variant or a later D+1 hourly file proves T00 was "
+            "rotated and closed."
+        )
+
+    if not require_complete_next_day:
+        return None
+
+    last_hour_base = next_dir / f"{next_date}T23.jsonl"
+    last_hour_variants = [
+        path
+        for path in (
+            last_hour_base,
+            Path(f"{last_hour_base}.zst"),
+            Path(f"{last_hour_base}.gz"),
+        )
+        if path.is_file()
+    ]
+    if len(last_hour_variants) != 1:
+        return (
+            f"offline validation requires exactly one closed last-hour raw "
+            f"file for {next_date}, but found "
+            f"{[path.name for path in last_hour_variants]} at {next_dir}. "
+            "Refusing to treat a partial or ambiguous D+1 scope as complete."
+        )
+    last_hour_path = last_hour_variants[0]
+    if last_hour_path.suffix in {".zst", ".gz"}:
+        return None
+
+    following_date = _depth_date_shift(next_date, 1)
+    following_dir = data_root / venue / "depth_v2" / symbol / following_date
+    following_hour_exists = any(
+        path.is_file()
+        for path in (
+            following_dir / f"{following_date}T00.jsonl",
+            following_dir / f"{following_date}T00.jsonl.zst",
+            following_dir / f"{following_date}T00.jsonl.gz",
+        )
+    )
+    if following_hour_exists:
+        return None
+    return (
+        f"offline validation found uncompressed last-hour raw file "
+        f"{last_hour_path} with no following-day T00 path proving it was "
+        "rotated and closed. Refusing an unproven D+1 scope."
+    )
+
+
+def _stream_repartitioned_depth_records(
+    venue: str,
+    symbol: str,
+    date: str,
+    data_root: Path,
+    *,
+    strict: bool = False,
+):
+    """Yield (raw_index, raw_record, source_date) triples for ``date``'s
+    depth_v2 channel, applying the EXACT SAME event-time repartitioning
+    rule as ``convert_day.py``'s reference route
+    (``converter.depth_phase2._spool_repartitioned_records``): scans
+    ``date``'s previous, target, and next UTC-day raw depth_v2 directories
+    (in that order), assigns each record to the target partition if and
+    only if its canonical event time satisfies
+    ``target_start_ns <= event_time_ns < target_end_ns``, and applies the
+    reference's own deduplication key
+    (``converter.depth_phase2._dedupe_key``) so a record physically
+    duplicated across adjacent directories (should that ever occur) is
+    never double-counted.
+
+    ``raw_index`` is a single incrementing counter across the full
+    prev/target/next scan (matching the reference's own ``target_index``
+    semantics) — NOT the record's original raw_index within its own
+    physical source file. ``source_date`` (the UTC calendar day the
+    record was physically stored under, which may differ from ``date``
+    itself for repartitioned records) is yielded alongside so callers can
+    build exact source-file identity and contribution ranges.
+
+    Test/epoch-like timestamps (``_depth_is_epoch_like_ns``) are handled
+    exactly as the reference does: only accepted when physically stored
+    under ``date`` itself, never repartitioned in from an adjacent day —
+    existing small-relative-timestamp unit fixtures must not silently
+    change behavior.
+
+    Bounded memory throughout: the dedupe key set is a disk-backed
+    ``converter.spool.DedupeSet`` (SQLite), never an in-memory Python set
+    growing with day size.
+    """
+    target_start_ns, target_end_ns = _depth_target_bounds_ns(date)
+    prev_date = _depth_date_shift(date, -1)
+    next_date = _depth_date_shift(date, 1)
+    scan_dates = [prev_date, date, next_date]
+
+    target_index = 0
+    with DedupeSet(prefix="cryptorecorder-replaybuild-depth-dedupe-") as seen_target:
+        for source_date in scan_dates:
+            records = (
+                _stream_raw_records_strict(
+                    venue,
+                    symbol,
+                    "depth_v2",
+                    source_date,
+                    data_root,
+                )
+                if strict
+                else stream_raw_records(
+                    venue,
+                    symbol,
+                    "depth_v2",
+                    source_date,
+                    root=data_root,
+                )
+            )
+            for rec in records:
+                item = dict(rec)
+                item["record_type"] = item.get("record_type", "depth_update")
+                ts_ns = _depth_ts_event_ns(item)
+
+                if not _depth_is_epoch_like_ns(ts_ns):
+                    if source_date == date:
+                        key = _depth_dedupe_key(item)
+                        if not seen_target.add(key):
+                            continue
+                        yield target_index, item, source_date
+                        target_index += 1
+                    continue
+
+                if target_start_ns <= ts_ns < target_end_ns:
+                    key = _depth_dedupe_key(item)
+                    if not seen_target.add(key):
+                        continue
+                    yield target_index, item, source_date
+                    target_index += 1
+        seen_target.commit()
+
+
+def replay_partition_has_source_records(
+    venue: str,
+    symbol: str,
+    date: str,
+    data_root: Path,
+) -> bool:
+    """Return whether a replay partition has any depth or trade input.
+
+    Depth uses the same D-1/D/D+1 event-time repartitioning as the builder,
+    so a physically absent ``date`` directory alone is not enough to prove a
+    pre-listing day is truly empty. This bounded probe is used by validation
+    orchestration to distinguish a legitimate pre-listing previous day from
+    a failed previous-day build; it never permits a failed non-empty carry
+    partition to be silently ignored.
+    """
+    depth_records = _stream_repartitioned_depth_records(
+        venue, symbol, date, data_root
+    )
+    try:
+        if next(depth_records, None) is not None:
+            return True
+    finally:
+        depth_records.close()
+
+    trade_records = stream_raw_records(
+        venue, symbol, "trade_v2", date, root=data_root
+    )
+    try:
+        return next(trade_records, None) is not None
+    finally:
+        trade_records.close()
+
+
+def _iter_raw_file_records(file_path: Path):
+    """Yield parsed JSON dicts from a single raw file, decompressing
+    ``.zst``/``.gz`` transparently (mirrors
+    ``converter.readers.stream_raw_records``'s per-file opener logic
+    exactly, but at single-file granularity so callers can track which
+    file each record came from)."""
+    if file_path.suffix == ".zst":
+        opener = lambda: zstd.open(file_path, "rt", errors="ignore")
+    elif file_path.suffix == ".gz":
+        opener = lambda: gzip.open(file_path, "rt", errors="ignore")
+    else:
+        opener = lambda: open(file_path, "r", errors="ignore")
+    with opener() as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                yield json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+
+def _stream_raw_records_strict(
+    venue: str,
+    symbol: str,
+    channel: str,
+    date: str,
+    data_root: Path,
+):
+    """Strict build-side equivalent of ``stream_raw_records``.
+
+    It uses the same selected-file glob/order, decompression behavior, and
+    malformed-JSON skipping, but propagates file I/O/decompression failures
+    and rejects ambiguous compression siblings. Schema v2 uses this iterator
+    so a transient reader error cannot turn into a silently truncated replay
+    partition even when pre/post file hashes happen to match.
+    """
+    from pipeline.raw_manifest import (
+        _assert_no_compression_variants,
+        _iter_consumed_raw_files,
+    )
+
+    channel_dir = data_root / venue / channel / symbol / date
+    if not channel_dir.exists():
+        return
+    selected_files = _iter_consumed_raw_files(channel_dir)
+    _assert_no_compression_variants(
+        selected_files,
+        context=f"{venue}/{channel}/{symbol}/{date}",
+    )
+    for file_path in selected_files:
+        try:
+            yield from _iter_raw_file_records(file_path)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Could not read selected raw input {file_path} during "
+                f"schema-version-2 streaming for "
+                f"{venue}/{symbol}/{date}/{channel}: {exc}"
+            ) from exc
+
+
+def compute_depth_repartitioned_source_identity(
+    venue: str,
+    symbol: str,
+    date: str,
+    data_root: Path,
+    *,
+    include_record_counts: bool = False,
+    strict: bool = False,
+) -> dict:
+    """Compute the depth_v2 ``source_identity`` channel entry in the SAME
+    repartitioned ``raw_index`` space that
+    ``_stream_repartitioned_depth_records`` actually produces (issue #20
+    Phase 7 semantic-oracle correction).
+
+    This exists because ``pipeline.raw_manifest.compute_raw_source_identity``'s
+    existing ``record_range`` computation counts records per-file for a
+    SINGLE date only — that numbering no longer matches ``raw_index`` once
+    depth_v2 records are repartitioned across D-1/D/D+1 (a record physically
+    stored under D+1 can now be assigned a ``raw_index`` position interleaved
+    among D's own records). This function performs the exact same
+    scan/filter/dedup algorithm as ``_stream_repartitioned_depth_records``,
+    but per-file (via ``_iter_raw_file_records``, tracking file boundaries
+    directly, which the flat ``stream_raw_records`` generator does not
+    expose) so each contributing physical file's exact ``record_range`` in
+    the repartitioned ``raw_index`` space can be recorded — this is what
+    makes ``stores.replay_writer.resolve_source_record`` map a repartitioned
+    event's ``raw_index`` back to its exact physical source file (which may
+    be under an adjacent UTC day) and its ordinal among that file's accepted
+    contribution. The latter is not necessarily a physical JSON-line ordinal
+    when the file also contains rejected adjacent-day or duplicate records.
+
+    A second, independent bounded-memory scan pass (disk-backed
+    ``DedupeSet``, never a full-day Python list/set) — matches the existing
+    cost model of ``include_record_counts=True`` for schema_version=2 (an
+    additional read pass over the raw data, never held fully in memory).
+
+    Returns a ``{"channels": {"depth_v2": [...]}, "complete": bool,
+    "missing_channels": [...]}`` shaped dict (matching
+    ``compute_raw_source_identity``'s return shape) — each depth_v2 entry
+    additionally carries ``source_date`` (the UTC calendar day the file is
+    physically stored under, which may differ from ``date`` for
+    repartitioned entries).
+    """
+    from pipeline.raw_manifest import (
+        _assert_no_compression_variants,
+        _iter_consumed_raw_files,
+        _sha256_file,
+    )
+
+    target_start_ns, target_end_ns = _depth_target_bounds_ns(date)
+    prev_date = _depth_date_shift(date, -1)
+    next_date = _depth_date_shift(date, 1)
+    scan_dates = [prev_date, date, next_date]
+
+    entries: "list[dict]" = []
+    target_index = 0
+    with DedupeSet(prefix="cryptorecorder-replaybuild-depth-dedupe-count-") as seen_target:
+        for source_date in scan_dates:
+            channel_dir = data_root / venue / "depth_v2" / symbol / source_date
+            if not channel_dir.exists():
+                continue
+            selected_files = _iter_consumed_raw_files(channel_dir)
+            if strict:
+                _assert_no_compression_variants(
+                    selected_files,
+                    context=f"{venue}/depth_v2/{symbol}/{source_date}",
+                )
+            for fpath in selected_files:
+                try:
+                    file_start_index = target_index
+                    for rec in _iter_raw_file_records(fpath):
+                        item = dict(rec)
+                        item["record_type"] = item.get("record_type", "depth_update")
+                        ts_ns = _depth_ts_event_ns(item)
+                        accepted = False
+                        if not _depth_is_epoch_like_ns(ts_ns):
+                            if source_date == date:
+                                key = _depth_dedupe_key(item)
+                                if seen_target.add(key):
+                                    accepted = True
+                        elif target_start_ns <= ts_ns < target_end_ns:
+                            key = _depth_dedupe_key(item)
+                            if seen_target.add(key):
+                                accepted = True
+                        if accepted:
+                            target_index += 1
+                    if target_index > file_start_index:
+                        entry = {
+                            "path": fpath.relative_to(data_root).as_posix(),
+                            "sha256": _sha256_file(fpath),
+                            "size_bytes": fpath.stat().st_size,
+                            "source_date": source_date,
+                        }
+                        if include_record_counts:
+                            entry["record_count"] = target_index - file_start_index
+                            entry["record_range"] = [file_start_index, target_index]
+                        entries.append(entry)
+                except Exception as exc:
+                    if strict:
+                        raise RuntimeError(
+                            f"Could not read selected raw input {fpath} while "
+                            f"computing repartitioned source identity for "
+                            f"{venue}/{symbol}/{date}/depth_v2: {exc}"
+                        ) from exc
+                    raise
+        seen_target.commit()
+
+    return {
+        "channels": {"depth_v2": entries},
+        "complete": len(entries) > 0,
+        "missing_channels": [] if entries else ["depth_v2"],
+    }
+
+
+def compute_repartitioned_source_identity(
+    venue: str,
+    symbol: str,
+    date: str,
+    data_root: Path,
+    *,
+    include_record_counts: bool = False,
+    strict: bool = False,
+) -> dict:
+    """Merge the repartitioned depth_v2 source identity
+    (:func:`compute_depth_repartitioned_source_identity`) with the
+    unaffected, single-date trade_v2 source identity
+    (``pipeline.raw_manifest.compute_raw_source_identity`` — trade_v2 is
+    NOT repartitioned; see this module's cross-day-repartitioning docstring
+    for why) into one manifest-shaped ``source_identity`` dict."""
+    from pipeline.raw_manifest import compute_raw_source_identity
+
+    depth_identity = compute_depth_repartitioned_source_identity(
+        venue,
+        symbol,
+        date,
+        data_root,
+        include_record_counts=include_record_counts,
+        strict=strict,
+    )
+    trade_identity = compute_raw_source_identity(
+        venue, symbol, date, ["trade_v2"], data_root=data_root,
+        include_record_counts=include_record_counts,
+        strict=strict,
+    )
+    channels = {
+        "depth_v2": depth_identity["channels"]["depth_v2"],
+        "trade_v2": trade_identity["channels"]["trade_v2"],
+    }
+    missing = [c for c, entries in channels.items() if not entries]
+    return {
+        "venue": venue,
+        "symbol": symbol,
+        "date": date,
+        "channels": channels,
+        "complete": not missing,
+        "missing_channels": missing,
+    }
 
 
 def _to_ns_from_ms(value: object) -> int | None:
@@ -525,6 +1060,8 @@ def build_replay_for_symbol(
     schema_version: int = 0,
     price_scale: "Optional[int]" = None,
     qty_scale: "Optional[int]" = None,
+    check_repartition_readiness: bool = False,
+    require_complete_next_day: bool = False,
 ) -> dict:
     """
     Build replay store for a single venue/symbol/date.
@@ -537,19 +1074,52 @@ def build_replay_for_symbol(
     Args:
         schema_version: 0 (default — legacy v0, unchanged production
             behavior; every existing caller that omits this argument keeps
-            producing exactly today's output) or 1 (the issue #20 Phase 5
-            compact prototype schema, intended for development validation
-            only — not wired into any systemd unit or production config by
-            this change). Any other value raises immediately via
-            ``ReplayWriter``'s own constructor check — never silently falls
-            back to v0.
-        price_scale / qty_scale: only used when schema_version=1; forwarded
-            to ``ReplayWriter`` (see its docstring for the derivation
-            fallback).
+            producing exactly today's output), 1 (the issue #20 Phase 5
+            compact prototype schema), or 2 (the issue #20 Phase 7
+            hierarchical-integrity candidate). The compact schemas are
+            intended for development validation only and are not wired into
+            a systemd unit or production config. Any other value raises
+            immediately via ``ReplayWriter``'s own constructor check — never
+            silently falls back to v0.
+        price_scale / qty_scale: used by schema_version 1 and 2; forwarded to
+            ``ReplayWriter`` (see its docstring for the derivation fallback).
+        check_repartition_readiness: when True, refuse (return
+            ``status="deferred"``, never publish) to build this partition
+            until the NEXT UTC day's depth_v2 raw directory has at least
+            one hourly file present (see
+            ``check_depth_repartition_readiness`` for the exact rule and
+            rationale: a depth_update whose exchange event time is late on
+            ``date`` can be physically written into ``date+1``'s raw
+            files by ordinary recorder receive-latency, and
+            ``convert_day.py``'s reference route already scans D-1/D/D+1
+            to assign every record to its true event-time day — see
+            ``_stream_repartitioned_depth_records``, always applied to the
+            depth_v2 channel regardless of this flag). Defaults to
+            ``False`` for backward compatibility with existing
+            single-day-only callers/test fixtures that never populate an
+            adjacent-day raw directory; all operator/validation entry
+            points (this module's CLI ``main()``, ``pipeline.daily_build``,
+            and ``validation.validate_catalog_equivalence``) explicitly
+            pass ``True``. Depth
+            records themselves are ALWAYS repartitioned across D-1/D/D+1
+            when present, independent of this flag — this flag controls
+            only whether an ABSENT/not-yet-started D+1 blocks publication.
+        require_complete_next_day: when readiness checking is enabled,
+            require proof that D+1's final hour is closed. Canonical offline
+            semantic validation enables this; the 01:00 production timer
+            cannot because D+1 is still in progress.
 
     Returns:
         Status dict with counts and errors.
     """
+    if schema_version not in (0, 1, 2):
+        # Preserve the public fail-fast contract even though writer creation
+        # now lives inside the staging-cleanup scope below.
+        raise ValueError(
+            f"Unsupported schema_version={schema_version!r} "
+            "(supported: 0, 1, 2)"
+        )
+
     status = {
         "venue": venue,
         "symbol": symbol,
@@ -585,7 +1155,94 @@ def build_replay_for_symbol(
         logger.error(recovery.message)
         return status
     if recovery.action == "skip" and not force:
-        # Partition is valid (possibly just restored from backup).
+        # Partition is valid (possibly just restored from backup), but it is
+        # reusable only for the schema the caller actually requested.
+        manifest_path = (
+            replay_root
+            / f"venue={venue}"
+            / f"symbol={symbol}"
+            / f"date={date}"
+            / "manifest.json"
+        )
+        try:
+            with open(manifest_path) as manifest_file:
+                existing_manifest = json.load(manifest_file)
+        except Exception as exc:
+            status["status"] = "failed"
+            status["errors"].append(
+                f"Could not read validated existing manifest "
+                f"{manifest_path}: {exc}"
+            )
+            return status
+        existing_schema_version = existing_manifest.get("schema_version", 0)
+        if existing_schema_version != schema_version:
+            status["status"] = "failed"
+            status["errors"].append(
+                f"Existing valid partition {venue}/{symbol}/{date} uses "
+                f"schema_version={existing_schema_version!r}, but the caller "
+                f"requested schema_version={schema_version!r}. Refusing to "
+                "reuse or overwrite it implicitly; use force=True for an "
+                "intentional replacement."
+            )
+            logger.error(status["errors"][-1])
+            return status
+
+        if schema_version == 2:
+            # A v2 partition's replacement for the per-event payload hash is
+            # its exact raw-source identity. Reuse therefore requires the same
+            # readiness proof as a fresh build and a fresh, strict identity
+            # scan of the currently selected raw files.
+            if check_repartition_readiness:
+                readiness_reason = check_depth_repartition_readiness(
+                    venue,
+                    symbol,
+                    date,
+                    data_root,
+                    require_complete_next_day=require_complete_next_day,
+                )
+                if readiness_reason is not None:
+                    status["status"] = "deferred"
+                    status["errors"].append(readiness_reason)
+                    logger.info(
+                        f"Deferring reuse of {venue}/{symbol}/{date}: "
+                        f"{readiness_reason}"
+                    )
+                    return status
+            try:
+                live_source_identity = compute_repartitioned_source_identity(
+                    venue,
+                    symbol,
+                    date,
+                    data_root,
+                    include_record_counts=True,
+                    strict=True,
+                )
+                validate_v2_source_identity(
+                    live_source_identity,
+                    venue,
+                    symbol,
+                    date,
+                )
+            except Exception as exc:
+                status["status"] = "failed"
+                status["errors"].append(
+                    f"Cannot reuse schema_version=2 partition "
+                    f"{venue}/{symbol}/{date}: live raw source identity could "
+                    f"not be proven: {exc}"
+                )
+                logger.error(status["errors"][-1])
+                return status
+            if existing_manifest.get("source_identity") != live_source_identity:
+                status["status"] = "failed"
+                status["errors"].append(
+                    f"Cannot reuse schema_version=2 partition "
+                    f"{venue}/{symbol}/{date}: current selected raw source "
+                    "identity differs from the published manifest. Refusing "
+                    "silent reuse or automatic replacement."
+                )
+                logger.error(status["errors"][-1])
+                return status
+
         logger.info(
             f"Skipping already-complete partition: {venue}/{symbol}/{date}"
         )
@@ -596,6 +1253,31 @@ def build_replay_for_symbol(
     # resolved any crash-left backup/canonical ambiguity, and the current
     # valid canonical output (if any) will be moved into the backup slot by
     # publish() itself, then deleted only after the replacement validates.
+
+    # issue #20 Phase 7 semantic-oracle correction: depth_v2 cross-day
+    # event-time repartitioning readiness. The reference route
+    # (convert_day.py) requires D-1/D/D+1's raw depth_v2 data to correctly
+    # assign every record to its true UTC event-time day; a replay
+    # partition built before D+1's raw data has even started being written
+    # would silently omit any late-D event-time-skewed record that lands
+    # under D+1. Defer rather than knowingly publishing an input-incomplete
+    # partition. The programmatic default remains disabled for existing
+    # single-day library fixtures; every operator and canonical validation
+    # entry point enables it explicitly.
+    readiness_reason = None
+    if check_repartition_readiness:
+        readiness_reason = check_depth_repartition_readiness(
+            venue,
+            symbol,
+            date,
+            data_root,
+            require_complete_next_day=require_complete_next_day,
+        )
+    if readiness_reason is not None:
+        status["status"] = "deferred"
+        status["errors"].append(readiness_reason)
+        logger.info(f"Deferring {venue}/{symbol}/{date}: {readiness_reason}")
+        return status
 
     # Remove stale staging directory from a previous SIGKILL so it cannot be
     # confused with a successful previous build.
@@ -619,22 +1301,52 @@ def build_replay_for_symbol(
             logger.error(status["errors"][-1])
             return status
 
-    writer = ReplayWriter(
-        replay_root, venue, symbol, date,
-        schema_version=schema_version,
-        price_scale=price_scale,
-        qty_scale=qty_scale,
-        data_root=data_root,
-    )
-
+    writer: "ReplayWriter | None" = None
+    pre_build_raw_identity = None
     try:
-        # Stream depth records
+        writer = ReplayWriter(
+            replay_root, venue, symbol, date,
+            schema_version=schema_version,
+            price_scale=price_scale,
+            qty_scale=qty_scale,
+            data_root=data_root,
+        )
+
+        # issue #20 Phase 7 review point 6 (time-of-check/time-of-use):
+        # snapshot the selected raw files' identity BEFORE streaming begins,
+        # so a change during the build window can be detected against the
+        # second snapshot below. This is inside the cleanup scope because the
+        # writer has already created its staging directory.
+        if schema_version in (1, 2):
+            pre_build_raw_identity = compute_repartitioned_source_identity(
+                venue,
+                symbol,
+                date,
+                data_root,
+                strict=(schema_version == 2),
+            )
+            if schema_version == 2 and not pre_build_raw_identity.get("complete"):
+                raise RuntimeError(
+                    f"Cannot build schema_version=2 replay for "
+                    f"{venue}/{symbol}/{date}: selected raw source identity "
+                    "is incomplete before streaming"
+                )
+        # Stream depth records (issue #20 Phase 7: cross-day event-time
+        # repartitioned, matching convert_day.py's reference rule exactly —
+        # see _stream_repartitioned_depth_records's docstring. raw_index is
+        # the repartitioned scan-order index (matching the reference's own
+        # target_index semantics), NOT necessarily the record's ordinal
+        # within its own physical source file.
         depth_batch = []
-        for raw_index, raw_record in enumerate(stream_raw_records(
-            venue, symbol, "depth_v2", date, root=data_root
-        )):
+        for raw_index, raw_record, _source_date in _stream_repartitioned_depth_records(
+            venue,
+            symbol,
+            date,
+            data_root,
+            strict=(schema_version == 2),
+        ):
             raw_record = dict(raw_record)
-            raw_record.setdefault("raw_index", raw_index)
+            raw_record["raw_index"] = raw_index
             converted = _convert_depth_record(raw_record, venue, symbol, date)
             if converted:
                 depth_batch.append(converted)
@@ -646,9 +1358,24 @@ def build_replay_for_symbol(
 
         # Stream trade records
         trade_batch = []
-        for raw_index, raw_record in enumerate(stream_raw_records(
-            venue, symbol, "trade_v2", date, root=data_root
-        )):
+        trade_records = (
+            _stream_raw_records_strict(
+                venue,
+                symbol,
+                "trade_v2",
+                date,
+                data_root,
+            )
+            if schema_version == 2
+            else stream_raw_records(
+                venue,
+                symbol,
+                "trade_v2",
+                date,
+                root=data_root,
+            )
+        )
+        for raw_index, raw_record in enumerate(trade_records):
             raw_record = dict(raw_record)
             raw_record.setdefault("raw_index", raw_index)
             converted = _convert_trade_record(raw_record, venue, symbol, date)
@@ -660,17 +1387,56 @@ def build_replay_for_symbol(
         if trade_batch:
             writer.write_trades_batch(trade_batch)
 
-        if schema_version == 1:
+        if schema_version in (1, 2):
             # Issue #20 Phase 5 correction: source identity must reflect the
             # EXACT data_root/channels this build actually consumed above
             # (depth_v2, trade_v2) — never independently recomputed by
             # ReplayWriter against the global config.DATA_ROOT, which would
             # silently record checksums from a different raw root than a
             # custom --data-root build actually used.
-            from pipeline.raw_manifest import compute_raw_source_identity
-            writer.set_source_identity(compute_raw_source_identity(
-                venue, symbol, date, ["depth_v2", "trade_v2"], data_root=data_root
-            ))
+            #
+            # schema_version=2 (issue #20 Phase 7 hierarchical-integrity
+            # candidate) additionally requires per-file record_count/
+            # record_range, so a replay event's raw_index can be mapped
+            # back to its exact source file deterministically (see
+            # stores.replay_writer.resolve_source_record) — this replaces
+            # the removed per-event native_payload_hash.
+            post_build_raw_identity = compute_repartitioned_source_identity(
+                venue, symbol, date, data_root,
+                include_record_counts=(schema_version == 2),
+                strict=(schema_version == 2),
+            )
+
+            # issue #20 Phase 7 review point 6 (TOCTOU): compare the
+            # pre-streaming snapshot against this post-streaming one
+            # (path/sha256/size_bytes only — record_count/record_range are
+            # v2-only and not part of the pre-build snapshot). Any
+            # difference means the raw files were mutated WHILE this build
+            # was streaming/converting them, so the manifest we are about
+            # to write would describe raw bytes that do not match what was
+            # actually read. Fail closed rather than publish a manifest
+            # for different raw bytes than were streamed.
+            def _identity_fingerprint(identity: dict) -> dict:
+                return {
+                    channel: sorted(
+                        (e["path"], e["sha256"], e["size_bytes"])
+                        for e in entries
+                    )
+                    for channel, entries in identity.get("channels", {}).items()
+                }
+
+            if _identity_fingerprint(pre_build_raw_identity) != _identity_fingerprint(post_build_raw_identity):
+                raise RuntimeError(
+                    f"Raw source files for {venue}/{symbol}/{date} changed "
+                    "during this build (time-of-check/time-of-use hazard): "
+                    "the pre-streaming and post-streaming raw file "
+                    "checksums/sizes differ. Refusing to publish a manifest "
+                    "that would describe different raw bytes than were "
+                    "actually streamed/converted. Rebuild from a stable raw "
+                    "snapshot."
+                )
+
+            writer.set_source_identity(post_build_raw_identity)
 
         # Load instrument metadata if available
         instrument_metadata = None
@@ -735,7 +1501,8 @@ def build_replay_for_symbol(
             f"Failed to build replay for {venue}/{symbol}/{date}: {primary_error}"
         )
         try:
-            writer.cleanup_staging()
+            if writer is not None:
+                writer.cleanup_staging()
         except Exception as cleanup_error:
             status["errors"].append(f"Staging cleanup also failed: {cleanup_error}")
             logger.error(
@@ -787,11 +1554,14 @@ Examples:
         "--schema-version",
         type=int,
         default=0,
-        choices=(0, 1),
+        choices=(0, 1, 2),
         help="Replay schema version to build: 0 (default, production legacy "
-             "layout) or 1 (issue #20 Phase 5 compact prototype, for "
-             "development validation only — not used by any systemd unit "
-             "or production configuration).",
+             "layout), 1 (issue #20 Phase 5 compact prototype), or 2 (issue "
+             "#20 Phase 7 hierarchical-integrity candidate — compact "
+             "encoding plus a manifest-level traceability hierarchy "
+             "replacing the per-event native_payload_hash column). 1 and 2 "
+             "are for development validation only — not used by any "
+             "systemd unit or production configuration.",
     )
     args = parser.parse_args()
 
@@ -829,18 +1599,22 @@ Examples:
                     venue, symbol, date_str, data_root, replay_root,
                     force=args.force,
                     schema_version=args.schema_version,
+                    check_repartition_readiness=True,
                 )
                 results.append(result)
 
     # Summary
     successful = sum(1 for r in results if r["status"] == "success")
     failed = sum(1 for r in results if r["status"] == "failed")
+    deferred = sum(1 for r in results if r["status"] == "deferred")
     total_depth = sum(r.get("depth_count", 0) for r in results)
     total_trades = sum(r.get("trade_count", 0) for r in results)
 
     logger.info(
         f"Replay build complete: {successful} successful, {failed} failed, "
-        f"{total_depth} depth records, {total_trades} trade records"
+        f"{deferred} deferred (pending next-day raw availability for depth "
+        f"cross-day repartitioning), {total_depth} depth records, "
+        f"{total_trades} trade records"
     )
 
     return 0 if failed == 0 else 1

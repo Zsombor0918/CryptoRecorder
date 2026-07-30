@@ -144,6 +144,21 @@ def _write_clean_raw_day(data_root: Path) -> None:
             },
         ],
     )
+    # The canonical validation path is fail-closed for depth event-time
+    # repartitioning. A later-hour path proves the next day's T00 file is
+    # rotated/closed; both are empty because this fixture has no skewed tail.
+    _jsonl(
+        data_root / venue / "depth_v2" / symbol / "2026-06-13" / "2026-06-13T00.jsonl",
+        [],
+    )
+    _jsonl(
+        data_root / venue / "depth_v2" / symbol / "2026-06-13" / "2026-06-13T23.jsonl",
+        [],
+    )
+    _jsonl(
+        data_root / venue / "depth_v2" / symbol / "2026-06-14" / "2026-06-14T00.jsonl",
+        [],
+    )
 
 
 def test_full_l2_validator_matches_convert_day_on_clean_synthetic_day(tmp_path: Path) -> None:

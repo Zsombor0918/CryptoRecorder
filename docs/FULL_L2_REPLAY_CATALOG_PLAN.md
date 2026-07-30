@@ -21,10 +21,12 @@ Do not replace `convert_day.py` until equivalence is proven.
 > **Status (updated)**: `full_l2` is **implemented** and reuses the shared depth
 > engine in `converter/depth_phase2.py` (via the `stores/replay_depth_adapter.py`
 > adapter). It is **semantically validated on the ADAUSDT single-day smoke**
-> against `convert_day.py` (trades, OrderBookDeltas, OrderBookDepth10, and book
-> checkpoints all match). `convert_day.py` remains the production reference until
-> broader top50/multi-day validation passes; `v2.0.0` is **not** declared. There
-> is no second independent depth converter.
+> and now also has a completed high-volume BTCUSDT schema-v2 representative-day
+> report against `convert_day.py` (all exhaustive event streams, checkpoints,
+> continuity/fences, metadata, and source identity pass). These remain
+> single-symbol/single-day results. `convert_day.py` remains the production
+> reference until broader top50/multi-day validation passes; `v2.0.0` is **not**
+> declared. There is no second independent depth converter.
 
 ## Current Status
 
@@ -34,8 +36,10 @@ Implemented:
 - `replay_store -> validation.replay_catalog_reconstruct --profile trades_only` (validation-only, no CLI)
 - trades-only old-vs-new semantic validation
 - **`replay_store -> validation.replay_catalog_reconstruct --profile full_l2`** (shared depth engine)
-- **replay-based `OrderBookDeltas`** (validated on ADAUSDT smoke)
-- **replay-based `OrderBookDepth10`** (validated on ADAUSDT smoke)
+- **replay-based `OrderBookDeltas`** (validated on ADAUSDT smoke and BTCUSDT
+  representative day)
+- **replay-based `OrderBookDepth10`** (validated on ADAUSDT smoke and BTCUSDT
+  representative day)
 - **full-L2 old-vs-new semantic validation** (`validate_catalog_equivalence
   --profile full_l2`)
 
@@ -207,20 +211,67 @@ local raw market data.
 This is a **single-symbol, single-day** result. It does not by itself prove
 universe-wide equivalence.
 
+## Real-Data Result (BTCUSDT schema-v2 representative day)
+
+```
+2026-06-11 BINANCE_SPOT/BTCUSDT full_l2 (schema-v2 replay vs convert_day.py):
+  trade_ticks         old 3418712   new 3418712    exact
+  order_book_deltas   old 30009655  new 30009655   exact
+  order_book_depth10  old 84066     new 84066      exact
+  book checkpoints    7/7 canonical hashes match
+  continuity/fences   exact (25/25 fences, canonical digest match)
+  raw/replay metadata exact (846430 depth, 3419004 trades)
+  source identity     current raw = manifest = integrity copy
+  status              passed
+```
+
+The reference, replay, and trade fragments were preserved; no rebuild or rerun
+of those stages was required. Reader hardening changed the streaming algorithm,
+so only deltas were rerun before the remaining stages. Every substantial new
+stage ran serially under a 10 GiB cgroup and recorded zero OOM events. The
+accepted external report SHA-256 is
+`69c4466d1a6cb4206110f07def6f9d9c2b751a65f6923bd270ac16956668c281`;
+a compact path-sanitized local summary is generated under the contractually
+gitignored `validation_reports/` structure. Catalogs and large evidence logs
+remain external.
+
+This is additional high-volume, single-symbol/single-day development evidence,
+not the broader top50/multi-day gate.
+
 ## Equivalence Boundary (caveats)
 
 Reproducible by the replay full-L2 path (matches `convert_day.py`):
 
 - snapshot-seed deltas, live depth deltas, derived Depth10;
-- continuity fences, session resets, clean single-session bootstrap days.
+- continuity fences, session resets, clean single-session bootstrap days;
+- cross-day event-time repartitioning (issue #20 Phase 7 correction,
+  implemented and proven, not a caveat anymore): `pipeline.build_replay_store`
+  now applies convert_day.py's own reference rule
+  (`converter.depth_phase2._spool_repartitioned_records`) exactly, scanning
+  D-1/D/D+1's raw depth_v2 directories and assigning each record to whichever
+  UTC day its canonical event time falls in. Proven via the exhaustive
+  `validate_catalog_equivalence` gate on BINANCE_SPOT/ADAUSDT for
+  2026-06-10, 2026-06-11 (the day that originally exposed a 47-event
+  OrderBookDeltas gap — now old=new=1,071,997 exactly), and 2026-06-12, for
+  both schema_version=0 and schema_version=2 — all 8 comparison components
+  (instrument identity/precision, TradeTicks, OrderBookDeltas,
+  OrderBookDepth10, book checkpoints, continuity diagnostics, fenced ranges,
+  raw-to-replay metadata) pass. See
+  `pipeline.build_replay_store.check_depth_repartition_readiness` for the
+  readiness boundary: canonical offline validation requires D+1's final hour
+  to be closed before construction. The 01:00 production timer uses a
+  narrower closed-T00 operational policy; because the recorder does not
+  enforce a formal maximum websocket delay, that production timing policy is
+  not itself a proof that all future D+1 hours are irrelevant.
 
-Documented acceptable differences (the replay v0 path does not reproduce these
-old-converter internals byte-for-byte; comparison is semantic, not byte-equal):
+Documented acceptable difference (comparison is semantic, not byte-equal):
 
-- `sync_state` fenced-range bookkeeping;
-- carry synthetic snapshots across partition boundaries;
-- repartitioned boundary records;
-- duplicate-suppression details.
+- duplicate-suppression implementation details.
+
+Current replay schemas preserve `sync_state` and `stream_lifecycle` records.
+The accepted ADAUSDT/BTCUSDT gates proved continuity diagnostics and complete
+canonical fenced-range results exact, so sync-state fencing is not a current
+caveat.
 
 Days dominated by these internals may diverge; the ADAUSDT smoke day did not.
 

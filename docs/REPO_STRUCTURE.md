@@ -1,6 +1,6 @@
 # Repository Structure Contract
 
-**Date**: 2026-07-20
+**Date**: 2026-07-30
 
 This document is the binding contract for all future implementation in this
 repository. Any Codex task or contributor must read this before adding files.
@@ -111,7 +111,8 @@ Pure data access layer; no CLI entrypoints. There is no feature-store or
 label-store schema/reader/writer in this package.
 
 **`validation/`** — The single general validation package. Contains all
-audit CLIs (audit_replay_store, audit_storage_size), equivalence checks
+audit CLIs (audit_replay_store, audit_storage_size), fail-closed artifact
+identity and serial semantic-stage orchestration, equivalence checks
 (validate_catalog_equivalence), the internal validation-only replay→catalog
 reconstruction helper (replay_catalog_reconstruct — no CLI), catalog
 comparison utilities (catalog_compare), catalog inspection (catalog_inspect),
@@ -120,6 +121,9 @@ logic; that belongs in `pipeline/`.
 
 **`scripts/`** — Thin operator wrappers only. Scripts may call subprocesses or
 invoke pipeline/validation CLIs, but must not contain importable business logic.
+`run_under_cgroup.sh` is the supported thin cgroup-v2 execution/evidence
+wrapper for serial validation stages; all comparison logic remains in
+`validation/`.
 The replay full-L2 reconstruction path is implemented (validation-only) and
 validated on the ADAUSDT smoke; no script may claim broader top50/multi-day
 full-L2 equivalence until that wider validation is run and declared done.
@@ -264,6 +268,9 @@ internal helper with no CLI used exclusively by the equivalence check):
 - `audit_change_compliance.py`
 - `audit_replay_store.py`
 - `audit_storage_size.py`
+- `artifact_identity.py` (content-derived identity and revalidation)
+- `serial_gate.py` (serial subprocess orchestration; no retry)
+- `stage_runner_cli.py` (isolated validation-stage/report CLI)
 - `validate_catalog_equivalence.py`
 - `replay_catalog_reconstruct.py` (no CLI; validation-only)
 - `catalog_compare.py`
@@ -363,3 +370,4 @@ replay_store -> validation.replay_catalog_reconstruct (validation-only, no CLI)
 | 2026-07-20 | Issues #17/#19 completion: expanded the Root-Level Files table to list every real root `.py` module; deleted stale duplicate systemd units (`crypto-recorder.service`, `nautilus-convert.{service,timer}`, `cryptorecorder-daily-build.{service,timer}`) superseded by `cryptorecorder-recorder.service`, `cryptorecorder-convert.{service,timer}`, and `cryptorecorder-replay-build.{service,timer}`, the units actually referenced by `scripts/deploy_linux_server.sh`; removed root `inspect_catalog.py` (dead code); removed `docs/GUARANTEES.md` (superseded by `ARCHITECTURE.md`); added 7 tests to `tests/test_repo_structure.py` enforcing this contract exactly. |
 | 2026-07-22 | PR #18 finalization: deleted `systemd/cryptorecorder-convert.service` and `systemd/cryptorecorder-convert.timer` — converter systemd automation is not part of the supported production architecture. Manual reconstruction uses documented CLI commands, not systemd templates. Stale installed converter units are still removed by `scripts/deploy_linux_server.sh` cleanup. Converter Python code (`convert_day.py`, `converter/`) is unchanged and required. |
 | 2026-07-24 | Issue #20 Phase 4: `pipeline/` may now contain exactly one supported, explicitly-scoped selected-reconstruction CLI (development-computer, temporary catalog, explicit venue/symbol/time-window only) — this deliberately re-scopes the issue #17 removal of `pipeline/generate_catalog.py`, which stays permanently forbidden by name and by its unscoped ("all symbols/all history") shape. No such CLI exists yet in this repository; this amendment only updates the contract and its guard test (`tests/test_repo_structure.py::test_pipeline_reconstruction_cli_stays_explicitly_scoped`) ahead of a future implementation phase. |
+| 2026-07-30 | Issue #20 Phase 7 checkpoint: added validation-only `artifact_identity.py`, `serial_gate.py`, and `stage_runner_cli.py` to bind and execute isolated exhaustive semantic stages, plus thin operator wrapper `scripts/run_under_cgroup.sh` for fail-closed cgroup limits/telemetry. No build logic moved into `validation/` and no business logic moved into `scripts/`. |

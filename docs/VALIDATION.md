@@ -143,6 +143,164 @@ python -m validation.validate_catalog_equivalence \
 top50/multi-day validation is pending — see
 [FULL_L2_REPLAY_CATALOG_PLAN.md](FULL_L2_REPLAY_CATALOG_PLAN.md).
 
+#### Bounded catalog-reader compatibility boundary
+
+The exhaustive TradeTick, OrderBookDelta, and Depth10 comparisons do not use
+Nautilus's normal DataFusion query for full-day streams. In
+`nautilus_trader==1.225.0`, that query unconditionally applies a global
+`ORDER BY ts_init`; real BTCUSDT diagnostics showed that the native sort can
+materialize the complete multi-file result before yielding a batch. The
+validation reader instead uses `ParquetDataCatalog._query_files()` to select
+candidate files, then reads one Parquet file and row group at a time with
+bounded PyArrow batches.
+
+`_query_files()` is a **private Nautilus method**, not a supported public API.
+It is currently used because Nautilus 1.225.0 exposes no public
+class/instrument/time file-pruning API that avoids the DataFusion query.
+`requirements.txt` therefore pins exactly `nautilus_trader==1.225.0`, and the
+reader also checks the installed version and private method signature at
+runtime. A different, missing, or incompatible implementation raises a clear
+compatibility error. It must never silently fall back to `catalog.query()`,
+`_query_rust()`, or `backend_session()`.
+
+The direct file reader accepts only one requested instrument and one supported
+data class per stream. Before yielding any object it preflights every selected
+file and requires:
+
+- the expected catalog class path, Arrow schema, and exact `instrument_id`
+  metadata (the physical field names, order, types, and nullability must
+  exactly match the pinned Nautilus 1.225.0 schema for that data class);
+- a parseable Nautilus filename whose interval equals the file's actual
+  `ts_init` range;
+- explicit ascending row-group order and internally non-decreasing `ts_init`;
+- strictly disjoint adjacent closed file intervals
+  (`next.first_ts > previous.last_ts`).
+
+This layout is a proved invariant of the successfully written
+CryptoRecorder reference and replay-reconstruction validation catalogs under
+Nautilus 1.225.0: both paths write `ObjectSpool` output ordered by
+`(ts_init, ordinal)` and neither bypasses Nautilus's closed-interval
+disjointness check. It is not a guarantee for arbitrary Nautilus catalogs,
+which can opt out of that check. Overlap, including equal `ts_init` at a file
+boundary, therefore fails closed; the reader never silently concatenates it.
+Equal timestamps inside one file retain physical `(ts_init, ordinal)` order.
+
+One writer-side limitation remains explicit: Nautilus 1.225.0 checks for an
+already-existing timestamp-derived filename before its overlap check. Two
+separate write chunks with the exact same singleton interval can cause the
+later write to be skipped. The reader can reject overlap among files that
+exist, but cannot recover a chunk already omitted by the writer. Thus
+non-overlap proves the supported file layout, not independently the
+completeness of arbitrary equal-timestamp write chunks. The preserved
+BTCUSDT reference/replay artifacts contain strictly disjoint files and their
+exhaustive trade/delta comparisons match; no rebuild is implied by this
+documented boundary.
+
+The preflight and decode passes keep at most one Parquet file open and one
+bounded Arrow batch live. `ArrowSerializer.deserialize()` receives only that
+current batch, and `from_pyo3_list()` converts only its returned current-batch
+list. Before yielding the first object from a decoded batch, the reader checks
+its row count, every decoded `ts_init` against the corresponding Arrow row,
+non-decreasing order, and instrument identity. Focused tests verify the prior
+Arrow batch is released at the next batch transition, conversion does not
+retain its input list, and no batch references remain after iteration. Caller
+ranges remain half-open `[start, end)`; internally the reader applies inclusive
+`[start, end - 1]` filtering, matching the prior Nautilus catalog-query
+contract exactly. Memory is bounded by Arrow batch size, not a time
+subdivision; the obsolete no-op `window_ns`/`--window-hours` compatibility
+surface has been removed.
+
+#### Process-isolated semantic stages
+
+Large production-day comparisons are split into independent
+`validation.stage_runner_cli` subprocesses so allocator state is released
+between stages and every substantial stage can have its own cgroup limit.
+The comparison/diagnostic subcommands are:
+
+- `trades` and `deltas`: exhaustive event-by-event comparisons;
+- `depth10`: exhaustive Depth10 comparison;
+- `checkpoints`: bounded delta replay at the canonical book checkpoints;
+- `continuity`: persisted reference/candidate continuity-count comparison;
+- `fences`: complete fenced-range count and canonical-digest comparison;
+- `metadata`: exhaustive event-keyed raw-to-replay metadata comparison plus
+  a fresh raw source-identity recomputation against the replay manifest; it
+  first requires the complete D+1 raw scope to be closed;
+- `integrity`: exact schema/version routine validation plus the explicit
+  row-group-by-row-group deep digest and boundary audit.
+
+The obsolete combined `depth` compatibility subcommand was removed; Depth10
+and checkpoints are always explicit stages.
+
+Before the first comparison, create an artifact identity in its own bounded
+validation process:
+
+```bash
+python -m validation.artifact_identity \
+  --config artifact-identity-config.json \
+  --out artifact-identity.json
+```
+
+The config selects exactly one `date`, `venue`, `symbol`, and `instrument_id`
+and supplies `data_root`, `replay_root`, `reference_catalog_root`,
+`reference_report_path`, `candidate_catalog_root`, and
+`candidate_reconstruction_manifest_path`. It also supplies an explicit
+previous-day `carry` object. `carry.kind=replay_manifest` requires and hashes
+the complete previous-day schema-v2 replay manifest.
+`carry.kind=no_carry_prelisting` is not a caller assertion: the command
+requires `data_root`, probes the previous date with the replay builder's
+bounded source-record predicate, and fails if any contributing depth/trade
+record or previous-day replay partition exists. Its sanitized recorded result
+is `not_applicable_pre_listing`; the data-root path is never emitted.
+
+The source composite covers the reference catalog tree, normalized reference
+convert report, and freshly recomputed target raw-source identity. The
+candidate composite covers the reconstructed catalog tree, normalized
+reconstruction manifest, exact target replay manifest, and either the exact
+carry manifest or verified pre-listing marker. Replay manifests must be
+`status=complete`, `schema_version=2`, `format_version=2`, built by
+`cryptorecorder-replay-writer-v2.0.0`, and carry a complete, structurally valid
+source identity which exactly matches its integrity copy. The target replay
+identity must also exactly equal the fresh raw identity.
+
+Catalog trees use bounded, deterministic, length-framed SHA-256 hashing over
+sorted root-relative POSIX names, file sizes, and file-byte digests. Absolute
+tree roots, mtimes, ownership, and inode numbers are excluded; symlinks,
+non-regular files, mutation during hashing, and an empty selected tree fail
+closed. JSON hashing canonicalizes content and replaces absolute machine paths
+with one fixed marker only after the report/manifest's configured-root
+provenance has been checked. The compact identity JSON contains no machine
+paths and its output is created exclusively: an existing file is never
+overwritten.
+
+Every stage config includes `artifact_identity_path`, the same explicit
+artifact input fields used to create it, and a `scope` whose date, venue,
+symbol, instrument, source hash, and candidate hash exactly equal the
+validated document. The document itself has one canonical length-framed
+SHA-256 representation. Before and after running its comparison, every stage
+revalidates and re-hashes the configured artifacts; mutation or substitution
+turns the stage into a failure. Each fragment records the canonical identity
+digest, sanitized stage configuration (profile/window plus
+schema/format/builder identity), and the exact source/candidate/component
+hashes. Caller-provided labels alone are never an identity.
+
+The `report` subcommand independently loads and recomputes the identity before
+aggregation, performs the same post-stage recheck, and requires every
+fragment's complete cryptographic binding to equal the verified document. It
+rejects matching labels with different hashes, old/new build mixtures,
+missing, duplicate, unexpected, failed, or cross-artifact fragments. Reusing
+a preserved fragment is valid only when its canonical identity binding still
+matches the independently verified artifacts.
+
+Wrap each substantial CLI invocation with
+`scripts/run_under_cgroup.sh 10G <fresh-output-dir> <fresh-unit-name> -- ...`.
+The wrapper verifies the effective limit and cgroup membership before release,
+enforces zero swap, samples `memory.current`, records kernel `memory.peak` and
+final `memory.events`, propagates the child exit status, never retries, and
+fails on missing telemetry, a zero peak, or any OOM event. It refuses to
+overwrite prior evidence. `validation.serial_gate` likewise
+rejects an existing output, a fragment larger than 8 MiB, non-object JSON, or
+an exit-zero fragment whose `passed` field is not exactly `true`.
+
 See [DAILY_BUILD_PIPELINE.md](DAILY_BUILD_PIPELINE.md) `## Local Testing
 Workflow (temp-root smoke)` for the full end-to-end build-then-validate
 recipe using temporary roots.

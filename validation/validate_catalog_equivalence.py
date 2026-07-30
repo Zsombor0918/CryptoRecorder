@@ -19,7 +19,10 @@ from config import (
 )
 from converter.readers import stream_raw_records
 from converter.spool import RawRecordSpool
-from pipeline.build_replay_store import build_replay_for_symbol
+from pipeline.build_replay_store import (
+    build_replay_for_symbol,
+    replay_partition_has_source_records,
+)
 from stores.replay_reader import ReplayReader
 from validation.replay_catalog_reconstruct import generate_catalog_from_replay
 from validation.catalog_compare import (
@@ -31,9 +34,9 @@ from validation.catalog_compare import (
     compare_order_book_deltas_exhaustive,
     compare_order_book_depth10_exhaustive,
     compare_trade_ticks_exhaustive,
-    iter_order_book_deltas_windowed,
-    iter_order_book_depth10_windowed,
-    iter_trade_ticks_windowed,
+    iter_order_book_deltas_bounded,
+    iter_order_book_depth10_bounded,
+    iter_trade_ticks_bounded,
     load_instrument_ids,
     load_instruments,
     write_validation_report,
@@ -43,13 +46,6 @@ logger = logging.getLogger(__name__)
 
 # Profiles that exercise the depth (OrderBookDeltas / Depth10) comparison path.
 _DEPTH_PROFILES = ("full_l2", "depth_only", "depth10")
-
-# Default window size for the bounded-memory windowed loaders used by the
-# acceptance path (see iter_trade_ticks_windowed()/iter_order_book_deltas_windowed()
-# in validation.catalog_compare for the boundary-safety design and its
-# explicit "not a proven strict memory ceiling from time alone" caveat).
-DEFAULT_WINDOW_NS = 3_600_000_000_000  # 1 hour
-
 
 def _parse_date(date_str: str) -> datetime:
     return datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
@@ -142,23 +138,73 @@ def _run_new_pipeline(
             # scanning is derived from `start`/`end` below, not from what
             # partitions happen to exist in replay_root).
             prev_date = (datetime.strptime(date, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
-            prev_day_result = build_replay_for_symbol(
-                venue, symbol, prev_date, data_root, replay_root,
-                schema_version=schema_version,
-            )
-            if prev_day_result["status"] not in ("success", "skipped"):
-                logger.info(
-                    f"Previous-day replay build for carry recovery "
-                    f"({venue}/{symbol}/{prev_date}) did not succeed "
-                    f"(status={prev_day_result['status']!r}); proceeding "
-                    "without cross-day carry recovery for this partition."
-                )
-            replay_results.append(
-                build_replay_for_symbol(
-                    venue, symbol, date, data_root, replay_root,
+            if replay_partition_has_source_records(
+                venue, symbol, prev_date, data_root
+            ):
+                prev_day_result = build_replay_for_symbol(
+                    venue,
+                    symbol,
+                    prev_date,
+                    data_root,
+                    replay_root,
                     schema_version=schema_version,
+                    check_repartition_readiness=True,
+                    require_complete_next_day=True,
                 )
+                if prev_day_result["status"] not in ("success", "skipped"):
+                    return {
+                        "replay_results": [prev_day_result],
+                        "catalog_result": {
+                            "status": "failed",
+                            "errors": [
+                                "previous-day replay input exists but its "
+                                "carry partition did not build successfully"
+                            ],
+                        },
+                        "catalog_path": str(
+                            new_catalog_root / "job_validation_new"
+                        ),
+                    }
+                replay_results.append(prev_day_result)
+            else:
+                replay_results.append(
+                    {
+                        "venue": venue,
+                        "symbol": symbol,
+                        "date": prev_date,
+                        "status": "not_applicable",
+                        "reason": (
+                            "no depth/trade records contribute to this "
+                            "pre-listing previous-day partition"
+                        ),
+                    }
+                )
+
+            target_result = build_replay_for_symbol(
+                venue,
+                symbol,
+                date,
+                data_root,
+                replay_root,
+                schema_version=schema_version,
+                check_repartition_readiness=True,
+                require_complete_next_day=True,
             )
+            replay_results.append(target_result)
+            if target_result["status"] not in ("success", "skipped"):
+                return {
+                    "replay_results": replay_results,
+                    "catalog_result": {
+                        "status": "failed",
+                        "errors": [
+                            "target replay partition did not build "
+                            "successfully"
+                        ],
+                    },
+                    "catalog_path": str(
+                        new_catalog_root / "job_validation_new"
+                    ),
+                }
 
     catalog_result = generate_catalog_from_replay(
         replay_root=replay_root,
@@ -188,7 +234,6 @@ def _compare_depth_for_instrument(
     start_ns: int,
     end_ns: int,
     *,
-    window_ns: int,
     emit_depth10: bool,
     levels: int,
 ) -> dict[str, Any]:
@@ -198,33 +243,40 @@ def _compare_depth_for_instrument(
     non-gating or degraded to a full-day-list diagnostic).
 
     - `order_book_deltas`: compare_order_book_deltas_exhaustive() fed by
-      iter_order_book_deltas_windowed().
+      iter_order_book_deltas_bounded().
     - `book_checkpoints`: compare_book_checkpoints_streaming() — the
       bounded-memory checkpoint reconstruction, fed by a SECOND pair of
-      windowed delta iterators (checkpoints need their own independent
+      bounded delta iterators (checkpoints need their own independent
       traversal from the exhaustive delta comparison above, since a
       generator can only be consumed once; this doubles the on-disk read
       for the delta channel but keeps memory bounded for each pass). The
       full-day `load_order_book_deltas()`-based `compare_book_checkpoints()`
       is no longer used here at all.
     - `order_book_depth10`: compare_order_book_depth10_exhaustive() fed by
-      iter_order_book_depth10_windowed() when `emit_depth10` is True and
+      iter_order_book_depth10_bounded() when `emit_depth10` is True and
       gates `passed`; when explicitly disabled, reported as intentionally
       skipped (not a failing-but-ignored comparison).
+
+    All three bounded readers stream directly via PyArrow's own
+    file/row-group-bounded Parquet reader (see
+    validation.catalog_compare._iter_catalog_files_bounded()) rather than
+    DataFusion's SQL/ORDER BY path or bisecting a time window — peak live
+    objects is bounded by the configured batch size, not by event count or
+    day length.
     """
-    old_delta_stream = iter_order_book_deltas_windowed(
-        old_catalog_root, instrument_id, start_ns, end_ns, window_ns=window_ns
+    old_delta_stream = iter_order_book_deltas_bounded(
+        old_catalog_root, instrument_id, start_ns, end_ns
     )
-    new_delta_stream = iter_order_book_deltas_windowed(
-        new_catalog_path, instrument_id, start_ns, end_ns, window_ns=window_ns
+    new_delta_stream = iter_order_book_deltas_bounded(
+        new_catalog_path, instrument_id, start_ns, end_ns
     )
     deltas_cmp = compare_order_book_deltas_exhaustive(old_delta_stream, new_delta_stream)
 
-    old_delta_stream_for_checkpoints = iter_order_book_deltas_windowed(
-        old_catalog_root, instrument_id, start_ns, end_ns, window_ns=window_ns
+    old_delta_stream_for_checkpoints = iter_order_book_deltas_bounded(
+        old_catalog_root, instrument_id, start_ns, end_ns
     )
-    new_delta_stream_for_checkpoints = iter_order_book_deltas_windowed(
-        new_catalog_path, instrument_id, start_ns, end_ns, window_ns=window_ns
+    new_delta_stream_for_checkpoints = iter_order_book_deltas_bounded(
+        new_catalog_path, instrument_id, start_ns, end_ns
     )
     checkpoints_cmp = compare_book_checkpoints_streaming(
         old_delta_stream_for_checkpoints, new_delta_stream_for_checkpoints, start_ns, end_ns, levels=levels
@@ -235,11 +287,11 @@ def _compare_depth_for_instrument(
         "book_checkpoints": checkpoints_cmp,
     }
     if emit_depth10:
-        old_depth10_stream = iter_order_book_depth10_windowed(
-            old_catalog_root, instrument_id, start_ns, end_ns, window_ns=window_ns
+        old_depth10_stream = iter_order_book_depth10_bounded(
+            old_catalog_root, instrument_id, start_ns, end_ns
         )
-        new_depth10_stream = iter_order_book_depth10_windowed(
-            new_catalog_path, instrument_id, start_ns, end_ns, window_ns=window_ns
+        new_depth10_stream = iter_order_book_depth10_bounded(
+            new_catalog_path, instrument_id, start_ns, end_ns
         )
         out["order_book_depth10"] = compare_order_book_depth10_exhaustive(old_depth10_stream, new_depth10_stream)
     else:
@@ -481,22 +533,38 @@ def _iter_sorted_raw_depth(data_root: Path, venue: str, symbol: str, date: str):
     already be in this order across file boundaries, so sorting is
     required for a correct positional comparison against the replay side
     (which the replay-store contract already guarantees is delivered in
-    this order)."""
+    this order).
+
+    issue #20 Phase 7 cross-day repartitioning correction: this raw-side
+    scan must apply the EXACT SAME event-time repartitioning rule as
+    ``pipeline.build_replay_store._stream_repartitioned_depth_records``
+    (itself matching ``convert_day.py``'s own reference rule) — otherwise
+    this "raw vs replay" metadata comparator would spuriously disagree with
+    a CORRECTLY repartitioned replay partition (an event physically stored
+    under an adjacent UTC day, but assigned to ``date`` by event time,
+    would appear as "extra" on the replay side and "missing" on this raw
+    side if this scan only read ``date``'s own directory). Reusing the
+    shared repartitioning function directly (rather than reimplementing it)
+    guarantees this comparator can never silently drift from the actual
+    replay-build behavior it is meant to validate.
+    """
+    from pipeline.build_replay_store import _stream_repartitioned_depth_records
+
     with RawRecordSpool(prefix="cr-validate-depth-") as spool:
-        raw_index = 0
-        for rec in stream_raw_records(venue, symbol, "depth_v2", date, root=data_root):
+        for raw_index, rec, _source_date in _stream_repartitioned_depth_records(
+            venue, symbol, date, data_root
+        ):
             if rec.get("record_type", "depth_update") not in _DEPTH_ACCEPTED_RECORD_TYPES:
-                raw_index += 1
                 continue
             session_id = int(rec.get("stream_session_id") or 0)
             session_seq = int(rec.get("session_seq") or 0)
             rec = dict(rec)
             rec["raw_index"] = raw_index
             spool.insert(rec, (session_id, session_seq, 0), raw_index)
-            raw_index += 1
         spool.commit()
         for rec in spool.iter_records():
             yield _normalize_raw_depth_record(rec)
+
 
 
 def _iter_sorted_raw_trades(data_root: Path, venue: str, symbol: str, date: str):
@@ -588,7 +656,6 @@ def validate_catalog_equivalence(
     emit_depth10: bool = EMIT_DEPTH10_DEFAULT,
     depth10_interval_sec: float = DEPTH10_INTERVAL_SEC,
     derived_depth_snapshot_levels: int = DERIVED_DEPTH_SNAPSHOT_LEVELS,
-    window_ns: int = DEFAULT_WINDOW_NS,
     schema_version: int = 0,
 ) -> dict[str, Any]:
     """Run the canonical semantic-equivalence gate between the reference
@@ -597,9 +664,10 @@ def validate_catalog_equivalence(
 
     Args:
         schema_version: replay schema version to build the candidate side
-            with (0 default/legacy, or 1 for the issue #20 Phase 5 compact
-            prototype). This lets the SAME canonical validator gate a v1
-            replay build end-to-end (instruments/precision, exhaustive
+            with (0 default/legacy, 1 for the issue #20 Phase 5 compact
+            prototype, or 2 for the hierarchical-integrity candidate).
+            This lets the SAME canonical validator gate a compact replay
+            build end-to-end (instruments/precision, exhaustive
             trades/deltas, book checkpoints, Depth10, fenced-range/
             continuity/quality-flag evidence) without a separate ad-hoc
             four-function comparison script.
@@ -723,14 +791,14 @@ def validate_catalog_equivalence(
         if compares_trades:
             # Exhaustive, order-preserving, bounded-memory comparison —
             # the acceptance-gating trade comparison (issue #20 follow-up
-            # correction). Fed by the windowed loader, never the full-day
+            # correction). Fed by the bounded reader, never the full-day
             # load_trade_ticks() list loader, and never
             # compare_trade_ticks_semantic()'s sampled comparator.
-            old_trade_stream = iter_trade_ticks_windowed(
-                old_catalog_root, instrument_id, start_ns, end_ns, window_ns=window_ns
+            old_trade_stream = iter_trade_ticks_bounded(
+                old_catalog_root, instrument_id, start_ns, end_ns
             )
-            new_trade_stream = iter_trade_ticks_windowed(
-                new_catalog_path, instrument_id, start_ns, end_ns, window_ns=window_ns
+            new_trade_stream = iter_trade_ticks_bounded(
+                new_catalog_path, instrument_id, start_ns, end_ns
             )
             trades_cmp = compare_trade_ticks_exhaustive(old_trade_stream, new_trade_stream)
             per_instrument["trade_ticks"] = trades_cmp
@@ -744,7 +812,6 @@ def validate_catalog_equivalence(
                 instrument_id,
                 start_ns,
                 end_ns,
-                window_ns=window_ns,
                 emit_depth10=emit_depth10,
                 levels=derived_depth_snapshot_levels,
             )
@@ -864,29 +931,16 @@ def main() -> int:
         default=DERIVED_DEPTH_SNAPSHOT_LEVELS,
         help=f"Depth10 levels for the new pipeline (default: {DERIVED_DEPTH_SNAPSHOT_LEVELS}).",
     )
-    parser.add_argument(
-        "--window-hours",
-        type=float,
-        default=DEFAULT_WINDOW_NS / 3_600_000_000_000,
-        help=(
-            "Bounded-memory time window (in hours) used by the exhaustive "
-            "trade/delta comparators' windowed catalog loaders. Default: 1 "
-            "hour. Tune based on measured per-window RSS for the target "
-            "production day (issue #20 Tier 3) — a fixed time window bounds "
-            "query result size per window but is not by itself a proven "
-            "strict event-count/RSS ceiling."
-        ),
-    )
     parser.add_argument("--report-path", type=Path, default=None)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument(
         "--schema-version",
         type=int,
         default=0,
-        choices=(0, 1),
+        choices=(0, 1, 2),
         help="Replay schema version to build the candidate side with: 0 "
-             "(default, legacy) or 1 (issue #20 Phase 5 compact prototype, "
-             "for development validation only).",
+             "(default, legacy), 1 (issue #20 Phase 5 compact prototype), "
+             "or 2 (issue #20 Phase 7 hierarchical-integrity candidate).",
     )
     args = parser.parse_args()
 
@@ -912,7 +966,6 @@ def main() -> int:
         emit_depth10=args.emit_depth10,
         depth10_interval_sec=args.depth10_interval_sec,
         derived_depth_snapshot_levels=args.derived_depth_snapshot_levels,
-        window_ns=int(args.window_hours * 3_600_000_000_000),
         schema_version=args.schema_version,
     )
 

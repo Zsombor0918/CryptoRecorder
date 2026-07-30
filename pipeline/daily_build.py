@@ -64,8 +64,16 @@ def run_build_replay_store(
     symbols: list[str],
     data_root: Path,
     replay_root: Path,
+    *,
+    check_repartition_readiness: bool = True,
 ) -> dict:
-    """Run replay store builder."""
+    """Run replay store builder.
+
+    check_repartition_readiness: defaults to True for this production
+    orchestrator (see build_replay_for_symbol's docstring) — pass False
+    only for tests/development that intentionally build single-day
+    fixtures without an adjacent-day raw directory.
+    """
     logger.info(f"Building replay_store for {date_str}...")
     
     # Import here to avoid circular deps
@@ -94,17 +102,23 @@ def run_build_replay_store(
                 )
                 continue
             result = build_replay_for_symbol(
-                venue, symbol, date_str, data_root, replay_root
+                venue, symbol, date_str, data_root, replay_root,
+                check_repartition_readiness=check_repartition_readiness,
             )
             results.append(result)
     
     successful = sum(1 for r in results if r["status"] == "success")
     skipped = sum(1 for r in results if r["status"] == "skipped")
     failed_count = sum(1 for r in results if r["status"] == "failed")
+    deferred_count = sum(1 for r in results if r["status"] == "deferred")
     total_depth = sum(r.get("depth_count", 0) for r in results)
     total_trades = sum(r.get("trade_count", 0) for r in results)
 
     # A skipped partition is already-valid; treat it as success for status.
+    # A deferred partition (issue #20 Phase 7: depth cross-day repartitioning
+    # readiness not yet satisfied) is neither a success nor a failure -- it
+    # is an expected, retryable "not yet" state, so it must not count toward
+    # "failed" or trigger an overall "failed" status on its own.
     successful_or_skipped = successful + skipped
 
     if not results:
@@ -118,6 +132,10 @@ def run_build_replay_store(
         )
     elif successful_or_skipped == len(results):
         status = "success"
+    elif successful_or_skipped + deferred_count == len(results) and failed_count == 0:
+        # Every non-successful partition is deferred (pending next-day raw
+        # availability), none genuinely failed.
+        status = "partial" if successful_or_skipped > 0 else "deferred"
     elif successful_or_skipped == 0:
         # Partitions were attempted but every single one failed — distinct
         # from both "no_data" (nothing was eligible) and "partial" (a mix
@@ -132,14 +150,15 @@ def run_build_replay_store(
 
     logger.info(
         f"Replay build complete: {successful} built, {skipped} skipped, "
-        f"{failed_count} failed / {len(results)} total, "
-        f"{total_depth} depth, {total_trades} trades"
+        f"{deferred_count} deferred, {failed_count} failed / {len(results)} "
+        f"total, {total_depth} depth, {total_trades} trades"
     )
     
     return {
         "status": status,
         "symbols_processed": successful,
         "symbols_skipped": skipped,
+        "symbols_deferred": deferred_count,
         "symbols_total": len(results),
         "depth_records": total_depth,
         "trade_records": total_trades,

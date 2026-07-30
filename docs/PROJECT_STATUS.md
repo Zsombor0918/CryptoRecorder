@@ -1,7 +1,7 @@
 # Project Status
 
 **Version:** `v1.1.0-dev`
-**Last updated:** 2026-07-20
+**Last updated:** 2026-07-29
 
 This document is the single source of truth for **what is validated** vs **what is
 deferred** in CryptoRecorder. Keep it honest. Do not promote a deferred item to
@@ -40,9 +40,11 @@ validated without recorded evidence.
   catalog from replay_store for equivalence checking. Supports `trades_only`
   (matches the reference converter for trades) and `full_l2` (full order-book
   reconstruction via the shared depth engine). **Semantically validated on the
-  ADAUSDT smoke** against `convert_day.py`; broader top50/multi-day validation is
-  still pending (see Deferred). This is the `v2.0.0` gate and `v2.0.0` is **not**
-  declared. This helper is not a supported downstream runtime API.
+  ADAUSDT smoke with additional completed high-volume BTCUSDT schema-v2
+  representative-day evidence** against `convert_day.py`; broader
+  top50/multi-day validation is still pending (see Deferred). This is the
+  `v2.0.0` gate and `v2.0.0` is **not** declared. This helper is not a supported
+  downstream runtime API.
 
 ### Recorded validation evidence
 
@@ -72,15 +74,49 @@ gitignored). Reproduce with `python -m validation.validate_catalog_equivalence
 --date 2026-06-12 --symbols ADAUSDT --venues BINANCE_SPOT --profile full_l2`.
 This is a **single-symbol single-day smoke**, not a universe benchmark.
 
+**Full-L2 catalog equivalence (BTCUSDT schema-v2 representative day)**
+
+```
+2026-06-11 BINANCE_SPOT/BTCUSDT full_l2 (schema-v2 replay vs convert_day.py):
+  reference construction                         passed (preserved)
+  replay construction/catalog reconstruction      passed (preserved)
+  trade_ticks        old 3418712   new 3418712    exact, 0 mismatches
+  order_book_deltas  old 30009655  new 30009655   exact, 0 mismatches
+  order_book_depth10 old 84066     new 84066       exact, 0 mismatches
+  book checkpoints   7/7 canonical hashes match
+  continuity         seeds 7/7, resyncs 0/0, desyncs 0/0, fences 25/25
+  fenced ranges      25/25, canonical digest match
+  raw/replay metadata depth 846430/846430, trades 3419004/3419004, exact
+  live source identity matches manifest + integrity copy (25 depth, 24 trade files)
+  status             passed
+```
+
+The accepted external report has SHA-256
+`69c4466d1a6cb4206110f07def6f9d9c2b751a65f6923bd270ac16956668c281`.
+A compact, path-sanitized local summary is generated at
+`validation_reports/issue20_phase7_btcusdt_spot_2026-06-11.json` (SHA-256
+`aa3d116b269355e267058491562245a8e4f3e0add3182e653d48e59fbbf61782`);
+`validation_reports/` is contractually gitignored. Catalogs, replay
+partitions, raw data, large logs, and cgroup sample streams remain external.
+The report reuses the preserved passing reference, replay, and trade
+fragments; the hardened reader reran only deltas and produced the same passing
+fragment SHA-256 as the accepted Round 5 result. Every new substantial stage
+ran serially in its own 10 GiB cgroup with zero OOM events.
+
+This is strong high-volume, single-symbol/single-day local development
+evidence. It does **not** satisfy or narrow the broader top50/multi-day
+`v2.0.0` gate, does not make schema v2 a production default, and does not
+replace `convert_day.py` as the production reference.
+
 ---
 
 ## Deferred (NOT done — do not claim otherwise)
 
 - **Broader `full_l2` validation (top50 + multi-day)** — the replay full-L2
-  reconstruction path is implemented and **passes the ADAUSDT single-day smoke**
-  against `convert_day.py` (see evidence above), but it is **not** yet validated
-  across the top50 universe or multiple days. `v2.0.0` remains **ungated** until
-  that wider validation passes.
+  reconstruction path is implemented and **passes the ADAUSDT single-day smoke
+  plus the BTCUSDT schema-v2 representative day** against `convert_day.py` (see
+  evidence above), but it is **not** yet validated across the top50 universe or
+  multiple days. `v2.0.0` remains **ungated** until that wider validation passes.
   See [FULL_L2_REPLAY_CATALOG_PLAN.md](FULL_L2_REPLAY_CATALOG_PLAN.md).
 - **Syncthing archive / backup** — `ARCHIVE_DAYS_ROOT` is a **placeholder** env path
   only. No archive code exists.
@@ -103,8 +139,9 @@ repositories (e.g. KovacsTrader).
    replay_store for validation purposes, use
    `python -m validation.validate_catalog_equivalence --profile trades_only`
    (there is no product-facing `generate_catalog` CLI).
-5. The replay `full_l2` reconstruction path passes the ADAUSDT single-day smoke, but
-   `convert_day.py` remains the **production reference** for full order-book
-   catalogs until broader top50/multi-day validation passes.
+5. The replay `full_l2` reconstruction path passes the ADAUSDT smoke and the
+   BTCUSDT schema-v2 representative day, but `convert_day.py` remains the
+   **production reference** for full order-book catalogs until broader
+   top50/multi-day validation passes.
 
 See [OPERATIONS.md](OPERATIONS.md) for the service layout that runs these steps.
