@@ -13,16 +13,17 @@ data_raw -> replay_store
   validated v0 replay layer; the stable external contract handed off to
   downstream repositories (e.g. KovacsTrader)
 
-replay_store -> validation.replay_catalog_reconstruct (validation-only, no CLI)
-  internal helper used only by validation.validate_catalog_equivalence;
-  trades_only and full_l2 profiles both implemented; full_l2 semantically
-  validated on the ADAUSDT single-day smoke vs convert_day.py (trades +
-  OrderBookDeltas + OrderBookDepth10 + checkpoints)
+replay_store -> pipeline.reconstruct_selected_catalog -> temporary Nautilus catalog
+  supported development-computer CLI/API with explicit venue, symbol,
+  end-exclusive UTC window, output root, job ID, and profile; it wraps the
+  internal validation.replay_catalog_reconstruct engine and publishes only a
+  checksum-bound job directory
 ```
 
 CryptoRecorder does not build a feature-store, label-store, or
-general-purpose consumer catalog from `replay_store` (removed, issue #17) —
-those are downstream responsibilities.
+permanent or unscoped consumer catalog from `replay_store` (removed, issue
+#17). Feature, strategy, risk, execution, and backtest orchestration remain
+downstream responsibilities.
 
 The `full_l2` reconstruction reuses the old converter's shared depth engine. It
 passes the ADAUSDT single-day smoke against `convert_day.py`, but **broader
@@ -63,8 +64,26 @@ python -m pipeline.build_replay_store \
   --replay-root /tmp/replay_store
 ```
 
-There is no `generate_catalog` product CLI. To validate replay-store
-equivalence against `convert_day.py`, use the validation-only helper:
+Reconstruct a selected temporary catalog on the development computer:
+
+```bash
+python -m pipeline.reconstruct_selected_catalog \
+  --replay-root /path/to/replay_store \
+  --venues BINANCE_SPOT \
+  --symbols ADAUSDT BTCUSDT \
+  --start 2026-06-11T12:00:00Z \
+  --end 2026-06-12T00:00:00Z \
+  --output-root /external/temporary/catalog_jobs \
+  --job-id selected-20260611 \
+  --profile full_l2
+```
+
+The interval is `[start,end)`. The command never expands an empty selection,
+refuses unsafe/existing job paths by default, preflights all replay artifacts,
+and atomically publishes `<output-root>/<job-id>/` with `job_manifest.json`.
+Use `--overwrite` only to replace that exact completed job.
+
+To validate replay-store equivalence against `convert_day.py`, use:
 
 ```bash
 python -m validation.validate_catalog_equivalence \
@@ -91,7 +110,7 @@ python -m validation.validate_catalog_equivalence \
 | `convert_day.py` | Validated raw -> Nautilus full-L2 converter |
 | `converter/` | Legacy converter implementation |
 | `stores/` | Replay Parquet schemas/readers/writers (no feature/label schemas) |
-| `pipeline/` | Replay build/transform CLIs (`daily_build`, `build_replay_store`, `raw_manifest`) |
+| `pipeline/` | Replay build/transform CLIs plus explicitly selected temporary-catalog reconstruction |
 | `validation/` | Audit, equivalence check, and catalog inspection CLIs |
 | `scripts/` | Manual recorder and legacy-converter smoke scripts |
 | `docs/` | Detailed documentation |
@@ -121,8 +140,11 @@ Agent rules: [AGENTS.md](AGENTS.md). Version: see [VERSION](VERSION) and [CHANGE
 - Replay store preserves exact price/quantity strings and depth continuity
   fields needed for full-L2 reconstruction, and is the stable external
   contract handed off to downstream repositories (e.g. KovacsTrader).
-- CryptoRecorder does not build a feature-store, label-store, or
-  general-purpose consumer catalog from replay_store (removed, issue #17).
+- CryptoRecorder does not build a feature-store, label-store, persistent
+  catalog service, or unscoped consumer catalog from replay_store.
+- `pipeline.reconstruct_selected_catalog` is the supported development-
+  computer boundary for explicit, job-scoped temporary catalogs; the
+  reconstruction engine remains `validation.replay_catalog_reconstruct`.
 - The internal `validation.replay_catalog_reconstruct` `trades_only` profile
   can be validated against the old converter for TradeTick semantic equality
   via `validation.validate_catalog_equivalence`.

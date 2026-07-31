@@ -377,12 +377,37 @@ remain required implementation/reference code for replay building, validation,
 and local test-computer catalog reconstruction: replay stores are synced
 separately by the operator, and on the test computer the synced replay stores
 may be reconstructed into temporary Nautilus catalogs by symbol (e.g. for
-KovacsTrader) using `validation.replay_catalog_reconstruct` — run manually, not
-via systemd. Any `cryptorecorder-convert.{service,timer}` already installed on
+KovacsTrader) through the supported `pipeline.reconstruct_selected_catalog`
+boundary — run manually, not via systemd. Any
+`cryptorecorder-convert.{service,timer}` already installed on
 an existing server (from before this change) is stopped, disabled, and removed
 automatically the next time the deploy script runs (see "Safety notes" above).
 There is no feature-build step; CryptoRecorder's scope ends at `replay_store`
 (removed, issue #17).
+
+### Development-computer selected reconstruction
+
+This command is deliberately outside the Linux service/timer groups:
+
+```bash
+python -m pipeline.reconstruct_selected_catalog \
+  --replay-root /path/to/synced/replay_store \
+  --venues BINANCE_SPOT \
+  --symbols ADAUSDT BTCUSDT \
+  --start 2026-06-11T12:00:00Z \
+  --end 2026-06-12T00:00:00Z \
+  --output-root /external/temporary/catalog_jobs \
+  --job-id selected-20260611 \
+  --profile full_l2
+```
+
+Create the external output root first and keep it outside production
+`replay_store`. The final job is `<output-root>/<job-id>/`, containing
+`catalog/` and its cryptographic `job_manifest.json`. The interval is
+end-exclusive. Every venue, symbol, endpoint, output root, job ID, and profile
+must be explicit; empty scope never means everything. Use `--overwrite` only
+for intentional replacement of that exact completed job. No unit, timer, or
+unattended catalog lifecycle is installed for this command.
 
 > The replay-build service invokes `pipeline.daily_build` because
 > `pipeline.build_replay_store` requires an explicit `YYYY-MM-DD` date and does

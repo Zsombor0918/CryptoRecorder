@@ -5393,3 +5393,113 @@ builder/validator/reconstruction command was explicitly prohibited.
 - Per-symbol memory-pressure attribution was not persisted.
 - No repository source, test, raw data, replay artifact, FAILED sentinel,
   production service, deployment, Phase 8, or Issue #20 closure was changed.
+
+## 2026-07-31 — Issue #20 closure checkpoint 1 selected reconstruction boundary
+
+### Change summary
+- Added `pipeline.reconstruct_selected_catalog`, the one contract-permitted
+  development-computer CLI/API for explicit selected temporary Nautilus
+  catalogs. It requires replay/output roots, nonempty venue/symbol lists,
+  timezone-aware `[start,end)` endpoints, a safe job ID, and an intentional
+  profile (`full_l2` or `trades_only`).
+- Reused `validation.replay_catalog_reconstruct` as the sole reconstruction
+  engine; added only per-partition output accounting to that engine.
+- Added fail-closed replay/schema/checksum/instrument/carry preflight,
+  before/after identity verification, canonical consumed-partition and catalog
+  inventories, safe same-parent staging, exact-job overwrite, and atomic final
+  publication. Missing dependencies report the pinned Nautilus requirement.
+- Updated current repository, architecture, validation, operation, status, and
+  plan contracts without changing `convert_day.py` or replay semantics.
+
+### Files/packages touched
+- `pipeline/reconstruct_selected_catalog.py`
+- `pipeline/__init__.py`
+- `validation/replay_catalog_reconstruct.py`
+- `tests/test_reconstruct_selected_catalog.py`
+- `tests/test_repo_structure.py`
+- `README.md`
+- `docs/ARCHITECTURE.md`
+- `docs/REPO_STRUCTURE.md`
+- `docs/PROJECT_STATUS.md`
+- `docs/FULL_L2_REPLAY_CATALOG_PLAN.md`
+- `docs/VALIDATION.md`
+- `docs/OPERATIONS.md`
+- `docs/IMPLEMENTATION_AUDIT.md`
+- `CHANGELOG.md`
+- `docs/CHANGE_AUDIT.md`
+
+### Docs reviewed and updated
+- [x] AGENTS.md and `.github/copilot-instructions.md`
+- [x] docs/REPO_STRUCTURE.md
+- [x] docs/PROJECT_STATUS.md
+- [x] docs/IMPLEMENTATION_AUDIT.md
+- [x] docs/FULL_L2_REPLAY_CATALOG_PLAN.md
+- [x] docs/VALIDATION.md
+- [x] docs/OPERATIONS.md
+- [x] docs/ARCHITECTURE.md
+- [x] README.md
+- [x] CHANGELOG.md
+
+### Status / validation impact
+- The explicitly selected development-computer reconstruction CLI/API is now
+  supported. Its internal engine remains shared with equivalence validation.
+- It is not a Linux service/timer, persistent catalog lifecycle, feature store,
+  backtest, strategy, risk, or execution boundary.
+- Broader top50/multi-day validation, v2.0.0, lifecycle/backlog/production
+  integration, uv migration, deployment, PR creation, and Issue #20 closure
+  remain deferred and were not started.
+
+### Tests run
+```bash
+git diff --check
+python -m py_compile pipeline/reconstruct_selected_catalog.py \
+  validation/replay_catalog_reconstruct.py \
+  tests/test_reconstruct_selected_catalog.py
+pytest -q tests/test_reconstruct_selected_catalog.py \
+  tests/test_repo_structure.py tests/test_agent_infrastructure.py
+# 84 passed
+
+pytest -q tests/test_reconstruct_selected_catalog.py \
+  tests/test_replay_catalog_reconstruct.py tests/test_replay_store.py \
+  tests/test_replay_fail_closed_hardening.py \
+  tests/test_replay_hierarchical_integrity_v2.py \
+  tests/test_replay_depth_adapter.py tests/test_replay_depth_repartitioning.py \
+  tests/test_replay_sync_continuity.py tests/test_catalog_equivalence.py \
+  tests/test_catalog_equivalence_full_l2.py tests/test_pipeline_validation.py \
+  tests/test_repo_structure.py tests/test_agent_infrastructure.py
+# 222 passed, 2 skipped
+
+pytest -q
+# 773 passed, 3 skipped
+```
+
+No repository linter is configured; none was installed for this checkpoint.
+
+### Validation CLIs and real smoke
+```bash
+bash scripts/run_under_cgroup.sh 10G <external-cgroup-evidence> \
+  cr-p7-selected-smoke-185710 -- \
+  .venv/bin/python -m pipeline.reconstruct_selected_catalog \
+  --replay-root <preserved-schema-v2-replay> \
+  --venues BINANCE_SPOT --symbols ADAUSDT \
+  --start 2026-06-11T12:00:00Z --end 2026-06-11T12:05:00Z \
+  --output-root <external-job-root> --job-id ada-intraday-full-l2 \
+  --profile full_l2
+```
+
+- Exit 0; 51.436815298 seconds; peak 640,143,360 bytes; effective
+  MemoryMax 10,737,418,240; swap 0; memory.high/max 0; OOM/OOM-kill 0.
+- Pinned-Nautilus read verification: 475 TradeTicks, 3,328 flattened
+  OrderBookDelta rows, 227 Depth10 objects; exact catalog inventory digest and
+  end-exclusive upper bound verified.
+- External job manifest SHA-256:
+  `7d3eef0020c210911d485dff5f1d9d933e55981c70b0a95edb9a3b13446011ff`.
+
+### Known limitations / out of scope
+- The smoke is one selected symbol and five-minute output window using already
+  accepted schema-v2 replay; it is not another semantic matrix, replay build,
+  top50/multi-day gate, or production acceptance.
+- `convert_day.py`, replay rows/schema/ordering, the ten-case representative
+  evidence, and the 150-partition storage evidence were unchanged.
+- Checkpoints 2-4, PR creation, Issue #20 mutation/closure, production
+  deployment, Phase 8, retention, uv, and KovacsTrader were not started.

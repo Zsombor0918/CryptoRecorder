@@ -5,10 +5,11 @@
 Implement and validate:
 
 ```text
-data_raw -> replay_store -> validation.replay_catalog_reconstruct --profile full_l2
+data_raw -> replay_store -> pipeline.reconstruct_selected_catalog --profile full_l2
 ```
 
-(validation-only, no CLI; invoked only by `validation.validate_catalog_equivalence`)
+(supported explicit development-computer CLI/API wrapping the shared internal
+`validation.replay_catalog_reconstruct` engine)
 
 so it is semantically equivalent to the current validated path:
 
@@ -26,7 +27,8 @@ Do not replace `convert_day.py` until equivalence is proven.
 > continuity/fences, metadata, and source identity pass). These remain
 > single-symbol/single-day results. `convert_day.py` remains the production
 > reference until broader top50/multi-day validation passes; `v2.0.0` is **not**
-> declared. There is no second independent depth converter.
+> declared. The supported selected boundary is not a persistent service and
+> there is no second independent depth converter.
 
 ## Current Status
 
@@ -49,6 +51,8 @@ Implemented:
 
 - `data_raw -> replay_store`
 - `replay_store -> validation.replay_catalog_reconstruct --profile trades_only` (validation-only, no CLI)
+- `replay_store -> pipeline.reconstruct_selected_catalog` (supported,
+  explicitly scoped development-computer temporary catalogs)
 - trades-only old-vs-new semantic validation
 - **`replay_store -> validation.replay_catalog_reconstruct --profile full_l2`** (shared depth engine)
 - **replay-based `OrderBookDeltas`** (validated on ADAUSDT smoke and BTCUSDT
@@ -294,7 +298,9 @@ Days dominated by these internals may diverge; the ADAUSDT smoke day did not.
 
 Milestone-complete checklist (✅ = done for the ADAUSDT smoke milestone):
 
-1. ✅ `validation.replay_catalog_reconstruct --profile full_l2` exists (validation-only, no CLI) and writes a Nautilus-readable temporary catalog.
+1. ✅ `pipeline.reconstruct_selected_catalog --profile full_l2` is the
+   supported explicit CLI/API and wraps the internal engine to write an
+   artifact-bound, job-scoped, Nautilus-readable temporary catalog.
 2. ✅ It reuses the old converter semantics through the shared depth engine + thin replay adapter.
 3. ✅ TradeTick equivalence passes (synthetic + ADAUSDT smoke).
 4. ✅ OrderBookDeltas equivalence passes for synthetic fixtures and real ADAUSDT smoke.

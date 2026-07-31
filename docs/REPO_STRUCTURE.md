@@ -83,7 +83,8 @@ raw data. Contains daily build orchestration and the replay builder. Does
 equivalence check commands; those belong in `validation/`.
 
 `pipeline/` **may** contain exactly one supported, explicitly-scoped
-selected-reconstruction CLI (issue #20): a development-computer command that
+selected-reconstruction CLI (issue #20),
+`pipeline/reconstruct_selected_catalog.py`: a development-computer command that
 builds a **temporary** Nautilus full-L2 catalog for an explicitly requested
 venue/symbol list and start/end time window only. This is a deliberate,
 foreseeable re-scoping of the boundary drawn in issue #17 — CryptoRecorder is
@@ -101,7 +102,7 @@ any file in `pipeline/` to:
 
 The historical `pipeline/generate_catalog.py` product CLI (removed, issue
 #17) is a distinct, permanently-forbidden design: it built a general-purpose,
-unscoped consumer catalog. A future scoped-reconstruction CLI must use a
+unscoped consumer catalog. The supported scoped-reconstruction CLI uses a
 different name and must not resurrect that unscoped shape. See the 2026-07-24
 amendment log entry below and `tests/test_repo_structure.py`'s
 `test_pipeline_reconstruction_cli_stays_explicitly_scoped()` guard.
@@ -114,7 +115,8 @@ label-store schema/reader/writer in this package.
 audit CLIs (audit_replay_store, audit_storage_size), fail-closed artifact
 identity and serial semantic-stage orchestration, equivalence checks
 (validate_catalog_equivalence), the internal validation-only replay→catalog
-reconstruction helper (replay_catalog_reconstruct — no CLI), catalog
+reconstruction engine (replay_catalog_reconstruct — no direct CLI, shared by
+validation and the supported pipeline boundary), catalog
 comparison utilities (catalog_compare), catalog inspection (catalog_inspect),
 and report validation (phase2_report). Does **not** contain build/transform
 logic; that belongs in `pipeline/`.
@@ -131,7 +133,9 @@ full-L2 equivalence until that wider validation is run and declared done.
 **`tests/`** — All automated tests. No test file outside this directory. Tests
 are organized by subsystem:
 - `test_replay_store.py` — replay build and audit
-- `test_replay_catalog_reconstruct.py` — validation-only full_l2 reconstruction
+- `test_replay_catalog_reconstruct.py` — internal full_l2 reconstruction engine
+- `test_reconstruct_selected_catalog.py` — supported selected CLI/API safety,
+  binding, carry, and real-Parquet catalog tests
 - `test_catalog_equivalence.py` — old-vs-new catalog comparison
 - `test_repo_structure.py` — folder contract enforcement
 - Legacy converter tests remain named as-is
@@ -255,15 +259,18 @@ catalog outputs, or tool caches. Use `.gitignore` to block them.
 - `daily_build.py`
 - `build_replay_store.py`
 - `raw_manifest.py`
+- `reconstruct_selected_catalog.py` (supported explicit development-computer
+  temporary-catalog CLI/API)
 
 Audit and equivalence modules live in `validation/`, not `pipeline/`. There is
-no feature-store builder and no product-facing catalog-generation CLI here.
+no feature-store builder and no persistent or unscoped catalog service here.
 
 ### `validation/` Is Inspect/Audit-Only
 
 `validation/` contains only modules that **inspect, compare, or audit**
-existing artifacts (or, in the case of `replay_catalog_reconstruct.py`, an
-internal helper with no CLI used exclusively by the equivalence check):
+existing artifacts (or, in the case of `replay_catalog_reconstruct.py`, the
+shared internal engine with no direct CLI used by equivalence validation and
+the supported pipeline boundary):
 
 - `audit_change_compliance.py`
 - `audit_replay_store.py`
@@ -272,7 +279,7 @@ internal helper with no CLI used exclusively by the equivalence check):
 - `serial_gate.py` (serial subprocess orchestration; no retry)
 - `stage_runner_cli.py` (isolated validation-stage/report CLI)
 - `validate_catalog_equivalence.py`
-- `replay_catalog_reconstruct.py` (no CLI; validation-only)
+- `replay_catalog_reconstruct.py` (shared internal engine; no direct CLI)
 - `catalog_compare.py`
 - `catalog_inspect.py`
 - `phase2_report.py`
@@ -293,6 +300,12 @@ python -m pipeline.build_replay_store --date YYYY-MM-DD [OPTIONS]
 
 # Run daily build (raw manifest scan + replay store build + report)
 python -m pipeline.daily_build --date YYYY-MM-DD [OPTIONS]
+
+# Build one explicit development-computer temporary catalog job
+python -m pipeline.reconstruct_selected_catalog \
+  --replay-root PATH --venues VENUE [VENUE ...] \
+  --symbols SYMBOL [SYMBOL ...] --start UTC --end UTC \
+  --output-root PATH --job-id SAFE_ID --profile full_l2
 ```
 
 ### Audit / Validate (validation)
@@ -317,8 +330,8 @@ python -m validation.catalog_inspect CATALOG_ROOT INSTRUMENT_ID
 python -m validation.phase2_report PATH_TO_REPORT
 ```
 
-`validation.replay_catalog_reconstruct` has no CLI — it is an internal helper
-imported only by `validation.validate_catalog_equivalence`.
+`validation.replay_catalog_reconstruct` has no direct CLI — it is the shared
+internal engine imported by validation and `pipeline.reconstruct_selected_catalog`.
 
 ### Legacy Full-L2 Converter (root-level)
 
@@ -347,12 +360,13 @@ data_raw -> replay_store
   (e.g. KovacsTrader). CryptoRecorder does not build a feature/label layer or
   a general-purpose consumer catalog from it.
 
-replay_store -> validation.replay_catalog_reconstruct (validation-only, no CLI)
-  IMPLEMENTED: semantically validated on the ADAUSDT smoke
+replay_store -> pipeline.reconstruct_selected_catalog -> temporary catalog
+  SUPPORTED ON THE DEVELOPMENT COMPUTER: explicit selected scope wrapping the
+  internal replay_catalog_reconstruct engine; semantically validated on the ADAUSDT smoke
   (BINANCE_SPOT/ADAUSDT/2026-06-12 vs convert_day.py: trades, OrderBookDeltas,
    OrderBookDepth10, and book checkpoints all match). Broader top50/multi-day
    validation still pending. See docs/FULL_L2_REPLAY_CATALOG_PLAN.md. Not a
-   supported downstream runtime API.
+   persistent service or backtest/runtime orchestration API.
 ```
 
 ---
@@ -371,3 +385,4 @@ replay_store -> validation.replay_catalog_reconstruct (validation-only, no CLI)
 | 2026-07-22 | PR #18 finalization: deleted `systemd/cryptorecorder-convert.service` and `systemd/cryptorecorder-convert.timer` — converter systemd automation is not part of the supported production architecture. Manual reconstruction uses documented CLI commands, not systemd templates. Stale installed converter units are still removed by `scripts/deploy_linux_server.sh` cleanup. Converter Python code (`convert_day.py`, `converter/`) is unchanged and required. |
 | 2026-07-24 | Issue #20 Phase 4: `pipeline/` may now contain exactly one supported, explicitly-scoped selected-reconstruction CLI (development-computer, temporary catalog, explicit venue/symbol/time-window only) — this deliberately re-scopes the issue #17 removal of `pipeline/generate_catalog.py`, which stays permanently forbidden by name and by its unscoped ("all symbols/all history") shape. No such CLI exists yet in this repository; this amendment only updates the contract and its guard test (`tests/test_repo_structure.py::test_pipeline_reconstruction_cli_stays_explicitly_scoped`) ahead of a future implementation phase. |
 | 2026-07-30 | Issue #20 Phase 7 checkpoint: added validation-only `artifact_identity.py`, `serial_gate.py`, and `stage_runner_cli.py` to bind and execute isolated exhaustive semantic stages, plus thin operator wrapper `scripts/run_under_cgroup.sh` for fail-closed cgroup limits/telemetry. No build logic moved into `validation/` and no business logic moved into `scripts/`. |
+| 2026-07-31 | Issue #20 closure checkpoint 1: implemented the one contract-permitted `pipeline/reconstruct_selected_catalog.py` development-computer CLI/API. It requires explicit venue/symbol/[start,end)/output/job/profile scope, wraps the unchanged shared internal engine, preflights and rehashes replay inputs, and atomically publishes only cryptographically inventoried temporary job directories. No Linux service/timer or persistent catalog lifecycle was added. |

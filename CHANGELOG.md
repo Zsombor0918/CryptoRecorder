@@ -39,13 +39,14 @@ The planned `v1.2` line will harden operations:
 - a fully tested one-command Linux server deployment,
 - stronger automated validation/audit gates around the replay build.
 
-It still must **not** introduce a general-purpose consumer catalog-generation
-service from the replay store; catalog reconstruction stays validation-only.
+It still must **not** introduce a general-purpose or persistent consumer
+catalog-generation service. Explicit development-computer selected temporary
+reconstruction is permitted through its supported scoped boundary.
 
 ### v2.0.0 — validated replay_store full-L2 equivalence
-The `v2.0.0` release is reserved for one thing: the internal
+The `v2.0.0` release is reserved for one thing: the shared
 **replay_store full-L2 reconstruction path** (`validation/replay_catalog_reconstruct.py`,
-exercised via `validation/validate_catalog_equivalence.py`) being **validated for
+exercised through validation and the supported selected boundary) being **validated for
 semantic equivalence against `convert_day.py`** across the broader top50
 universe and multiple days.
 
@@ -67,6 +68,25 @@ passes.** Until then, broader full-L2 equivalence stays **deferred** (see
 ## [Unreleased]
 
 ### Added
+- **Issue #20 closure checkpoint 1: supported selected full-L2 reconstruction
+  CLI/API** — `pipeline.reconstruct_selected_catalog` promotes the existing
+  shared reconstruction engine through an explicit development-computer
+  boundary. Venue, symbol, timezone-aware `[start,end)` UTC window, replay
+  root, external output root, safe job ID, and profile are mandatory; empty or
+  duplicate selection, generic instrument fallback, missing/unsupported replay
+  contracts, checksum failures, mutation, symlink traversal, and ambiguous
+  overwrite fail closed. Same-parent staging publishes only a completed
+  `<output-root>/<job-id>/` and preserves failed evidence separately. Its job
+  manifest cryptographically inventories every target/carry replay manifest,
+  data file, instrument, source-identity/integrity reference, and generated
+  catalog file. This is not a Linux service, permanent catalog lifecycle,
+  feature/backtest boundary, broader top50/multi-day gate, or v2.0.0 release.
+  Focused boundary/guard verification is 84 passed; the broader focused replay
+  set is 222 passed, 2 skipped; the full suite is 773 passed, 3 skipped. The
+  preserved schema-v2 ADAUSDT five-minute real smoke was Nautilus-readable and
+  completed in 51.437 seconds at 640,143,360 bytes peak with zero swap,
+  pressure events, or OOM; external job-manifest SHA-256:
+  `7d3eef0020c210911d485dff5f1d9d933e55981c70b0a95edb9a3b13446011ff`.
 - **Issue #20 Phase 7 full-universe schema-v2 storage/build acceptance
   aggregation (partial-source fixture)** — persisted evidence from the one
   detached 2026-06-11 local build covers all 150 available target partitions

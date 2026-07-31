@@ -25,8 +25,8 @@ repositories, e.g. KovacsTrader):
 data_raw -> replay_store
 ```
 
-Internal validation-only catalog reconstruction path (no CLI; used only by
-`validation.validate_catalog_equivalence`):
+Shared internal catalog reconstruction engine (no direct CLI; used by
+`validation.validate_catalog_equivalence` and the supported selected boundary):
 
 ```text
 replay_store -> validation.replay_catalog_reconstruct --profile trades_only
@@ -111,7 +111,8 @@ See `docs/OPERATIONS.md` for the full field reference and environment knobs.
 | `stores/` | Replay Parquet schemas/readers/writers (no feature/label schemas) |
 | `pipeline/build_replay_store.py` | Raw JSONL -> replay_store v0 |
 | `validation/audit_replay_store.py` | Non-mutating replay partition audit |
-| `validation/replay_catalog_reconstruct.py` | replay_store -> temporary Nautilus catalog (validation-only, no CLI) |
+| `validation/replay_catalog_reconstruct.py` | Shared replay_store -> temporary Nautilus catalog engine (no direct CLI) |
+| `pipeline/reconstruct_selected_catalog.py` | Supported explicit development-computer temporary-catalog CLI/API |
 | `validation/validate_catalog_equivalence.py` | Old-vs-new semantic comparison (trades_only, full_l2, depth_only, depth10) |
 
 ## Session Ordering
@@ -221,9 +222,9 @@ data_raw -> convert_day.py -> full_l2 Nautilus catalog
 data_raw -> replay_store
   current implemented replay layer (stable external contract)
 
-replay_store -> validation.replay_catalog_reconstruct (validation-only, no CLI)
-  internal helper for old-vs-new equivalence checking; trades_only and full_l2
-  both implemented; full_l2 validated on the ADAUSDT single-day smoke
+replay_store -> pipeline.reconstruct_selected_catalog (supported selected temporary jobs)
+  explicit development-computer boundary wrapping the shared internal engine;
+  trades_only and full_l2 both implemented; full_l2 validated on the ADAUSDT smoke
 ```
 
 ### Key Design Principles
@@ -401,41 +402,49 @@ python -m pipeline.build_replay_store --date 2026-06-15 [--symbols BTCUSDT,ETHUS
 - Raw index from original file position
 - Result: Two runs on same raw data produce identical Parquet files
 
-### Reconstruct a Validation-Only Catalog
+### Reconstruct a Selected Temporary Catalog
 
-Invoked exclusively by `validation.validate_catalog_equivalence` (no standalone
-CLI); reconstructs a temporary Nautilus `ParquetDataCatalog` from replay_store
-for a specific time window, for equivalence checking only.
+The supported `pipeline.reconstruct_selected_catalog` CLI/API reconstructs a
+temporary Nautilus `ParquetDataCatalog` from replay_store for an explicit
+venue/symbol/[start,end) selection. It wraps the same internal engine invoked
+by `validation.validate_catalog_equivalence`; the engine has no direct CLI.
+The supported boundary preflights and cryptographically binds exact replay
+inputs and atomically publishes only a job-scoped temporary output.
 
-**Python API** (`validation/replay_catalog_reconstruct.py`):
+**Python API** (`pipeline/reconstruct_selected_catalog.py`):
 ```python
-from validation.replay_catalog_reconstruct import generate_catalog_from_replay
+from pathlib import Path
 
-generate_catalog_from_replay(
-    replay_root="/path/to/replay_store",
-    catalog_root="/path/to/tmp_catalog",
-    job_id="validation_new",
-    symbols=["BTCUSDT", "ETHUSDT"],
-    venues=["BINANCE_SPOT", "BINANCE_USDTF"],
-    start="2026-06-15T00:00:00Z",
-    end="2026-06-16T00:00:00Z",
-    profile="trades_only",
+from pipeline.reconstruct_selected_catalog import (
+    SelectedCatalogRequest,
+    reconstruct_selected_catalog,
 )
+
+job_path = reconstruct_selected_catalog(request=SelectedCatalogRequest(
+    replay_root=Path("/path/to/replay_store"),
+    output_root=Path("/external/temporary/catalog_jobs"),
+    job_id="selected-20260615",
+    symbols=["BTCUSDT", "ETHUSDT"],
+    venues=["BINANCE_SPOT"],
+    start="2026-06-15T12:00:00Z",
+    end="2026-06-16T00:00:00Z",
+    profile="full_l2",
+))
 ```
 
 **Processing**:
-1. Parse the requested time window (or the UTC-day shortcut passed through by the caller)
-2. Determine date range and Hive partitions to scan
-3. Per symbol: stream replay data, filter by time window
-4. Convert to Nautilus TradeTick objects using exact replay price/quantity strings
-5. Write a temporary Nautilus `ParquetDataCatalog` under the caller-provided `catalog_root`
-6. Generate a report with coverage info, including found/missing partitions and records read/written
+1. Validate explicit UTC scope and a safe immediate-child job path.
+2. Preflight every target/carry Hive partition, manifest, checksum, schema, and instrument.
+3. Per symbol: stream replay data and reuse the shared reconstruction engine.
+4. Rehash exact replay inputs and inventory every catalog file.
+5. Atomically publish `<output-root>/<job-id>/` with `job_manifest.json`.
 
 Current status: `trades_only` is implemented and smoke-tested. The `full_l2`,
 `depth_only`, and `depth10` profiles are implemented and semantically validated on
 the ADAUSDT single-day smoke against `convert_day.py`; broader top50/multi-day
 validation is pending and `convert_day.py` remains the production reference
-full-L2 path. This helper is not a supported downstream runtime API.
+full-L2 path. The internal helper is not a supported direct API; callers use
+the selected pipeline boundary.
 
 ## Daily Build Orchestrator
 
@@ -506,8 +515,9 @@ repositories):
 data_raw → replay_store
 ```
 
-The internal `validation.replay_catalog_reconstruct` helper (no CLI) supports
-`trades_only` and `full_l2` reconstruction for equivalence checking only.
+The internal `validation.replay_catalog_reconstruct` engine (no direct CLI)
+supports `trades_only` and `full_l2` reconstruction for equivalence checking
+and the supported selected temporary-catalog boundary.
 
 **Rollout**:
 1. Keep `convert_day.py` as the validated full-L2 path.

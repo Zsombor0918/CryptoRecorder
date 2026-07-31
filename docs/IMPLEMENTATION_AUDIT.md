@@ -9,8 +9,9 @@ converter. It does not own a feature-store, label-store, or general-purpose
 catalog-generation service (issue #17 removed the former feature-store
 subsystem and the `pipeline/generate_catalog.py` product CLI).
 
-The internal `validation.replay_catalog_reconstruct` helper (no CLI, used only
-by `validation.validate_catalog_equivalence`) is **semantically validated on
+The internal `validation.replay_catalog_reconstruct` engine (no direct CLI,
+shared by validation and `pipeline.reconstruct_selected_catalog`) is
+**semantically validated on
 the ADAUSDT single-day smoke** against `convert_day.py`. Broader top50/multi-day
 validation is still pending. Old `convert_day.py` remains the production
 reference full-L2 path.
@@ -24,9 +25,9 @@ data_raw -> convert_day.py -> Nautilus catalog
 data_raw -> replay_store
   implemented v0; the stable external contract for downstream repositories
 
-replay_store -> validation.replay_catalog_reconstruct (validation-only, no CLI)
-  implemented; semantically validated on the ADAUSDT single-day smoke
-  vs convert_day.py. Broader top50/multi-day validation pending.
+replay_store -> pipeline.reconstruct_selected_catalog -> temporary catalog
+  supported explicit development-computer CLI/API wrapping the internal
+  replay_catalog_reconstruct engine; broader top50/multi-day validation pending
 ```
 
 ## Issue #20 Phase 7 — BTWUSDT trade-identifier correction
@@ -96,7 +97,7 @@ Replay store:
 - Publishes completed staging directories atomically.
 - Supports custom temp roots through `stream_raw_records(..., root=...)`.
 
-Catalog reconstruction (validation-only, `validation/replay_catalog_reconstruct.py`):
+Catalog reconstruction:
 
 - Supports `trades_only`, `full_l2`, `depth_only`, and `depth10` profiles.
 - `full_l2`/`depth_only`/`depth10` reuse the shared depth engine in
@@ -104,13 +105,17 @@ Catalog reconstruction (validation-only, `validation/replay_catalog_reconstruct.
   depth converter); the manifest records `depth_diagnostics`, `fenced_ranges`, and
   `equivalence_caveats`.
 - It uses exact replay strings for Nautilus `Price` and `Quantity`.
-- It supports `--date`-equivalent `start`/`end` shortcuts (UTC-day window) via
-  its Python API (there is no CLI; it is invoked only from
-  `validation.validate_catalog_equivalence` and from tests).
+- The internal engine accepts explicit UTC `start`/`end` through its Python API
+  and is invoked by validation and the supported pipeline boundary.
 - It supports deterministic `job_id` and safe `overwrite`.
 - It writes coverage fields for requested/found/missing partitions, records read,
   records written, skipped invalid records, and `time_filter=ts_init`.
 - It rejects unknown profiles.
+- `pipeline.reconstruct_selected_catalog` exposes only `full_l2` and
+  `trades_only`, requires explicit venue/symbol/[start,end)/output/job scope,
+  rejects generic instrument fallback, revalidates exact replay identities
+  before and after reconstruction, and atomically publishes a cryptographically
+  inventoried temporary job.
 
 Validation:
 
@@ -144,8 +149,16 @@ Automated tests cover:
 Last full local suite:
 
 ```text
-240 passed, 3 skipped
+773 passed, 3 skipped
 ```
+
+The supported selected-boundary focus/guard set is 84 passed; the broader
+replay/reconstruction/carry/reader/guard set is 222 passed, 2 skipped. A real
+schema-v2 ADAUSDT five-minute full-L2 smoke published an artifact-bound job,
+was readable with pinned Nautilus 1.225.0, and recorded 51.437 seconds wall
+time plus 640,143,360 bytes peak under the 10 GiB/zero-swap wrapper with no
+memory or OOM events. Its external job-manifest SHA-256 is
+`7d3eef0020c210911d485dff5f1d9d933e55981c70b0a95edb9a3b13446011ff`.
 
 ## Smoke-Tested
 
@@ -237,9 +250,9 @@ python -m pipeline.build_replay_store \
   --replay-root "$BASE/replay_store"
 ```
 
-The `validation.replay_catalog_reconstruct` helper has no CLI; it is exercised
-via `python -m validation.validate_catalog_equivalence` (see below) or directly
-from Python/tests.
+Use `pipeline.reconstruct_selected_catalog` for supported selected temporary
+catalog construction. The internal engine has no direct CLI and is also
+exercised via `validation.validate_catalog_equivalence` and tests.
 
 ## Run Old-vs-New Validation
 
@@ -370,12 +383,14 @@ below: issue #17 removed the feature-store subsystem and the
   - `raw_manifest.py`
   - `build_replay_store.py`
   - `daily_build.py`
+  - `reconstruct_selected_catalog.py` (supported explicit development-computer
+    temporary-catalog CLI/API)
 - `validation/`
   - `catalog_compare.py`
   - `audit_replay_store.py`
   - `validate_catalog_equivalence.py`
-  - `replay_catalog_reconstruct.py` (validation-only, no CLI; formerly
-    `pipeline/generate_catalog.py`)
+  - `replay_catalog_reconstruct.py` (shared internal engine, no direct CLI;
+    formerly `pipeline/generate_catalog.py`)
   - `catalog_inspect.py`
   - `phase2_report.py`
 

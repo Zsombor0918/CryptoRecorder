@@ -143,6 +143,40 @@ python -m validation.validate_catalog_equivalence \
 top50/multi-day validation is pending — see
 [FULL_L2_REPLAY_CATALOG_PLAN.md](FULL_L2_REPLAY_CATALOG_PLAN.md).
 
+### Supported selected temporary-catalog reconstruction
+
+For development-computer consumers that need a bounded selection rather than
+an equivalence run, the supported boundary is:
+
+```bash
+python -m pipeline.reconstruct_selected_catalog \
+  --replay-root /path/to/replay_store \
+  --venues BINANCE_SPOT \
+  --symbols ADAUSDT BTCUSDT \
+  --start 2026-06-11T12:00:00Z \
+  --end 2026-06-12T00:00:00Z \
+  --output-root /external/temporary/catalog_jobs \
+  --job-id selected-20260611 \
+  --profile full_l2
+```
+
+The selection and `[start,end)` UTC window are mandatory. Supported profiles
+are `full_l2` and `trades_only`; the engine's validation-specific secondary
+profiles are intentionally not exposed. Before output publication, the CLI
+requires every requested replay partition, any available/required preceding
+carry partition, complete supported manifests, complete-file checksums, and
+exact instrument metadata. It never falls back to generic instrument defaults.
+
+The final `<output-root>/<job-id>/job_manifest.json` binds the exact replay
+manifest, depth, trades, instrument, source-identity, and integrity inputs plus
+the complete catalog file inventory. Inputs are rehashed after reconstruction
+and again before same-parent atomic publication. Unsafe IDs, symlink traversal,
+ambiguous ownership, missing partitions, mutation, and existing jobs fail
+closed. `--overwrite` is limited to that exact already-complete job. Failed
+staging is preserved as a non-complete `.failed_<job-id>_*` sibling when
+possible. This is a temporary artifact builder, not a semantic comparator,
+Linux service, persistent catalog owner, or backtest orchestrator.
+
 #### Bounded catalog-reader compatibility boundary
 
 The exhaustive TradeTick, OrderBookDelta, and Depth10 comparisons do not use

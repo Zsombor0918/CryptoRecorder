@@ -2,18 +2,16 @@
 validation.replay_catalog_reconstruct — Internal replay -> Nautilus catalog
 reconstruction helper.
 
-**This module is validation-only tooling. It is NOT a supported downstream
-runtime API and has no CLI entrypoint.** Its sole purpose is to let
-``validation.validate_catalog_equivalence`` reconstruct a temporary Nautilus
-``ParquetDataCatalog`` from ``replay_store`` data so it can be compared against
-the reference ``convert_day.py`` output for semantic equivalence.
+**This module is an internal engine and has no CLI entrypoint.** It serves both
+``validation.validate_catalog_equivalence`` and the supported, strictly scoped
+development-computer boundary ``pipeline.reconstruct_selected_catalog``.
+Callers outside this repository must use that boundary rather than this helper.
 
 Per the CryptoRecorder/KovacsTrader ownership boundary
 (see ``docs/ARCHITECTURE.md``), CryptoRecorder does not offer a general-purpose
-consumer catalog-generation service. Any downstream repository that needs a
-temporary Nautilus catalog reconstructed from replay_store data (e.g.
-KovacsTrader) is expected to own that reconstruction itself; this module exists
-only so the reference-vs-replay equivalence check keeps working.
+persistent catalog-generation service. The supported boundary produces only
+explicitly selected, job-scoped temporary catalogs; feature, strategy,
+backtest, risk, and execution orchestration stay outside CryptoRecorder.
 """
 from __future__ import annotations
 
@@ -335,10 +333,9 @@ def generate_catalog_from_replay(
     """
     Reconstruct a temporary Nautilus catalog from replay_store.
 
-    Validation-only helper: used exclusively by
-    ``validation.validate_catalog_equivalence`` to compare replay-based
-    reconstruction against the reference ``convert_day.py`` converter. Not a
-    supported downstream runtime API — there is no CLI for this module.
+    Internal helper shared by validation equivalence and the supported
+    ``pipeline.reconstruct_selected_catalog`` boundary. It has no direct CLI
+    and is not itself a supported downstream runtime API.
 
     Args:
         replay_root: Path to replay_store
@@ -374,6 +371,7 @@ def generate_catalog_from_replay(
         "found_partitions": [],
         "missing_partitions": [],
         "date_partitions_scanned": [],
+        "partition_record_counts": [],
         "records_read": {
             "trades": 0,
             "depth": 0,
@@ -494,6 +492,7 @@ def generate_catalog_from_replay(
                         continue
 
                     logger.info(f"Processing {venue}/{symbol}/{date}...")
+                    counts_before = dict(status["records_written"])
                     partition_key = f"{venue}:{symbol}:{date}"
                     status["found_partitions"].append({
                         "venue": venue,
@@ -643,6 +642,23 @@ def generate_catalog_from_replay(
                         f"deltas={status['records_written']['order_book_deltas']}, "
                         f"depth10={status['records_written']['order_book_depth10']}"
                     )
+                    status["partition_record_counts"].append({
+                        "venue": venue,
+                        "symbol": symbol,
+                        "date": date,
+                        "trade_ticks": (
+                            status["records_written"]["trade_ticks"]
+                            - counts_before["trade_ticks"]
+                        ),
+                        "order_book_deltas": (
+                            status["records_written"]["order_book_deltas"]
+                            - counts_before["order_book_deltas"]
+                        ),
+                        "order_book_depth10": (
+                            status["records_written"]["order_book_depth10"]
+                            - counts_before["order_book_depth10"]
+                        ),
+                    })
 
         if writes_trades and status["records_written"]["trade_ticks"] == 0:
             status["warnings"].append(
@@ -671,6 +687,7 @@ def generate_catalog_from_replay(
             },
             "records_read": status["records_read"],
             "record_counts": status["records_written"],
+            "partition_record_counts": status["partition_record_counts"],
             "records_skipped": status["records_skipped"],
             "skipped_invalid_records": status["skipped_invalid_records"],
             "instrument_count": len(instruments_written),

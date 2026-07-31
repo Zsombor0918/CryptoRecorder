@@ -1,7 +1,7 @@
 # Project Status
 
 **Version:** `v1.1.0-dev`
-**Last updated:** 2026-07-30
+**Last updated:** 2026-07-31
 
 This document is the single source of truth for **what is validated** vs **what is
 deferred** in CryptoRecorder. Keep it honest. Do not promote a deferred item to
@@ -34,17 +34,39 @@ validated without recorded evidence.
   incremental Parquet write); the service restart loop has been fixed
   (`Restart=no`); production RAM measurement against the DEXEUSDT partition is
   still pending on the production server.
-- **`replay_store → validation.replay_catalog_reconstruct`** (validation-only,
-  no CLI) — internal helper used only by
-  `validation.validate_catalog_equivalence` to reconstruct a temporary Nautilus
+- **`replay_store → pipeline.reconstruct_selected_catalog`** — supported
+  development-computer CLI/API for an explicitly selected venue/symbol,
+  end-exclusive UTC window, output root, job ID, and profile. It strictly
+  preflights complete replay manifests, checksums, schema/builder contracts,
+  and instrument metadata; binds every target/carry partition and final
+  catalog file into a deterministic job manifest; and atomically publishes
+  only `<output-root>/<job-id>/`. It is not a Linux service/timer and owns no
+  feature, strategy, backtest, risk, or execution orchestration.
+  `validation.replay_catalog_reconstruct` remains the shared internal engine
+  also used by `validation.validate_catalog_equivalence` to reconstruct a Nautilus
   catalog from replay_store for equivalence checking. Supports `trades_only`
   (matches the reference converter for trades) and `full_l2` (full order-book
   reconstruction via the shared depth engine). **Semantically validated on the
   ADAUSDT smoke with additional completed high-volume BTCUSDT schema-v2
   representative-day evidence** against `convert_day.py`; broader
   top50/multi-day validation is still pending (see Deferred). This is the
-  `v2.0.0` gate and `v2.0.0` is **not** declared. This helper is not a supported
-  downstream runtime API.
+  `v2.0.0` gate and `v2.0.0` is **not** declared. The internal helper is not a
+  supported direct API; callers use the pipeline boundary.
+
+**Supported selected-reconstruction real smoke (checkpoint 1)**
+
+The committed-boundary candidate was exercised against the preserved
+schema-v2 `BINANCE_SPOT/ADAUSDT` replay for the end-exclusive interval
+`2026-06-11T12:00:00Z` to `12:05:00Z`. It consumed and bound the exact
+2026-06-10 carry plus 2026-06-11 target partitions, atomically published one
+external job, and was readable with pinned `nautilus_trader==1.225.0`: 475
+TradeTicks, 3,328 flattened OrderBookDelta rows, and 227 Depth10 objects.
+The catalog object manifest records 991 `OrderBookDeltas` containers. Runtime
+was 51.437 seconds and cgroup peak was 640,143,360 bytes under 10 GiB with
+zero swap, `memory.high`, `memory.max`, OOM, and OOM-kill. External job manifest
+SHA-256: `7d3eef0020c210911d485dff5f1d9d933e55981c70b0a95edb9a3b13446011ff`.
+This is a selected development-computer smoke, not broader top50/multi-day or
+production acceptance.
 
 ### Recorded validation evidence
 
@@ -204,10 +226,10 @@ repositories (e.g. KovacsTrader).
 2. Convert the previous UTC day with **`convert_day.py --staging`** (the validated
    full-L2 path) shortly after 00:00 UTC.
 3. Build the **replay store** for the previous day via `pipeline.daily_build`.
-4. For downstream consumers needing a temporary Nautilus catalog rebuilt from
-   replay_store for validation purposes, use
-   `python -m validation.validate_catalog_equivalence --profile trades_only`
-   (there is no product-facing `generate_catalog` CLI).
+4. On the development computer, reconstruct an explicitly selected temporary
+   catalog with `python -m pipeline.reconstruct_selected_catalog` and all
+   required venue/symbol/start/end/output/job/profile arguments. Use
+   `validation.validate_catalog_equivalence` only for old-vs-new validation.
 5. The replay `full_l2` reconstruction path passes the ADAUSDT smoke and the
    BTCUSDT schema-v2 representative day, but `convert_day.py` remains the
    **production reference** for full order-book catalogs until broader

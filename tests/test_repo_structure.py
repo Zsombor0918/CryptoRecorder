@@ -225,10 +225,9 @@ def test_pipeline_reconstruction_cli_stays_explicitly_scoped() -> None:
     allowing a differently-named, explicitly-scoped CLI to exist once one is
     implemented.
 
-    No selected-reconstruction CLI has been implemented in this repository
-    yet (issue #20 Phase 4 is a documentation/guard-alignment change only);
-    this test is therefore forward-looking for the "if it exists, it must be
-    scoped" half of its assertions.
+    The supported boundary is ``pipeline.reconstruct_selected_catalog``. It
+    must retain this explicit selection contract and must not grow into a
+    persistent service or unscoped catalog builder.
     """
     # The old, permanently-forbidden unscoped product CLI must never return
     # under its original name.
@@ -242,6 +241,18 @@ def test_pipeline_reconstruction_cli_stays_explicitly_scoped() -> None:
     assert (VALIDATION / "replay_catalog_reconstruct.py").exists(), (
         "validation/replay_catalog_reconstruct.py is missing."
     )
+    selected_cli = PIPELINE / "reconstruct_selected_catalog.py"
+    assert selected_cli.exists(), "supported selected-reconstruction CLI is missing"
+    selected_text = selected_cli.read_text()
+    for required_flag in (
+        "--replay-root", "--venues", "--symbols", "--start", "--end",
+        "--output-root", "--job-id", "--profile",
+    ):
+        assert required_flag in selected_text, (
+            f"selected-reconstruction CLI must require {required_flag}"
+        )
+    assert "nargs=\"+\"" in selected_text
+    assert "systemd" not in selected_text.lower()
 
     # If a future selected-reconstruction CLI has been added to pipeline/,
     # it must not resurrect the unscoped shape: no module in pipeline/ may
@@ -261,6 +272,7 @@ def test_pipeline_reconstruction_cli_stays_explicitly_scoped() -> None:
         "build_replay_store.py",
         "daily_build.py",
         "raw_manifest.py",
+        "reconstruct_selected_catalog.py",
     }
     for py_file in PIPELINE.glob("*.py"):
         if py_file.name in known_module_names:
