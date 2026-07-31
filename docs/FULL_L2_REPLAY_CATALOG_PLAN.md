@@ -30,6 +30,21 @@ Do not replace `convert_day.py` until equivalence is proven.
 
 ## Current Status
 
+Phase 7 storage/build evidence (2026-07-31): the accepted local three-day
+fixture was processed once by the current schema-v2.0.1 builder for all 150
+available 2026-06-11 target partitions (72 spot, 78 futures). Persisted
+evidence records 150/150 successful builds and 150/150 routine/deep validation
+passes, with zero anonymous trades, valid source identities and checksums, and
+no staging or duplicate partitions. The final replay tree is 4,137,099,264
+allocated bytes (3.85 GiB), passing the 5 GiB gate but failing the 2 GiB stretch
+target. One hundred partitions had D+1 enclosure; 50 are partial because their
+2026-06-12 depth directory is absent. Raw completeness is PARTIAL / NOT PROVEN,
+not complete-day proof. The strict supervisor remains FAILED because memory.max
+was recorded 855,983 times at the exact 10 GiB ceiling, despite zero
+swap/OOM events. The aggregate is PASS WITH OPERATIONAL CAVEATS for Phase 7
+core acceptance and does not close the broader semantic gate or declare
+v2.0.0. No further full-day rebuild is required for Phase 7 acceptance.
+
 Implemented:
 
 - `data_raw -> replay_store`

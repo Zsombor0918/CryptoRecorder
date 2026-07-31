@@ -67,6 +67,28 @@ passes.** Until then, broader full-L2 equivalence stays **deferred** (see
 ## [Unreleased]
 
 ### Added
+- **Issue #20 Phase 7 full-universe schema-v2 storage/build acceptance
+  aggregation (partial-source fixture)** — persisted evidence from the one
+  detached 2026-06-11 local build covers all 150 available target partitions
+  (72 spot, 78 futures), with 150/150 successful builds and 150/150 successful
+  routine plus deep-integrity validation subprocesses. All published
+  partitions are schema v2.0.1, unique, staging-free, checksum-valid, source
+  identity-valid for the available files, fixed-point-scale-valid, and contain
+  zero anonymous trades. Final allocated replay size is 4,137,099,264 bytes
+  (3.85 GiB), so the 5 GiB gate passes and the 2 GiB stretch target fails. A
+  persisted-evidence-only, non-exact missing-tail estimate adds 1,681,900
+  bytes, leaving 4,138,781,164 bytes and still passing the 5 GiB gate.
+  One hundred partitions had D+1 depth enclosure; 50 are explicitly marked
+  partial_missing_d_plus_1, so raw completeness remains partial/not proven.
+  The strict supervisor result remains FAILED: the cgroup reached the exact
+  10 GiB MemoryMax and recorded 855,983 memory.max events, despite zero
+  swap/OOM/OOM-kill/OOM-group-kill events. The resulting classification is
+  PASS WITH OPERATIONAL CAVEATS for Phase 7 core acceptance, not a strict
+  zero-pressure pass. Aggregated external report SHA-256:
+  7dd82ba51b54d990c9c4fe37565402489eeaa9da58d90384a2f47f92a961a772.
+  No further full-day rebuild is required for Phase 7 acceptance; memory
+  headroom is a separate follow-up. This is not complete raw-day proof,
+  v2.0.0, production deployment, or Phase 8 completion.
 - **Issue #20 Phase 7 BTWUSDT trade-identifier normalization correction** —
   replay normalization now matches the unchanged reference converter's
   Binance identifier precedence: existing normalized top-level identifiers

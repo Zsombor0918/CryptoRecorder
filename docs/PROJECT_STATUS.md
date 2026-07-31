@@ -140,6 +140,43 @@ checkpoint evidence under the corrected v2.0.1 builder will require
 intentional spot replay/candidate revalidation; those large spot cases were
 not rebuilt in this correction round.
 
+**Full-universe schema-v2 storage/build acceptance (partial-source fixture)**
+
+The accepted local three-day fixture was processed once for all 150 available
+target-day partitions on 2026-06-11 (72 `BINANCE_SPOT`, 78 `BINANCE_USDTF`) by
+the v2.0.1 builder. Persisted evidence shows 150/150 successful builds,
+150/150 successful routine validations, 150/150 successful deep-integrity
+validations, zero reported validation problems, zero anonymous trades, schema
+version 2 throughout, complete available-source identities, valid artifact
+checksums, and no staging or duplicate partitions. This is storage/build
+evidence, not another semantic matrix or a complete raw-day proof.
+
+The final replay tree measured 4,137,099,264 allocated bytes (3.85 GiB) and
+4,134,547,170 apparent bytes: the hard 5 GiB gate passes, while the 2 GiB
+stretch target fails. The persisted evidence permits a non-exact conservative
+missing-tail estimate of 1,681,900 bytes; observed plus allowance is
+4,138,781,164 bytes, still below 5 GiB. The 100 partitions with D+1 depth
+enclosure are distinguished from 50 partitions marked
+`partial_missing_d_plus_1`; raw completeness therefore remains **PARTIAL / NOT
+PROVEN**.
+
+The strict supervisor result remains **FAILED**, because the cgroup reached its
+10 GiB `MemoryMax` and recorded 855,983 `memory.max` events. Peak memory was
+10,737,418,240 bytes, with zero swap, OOM, OOM-kill, and OOM-group-kill
+events. Build-stage and validation-stage `memory.max` event deltas were
+765,905 and 90,078 respectively; per-symbol pressure attribution was not
+persisted. This yields **PASS WITH OPERATIONAL CAVEATS** for Issue #20 Phase 7
+core acceptance, not a strict zero-pressure pass. No further full-day rebuild
+is required for Phase 7 acceptance; memory-headroom optimization is a separate
+follow-up concern.
+
+External aggregated report:
+`/home/z0055upd/cryptorecorder_phase7_bench/full_day_schema_v2_partial_source_2026-06-11_20260731T130753Z/reports/final_acceptance_report.json`
+(SHA-256
+`7dd82ba51b54d990c9c4fe37565402489eeaa9da58d90384a2f47f92a961a772`). The
+`FAILED` sentinel and original run evidence remain preserved. This does not
+declare `v2.0.0`, production deployment, or Phase 8 completion.
+
 ---
 
 ## Deferred (NOT done — do not claim otherwise)

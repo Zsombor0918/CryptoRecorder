@@ -5307,3 +5307,89 @@ python -m validation.audit_change_compliance --staged
 - The pre-commit hook must be activated manually per-clone via
   `git config core.hooksPath .githooks` (see INSTALL.md).
 - No changes to recorder, stores, pipeline, or converter code.
+
+## 2026-07-31 — Issue #20 Phase 7 partial-source full-universe evidence aggregation
+
+### Change summary
+- Aggregated the already persisted external full-day schema-v2 evidence for
+  the accepted three-day local fixture; no builder, partition validator,
+  deep-integrity validator, raw scanner, convert_day.py, or Nautilus
+  reconstruction was rerun.
+- Recorded 150/150 successful schema-v2.0.1 builds (72 spot, 78 futures),
+  150/150 successful routine/deep validation subprocesses, zero reported deep
+  problems, zero anonymous trades, valid source identities/checksums/scales,
+  no duplicate or staging partitions, and final replay size
+  4,137,099,264 allocated bytes / 4,134,547,170 apparent bytes.
+- Preserved the strict supervisor classification as FAILED: MemoryMax reached
+  10,737,418,240 bytes and memory.max events totaled 855,983, while swap,
+  OOM, OOM-kill, and OOM-group-kill remained zero.
+- Derived the non-exact conservative missing-tail estimate solely from
+  persisted per-partition build result fields: 1,681,900 bytes allowance and
+  4,138,781,164 bytes observed plus allowance, still below 5 GiB.
+
+### Files/packages touched
+- docs/PROJECT_STATUS.md
+- docs/FULL_L2_REPLAY_CATALOG_PLAN.md
+- docs/CHANGE_AUDIT.md
+- CHANGELOG.md
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] docs/REPO_STRUCTURE.md
+- [x] docs/PROJECT_STATUS.md
+- [x] docs/IMPLEMENTATION_AUDIT.md
+- [x] docs/FULL_L2_REPLAY_CATALOG_PLAN.md
+- [x] docs/OPERATIONS.md
+- [x] docs/AI_WORKFLOW.md
+- [x] CHANGELOG.md
+
+### Docs updated
+- [x] docs/PROJECT_STATUS.md — recorded the partial-source full-universe
+  storage/build evidence and exact independent classifications.
+- [x] docs/FULL_L2_REPLAY_CATALOG_PLAN.md — recorded Phase 7 storage evidence
+  without promoting semantic equivalence, raw completeness, v2.0.0, or
+  production status.
+- [x] CHANGELOG.md — added the current Unreleased evidence summary.
+- [x] docs/CHANGE_AUDIT.md — this entry.
+- [ ] README.md — no change needed; this is validation evidence/status detail.
+
+### Status / validation impact
+- Issue #20 Phase 7 core acceptance: PASS WITH OPERATIONAL CAVEATS.
+- Replay functionality: PASS from persisted 150/150 build and validation
+  evidence.
+- Routine/deep integrity: PASS, 150/150 with zero reported problems.
+- Observed 5 GiB storage gate: PASS.
+- 2 GiB stretch gate: FAIL.
+- Bounded execution without swap or OOM: PASS.
+- Zero memory-pressure events and strict supervisor contract: FAILED because
+  memory.max was nonzero.
+- Raw completeness: PARTIAL / NOT PROVEN for 50 missing D+1 depth directories.
+- No further full-day rebuild is required for Phase 7 acceptance.
+- Memory-headroom optimization is a separate follow-up concern.
+- No production deployment, Phase 8 completion, or v2.0.0 declaration.
+
+### Persisted evidence
+- External report:
+  /home/z0055upd/cryptorecorder_phase7_bench/full_day_schema_v2_partial_source_2026-06-11_20260731T130753Z/reports/final_acceptance_report.json
+- Report SHA-256:
+  7dd82ba51b54d990c9c4fe37565402489eeaa9da58d90384a2f47f92a961a772
+- The FAILED sentinel and the original full run evidence remain external and
+  untouched.
+
+### Tests run
+git diff --check
+python -m validation.audit_change_compliance --staged
+pytest tests/test_repo_structure.py tests/test_agent_infrastructure.py -q
+
+### Validation CLIs run
+none — this is a documentation-only status update, and rerunning any
+builder/validator/reconstruction command was explicitly prohibited.
+
+### Known limitations / out of scope
+- This evidence uses the accepted partial-source fixture and is not complete
+  raw-day proof.
+- The strict supervisor is not represented as COMPLETE.
+- The 2 GiB stretch target was not reached.
+- Per-symbol memory-pressure attribution was not persisted.
+- No repository source, test, raw data, replay artifact, FAILED sentinel,
+  production service, deployment, Phase 8, or Issue #20 closure was changed.
