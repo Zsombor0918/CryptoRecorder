@@ -377,8 +377,9 @@ def test_missing_optional_dependency_has_actionable_guidance(monkeypatch, tmp_pa
     monkeypatch.setattr(
         "pipeline.reconstruct_selected_catalog._load_engine",
         lambda: (_ for _ in ()).throw(SelectedCatalogError(
-            "selected reconstruction dependencies are required; install nautilus_trader==1.225.0"
+            "selected reconstruction dependencies are required; "
+            "uv sync --frozen --no-default-groups --extra reconstruction"
         )),
     )
-    with pytest.raises(SelectedCatalogError, match="nautilus_trader==1.225.0"):
+    with pytest.raises(SelectedCatalogError, match="uv sync --frozen"):
         reconstruct_selected_catalog(request=_request(tmp_path, replay))

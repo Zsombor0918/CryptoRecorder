@@ -1,6 +1,6 @@
 # Repository Structure Contract
 
-**Date**: 2026-07-30
+**Date**: 2026-08-01
 
 This document is the binding contract for all future implementation in this
 repository. Any Codex task or contributor must read this before adding files.
@@ -35,7 +35,8 @@ These are the only Python entrypoints and project files permitted at the root:
 | `debug_futures_trade_ws.py` | Standalone developer debug script for the futures/spot trade WebSocket (not imported by production code) |
 | `README.md` | Project overview |
 | `INSTALL.md` | Machine setup guide |
-| `requirements.txt` | Python dependencies |
+| `pyproject.toml` | Authoritative production/reconstruction/development dependency groups; virtual non-package project |
+| `uv.lock` | Committed authoritative resolved dependency lock |
 | `pytest.ini` | Test runner config |
 | `AGENTS.md` | Binding rules for AI agents |
 | `VERSION` | Current version string (e.g. `1.1.0-dev`) |
@@ -76,6 +77,12 @@ These are the only top-level packages permitted:
 `depth_phase2.py`, `trades.py`, `readers.py`, `catalog.py`, `instruments.py`,
 `universe.py`, `spool.py`, and `trade_coverage.py`. Do not add replay pipeline
 logic here; this package is the old-converter boundary.
+
+`converter/depth_repartition.py` is the dependency-free shared event-time
+selection/deduplication primitive used by both the legacy converter and the
+production replay builder. Nautilus object construction remains in
+`depth_phase2.py`; this split prevents production imports from requiring the
+reconstruction dependency set without duplicating semantics.
 
 **`pipeline/`** — Build and transform commands that create data artifacts from
 raw data. Contains daily build orchestration and the replay builder. Does
@@ -146,6 +153,8 @@ are organized by subsystem:
   bounded backlog/reporting, and schema/source replacement policy
 - `test_replay_monitoring_retention.py` — replay storage classification,
   filesystem grouping, and non-destructive paired raw-retention proofs
+- `test_uv_dependency_contract.py` — authoritative metadata, lock,
+  environment separation, and fail-closed deployment migration guards
 - `test_catalog_equivalence.py` — old-vs-new catalog comparison
 - `test_repo_structure.py` — folder contract enforcement
 - Legacy converter tests remain named as-is
@@ -294,6 +303,8 @@ the supported pipeline boundary):
 - `catalog_compare.py`
 - `catalog_inspect.py`
 - `phase2_report.py`
+- `validate_dependency_environment.py` (read-only uv lock/environment/import
+  separation validator; optional tiny external schema-v2 smoke)
 
 Build and transform modules live in `pipeline/`, not `validation/`.
 
@@ -340,6 +351,9 @@ python -m validation.catalog_inspect CATALOG_ROOT INSTRUMENT_ID
 
 # Validate a convert report JSON
 python -m validation.phase2_report PATH_TO_REPORT
+
+# Validate the active frozen dependency environment
+python -m validation.validate_dependency_environment --kind production
 ```
 
 `validation.replay_catalog_reconstruct` has no direct CLI — it is the shared
@@ -402,3 +416,4 @@ replay_store -> pipeline.reconstruct_selected_catalog -> temporary catalog
 | 2026-07-30 | Issue #20 Phase 7 checkpoint: added validation-only `artifact_identity.py`, `serial_gate.py`, and `stage_runner_cli.py` to bind and execute isolated exhaustive semantic stages, plus thin operator wrapper `scripts/run_under_cgroup.sh` for fail-closed cgroup limits/telemetry. No build logic moved into `validation/` and no business logic moved into `scripts/`. |
 | 2026-07-31 | Issue #20 closure checkpoint 1: implemented the one contract-permitted `pipeline/reconstruct_selected_catalog.py` development-computer CLI/API. It requires explicit venue/symbol/[start,end)/output/job/profile scope, wraps the unchanged shared internal engine, preflights and rehashes replay inputs, and atomically publishes only cryptographically inventoried temporary job directories. No Linux service/timer or persistent catalog lifecycle was added. |
 | 2026-07-31 | Issue #20 closure checkpoint 2: added `pipeline/replay_lifecycle.py` as a build-only shared helper; `daily_build` now owns a bounded schema-v2 backlog under one kernel advisory lock, reconciles canonical staging/backup/quarantine artifacts across dates, and publishes atomic run/date evidence. Disk monitoring classifies canonical replay and transients without an active persistent-catalog assumption. Automatic raw deletion is disabled; only proof-only paired depth/trade retention planning remains. The repository systemd template is bounded but not deployed. |
+| 2026-08-01 | Issue #20 closure checkpoint 3: replaced the loose requirements file with authoritative `pyproject.toml`/`uv.lock` production, reconstruction, and development groups; added dependency-free shared depth-repartition helpers plus the read-only dependency-environment validator. The flat application remains a non-packaged uv virtual project and systemd continues to execute `.venv/bin/python`. |

@@ -47,6 +47,8 @@ REQUIRED_FILES = [
     ROOT / "AGENTS.md",
     ROOT / "VERSION",
     ROOT / "CHANGELOG.md",
+    ROOT / "pyproject.toml",
+    ROOT / "uv.lock",
     DOCS / "PROJECT_STATUS.md",
     DOCS / "OPERATIONS.md",
     DOCS / "AI_WORKFLOW.md",
@@ -248,7 +250,10 @@ def test_deploy_script_documents_targets_and_flags() -> None:
     text = DEPLOY_SCRIPT.read_text()
     for target in DEPLOY_TARGETS:
         assert target in text, f"deploy script must mention target '{target}'"
-    for flag in ("--dry-run", "--no-systemd", "--install-only", "--enable", "--start", "--restart"):
+    for flag in (
+        "--dry-run", "--no-systemd", "--install-only", "--enable", "--start",
+        "--restart", "--uv-bin", "--migrate-venv",
+    ):
         assert flag in text, f"deploy script must support flag '{flag}'"
 
 

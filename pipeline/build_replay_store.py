@@ -21,12 +21,12 @@ import zstandard as zstd
 from config import DATA_ROOT, DAILY_REPORT_ROOT, REPLAY_ROOT, REPLAY_SCHEMA_VERSION
 from converter.readers import stream_raw_records
 from converter.spool import DedupeSet
-from converter.depth_phase2 import (
-    _date_shift as _depth_date_shift,
-    _dedupe_key as _depth_dedupe_key,
-    _is_epoch_like_ns as _depth_is_epoch_like_ns,
-    _target_bounds_ns as _depth_target_bounds_ns,
-    _ts_event_ns as _depth_ts_event_ns,
+from converter.depth_repartition import (
+    date_shift as _depth_date_shift,
+    dedupe_key as _depth_dedupe_key,
+    is_epoch_like_ns as _depth_is_epoch_like_ns,
+    target_bounds_ns as _depth_target_bounds_ns,
+    ts_event_ns as _depth_ts_event_ns,
 )
 from stores.replay_writer import (
     ReplayWriter,
@@ -237,7 +237,7 @@ def _stream_repartitioned_depth_records(
     only if its canonical event time satisfies
     ``target_start_ns <= event_time_ns < target_end_ns``, and applies the
     reference's own deduplication key
-    (``converter.depth_phase2._dedupe_key``) so a record physically
+    (``converter.depth_repartition.dedupe_key``) so a record physically
     duplicated across adjacent directories (should that ever occur) is
     never double-counted.
 

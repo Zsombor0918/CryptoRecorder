@@ -34,30 +34,36 @@ production reference for full-L2 Nautilus catalogs.
 ## Quick Start
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+uv lock --check
+UV_PROJECT_ENVIRONMENT="$PWD/.venv" \
+  uv sync --frozen --no-default-groups
 
-python validate.py
-pytest
+.venv/bin/python validate.py
 ```
+
+The repository `.venv` is the production-only contract: it excludes Nautilus
+and pytest. For selected catalog reconstruction, sync an external environment
+with `--extra reconstruction`; for tests, add both that extra and `--group
+dev`. See [INSTALL.md](INSTALL.md). Runtime services continue to execute
+`.venv/bin/python` and never invoke uv.
 
 Run the recorder:
 
 ```bash
-python recorder.py
+.venv/bin/python recorder.py
 ```
 
 Convert one UTC day with the validated full-L2 converter:
 
 ```bash
-python convert_day.py --date 2026-06-12 --staging
+/external/cryptorecorder-reconstruction-env/bin/python \
+  convert_day.py --date 2026-06-12 --staging
 ```
 
 Build one explicit schema-v2 partition with isolated roots:
 
 ```bash
-python -m pipeline.build_replay_store \
+.venv/bin/python -m pipeline.build_replay_store \
   --date 2026-06-12 \
   --symbols ADAUSDT \
   --data-root ./data_raw \
@@ -69,7 +75,7 @@ Run the intended bounded production backlog contract (the checked-in service
 template has not yet been deployed or production-accepted):
 
 ```bash
-python -m pipeline.daily_build \
+.venv/bin/python -m pipeline.daily_build \
   --date yesterday \
   --backlog-days 7 \
   --max-build-dates 3 \
@@ -79,7 +85,8 @@ python -m pipeline.daily_build \
 Reconstruct a selected temporary catalog on the development computer:
 
 ```bash
-python -m pipeline.reconstruct_selected_catalog \
+/external/cryptorecorder-reconstruction-env/bin/python \
+  -m pipeline.reconstruct_selected_catalog \
   --replay-root /path/to/replay_store \
   --venues BINANCE_SPOT \
   --symbols ADAUSDT BTCUSDT \
@@ -98,7 +105,8 @@ Use `--overwrite` only to replace that exact completed job.
 To validate replay-store equivalence against `convert_day.py`, use:
 
 ```bash
-python -m validation.validate_catalog_equivalence \
+/external/cryptorecorder-development-env/bin/python \
+  -m validation.validate_catalog_equivalence \
   --date 2026-06-12 \
   --symbols ADAUSDT \
   --venues BINANCE_SPOT \

@@ -9,8 +9,8 @@ CryptoRecorder currently:
 - converts one UTC day at a time with `convert_day.py`
 - stores operational health/readiness as JSON files, not web pages
 - exposes an in-repo CLI catalog inspector, not a browser catalog viewer
-- uses `requirements.txt` plus a virtual environment; there is no `pyproject.toml`,
-  `uv.lock`, or Node/npm dependency in this repository
+- uses committed `pyproject.toml` plus `uv.lock` as its only Python dependency
+  authority; the application remains a flat, non-packaged uv virtual project
 
 ## Assumptions Used Below
 
@@ -20,7 +20,8 @@ These commands assume:
 - the deploy user is the current shell user, exported as `APP_USER="$USER"`
 - project code lives at `~/services/CryptoRecorder`
 - optional large data storage lives at `/data/cryptorecorder`
-- Python `3.10+`
+- CPython `>=3.12,<3.15`
+- an operator-installed `uv` executable (checkpoint validated with uv 0.11.29)
 - outbound network access to Binance REST and WebSocket endpoints
 
 Adjust the exported variables once if your server differs.
@@ -44,13 +45,15 @@ sudo apt install -y \
   ca-certificates \
   build-essential \
   python3 \
-  python3-venv \
-  python3-pip
+  python3-venv
 
 python3 --version
+uv --version
 ```
 
-`python3 --version` must show Python `3.10` or newer.
+`python3 --version` must satisfy `>=3.12,<3.15`. Install uv through the
+operator's approved host-management process before deployment; the repository
+deploy script never downloads uv or accesses an installer URL itself.
 
 ## 2. Clone the Repository
 
@@ -68,41 +71,56 @@ pwd
 git status --short
 ```
 
-## 3. Choose Python Environment Setup
+## 3. Create an Explicit Locked Environment
 
-### Option A: repo-native `venv` + `pip`
-
-```bash
-cd "$APP_DIR"
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-```
-
-### Option B: optional `uv`
-
-`uv` is optional. The repository does not require it, but it can manage the same
-virtual environment and dependency installation workflow.
-
-```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
-export PATH="$HOME/.local/bin:$PATH"
-
-cd "$APP_DIR"
-uv venv .venv --python python3
-source .venv/bin/activate
-uv pip install -r requirements.txt
-```
-
-Verification for either option:
+First verify that project metadata and the committed lock agree:
 
 ```bash
 cd "$APP_DIR"
-source .venv/bin/activate
-python --version
-python -m pip --version || true
+uv lock --check
 ```
+
+### Production environment
+
+The canonical server environment stays at `<app-dir>/.venv`, preserving all
+systemd `ExecStart` paths. It intentionally excludes Nautilus and test tools:
+
+```bash
+cd "$APP_DIR"
+UV_PROJECT_ENVIRONMENT="$APP_DIR/.venv" \
+  uv sync --frozen --no-default-groups
+```
+
+### Reconstruction environment
+
+Selected catalog reconstruction and the unchanged reference converter require
+the exact Nautilus extra. Keep this environment external to the production
+`.venv`:
+
+```bash
+cd "$APP_DIR"
+UV_PROJECT_ENVIRONMENT=/external/cryptorecorder-reconstruction-env \
+  uv sync --frozen --no-default-groups --extra reconstruction
+```
+
+### Development/test environment
+
+Tests are also explicit and external:
+
+```bash
+cd "$APP_DIR"
+UV_PROJECT_ENVIRONMENT=/external/cryptorecorder-development-env \
+  uv sync --frozen --no-default-groups \
+    --extra reconstruction \
+    --group dev
+```
+
+Frozen syncs never update `uv.lock`. Production contains only the recorder,
+replay lifecycle/build/validation dependencies; reconstruction adds
+`nautilus_trader==1.225.0`; development adds pytest tooling. `VERSION` remains
+the sole application release value. The neutral `project.version = "0"` in
+the non-packaged virtual project is dependency-environment metadata, not an
+application version.
 
 ## 4. Understand Current Paths Before First Import
 
@@ -199,16 +217,19 @@ These are safe local checks. They do not start the live recorder.
 
 ```bash
 cd "$APP_DIR"
-source .venv/bin/activate
 
-python validate.py
-python -m pytest tests/
-python convert_day.py --help
+.venv/bin/python validate.py
+PYTHONPATH="$APP_DIR" .venv/bin/python \
+  -m validation.validate_dependency_environment --kind production
+/external/cryptorecorder-development-env/bin/python -m pytest tests/
+/external/cryptorecorder-reconstruction-env/bin/python convert_day.py --help
 ```
 
 Expected:
 
-- `validate.py` reports dependency/import/path checks
+- `validate.py` reports production dependency/import/path checks
+- the dependency validator proves the production environment excludes
+  Nautilus and pytest
 - the unit test suite passes
 - `convert_day.py --help` exits successfully and documents `--staging`
 
@@ -316,12 +337,48 @@ cd "$APP_DIR"
   --user "$APP_USER" \
   --app-dir "$APP_DIR" \
   --data-root "$DATA_BASE" \
+  --uv-bin "$(command -v uv)" \
   --dry-run
 ```
 
 Drop `--dry-run` once the printed actions look correct. Valid `--target`
 values are `all`, `recorder`, and `replay-build`
 (`scripts/deploy_linux_server.sh --help` documents every flag).
+
+The script runs `uv lock --check`, uses a same-parent candidate environment,
+performs the production import validator through that candidate, and promotes
+only the validated frozen production selection. It never invokes pip and
+never runs uv from a service. An existing `.venv` must carry the matching
+lock/selection marker; an unrecognized legacy environment is refused unless
+the operator explicitly supplies `--migrate-venv`.
+
+Legacy environment migration is deliberately manual and recoverable:
+
+```bash
+# 1. Stop supported units yourself; the deploy script will not do this for you.
+sudo systemctl stop cryptorecorder-recorder.service
+sudo systemctl stop cryptorecorder-replay-build.timer
+sudo systemctl stop cryptorecorder-replay-build.service || true
+
+# 2. Inspect a non-mutating plan.
+./scripts/deploy_linux_server.sh --target all --dry-run --install-only \
+  --uv-bin "$(command -v uv)" --migrate-venv
+
+# 3. Build, validate, and promote the candidate; do not start services yet.
+./scripts/deploy_linux_server.sh --target all --install-only \
+  --uv-bin "$(command -v uv)" --migrate-venv
+
+# 4. Inspect the preserved .venv.backup.<UTC>.<PID> and active .venv,
+#    then start/restart units only with a separate explicit command.
+```
+
+Promotion renames the old environment to a timestamped sibling backup and
+does not delete it. Candidate or post-promotion failure preserves evidence and
+restores the prior `.venv` where unambiguous. A symlink, unsafe ownership,
+collision, active supported unit, or interrupted candidate/failed directory
+blocks migration. Manual rollback is an inactive-service rename restoring the
+preserved backup to exactly `.venv`; inspect all sibling migration evidence
+first and never overwrite a collision.
 
 If you prefer manual installation, generate host-specific units with the same
 path/user substitution:
@@ -364,6 +421,8 @@ Current production unit behavior:
   at `01:00 UTC`
 - all services write stdout/stderr to `journald`
 - all services load `/etc/cryptorecorder/cryptorecorder.env` if present
+- all services execute `.venv/bin/python`; service startup never resolves,
+  synchronizes, or invokes uv
 
 Inspect the installed units:
 
@@ -568,13 +627,13 @@ Placeholder for the future deployment phase:
 
 ## Linux Server Deployment Checklist
 
-- [ ] Linux host has Python `3.10+`, `git`, and build tools
+- [ ] Linux host has CPython `>=3.12,<3.15`, `git`, build tools, and operator-installed uv
 - [ ] repository cloned to the intended deploy path
-- [ ] `.venv` created and dependencies installed
+- [ ] `uv lock --check` passes and the production-only frozen `.venv` is validated
 - [ ] large data directories and symlinks reviewed before first import
 - [ ] `python validate.py` passes
-- [ ] `python -m pytest tests/` passes
-- [ ] `python convert_day.py --help` works
+- [ ] full tests pass from an explicit external development environment
+- [ ] `convert_day.py --help` works from an explicit reconstruction environment
 - [ ] `/etc/cryptorecorder/cryptorecorder.env` reviewed
 - [ ] systemd units generated with the correct user/path
 - [ ] `systemd-analyze verify` passes

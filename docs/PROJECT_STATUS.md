@@ -1,7 +1,7 @@
 # Project Status
 
 **Version:** `v1.1.0-dev`
-**Last updated:** 2026-07-31
+**Last updated:** 2026-08-01
 
 This document is the single source of truth for **what is validated** vs **what is
 deferred** in CryptoRecorder. Keep it honest. Do not promote a deferred item to
@@ -58,6 +58,29 @@ or backup. External summary SHA-256:
 `1aacc5f402f9a42c17fe6aac71b1c92cd3b77494d4d64e44357918be9d3c7561`.
 This is isolated development evidence, not production deployment or service
 acceptance.
+
+**Authoritative uv environments (closure checkpoint 3)**
+
+`pyproject.toml` plus committed `uv.lock` are the sole dependency authority;
+the loose requirements file is removed. Production, reconstruction, and
+development/test selections are explicit, frozen, and non-default. Production
+imports recorder, monitoring, replay lifecycle/build/read/write, and routine/
+deep validation with neither Nautilus nor pytest installed. Reconstruction
+adds exact `nautilus_trader==1.225.0` and excludes pytest; development adds the
+two test dependencies.
+
+Three fresh external environments passed on Linux/WSL with CPython 3.12.3 and
+uv 0.11.29. The final lock SHA-256 is
+`976451a3c49b0098bc6e620acb889aa9fb6aa8aaf8098d20db0416721ed1b5af`
+and remained byte-identical. Production built and routine/deep-validated a
+tiny schema-v2 fixture (2 depth, 1 identified trade); reconstruction produced
+a Nautilus-readable selected `full_l2` catalog (1 trade, 4 flattened deltas,
+1 Depth10); the clean development suite passed 834 tests with 3 skipped.
+External acceptance-report SHA-256:
+`fde42fe0b6f2ba88294e093ab645e80a7490a8bcb9cc34e44e53344d9c118b01`.
+This is local environment acceptance, not production deployment, service
+control, production `.venv` migration, broader semantic acceptance, or a
+`v2.0.0` declaration.
 
 - **`replay_store → pipeline.reconstruct_selected_catalog`** — supported
   development-computer CLI/API for an explicitly selected venue/symbol,

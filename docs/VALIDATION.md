@@ -7,6 +7,7 @@ CryptoRecorder has a clear separation between validation, tests, and operational
 | What | Command | When |
 |------|---------|------|
 | Setup validation | `python validate.py` | After cloning/setup |
+| Dependency environment | `python -m validation.validate_dependency_environment --kind <production|reconstruction|development>` | After a frozen uv sync |
 | Unit tests | `pytest tests/` | After code changes |
 | Smoke test | `python scripts/smoke_test.py` | Verify recorder works |
 | Full acceptance | `python scripts/acceptance_test.py` | Release readiness |
@@ -16,7 +17,7 @@ CryptoRecorder has a clear separation between validation, tests, and operational
 
 ## Setup Validation (`validate.py`)
 
-Run this after cloning the repo or setting up on a new machine:
+Run this after the explicit frozen uv sync for the selected environment:
 
 ```bash
 python validate.py          # Full validation
@@ -24,11 +25,20 @@ python validate.py --quick  # Quick dependency check only
 ```
 
 Checks:
-- Python version (3.10+)
-- Dependencies installed (nautilus_trader, aiohttp, zstandard, etc.)
+- Python version (`>=3.12,<3.15`)
+- Production dependencies (`aiohttp`, NumPy, PyArrow, and zstandard)
 - Project structure (directories exist)
 - Configuration loads correctly
-- Core modules can be imported
+- Production core modules can be imported without Nautilus or pytest
+
+`validation.validate_dependency_environment` is the fail-closed environment
+contract. It checks `uv lock --check` without changing the lock, exact required
+and forbidden packages, production or reconstruction imports, and relevant CLI
+help boundaries. With `--kind production --production-smoke-root <new-external-
+path>` it may additionally build and routine/deep-validate one tiny synthetic
+schema-v2 partition. The path must be new, non-symlinked, owned by the caller,
+and outside both the repository and `.venv`; the validator never deletes an
+arbitrary path.
 
 ## Unit Tests (`tests/`)
 
@@ -191,8 +201,9 @@ bounded PyArrow batches.
 `_query_files()` is a **private Nautilus method**, not a supported public API.
 It is currently used because Nautilus 1.225.0 exposes no public
 class/instrument/time file-pruning API that avoids the DataFusion query.
-`requirements.txt` therefore pins exactly `nautilus_trader==1.225.0`, and the
-reader also checks the installed version and private method signature at
+The authoritative `pyproject.toml` reconstruction extra therefore pins exactly
+`nautilus_trader==1.225.0` (resolved in committed `uv.lock`), and the reader
+also checks the installed version and private method signature at
 runtime. A different, missing, or incompatible implementation raises a clear
 compatibility error. It must never silently fall back to `catalog.query()`,
 `_query_rust()`, or `backend_session()`.

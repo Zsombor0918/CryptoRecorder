@@ -93,6 +93,174 @@ An entry may be skipped **only** for:
 - <or "none — task fully completed">
 ```
 
+## 2026-08-01 — Issue #20 closure checkpoint 3 authoritative uv environments
+
+### Change summary
+- Replaced the hand-maintained requirements file with one authoritative,
+  committed `pyproject.toml`/`uv.lock` contract. The flat application remains
+  a non-packaged uv virtual project, all groups are explicit, and `VERSION`
+  remains the sole application release value.
+- Classified direct runtime dependencies from first-party imports and actual
+  clean-environment execution: production is aiohttp, NumPy, PyArrow, and
+  zstandard; reconstruction adds exact Nautilus 1.225.0; development adds only
+  pytest and pytest-asyncio. Pandas is transitive-only.
+- Moved the existing pure depth event-time/repartition helpers into
+  `converter.depth_repartition` so the production replay builder no longer
+  imports Nautilus at module import time. No timestamp, deduplication, replay,
+  converter, or reconstruction semantics changed.
+- Added a read-only dependency-environment validator for lock freshness/hash,
+  exact selected closure, required/forbidden packages, imports, CLI help,
+  exact Nautilus compatibility, and an optional safely scoped tiny production
+  replay smoke.
+- Migrated the deployment wrapper from pip to operator-supplied frozen uv.
+  Existing `.venv` paths and systemd runtime commands remain unchanged;
+  unrecognized legacy environments require explicit inactive-service
+  migration through a validated candidate, preserved backup, post-promotion
+  verification, and fail-closed rollback/evidence handling.
+- Preserved the first failed production smoke, which exposed the missing direct
+  NumPy contract in the initial classification. Regenerated the lock after
+  declaring NumPy, then used fresh non-overwriting successful smoke paths.
+
+### Files/packages touched
+- `pyproject.toml`, `uv.lock`, removed `requirements.txt`
+- `converter/depth_repartition.py`, `converter/depth_phase2.py`
+- `pipeline/build_replay_store.py`
+- `pipeline/reconstruct_selected_catalog.py`
+- `validation/validate_dependency_environment.py`
+- `validation/audit_change_compliance.py`
+- `validate.py`
+- `scripts/deploy_linux_server.sh`
+- `tests/test_uv_dependency_contract.py`
+- `tests/test_reconstruct_selected_catalog.py`
+- `tests/test_repo_structure.py`
+- `tests/test_agent_infrastructure.py`
+- `AGENTS.md`, `.github/copilot-instructions.md`
+- `README.md`, `INSTALL.md`, `CHANGELOG.md`
+- `docs/AI_WORKFLOW.md`, `docs/ARCHITECTURE.md`
+- `docs/IMPLEMENTATION_AUDIT.md`, `docs/OPERATIONS.md`
+- `docs/PROJECT_STATUS.md`, `docs/REPO_STRUCTURE.md`
+- `docs/VALIDATION.md`, `docs/CHANGE_AUDIT.md`
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] `.github/copilot-instructions.md`
+- [x] docs/REPO_STRUCTURE.md
+- [x] docs/PROJECT_STATUS.md
+- [x] docs/IMPLEMENTATION_AUDIT.md
+- [x] relevant feature docs:
+  - `docs/ARCHITECTURE.md`
+  - `docs/OPERATIONS.md`
+  - `docs/VALIDATION.md`
+  - `docs/FULL_L2_REPLAY_CATALOG_PLAN.md`
+  - `docs/AI_WORKFLOW.md`
+  - `README.md`, `INSTALL.md`, `CHANGELOG.md`
+
+### Docs updated
+- [x] CHANGELOG.md
+- [x] README.md
+- [x] INSTALL.md
+- [x] docs/PROJECT_STATUS.md
+- [x] docs/REPO_STRUCTURE.md
+- [x] relevant feature docs:
+  - `docs/ARCHITECTURE.md`
+  - `docs/OPERATIONS.md`
+  - `docs/VALIDATION.md`
+  - `docs/IMPLEMENTATION_AUDIT.md`
+  - `docs/AI_WORKFLOW.md`
+  - `AGENTS.md`, `.github/copilot-instructions.md`
+
+### Status / validation impact
+- Validated status changed: yes — authoritative dependency grouping and three
+  clean local Linux/WSL environments are now validated.
+- Deferred status changed: yes — uv migration is no longer deferred at the
+  repository/template level; production installation/migration remains
+  explicitly deferred.
+- New claims added: yes — only local CPython 3.12.3/uv 0.11.29 environment
+  separation, tiny production replay integrity, selected reconstruction, and
+  clean-suite evidence.
+- Evidence for any new validation claim:
+  - Production-only frozen environment excluded Nautilus/pytest, passed all
+    production imports/CLI help, and built/routine+deep-validated 2 depth + 1
+    identified trade row.
+  - Reconstruction frozen environment included Nautilus 1.225.0, excluded
+    pytest, and wrote a readable selected full-L2 catalog with 1 TradeTick, 4
+    flattened deltas, and 1 Depth10; job-manifest SHA-256
+    `f445e93895114f85c072cfd5fed6e7446a77609b02562574f33f4bd3e63972f4`.
+  - Development frozen environment passed 160 focused tests and the full 834
+    passed, 3 skipped suite. Lock SHA-256 remained
+    `976451a3c49b0098bc6e620acb889aa9fb6aa8aaf8098d20db0416721ed1b5af`.
+  - External acceptance JSON SHA-256:
+    `fde42fe0b6f2ba88294e093ab645e80a7490a8bcb9cc34e44e53344d9c118b01`.
+
+### Tests run
+```bash
+bash -n scripts/deploy_linux_server.sh
+uv lock --check
+
+<external-development-env>/bin/python -m pytest -q \
+  tests/test_uv_dependency_contract.py \
+  tests/test_reconstruct_selected_catalog.py \
+  tests/test_replay_catalog_reconstruct.py \
+  tests/test_replay_lifecycle.py \
+  tests/test_daily_backlog_lifecycle.py \
+  tests/test_daily_build.py \
+  tests/test_replay_build_policy.py \
+  tests/test_replay_store.py \
+  tests/test_writer_backpressure.py \
+  tests/test_repo_structure.py \
+  tests/test_agent_infrastructure.py
+# 160 passed, 2 third-party deprecation warnings
+
+<external-development-env>/bin/python -m pytest -q
+# 834 passed, 3 skipped, 2 third-party deprecation warnings
+```
+
+### Validation CLIs run
+```bash
+uv lock --check
+UV_PROJECT_ENVIRONMENT=<external-production-env> \
+  uv sync --frozen --no-default-groups
+UV_PROJECT_ENVIRONMENT=<external-reconstruction-env> \
+  uv sync --frozen --no-default-groups --extra reconstruction
+UV_PROJECT_ENVIRONMENT=<external-development-env> \
+  uv sync --frozen --no-default-groups --extra reconstruction --group dev
+
+<external-production-env>/bin/python \
+  -m validation.validate_dependency_environment --kind production \
+  --production-smoke-root <new-external-smoke-root>
+<external-reconstruction-env>/bin/python \
+  -m validation.validate_dependency_environment --kind reconstruction
+<external-development-env>/bin/python \
+  -m validation.validate_dependency_environment --kind development
+
+<external-reconstruction-env>/bin/python \
+  -m pipeline.reconstruct_selected_catalog \
+  --replay-root <tiny-external-schema-v2-replay> \
+  --venues BINANCE_SPOT --symbols ADAUSDT \
+  --start 2026-06-12T00:00:00Z --end 2026-06-12T00:01:00Z \
+  --output-root <external-reconstruction-jobs> --job-id uv-clean-smoke \
+  --profile full_l2
+
+bash scripts/deploy_linux_server.sh --target all --dry-run --no-systemd \
+  --uv-bin "$(command -v uv)" \
+  --app-dir <new-external-app-path> --data-root <new-external-data-path>
+
+python -m validation.audit_change_compliance --staged
+```
+
+### Known limitations / out of scope
+- This proves clean local Linux/WSL environments only; Windows and macOS were
+  not tested.
+- No production service, `/etc` environment, production replay root, or
+  production `.venv` was changed. The deployment/migration procedure is
+  implemented and dry-run tested, not production-accepted.
+- No representative matrix, 150-partition build, top50/multi-day semantic
+  gate, production replay migration, `v2.0.0` declaration, checkpoint 4, PR,
+  or Issue #20 mutation was performed.
+- `convert_day.py`, recorder ingestion, raw schema/layout, replay rows/order/
+  precision/schema, systemd runtime paths, and production service state are
+  unchanged.
+
 ## 2026-07-30 — fix(replay): recover native Binance trade identifiers
 
 ### Change summary

@@ -34,13 +34,19 @@ from config import (
     DERIVED_DEPTH_SNAPSHOT_LEVELS,
 )
 from converter.readers import stream_raw_records
+from converter.depth_repartition import (
+    date_shift as _date_shift,
+    dedupe_key as _dedupe_key,
+    is_epoch_like_ns as _is_epoch_like_ns,
+    target_bounds_ns as _target_bounds_ns,
+    ts_event_ns as _ts_event_ns,
+)
 from converter.spool import DedupeSet, RawRecordSpool
 
 logger = logging.getLogger(__name__)
 
 F_LAST = 1 << 7
 F_SNAPSHOT = 1 << 5
-EPOCH_LIKE_NS_MIN = 946684800000000000  # 2000-01-01T00:00:00Z
 DEFAULT_CONVERTER_BATCH_SIZE = 5000
 
 
@@ -149,53 +155,12 @@ class ReplayState:
         self.asks.clear()
 
 
-def _ts_event_ns(rec: dict) -> int:
-    # Adapter-normalized records (e.g. replay_store rows) may carry a
-    # pre-computed nanosecond event timestamp; honour it exactly so the
-    # replay path reproduces the raw path's ts_event without re-deriving
-    # from milliseconds. Raw records never set ``ts_event_ns``.
-    pre_ns = rec.get("ts_event_ns")
-    if pre_ns is not None:
-        return int(pre_ns)
-    ts_event_ms = rec.get("ts_event_ms") or rec.get("exchange_ts_ms")
-    ts_recv_ns = int(rec.get("ts_recv_ns", 0))
-    return int(ts_event_ms) * 1_000_000 if ts_event_ms else ts_recv_ns
-
-
-def _date_shift(date_str: str, days: int) -> str:
-    base = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-    return (base + timedelta(days=days)).strftime("%Y-%m-%d")
-
-
-def _target_bounds_ns(date_str: str) -> Tuple[int, int]:
-    start = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-    end = start + timedelta(days=1)
-    return int(start.timestamp() * 1_000_000_000), int(end.timestamp() * 1_000_000_000)
-
-
-def _is_epoch_like_ns(ts_ns: int) -> bool:
-    return ts_ns >= EPOCH_LIKE_NS_MIN
-
-
 def _sort_key(raw_index: int, rec: dict) -> Tuple[int, int, int]:
     """Sort by committed canonical order: (session, session_seq, raw_index fallback)."""
     return (
         int(rec.get("stream_session_id", 0)),
         int(rec.get("session_seq", rec.get("connection_seq", 0))),
         raw_index,
-    )
-
-
-def _dedupe_key(rec: dict) -> Tuple[object, ...]:
-    return (
-        rec.get("record_type", "depth_update"),
-        rec.get("stream_session_id"),
-        rec.get("session_seq", rec.get("connection_seq")),
-        rec.get("U"),
-        rec.get("u"),
-        rec.get("pu"),
-        rec.get("lastUpdateId"),
-        _ts_event_ns(rec),
     )
 
 

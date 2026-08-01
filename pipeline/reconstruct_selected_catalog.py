@@ -474,24 +474,24 @@ def _dependency_versions() -> dict[str, str]:
 
 
 def _load_engine():
+    guidance = (
+        "run 'uv sync --frozen --no-default-groups --extra reconstruction'"
+    )
     try:
         from validation import replay_catalog_reconstruct as engine
     except ImportError as exc:
         raise SelectedCatalogError(
-            "selected reconstruction dependencies are required; install the repository "
-            "reconstruction requirements, including nautilus_trader==1.225.0"
+            "selected reconstruction dependencies are required; " + guidance
         ) from exc
     if not engine.NAUTILUS_AVAILABLE:
         raise SelectedCatalogError(
-            "selected reconstruction dependencies are required; install the repository "
-            "reconstruction requirements, including nautilus_trader==1.225.0"
+            "selected reconstruction dependencies are required; " + guidance
         )
     try:
         installed = importlib.metadata.version("nautilus_trader")
     except importlib.metadata.PackageNotFoundError as exc:
         raise SelectedCatalogError(
-            "selected reconstruction dependencies are required; install "
-            "nautilus_trader==1.225.0"
+            "selected reconstruction dependencies are required; " + guidance
         ) from exc
     if installed != "1.225.0":
         raise SelectedCatalogError(

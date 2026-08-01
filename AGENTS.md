@@ -98,7 +98,8 @@ A change is **not** done until all of the following are true:
 1. Relevant docs are updated (`docs/`, `README.md`, and `docs/PROJECT_STATUS.md`
    if status changed).
 2. [CHANGELOG.md](CHANGELOG.md) `## [Unreleased]` section is updated.
-3. `pytest` passes locally (`source .venv/bin/activate && pytest`).
+3. `pytest` passes from the explicit locked development environment
+   (`uv sync --frozen --no-default-groups --extra reconstruction --group dev`).
 4. If you touched replay or catalog-reconstruction code, you ran the relevant
    audit/validation CLI (`validation/audit_replay_store.py` or
    `validation/validate_catalog_equivalence.py`) and reported the result.
@@ -136,6 +137,11 @@ A change is **not** done until all of the following are true:
   it).
 - Do **not** mark deferred work as done to "close" a task.
 - Prefer **small, reviewable changes** over large sweeping rewrites.
+- `pyproject.toml` plus the committed `uv.lock` are the only dependency
+  authority. Never restore a hand-maintained `requirements.txt`, use pip for
+  deployment installation, or run an unfrozen deployment sync. Production is
+  `uv sync --frozen --no-default-groups`; reconstruction adds
+  `--extra reconstruction`; development adds that extra plus `--group dev`.
 - When in doubt about whether a folder/file is allowed, consult
   [docs/REPO_STRUCTURE.md](docs/REPO_STRUCTURE.md) first.
 
@@ -152,7 +158,8 @@ complete.
 
 An entry is required for **any** commit that touches:
 - Python source files (`*.py`) anywhere in the repo
-- Schema, config, or deployment files (`config.py`, `systemd/`, `requirements.txt`)
+- Schema, dependency, config, or deployment files (`config.py`,
+  `pyproject.toml`, `uv.lock`, `systemd/`)
 - Documentation files if the change affects status claims, validated/deferred state,
   or the repo structure contract
 

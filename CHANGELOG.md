@@ -68,6 +68,31 @@ passes.** Until then, broader full-L2 equivalence stays **deferred** (see
 ## [Unreleased]
 
 ### Added
+- **Issue #20 closure checkpoint 3: authoritative uv dependency and
+  environment migration** — committed `pyproject.toml` plus `uv.lock` now
+  define explicit production, reconstruction, and development/test selections
+  for the existing flat non-packaged application; the hand-maintained
+  `requirements.txt` is removed and `VERSION` remains the application-version
+  authority. Production no longer imports Nautilus through the replay builder:
+  dependency-free depth event-time/repartition primitives are shared from
+  `converter.depth_repartition`, while object construction stays in the
+  reconstruction boundary. The read-only environment validator proves lock
+  freshness/hash, exact selected closure, required/forbidden packages,
+  imports/CLI help, exact Nautilus 1.225.0, and an optional tiny external
+  schema-v2 smoke. Deployment now requires operator-supplied uv, uses only
+  `uv lock --check` plus a frozen production sync, preserves
+  `.venv/bin/python`, and replaces a legacy environment only through explicit
+  inactive-service migration with a validated candidate, preserved backup,
+  and fail-closed rollback/evidence rules. Runtime services never invoke uv;
+  no production deployment or environment migration occurred. Three clean
+  external CPython 3.12.3/uv 0.11.29 environments passed; the focused set is
+  160 passed and the full clean-development suite is 834 passed, 3 skipped.
+  Lock SHA-256:
+  `976451a3c49b0098bc6e620acb889aa9fb6aa8aaf8098d20db0416721ed1b5af`;
+  external acceptance-report SHA-256:
+  `fde42fe0b6f2ba88294e093ab645e80a7490a8bcb9cc34e44e53344d9c118b01`.
+  Broader top50/multi-day semantics, `v2.0.0`, production deployment, and
+  checkpoint 4 remain pending.
 - **Issue #20 closure checkpoint 2: bounded replay-build lifecycle and
   operations contract** — all supported replay-root mutation boundaries now
   share one nonblocking Linux advisory lock with run/root/repository identity.

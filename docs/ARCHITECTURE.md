@@ -111,6 +111,7 @@ See `docs/OPERATIONS.md` for the full field reference and environment knobs.
 | `convert_day.py` | CLI converter orchestrator |
 | `converter/trades.py` | Raw trade_v2 → Nautilus `TradeTick` |
 | `converter/depth_phase2.py` | Deterministic depth_v2 replay → `OrderBookDeltas` (+ optional `OrderBookDepth10`) |
+| `converter/depth_repartition.py` | Dependency-free event-time selection/deduplication contract shared by converter and replay builder |
 | `converter/spool.py` | Temporary SQLite spools used to keep heavy conversions memory-bounded |
 | `stores/` | Replay Parquet schemas/readers/writers (no feature/label schemas) |
 | `pipeline/build_replay_store.py` | Raw JSONL -> versioned replay partitions; production CLI default v2 |
@@ -120,6 +121,34 @@ See `docs/OPERATIONS.md` for the full field reference and environment knobs.
 | `validation/replay_catalog_reconstruct.py` | Shared replay_store -> temporary Nautilus catalog engine (no direct CLI) |
 | `pipeline/reconstruct_selected_catalog.py` | Supported explicit development-computer temporary-catalog CLI/API |
 | `validation/validate_catalog_equivalence.py` | Old-vs-new semantic comparison (trades_only, full_l2, depth_only, depth10) |
+| `validation/validate_dependency_environment.py` | Read-only uv lock, dependency separation, import, CLI, and optional tiny production replay smoke validation |
+
+## Dependency and Import Boundaries
+
+`pyproject.toml` plus committed `uv.lock` are the only Python dependency
+authority. CryptoRecorder remains a flat, non-packaged uv virtual project with
+no build backend; `VERSION` alone carries the application release value.
+
+| Environment | Direct contract | Deliberately absent |
+|-------------|-----------------|---------------------|
+| production | aiohttp, NumPy, PyArrow, zstandard | Nautilus, pytest tooling |
+| reconstruction | production + `nautilus_trader==1.225.0` | pytest tooling |
+| development/test | production + reconstruction + pytest + pytest-asyncio | no implicit group |
+
+NumPy is an explicit production contract because routine/deep replay
+validation exercises PyArrow's NumPy conversion API and PyArrow does not
+declare NumPy for that optional interoperation. Pandas is not a direct
+CryptoRecorder dependency; it is present only where required transitively by
+the pinned Nautilus distribution.
+
+The production replay builder formerly imported event-time helpers through
+`converter.depth_phase2`, which imported Nautilus at module load. Those pure
+helpers now live in `converter.depth_repartition`; both callers share the same
+implementation while Nautilus object construction stays in the reconstruction
+boundary. A production environment can therefore import recorder, monitoring,
+lifecycle, replay build/read/write, and routine/deep validation without the
+reconstruction extra. Missing reconstruction dependencies fail with the
+canonical frozen uv-extra command rather than a generic traceback.
 
 ## Session Ordering
 

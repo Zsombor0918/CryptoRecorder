@@ -50,7 +50,9 @@ _CORE_CODE_PREFIXES: tuple[str, ...] = (
 _DEPLOYMENT_PREFIXES: tuple[str, ...] = (
     "systemd/",
     "scripts/",
-    "requirements.txt",
+    "pyproject.toml",
+    "uv.lock",
+    "requirements.txt",  # deletion/restoration remains compliance-relevant
 )
 
 _REPLAY_CATALOG_PATTERNS: tuple[str, ...] = (

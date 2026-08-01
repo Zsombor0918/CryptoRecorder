@@ -30,6 +30,67 @@ replay_store -> pipeline.reconstruct_selected_catalog -> temporary catalog
   replay_catalog_reconstruct engine; broader top50/multi-day validation pending
 ```
 
+## Issue #20 closure checkpoint 3 — authoritative uv environments
+
+The dependency authority is now `pyproject.toml` plus committed `uv.lock`;
+the former hand-maintained `requirements.txt` is removed. The application
+retains its flat module layout and has no build backend (`tool.uv.package =
+false`, `default-groups = []`). `VERSION` remains the sole application release
+value; the neutral project metadata version exists only because standardized
+project metadata requires a value and does not declare a release.
+
+The import-derived direct dependency matrix is:
+
+| Direct dependency | First-party consumer/contract | Environment | Constraint rationale |
+|-------------------|-------------------------------|-------------|----------------------|
+| `aiohttp` | recorder WebSocket/REST and universe resolution | production | direct imported runtime API; compatible floor retained |
+| `numpy` | PyArrow `to_numpy()` during replay integrity validation | production | contractual optional interop that PyArrow does not install itself |
+| `pyarrow` | schema-v2 writer, reader, checksums, routine/deep integrity | production | direct storage API; compatible floor retained |
+| `zstandard` | compressed raw readers and recording/storage | production | direct codec API; compatible floor retained |
+| `nautilus_trader` | reference converter, selected reconstruction, catalogs/equivalence | reconstruction | exact accepted compatibility pin `1.225.0` |
+| `pytest` | test runner | development | test-only, bounded `<10` compatibility range |
+| `pytest-asyncio` | async tests | development | test-only, bounded major range |
+
+Pandas is not imported directly and is no longer declared; it remains a
+Nautilus transitive dependency only. The supported range is CPython
+`>=3.12,<3.15`, derived from the pinned Nautilus distribution and tested on
+CPython 3.12.3 with uv 0.11.29. No Windows or macOS clean-environment claim is
+made.
+
+`converter.depth_repartition` now owns the dependency-free event-time bounds,
+timestamp, and deduplication primitives previously reached through the
+Nautilus-importing `converter.depth_phase2` module. Replay semantics are
+unchanged; the import boundary lets recorder/lifecycle/replay production
+modules load without Nautilus. The selected reconstruction error points to
+`uv sync --frozen --no-default-groups --extra reconstruction`.
+
+`validation.validate_dependency_environment` checks lock freshness and hash,
+required/forbidden packages, imports, CLI help, exact Nautilus version, and an
+optional tiny external schema-v2 production build/integrity smoke. The deploy
+wrapper uses an operator-supplied uv executable, runs `uv lock --check`, syncs
+only the frozen production selection into a same-parent candidate, validates
+before promotion, and keeps `.venv/bin/python` as the systemd path. Legacy
+`.venv` replacement is explicit, service-inactivity-gated, backup-preserving,
+and rollback-capable. Runtime units never invoke uv. Repository templates have
+not been installed or production-accepted.
+
+Clean-environment acceptance used three new external uv environments under the
+non-repository evidence root
+`issue20_checkpoint3_uv_20260801T064955Z`.
+The production selection excluded Nautilus/pytest and passed imports plus a
+2-depth/1-trade schema-v2 routine/deep-integrity smoke. The reconstruction
+selection pinned Nautilus 1.225.0, excluded pytest, and produced a readable
+selected `full_l2` catalog with 1 TradeTick, 4 flattened deltas, and 1
+Depth10. The development selection passed the 160-test focused set and the
+full suite (834 passed, 3 skipped). Frozen sync/validation left lock SHA-256
+`976451a3c49b0098bc6e620acb889aa9fb6aa8aaf8098d20db0416721ed1b5af`
+unchanged. External acceptance JSON SHA-256:
+`fde42fe0b6f2ba88294e093ab645e80a7490a8bcb9cc34e44e53344d9c118b01`.
+The first production smoke remains preserved: it exposed missing NumPy in the
+initial classification before any accepted result, prompting the direct
+production declaration and a fresh successful attempt. No production system,
+service, or repository `.venv` was changed.
+
 ## Issue #20 closure checkpoint 2 — replay lifecycle and operations boundary
 
 The current branch implements the repository-side replay-build lifecycle; no
@@ -137,9 +198,11 @@ them, yielding the exact 1,371,172 TradeTicks. Peak cgroup memory was
 2,371,661,824 bytes with zero OOM/OOM-kill; final report SHA-256 is
 `2ae29713f09dd10988566c10c3bb040ec55a0252d936a5e60e08032295af4d85`.
 
-This is one corrected futures representative. The remaining futures matrix,
-broader representative/top50 and multi-day gates, the 150-partition final v2
-build, Phase 8, deployment, retention, uv, and KovacsTrader remain pending.
+This paragraph records the state at the time of the correction. Subsequent
+Issue #20 checkpoints recorded the completed representative matrix, accepted
+Phase 7 storage build, lifecycle boundary, and authoritative uv migration.
+Broader top50/multi-day release gating, Phase 8, production deployment,
+transactional retention, and KovacsTrader remain pending.
 
 ## What Works
 
@@ -208,11 +271,13 @@ Automated tests cover:
 Last full local suite:
 
 ```text
-773 passed, 3 skipped
+834 passed, 3 skipped
 ```
 
-The supported selected-boundary focus/guard set is 84 passed; the broader
-replay/reconstruction/carry/reader/guard set is 222 passed, 2 skipped. A real
+The checkpoint-3 dependency/deployment/reconstruction/lifecycle/guard focus is
+160 passed. Earlier selected-boundary evidence remains 84 passed and the
+broader replay/reconstruction/carry/reader/guard set remains 222 passed,
+2 skipped. A real
 schema-v2 ADAUSDT five-minute full-L2 smoke published an artifact-bound job,
 was readable with pinned Nautilus 1.225.0, and recorded 51.437 seconds wall
 time plus 640,143,360 bytes peak under the 10 GiB/zero-swap wrapper with no
@@ -978,8 +1043,9 @@ This reader has a deliberately fail-closed compatibility contract:
 
 - `ParquetDataCatalog._query_files()` is a **private** method. It is used only
   because Nautilus 1.225.0 has no supported public file-pruning API that
-  avoids the DataFusion query. `requirements.txt` pins
-  `nautilus_trader==1.225.0`; runtime version/signature mismatches raise
+  avoids the DataFusion query. The authoritative `pyproject.toml`
+  reconstruction extra and `uv.lock` pin `nautilus_trader==1.225.0`; runtime
+  version/signature mismatches raise
   clearly, with no DataFusion fallback.
 - The reference writer (`convert_day.py` via `ObjectSpool`) and replay
   reconstruction writer (`validation/replay_catalog_reconstruct.py`, also via

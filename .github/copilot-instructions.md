@@ -19,6 +19,9 @@ This is a short pointer file. The full, binding rules live in:
 - **Never** implement Syncthing, archive, or import features. `ARCHIVE_DAYS_ROOT` is
   a placeholder only. `LABEL_ROOT` was removed entirely (issue #17); do not
   reintroduce a label/target store.
+- **Never** reintroduce `requirements.txt` or pip-based deployment installation.
+  `pyproject.toml` and committed `uv.lock` are authoritative; deployment syncs
+  are explicit, frozen, and install no default dependency groups.
 
 ## Package boundaries
 

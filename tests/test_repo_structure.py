@@ -45,7 +45,8 @@ ALLOWED_ROOT_PY_FILES = {
 ALLOWED_ROOT_OTHER_FILES = {
     "README.md",
     "INSTALL.md",
-    "requirements.txt",
+    "pyproject.toml",
+    "uv.lock",
     "pytest.ini",
     "AGENTS.md",
     "VERSION",
@@ -358,6 +359,7 @@ def test_validation_contains_audit_and_equivalence_modules() -> None:
         "validate_catalog_equivalence.py",
         "catalog_compare.py",
         "replay_catalog_reconstruct.py",
+        "validate_dependency_environment.py",
     ):
         assert (VALIDATION / name).exists(), (
             f"validation/{name} is missing. See docs/REPO_STRUCTURE.md."

@@ -262,7 +262,7 @@ just not part of the automated deployment path.
 |------|---------|
 | `--target <name>` | Service group to act on. Default `all`. |
 | `--dry-run` | Print every action; change nothing. |
-| `--no-systemd` | Skip all systemd/`/etc` actions (safe in WSL). |
+| `--no-systemd` | Skip systemd install/control and `/etc` writes (safe in WSL). A real environment promotion still checks supported units inactive when `systemctl` exists. |
 | `--install-only` | Prepare env + install units; do not enable/start. |
 | `--enable` | `systemctl enable` the selected units. |
 | `--start` | `systemctl start` the selected units. |
@@ -271,6 +271,8 @@ just not part of the automated deployment path.
 | `--app-dir <path>` | Repo checkout dir. Default `/home/zsom/services/CryptoRecorder`. Rendered into each unit's `WorkingDirectory=`/`ExecStart=` paths. |
 | `--data-root <path>` | Data base dir. Default `/data/cryptorecorder`. Rendered into a newly created env file's `CRYPTO_RECORDER_*_ROOT` values; has no effect if the env file already exists (never overwritten). |
 | `--env-file <path>` | Env file path. Default `/etc/cryptorecorder/cryptorecorder.env`. Rendered into each unit's `EnvironmentFile=` line. |
+| `--uv-bin <path>` | Operator-installed uv executable or command name. The script never downloads uv. |
+| `--migrate-venv` | Explicitly replace an unrecognized legacy `.venv` through a validated same-parent candidate and preserved backup. |
 
 ## Common steps performed
 
@@ -279,13 +281,19 @@ For the selected target, the script runs these steps (in order):
 1. **Verify Linux** — refuse to run on non-Linux hosts.
 2. **Verify repo root** — must be run from the repository checkout.
 3. **Verify structure** — `docs/REPO_STRUCTURE.md` must exist (the frozen contract).
-4. **Create venv** — create `.venv` if missing.
-5. **Install requirements** — `pip install -r requirements.txt` into `.venv`.
+4. **Verify dependency authority** — locate the operator-supplied uv, record its
+   version, run `uv lock --check`, and record the committed lock SHA-256.
+5. **Prepare the locked environment** — accept an existing `.venv` only when
+   its marker and live validation prove the current production-only lock
+   selection. Otherwise build and validate a same-parent candidate with
+   `uv sync --frozen --no-default-groups`; an unrecognized legacy environment
+   requires the explicit `--migrate-venv` policy.
 6. **Create env file** — render `systemd/cryptorecorder.env.example` (substituting `--data-root`)
    to the env-file path **only if it does not already exist** (never silently overwrite an
    existing env file).
 7. **Create data dirs** — create the data roots under `--data-root`.
-8. **Run validation** — `python validate.py --quick`.
+8. **Run validation** — validate dependency separation, imports, lock freshness,
+   and production CLIs through `.venv/bin/python`.
 9. **Validate unit template** — verify `Type=oneshot`, `Restart=no`, schema-v2
    backlog arguments, and 12 GiB/zero-swap limits without starting a service.
 10. **Clean up stale units** — stop/disable/remove every legacy or renamed unit name this repo
@@ -296,16 +304,18 @@ For the selected target, the script runs these steps (in order):
 13. **Print target** — show which units/groups were selected and their status.
 
 When `--no-systemd` is set, steps that touch systemd or `/etc` are skipped; the script
-still prepares the venv, dependencies, and data dirs (or prints them under `--dry-run`).
+still prepares the locked environment and data dirs (or prints them under `--dry-run`).
 
 ## Examples
 
 ```bash
 # See exactly what a full install would do, without touching the system:
-./scripts/deploy_linux_server.sh --target all --dry-run --no-systemd
+./scripts/deploy_linux_server.sh --target all --dry-run --no-systemd \
+  --uv-bin "$(command -v uv)"
 
 # Full server install: prepare, install units, enable + start everything:
-./scripts/deploy_linux_server.sh --target all --enable --start
+./scripts/deploy_linux_server.sh --target all --uv-bin "$(command -v uv)" \
+  --enable --start
 
 # Restart just the recorder after a code update:
 ./scripts/deploy_linux_server.sh --target recorder --restart
@@ -317,7 +327,18 @@ still prepares the venv, dependencies, and data dirs (or prints them under `--dr
 ## Safety notes
 
 - The script never overwrites an existing env file (step 6).
-- `--dry-run` makes no changes; `--no-systemd` avoids systemd and `/etc` entirely.
+- `--dry-run` makes no changes; `--no-systemd` avoids systemd mutation and
+  `/etc` entirely. A non-dry-run environment promotion still uses a read-only
+  `systemctl is-active` proof when systemd is available, so this flag cannot
+  bypass the inactive-service migration boundary.
+- It never installs uv, uses pip, resolves an unlocked environment, or invokes
+  uv from a runtime service. `pyproject.toml` plus `uv.lock` are authoritative.
+- An existing `.venv` that lacks the current lock marker is preserved and
+  refused by default. Explicit migration requires every supported unit to be
+  inactive, promotes only a validated same-parent candidate, keeps the old
+  environment as `.venv.backup.<UTC>.<PID>`, and rolls back on an unambiguous
+  post-promotion failure. Symlinks, unsafe ownership, collisions, or interrupted
+  candidate evidence fail closed.
 - The script does **not** deploy Syncthing, archive, or import features — none exist.
 - It does **not** modify `recorder.py`, the raw schema, or `convert_day.py`.
 - For every target (not just `all`/`replay-build`), the script stops, disables, and removes
@@ -353,6 +374,62 @@ one environment's paths into the other.
 The repository is developed in **WSL** and deployed on an **Ubuntu server**. The
 deploy script (`scripts/deploy_linux_server.sh`) is safe to dry-run in WSL and performs
 real systemd actions only on the server.
+
+Dependency environments are explicit and locked. CPython `>=3.12,<3.15` is
+supported; checkpoint 3 was resolved and locally exercised with CPython 3.12.3
+and uv 0.11.29. `VERSION` remains the application-version authority; the
+non-packaged uv project's neutral metadata version is not a release value.
+
+```bash
+# Production: recorder + replay lifecycle/build/validation only.
+uv lock --check
+UV_PROJECT_ENVIRONMENT="$APP_DIR/.venv" \
+  uv sync --frozen --no-default-groups
+
+# Reconstruction: production plus pinned Nautilus, in an external environment.
+uv lock --check
+UV_PROJECT_ENVIRONMENT=/external/cryptorecorder-reconstruction-env \
+  uv sync --frozen --no-default-groups --extra reconstruction
+
+# Development: production + reconstruction + tests, also external.
+uv lock --check
+UV_PROJECT_ENVIRONMENT=/external/cryptorecorder-development-env \
+  uv sync --frozen --no-default-groups \
+    --extra reconstruction \
+    --group dev
+```
+
+Plain production sync contains neither `nautilus_trader` nor pytest. The
+reconstruction extra pins `nautilus_trader==1.225.0` and still excludes test
+tools. The development selection adds only pytest and pytest-asyncio. Frozen
+syncs must leave `uv.lock` byte-identical; `requirements.txt` is intentionally
+absent so there is no second hand-maintained dependency authority.
+
+Services continue to execute `<app-dir>/.venv/bin/python`. They never execute
+uv, resolve dependencies, update the lock, or access a package index at
+startup. Repository templates have not yet been deployed or production-
+accepted.
+
+### Legacy `.venv` migration and rollback
+
+Do not stop a unit automatically merely to make an environment migration
+succeed. The operator sequence is:
+
+1. stop the supported recorder and replay-build service/timer manually;
+2. run the deploy command with `--dry-run --install-only --migrate-venv`;
+3. inspect the exact candidate, backup, lock, and unit plan;
+4. run the same command without `--dry-run` but still with `--install-only`;
+5. validate the promoted `.venv` and preserved timestamped backup;
+6. start or restart services only through a separate explicit command.
+
+The deployment wrapper refuses an active supported unit before promotion. It
+renames the existing environment to a timestamped backup, atomically renames
+the validated candidate to `.venv`, verifies the production contract again,
+and restores the backup if that post-promotion check fails unambiguously. It
+does not delete the backup. For manual rollback, keep all units inactive,
+inspect every sibling `.venv.*` artifact, move the failed active environment
+aside, and restore exactly one preserved backup to `.venv`; any collision or
+ambiguous interrupted state requires operator diagnosis rather than cleanup.
 
 ## Canonical production paths
 
@@ -412,7 +489,8 @@ There is no feature-build step; CryptoRecorder's scope ends at `replay_store`
 This command is deliberately outside the Linux service/timer groups:
 
 ```bash
-python -m pipeline.reconstruct_selected_catalog \
+/external/cryptorecorder-reconstruction-env/bin/python \
+  -m pipeline.reconstruct_selected_catalog \
   --replay-root /path/to/synced/replay_store \
   --venues BINANCE_SPOT \
   --symbols ADAUSDT BTCUSDT \
