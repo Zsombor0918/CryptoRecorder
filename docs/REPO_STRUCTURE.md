@@ -27,7 +27,7 @@ These are the only Python entrypoints and project files permitted at the root:
 | `storage.py` | Hourly-rotated JSONL(.zst) file writer (core recorder module, never change without explicit task allowance) |
 | `binance_universe.py` | Universe selection by 24h quote volume + futures precheck |
 | `health_monitor.py` | Publishes `state/heartbeat.json` |
-| `disk_monitor.py` | Fail-safe disk usage monitoring (see issue #19 / `docs/ARCHITECTURE.md`) |
+| `disk_monitor.py` | Replay-aware filesystem/capacity monitoring and non-destructive raw-retention planning |
 | `time_utils.py` | Shared timestamp helpers |
 | `convert_day.py` | Validated raw → Nautilus full-L2 converter |
 | `config.py` | Configuration and storage roots |
@@ -81,6 +81,11 @@ logic here; this package is the old-converter boundary.
 raw data. Contains daily build orchestration and the replay builder. Does
 **not** contain a feature-store builder, and does **not** contain audit or
 equivalence check commands; those belong in `validation/`.
+
+`pipeline/replay_lifecycle.py` is the shared build-side helper for the Linux
+advisory lock, bounded cross-date recovery, atomic JSON evidence, and bounded
+tree sizing. It has no standalone CLI and contains no replay decoding or
+validation-oracle semantics.
 
 `pipeline/` **may** contain exactly one supported, explicitly-scoped
 selected-reconstruction CLI (issue #20),
@@ -136,6 +141,11 @@ are organized by subsystem:
 - `test_replay_catalog_reconstruct.py` — internal full_l2 reconstruction engine
 - `test_reconstruct_selected_catalog.py` — supported selected CLI/API safety,
   binding, carry, and real-Parquet catalog tests
+- `test_replay_lifecycle.py`, `test_daily_backlog_lifecycle.py`,
+  `test_replay_build_policy.py` — exclusive ownership, cross-date recovery,
+  bounded backlog/reporting, and schema/source replacement policy
+- `test_replay_monitoring_retention.py` — replay storage classification,
+  filesystem grouping, and non-destructive paired raw-retention proofs
 - `test_catalog_equivalence.py` — old-vs-new catalog comparison
 - `test_repo_structure.py` — folder contract enforcement
 - Legacy converter tests remain named as-is
@@ -259,6 +269,7 @@ catalog outputs, or tool caches. Use `.gitignore` to block them.
 - `daily_build.py`
 - `build_replay_store.py`
 - `raw_manifest.py`
+- `replay_lifecycle.py` (shared lock/recovery/atomic-report helper; no CLI)
 - `reconstruct_selected_catalog.py` (supported explicit development-computer
   temporary-catalog CLI/API)
 
@@ -298,8 +309,9 @@ These are the canonical commands. Documentation must not use any other paths.
 # Build replay store for one day
 python -m pipeline.build_replay_store --date YYYY-MM-DD [OPTIONS]
 
-# Run daily build (raw manifest scan + replay store build + report)
-python -m pipeline.daily_build --date YYYY-MM-DD [OPTIONS]
+# Run bounded oldest-first replay backlog (production schema is explicit)
+python -m pipeline.daily_build --date yesterday \
+  --backlog-days 7 --max-build-dates 3 --schema-version 2 [OPTIONS]
 
 # Build one explicit development-computer temporary catalog job
 python -m pipeline.reconstruct_selected_catalog \
@@ -355,7 +367,10 @@ data_raw -> convert_day.py -> Nautilus full-L2 catalog
   VALIDATED: current production full-L2 path
 
 data_raw -> replay_store
-  IMPLEMENTED: v0 validated
+  IMPLEMENTED: schema v0/v1/v2 readers/builders; repository production template
+  intentionally requests schema v2 through a bounded, exclusive backlog build.
+  The template has not yet been installed or production-accepted and does not
+  automatically migrate legacy/source-changed partitions.
   This is the stable external contract handed off to downstream repositories
   (e.g. KovacsTrader). CryptoRecorder does not build a feature/label layer or
   a general-purpose consumer catalog from it.
@@ -386,3 +401,4 @@ replay_store -> pipeline.reconstruct_selected_catalog -> temporary catalog
 | 2026-07-24 | Issue #20 Phase 4: `pipeline/` may now contain exactly one supported, explicitly-scoped selected-reconstruction CLI (development-computer, temporary catalog, explicit venue/symbol/time-window only) — this deliberately re-scopes the issue #17 removal of `pipeline/generate_catalog.py`, which stays permanently forbidden by name and by its unscoped ("all symbols/all history") shape. No such CLI exists yet in this repository; this amendment only updates the contract and its guard test (`tests/test_repo_structure.py::test_pipeline_reconstruction_cli_stays_explicitly_scoped`) ahead of a future implementation phase. |
 | 2026-07-30 | Issue #20 Phase 7 checkpoint: added validation-only `artifact_identity.py`, `serial_gate.py`, and `stage_runner_cli.py` to bind and execute isolated exhaustive semantic stages, plus thin operator wrapper `scripts/run_under_cgroup.sh` for fail-closed cgroup limits/telemetry. No build logic moved into `validation/` and no business logic moved into `scripts/`. |
 | 2026-07-31 | Issue #20 closure checkpoint 1: implemented the one contract-permitted `pipeline/reconstruct_selected_catalog.py` development-computer CLI/API. It requires explicit venue/symbol/[start,end)/output/job/profile scope, wraps the unchanged shared internal engine, preflights and rehashes replay inputs, and atomically publishes only cryptographically inventoried temporary job directories. No Linux service/timer or persistent catalog lifecycle was added. |
+| 2026-07-31 | Issue #20 closure checkpoint 2: added `pipeline/replay_lifecycle.py` as a build-only shared helper; `daily_build` now owns a bounded schema-v2 backlog under one kernel advisory lock, reconciles canonical staging/backup/quarantine artifacts across dates, and publishes atomic run/date evidence. Disk monitoring classifies canonical replay and transients without an active persistent-catalog assumption. Automatic raw deletion is disabled; only proof-only paired depth/trade retention planning remains. The repository systemd template is bounded but not deployed. |

@@ -16,7 +16,7 @@ EnvironmentFile=-/etc/cryptorecorder/cryptorecorder.env
 # daily_build requires an explicit YYYY-MM-DD date or the 'yesterday' shortcut,
 # which resolves to the previous completed UTC day. It always builds the
 # replay store (there is no --steps flag; daily_build is replay-only).
-ExecStart=/home/zsom/services/CryptoRecorder/.venv/bin/python -m pipeline.daily_build --date yesterday
+ExecStart=/home/zsom/services/CryptoRecorder/.venv/bin/python -m pipeline.daily_build --date yesterday --backlog-days 7 --max-build-dates 3 --schema-version 2
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=cryptorecorder-replay-build
@@ -34,10 +34,16 @@ RestartSec=300
 # Restart=no is unchanged, so a timeout failure cannot create a restart
 # loop; the crash-safe staging/backup recovery in pipeline.build_replay_store
 # already protects replay data if systemd terminates the build mid-run.
-# Manual --force rebuilds and historical backfills are run via the
-# documented CLI (or a separately controlled transient systemd scope with
-# its own explicit timeout) -- not via this installed daily service.
+# Explicit source-changed or incompatible-schema replacements and historical
+# backfills are run via the documented isolated operator flow (or a separately
+# controlled transient systemd scope) -- not via this installed daily service.
 TimeoutStartSec=23h
+
+# Repository template for the known 16 GiB host. This has not yet been
+# installed or production-validated; the later owner acceptance must confirm
+# real headroom under the 12 GiB ceiling.
+MemoryMax=12G
+MemorySwapMax=0
 
 # Security hardening
 NoNewPrivileges=yes

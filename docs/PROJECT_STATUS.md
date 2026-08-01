@@ -13,27 +13,52 @@ validated without recorded evidence.
 
 - **Recorder** — Binance spot + USDT-M futures ingestion to `data_raw/`
   (deterministic-native depth_v2 + trade_v2). Stable.
-- **Disk monitoring (fail-safe measurement)** — `disk_monitor.py` never reports a
+- **Replay-aware disk monitoring (fail-safe measurement)** — `disk_monitor.py` never reports a
   failed/timed-out directory-size scan as zero. Failures fall back to a persisted
   last-known-good value marked `stale`, or `null` if none exists;
   `state/disk_usage.json` exposes `monitoring_health` (healthy/degraded/unhealthy)
-  and alerts; automatic cleanup fails closed on any untrusted `data_raw`
-  measurement; filesystem capacity is reported independently via
-  `shutil.disk_usage()`. See `docs/ARCHITECTURE.md` and `docs/OPERATIONS.md`.
+  and alerts. A single bounded scan separates canonical replay, staging,
+  backups, quarantine, and lifecycle metadata; actual filesystems group raw,
+  replay, metadata, and reports without double-counting free bytes. The
+  retired persistent catalog root is not monitored. Automatic raw deletion is
+  disabled/removed; proof-only paired depth/trade planning reports
+  `cleanup_required` without moving data.
   Covered by `tests/test_disk_monitor_fail_safe.py` and
-  `tests/test_disk_monitor_cleanup.py`. Real-server verification (post-deploy
-  log/report inspection) is pending — see deployment checklist in the PR.
+  `tests/test_disk_monitor_cleanup.py` plus
+  `tests/test_replay_monitoring_retention.py`. Real-server verification (post-deploy
+  log/report inspection) is pending — see the later owner-run checklist in
+  `docs/OPERATIONS.md`.
 - **`data_raw/ → convert_day.py → Nautilus full-L2 catalog`** — the reference
   production conversion path. This is the byte-for-byte validated path and must not
   regress.
-- **`data_raw/ → replay_store`** (v0) — normalized deterministic Parquet replay layer
+- **`data_raw/ → replay_store`** (versioned v0/v1/v2) — normalized deterministic Parquet replay layer
   (`stores/replay_*`, `pipeline/build_replay_store.py`). This is the stable
   external contract consumed by downstream repositories (e.g. KovacsTrader).
   CryptoRecorder does not build a feature/label layer or a general-purpose
   consumer catalog from it. `ReplayWriter` is memory-bounded (SQLite spool +
-  incremental Parquet write); the service restart loop has been fixed
-  (`Restart=no`); production RAM measurement against the DEXEUSDT partition is
-  still pending on the production server.
+  incremental Parquet write). Supported mutation entrypoints share one
+  nonblocking kernel advisory lock; the daily path reconciles bounded
+  cross-date staging/backup/quarantine state, builds a bounded oldest-first
+  backlog, and writes atomic per-date/run reports. The intended repository
+  service explicitly requests schema 2 and keeps `Restart=no`, 12 GiB, and
+  zero swap, but it has not been installed or production-accepted.
+
+**Replay lifecycle isolated smoke (checkpoint 2)**
+
+The repository-side candidate built only
+`BINANCE_SPOT/ADAUSDT/2026-06-11` into fresh external replay/report roots under
+the common lock with schema 2. It published 303,293 depth and 129,824 trade
+rows, passed the replay audit and deep integrity with zero anonymous trades,
+and a second identical invocation returned `skipped_valid`. Build runtime was
+45.081 seconds with 1,196,359,680 bytes peak; audit/deep/skip also passed.
+Every subprocess used an effective 12,884,901,888-byte MemoryMax with zero
+swap, `memory.high`, `memory.max`, OOM, OOM-kill, and OOM-group-kill. The
+published partition is 8,110,080 allocated bytes and has no residual staging
+or backup. External summary SHA-256:
+`1aacc5f402f9a42c17fe6aac71b1c92cd3b77494d4d64e44357918be9d3c7561`.
+This is isolated development evidence, not production deployment or service
+acceptance.
+
 - **`replay_store → pipeline.reconstruct_selected_catalog`** — supported
   development-computer CLI/API for an explicitly selected venue/symbol,
   end-exclusive UTC window, output root, job ID, and profile. It strictly
@@ -127,8 +152,10 @@ ran serially in its own 10 GiB cgroup with zero OOM events.
 
 This is strong high-volume, single-symbol/single-day local development
 evidence. It does **not** satisfy or narrow the broader top50/multi-day
-`v2.0.0` gate, does not make schema v2 a production default, and does not
-replace `convert_day.py` as the production reference.
+`v2.0.0` gate and does not replace `convert_day.py` as the production
+reference. Schema 2 is now the explicit intended replay-build configuration
+in repository templates; those templates have not been deployed or accepted
+on the production server.
 
 **Full-L2 catalog equivalence (BTWUSDT corrected schema-v2 futures case)**
 
@@ -212,6 +239,14 @@ declare `v2.0.0`, production deployment, or Phase 8 completion.
 - **Syncthing archive / backup** — `ARCHIVE_DAYS_ROOT` is a **placeholder** env path
   only. No archive code exists.
 - **Import / restore tooling** — not implemented.
+- **Production replay-build acceptance/deployment** — schema-v2 bounded
+  service/env templates and deployment dry-run guards exist, but no installed
+  unit, `/etc` env file, or production replay root was changed. The isolated
+  owner-run acceptance in `docs/OPERATIONS.md` remains pending.
+- **Transactional raw retirement** — automatic mutation is absent. A
+  proof-only paired depth/trade planner reports blockers, but durable
+  journaled move/rollback/startup recovery remains separate future work before
+  any deletion can be enabled.
 
 CryptoRecorder does not own a feature-store or label-store subsystem (removed,
 issue #17); `FEATURE_ROOT`, `LABEL_ROOT`, and `CATALOG_JOBS_ROOT` no longer
@@ -225,7 +260,9 @@ repositories (e.g. KovacsTrader).
 1. Run the **recorder** continuously (`recorder.py`).
 2. Convert the previous UTC day with **`convert_day.py --staging`** (the validated
    full-L2 path) shortly after 00:00 UTC.
-3. Build the **replay store** for the previous day via `pipeline.daily_build`.
+3. After separate owner acceptance/deployment, build the **replay store** with
+   the explicit bounded schema-v2 `pipeline.daily_build` service contract.
+   Until then, treat the repository unit as an uninstalled template.
 4. On the development computer, reconstruct an explicitly selected temporary
    catalog with `python -m pipeline.reconstruct_selected_catalog` and all
    required venue/symbol/start/end/output/job/profile arguments. Use

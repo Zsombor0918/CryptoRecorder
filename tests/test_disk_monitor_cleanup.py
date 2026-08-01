@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -21,6 +22,10 @@ class FakeConfig:
         self.META_ROOT = root / "meta"
         self.STATE_ROOT = root / "state"
         self.NAUTILUS_CATALOG_ROOT = root / "catalog"
+        self.REPLAY_ROOT = root / "replay_store"
+        self.DAILY_REPORT_ROOT = root / "reports"
+        self.RAW_RETENTION_ENABLED = False
+        self.RAW_RETENTION_DAYS = 7
         self.DISK_SOFT_LIMIT_GB = soft_limit_gb
         self.DISK_HARD_LIMIT_GB = hard_limit_gb
         self.DISK_CLEANUP_TARGET_GB = cleanup_target_gb
@@ -65,7 +70,7 @@ async def test_catalog_size_does_not_trigger_raw_cleanup(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_cleanup_deletes_oldest_raw_date_dirs_until_raw_target(tmp_path, monkeypatch) -> None:
+async def test_cleanup_never_deletes_single_channel_or_date_directory(tmp_path, monkeypatch) -> None:
     config = FakeConfig(tmp_path, soft_limit_gb=3, cleanup_target_gb=1)
     monitor = DiskMonitor(config)
 
@@ -94,5 +99,5 @@ async def test_cleanup_deletes_oldest_raw_date_dirs_until_raw_target(tmp_path, m
     cleaned = await monitor.cleanup_old_data()
     remaining_dates = [p.name for p in _raw_date_dirs(tmp_path)]
 
-    assert cleaned is True
-    assert remaining_dates == ["2026-05-15"]
+    assert cleaned is False
+    assert Counter(remaining_dates) == Counter({"2026-05-14": 2, "2026-05-15": 2})

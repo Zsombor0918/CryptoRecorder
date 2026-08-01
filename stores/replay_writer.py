@@ -2204,6 +2204,8 @@ class ReplayWriter:
             instrument_path = self.staging_dir / "instrument.json"
             with open(instrument_path, "w") as f:
                 json.dump(instrument_metadata, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
             logger.info(f"Wrote instrument metadata: {instrument_path}")
 
         manifest = self._manifest
@@ -2213,7 +2215,15 @@ class ReplayWriter:
         manifest_path = self.staging_dir / "manifest.json"
         with open(manifest_path, "w") as f:
             json.dump(manifest, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
         logger.info(f"Wrote manifest: {manifest_path}")
+
+        staging_fd = os.open(self.staging_dir, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(staging_fd)
+        finally:
+            os.close(staging_fd)
 
         # Atomic publication with backup/restore so the existing valid partition
         # is never lost if the replacement fails (I/O error, permissions, etc.).
@@ -2223,7 +2233,11 @@ class ReplayWriter:
         # Step 1: rename existing output to backup (if it exists).
         if self.output_dir.exists():
             if backup_dir.exists():
-                shutil.rmtree(backup_dir)
+                raise RuntimeError(
+                    f"Ambiguous publication state: backup already exists at "
+                    f"{backup_dir}. Run build-wide reconciliation while holding "
+                    "the replay lifecycle lock; refusing to delete it."
+                )
             os.replace(self.output_dir, backup_dir)
 
         try:
@@ -2255,10 +2269,15 @@ class ReplayWriter:
                 "missing/corrupt manifest, parquet files, or checksum mismatch. "
                 "Quarantining invalid output and restoring backup if available."
             )
-            quarantine_dir = self.output_dir.parent / f".quarantine_{self.date}_{self.symbol}"
+            suffix = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+            quarantine_dir = self.output_dir.parent / (
+                f".quarantine_{self.date}_{self.symbol}_invalid_publish.{suffix}.{os.getpid()}"
+            )
             try:
                 if quarantine_dir.exists():
-                    shutil.rmtree(quarantine_dir)
+                    raise RuntimeError(
+                        f"quarantine destination already exists: {quarantine_dir}"
+                    )
                 if self.output_dir.exists():
                     os.replace(self.output_dir, quarantine_dir)
             except Exception as qe:

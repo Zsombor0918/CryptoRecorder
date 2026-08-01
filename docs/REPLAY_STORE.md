@@ -12,7 +12,9 @@ reference full-L2 path. CryptoRecorder does not build a feature-store,
 label-store, or general-purpose consumer catalog from replay_store.
 
 **Key properties**:
-- **Immutable after publication** — Each date/symbol partition is written once and never modified
+- **Fail-closed publication** — Published partitions are reused only when
+  schema/source/checksum-valid; an intentional exact-partition source/schema
+  replacement uses backup/restore and never silently overwrites legacy data
 - **Deterministically sorted** — Same raw data always produces identical Parquet (enables validation)
 - **Columnar format** — Efficient for time-series queries and feature calculations
 - **Streaming access** — Load via [ReplayReader](#replayreader-api) without materializing full days in memory
@@ -344,6 +346,9 @@ python -m pipeline.build_replay_store --date 2026-06-15 [OPTIONS]
 --symbols SYMBOLS        Comma-separated symbols (default: all)
 --data-root PATH         Raw data root (default: config.DATA_ROOT)
 --replay-root PATH       Replay store root (default: config.REPLAY_ROOT)
+--schema-version {0,1,2} Physical schema (production default: 2)
+--rebuild-source-changed Explicit exact-partition source-change replacement
+--replace-incompatible  Explicit exact-partition legacy/schema replacement
 ```
 
 ### Example
@@ -360,7 +365,8 @@ python -m pipeline.build_replay_store \
   --date 2026-06-15 \
   --symbols BTCUSDT,ETHUSDT \
   --data-root /data/raw \
-  --replay-root /data/replay
+  --replay-root /data/replay \
+  --schema-version 2
 ```
 
 ### Processing Details
@@ -373,9 +379,24 @@ For each symbol/date:
 4. **Incremental Parquet write**: Spool is read back in bounded batches (default 5 000 rows) through `pyarrow.parquet.ParquetWriter`; depth channel is fully written and closed before the trade channel begins
 5. **Compute checksums**: SHA256 hash of each Parquet file for integrity
 6. **Write manifest**: Store metadata and checksums
-7. **Atomic move**: Move from staging to published directory
+7. **Durable evidence**: fsync manifest and staging directory before rename
+8. **Atomic publication**: preserve any existing canonical as one backup,
+   publish staging, routine-validate the new canonical, restore on failure,
+   and remove the obsolete valid backup only after success
 
-Temporary spool files live inside `staging_dir/scratch/` and are removed automatically when the staging directory is cleaned up (on both success and on the next build after a SIGKILL/OOM). A stale staging directory from a previous SIGKILL is removed before starting a new build for the same partition.
+Temporary spool files live inside `staging_dir/scratch/`. Every supported
+mutation entrypoint holds `<replay-root>/.lifecycle/build.lock`. Before a
+direct/daily build, a bounded cross-date reconciliation moves stale staging
+to unique quarantine, restores one unambiguous valid backup, safely removes
+an obsolete valid backup beside a valid canonical, and refuses unknown,
+symlinked, corrupt, or ambiguous state. Quarantine is never automatically
+deleted. Lock metadata and every recovery action are carried into daily/run
+reports; kernel lock ownership, not PID-file age, is authoritative.
+
+The scheduled/default path requests schema 2 and does not set either
+replacement policy. A matching v2/source partition is `skipped_valid`; changed
+source is `source_changed_rebuild_required`; legacy/incompatible schema is
+`incompatible_schema_rebuild_required`; corrupt replay is `failed`.
 
 ## Auditing Replay Store
 
@@ -416,15 +437,16 @@ The audit reports:
 
 **Validation**:
 ```bash
-# Build twice, compare checksums
-python -m pipeline.build_replay_store --date 2026-06-15
-CHECKSUM1=$(cat replay_store/venue=BINANCE_SPOT/symbol=BTCUSDT/date=2026-06-15/manifest.json | jq -r .trades_checksum)
+# Build twice in an isolated external root and compare checksums
+python -m pipeline.build_replay_store --date 2026-06-15 --schema-version 2 \
+  --replay-root /external/replay-check
+CHECKSUM1=$(jq -r .trades_checksum /external/replay-check/venue=BINANCE_SPOT/symbol=BTCUSDT/date=2026-06-15/manifest.json)
 
-# Delete and rebuild
-rm -rf replay_store/venue=BINANCE_SPOT/symbol=BTCUSDT/date=2026-06-15/
-python -m pipeline.build_replay_store --date 2026-06-15
+# A second ordinary run must skip the same valid artifact.
+python -m pipeline.build_replay_store --date 2026-06-15 --schema-version 2 \
+  --replay-root /external/replay-check
 
-CHECKSUM2=$(cat replay_store/venue=BINANCE_SPOT/symbol=BTCUSDT/date=2026-06-15/manifest.json | jq -r .trades_checksum)
+CHECKSUM2=$(jq -r .trades_checksum /external/replay-check/venue=BINANCE_SPOT/symbol=BTCUSDT/date=2026-06-15/manifest.json)
 
 # Should be identical
 echo "Checksums match: $([[ $CHECKSUM1 == $CHECKSUM2 ]] && echo YES || echo NO)"
@@ -522,14 +544,11 @@ ArrowInvalid: Parquet magic bytes not found
 
 **Cause**: Write interrupted or disk full during build
 
-**Solution**:
-```bash
-# Delete partition and rebuild
-rm -rf /path/to/replay_store/venue=X/symbol=Y/date=Z/
-
-# Rebuild from raw
-python -m pipeline.build_replay_store --date 2026-06-15 --symbols Y
-```
+**Solution**: stop. Preserve the canonical, lock metadata, backups, staging,
+and quarantine. Run the non-mutating replay audit and inspect the daily/run
+recovery report. Corrupt replay is never implicitly replaced by either
+source/schema policy; obtain a separate exact-partition owner decision after
+the root cause and a valid source identity are proven.
 
 ### Issue: "Checksum mismatch"
 

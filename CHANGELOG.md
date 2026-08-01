@@ -68,6 +68,30 @@ passes.** Until then, broader full-L2 equivalence stays **deferred** (see
 ## [Unreleased]
 
 ### Added
+- **Issue #20 closure checkpoint 2: bounded replay-build lifecycle and
+  operations contract** — all supported replay-root mutation boundaries now
+  share one nonblocking Linux advisory lock with run/root/repository identity.
+  The schema-v2 daily path performs bounded cross-date staging/backup/
+  quarantine reconciliation, scans an oldest-first bounded backlog, requires
+  explicit source-change and incompatible-schema replacement policies, and
+  publishes fsynced atomic per-date and invocation reports with distinct
+  built/skipped/deferred/missing/rebuild-required/recovered/failed outcomes.
+  Replay-aware disk monitoring classifies canonical and transient storage in
+  one bounded scan, groups actual filesystems without summing free space, and
+  includes replay growth/transient pressure. The unsafe single-channel raw
+  deletion path is disabled; only a non-mutating paired depth/trade proof plan
+  remains until durable transactional retirement is separately accepted. The
+  repository service template explicitly selects schema 2, a seven-day/
+  three-build backlog, `Restart=no`, `MemoryMax=12G`, and
+  `MemorySwapMax=0`; deployment dry-run validates those fields. This template
+  has not been installed or production-accepted, existing production replay
+  is not migrated, and replay semantics, raw ingestion, and `convert_day.py`
+  are unchanged. Focused checkpoint verification is 380 passed; the full
+  suite is 820 passed, 3 skipped. An isolated real ADAUSDT lifecycle smoke
+  built 303,293 depth and 129,824 trade rows, passed routine/deep integrity,
+  then returned `skipped_valid`; its build peak was 1,196,359,680 bytes under
+  12 GiB with zero swap, memory pressure, or OOM. External smoke-summary
+  SHA-256: `1aacc5f402f9a42c17fe6aac71b1c92cd3b77494d4d64e44357918be9d3c7561`.
 - **Issue #20 closure checkpoint 1: supported selected full-L2 reconstruction
   CLI/API** — `pipeline.reconstruct_selected_catalog` promotes the existing
   shared reconstruction engine through an explicit development-computer

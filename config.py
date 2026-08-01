@@ -6,7 +6,13 @@ from pathlib import Path
 from typing import Final
 
 
-def _env_int(name: str, default: str, *, min_value: int | None = None) -> int:
+def _env_int(
+    name: str,
+    default: str,
+    *,
+    min_value: int | None = None,
+    max_value: int | None = None,
+) -> int:
     raw = os.environ.get(name, default).strip()
     try:
         value = int(raw)
@@ -14,7 +20,18 @@ def _env_int(name: str, default: str, *, min_value: int | None = None) -> int:
         raise ValueError(f"{name} must be an integer, got {raw!r}") from exc
     if min_value is not None and value < min_value:
         raise ValueError(f"{name} must be >= {min_value}, got {value}")
+    if max_value is not None and value > max_value:
+        raise ValueError(f"{name} must be <= {max_value}, got {value}")
     return value
+
+
+def _env_bool(name: str, default: str = "0") -> bool:
+    raw = os.environ.get(name, default).strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean (0/1/true/false), got {raw!r}")
 
 
 def _env_float(name: str, default: str, *, min_value: float | None = None) -> float:
@@ -53,6 +70,25 @@ REPLAY_ROOT: Final = Path(
 DAILY_REPORT_ROOT: Final = Path(
     os.environ.get("CRYPTO_RECORDER_DAILY_REPORT_ROOT", str(STATE_ROOT / "daily_build_reports"))
 ).expanduser()
+
+# Production replay lifecycle policy. Historical validation callers may still
+# request schemas 0/1 explicitly, but operator entrypoints and the installed
+# service use this validated schema-v2 default.
+REPLAY_SCHEMA_VERSION: Final = _env_int(
+    "CRYPTO_RECORDER_REPLAY_SCHEMA_VERSION", "2", min_value=2, max_value=2
+)
+REPLAY_BACKLOG_DAYS: Final = _env_int(
+    "CRYPTO_RECORDER_REPLAY_BACKLOG_DAYS", "7", min_value=1, max_value=31
+)
+REPLAY_MAX_BUILD_DATES: Final = _env_int(
+    "CRYPTO_RECORDER_REPLAY_MAX_BUILD_DATES", "3", min_value=1, max_value=31
+)
+REPLAY_RECOVERY_MAX_ENTRIES: Final = _env_int(
+    "CRYPTO_RECORDER_REPLAY_RECOVERY_MAX_ENTRIES", "20000", min_value=1, max_value=1000000
+)
+REPLAY_RECOVERY_MAX_ACTIONS: Final = _env_int(
+    "CRYPTO_RECORDER_REPLAY_RECOVERY_MAX_ACTIONS", "2000", min_value=1, max_value=100000
+)
 
 # Archive days: future Syncthing-based backup structure
 ARCHIVE_DAYS_ROOT: Final = Path(
@@ -279,8 +315,8 @@ DISK_CHECK_INTERVAL_SEC: Final = 600  # 10 minutes
 
 # Raw-data retention thresholds (GB). These apply to fresh `data_raw` disk
 # usage only — never to filesystem capacity, and never to the cross-root
-# observability total (data_raw + catalog + meta + state), which may span
-# different filesystems and never drives cleanup decisions. See
+# observability total (raw + published/transient replay + metadata + reports),
+# which may span different filesystems and never drives cleanup decisions. See
 # DISK_FS_FREE_WARN_GB / DISK_FS_FREE_CRITICAL_GB below for filesystem-level
 # free-space thresholds, which are a separate concern.
 DISK_SOFT_LIMIT_GB: Final = int(os.environ.get("CRYPTO_RECORDER_DISK_SOFT_LIMIT_GB", "750"))
@@ -334,6 +370,21 @@ DISK_HISTORY_MAX_SAMPLES: Final = _env_int(
 DISK_HISTORY_MAX_AGE_SEC: Final = _env_float(
     "CRYPTO_RECORDER_DISK_HISTORY_MAX_AGE_SEC",
     "172800.0",
+    min_value=60.0,
+)
+
+# One replay-tree traversal classifies canonical and transient storage. The
+# bounds prevent an unexpectedly large/hostile tree from turning monitoring
+# into an unbounded scan; exceeding either limit is a visible failed reading.
+REPLAY_MONITOR_MAX_ENTRIES: Final = _env_int(
+    "CRYPTO_RECORDER_REPLAY_MONITOR_MAX_ENTRIES",
+    "250000",
+    min_value=1,
+    max_value=5000000,
+)
+REPLAY_TRANSIENT_WARN_AGE_SEC: Final = _env_float(
+    "CRYPTO_RECORDER_REPLAY_TRANSIENT_WARN_AGE_SEC",
+    "86400",
     min_value=60.0,
 )
 
@@ -480,8 +531,19 @@ MIN_TRADE_RECORDS_FOR_FULL_READY: Final = int(
     os.environ.get("CRYPTO_RECORDER_MIN_TRADE_RECORDS_FOR_FULL_READY", "1")
 )
 
-# Raw data retention days for disk cleanup.
-RAW_RETENTION_DAYS: Final = 7
+# Raw retirement is deliberately disabled until the paired depth/trade journal
+# implementation is separately accepted. The monitor can produce a dry-run
+# proof plan, but never performs the historical single-directory deletion.
+RAW_RETENTION_ENABLED: Final = _env_bool("CRYPTO_RECORDER_RAW_RETENTION_ENABLED", "0")
+RAW_RETENTION_DAYS: Final = _env_int(
+    "CRYPTO_RECORDER_RAW_RETENTION_DAYS", "7", min_value=2, max_value=3650
+)
+RAW_RETENTION_STABLE_AGE_SEC: Final = _env_int(
+    "CRYPTO_RECORDER_RAW_RETENTION_STABLE_AGE_SEC",
+    "3600",
+    min_value=60,
+    max_value=604800,
+)
 
 # ============================================================================
 # Validation / test mode

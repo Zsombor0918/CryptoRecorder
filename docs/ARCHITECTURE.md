@@ -18,8 +18,9 @@ Validated full-L2 path:
 data_raw -> convert_day.py -> Nautilus catalog
 ```
 
-Validated replay v0 path (the stable external contract consumed by downstream
-repositories, e.g. KovacsTrader):
+Versioned replay path (the stable external contract consumed by downstream
+repositories, e.g. KovacsTrader; the repository production template now
+intentionally requests schema 2, but has not been deployed):
 
 ```text
 data_raw -> replay_store
@@ -51,13 +52,16 @@ responsibilities.
 
 ## Disk Monitoring Safety Invariant
 
-`disk_monitor.py` measures `data_raw/`, the Nautilus catalog, `meta/`, and
-`state/` on a fixed interval (`DISK_CHECK_INTERVAL_SEC`, default 600s) via a
-recursive `du -s -B1` scan, and enforces:
+`disk_monitor.py` measures `data_raw/`, replay storage, `meta/`, and
+state/report evidence on a fixed interval. Replay is classified in one bounded,
+non-symlink-following traversal into canonical published data, staging,
+backups, quarantine, and lifecycle metadata; the retired persistent Nautilus
+catalog root is not an active monitoring component.
 
 > If a directory-size measurement fails or is unavailable, monitoring must
 > become visibly unhealthy. It must never optimistically report zero, and
-> automatic cleanup must fail closed.
+> raw retirement must never be authorized by a failed measurement or by a
+> cross-filesystem logical total.
 
 Concretely:
 
@@ -75,17 +79,17 @@ Concretely:
   `stale` fields, and an `alerts` list. Retention percentage, growth rate, and
   `days_to_full` are only computed from known, trustworthy values — otherwise
   they are `null`, not misleadingly derived from a stale or missing sample.
-- Filesystem-level free space is measured independently via
-  `shutil.disk_usage(DATA_ROOT)` (fast, not a recursive scan) and reported
-  under `filesystem` with its own `DISK_FS_FREE_WARN_GB` /
-  `DISK_FS_FREE_CRITICAL_GB` thresholds. This stays operational even when the
-  recursive `data_raw` scan fails, and is never summed with retention GB.
-- Automatic cleanup (`cleanup_old_data()`) refuses to run or continue unless
-  the current cycle's `data_raw` measurement is fresh and successful
-  (`retention_measurement_trustworthy=True`); a missing, failed, timed-out, or
-  merely-stale (last-known-good) value is never treated as "below threshold".
-  Cleanup re-validates this before each destructive deletion, not just once
-  up front.
+- Capacity is grouped by `st_dev`; each filesystem's free bytes appear once.
+  When raw and replay share a device, their allocated usage is combined with
+  replay transient pressure. Separate devices remain separate; free-space
+  values are never added into a fictitious logical pool.
+- Automatic destructive raw cleanup is disabled. `cleanup_old_data()` never
+  moves or deletes a channel/date directory. `plan_raw_retention()` can build
+  a proof-only unit inventory for exact `venue/symbol/source-date` pairs,
+  requiring depth+trade together and the adjacent replay dependencies, but
+  reports `cleanup_required` until a separately accepted durable transaction
+  journal/move/rollback implementation exists. ExchangeInfo is never in this
+  unit.
 - Overlapping scans are prevented with an `asyncio.Lock`; a scan already in
   flight causes the next call to return the previous report with
   `skipped_duplicate=True` rather than queuing or running concurrently.
@@ -109,7 +113,9 @@ See `docs/OPERATIONS.md` for the full field reference and environment knobs.
 | `converter/depth_phase2.py` | Deterministic depth_v2 replay → `OrderBookDeltas` (+ optional `OrderBookDepth10`) |
 | `converter/spool.py` | Temporary SQLite spools used to keep heavy conversions memory-bounded |
 | `stores/` | Replay Parquet schemas/readers/writers (no feature/label schemas) |
-| `pipeline/build_replay_store.py` | Raw JSONL -> replay_store v0 |
+| `pipeline/build_replay_store.py` | Raw JSONL -> versioned replay partitions; production CLI default v2 |
+| `pipeline/replay_lifecycle.py` | Shared advisory lock, cross-date recovery, atomic reports/sizing |
+| `pipeline/daily_build.py` | Bounded oldest-first replay backlog and honest per-date/run reporting |
 | `validation/audit_replay_store.py` | Non-mutating replay partition audit |
 | `validation/replay_catalog_reconstruct.py` | Shared replay_store -> temporary Nautilus catalog engine (no direct CLI) |
 | `pipeline/reconstruct_selected_catalog.py` | Supported explicit development-computer temporary-catalog CLI/API |
@@ -209,8 +215,8 @@ See [VALIDATION.md](VALIDATION.md) for the complete validation layer structure:
 
 ## Overview
 
-The replay architecture implements a v0 layered pipeline around the existing
-recorder and converter. `replay_store` is the stable external contract handed
+The replay architecture implements a versioned layered pipeline around the
+existing recorder and converter. `replay_store` is the stable external contract handed
 off to downstream repositories (e.g. KovacsTrader); CryptoRecorder itself does
 not build a feature-store, label-store, or general-purpose consumer catalog
 from it (removed, issue #17).
@@ -232,8 +238,13 @@ replay_store -> pipeline.reconstruct_selected_catalog (supported selected tempor
 1. **Raw retention, not automatic deletion** — Raw is the original capture/audit source while retained. Replay store is a candidate long-term replay layer after validation.
 2. **Deterministic replay** — Replay store sorts by committed stream keys plus `raw_index` for reproducible rebuilds.
 3. **Hive-style partitioning** — All stores use `venue=X/symbol=Y/date=Z` for efficient directory-based filtering.
-4. **Atomic writes** — All writers use staging directory + move pattern to prevent half-written data.
-5. **Memory status is explicit** — v0 replay writing still materializes one symbol/date. Do not claim full production memory safety until RSS benchmarks pass.
+4. **Exclusive atomic writes** — Supported mutations share a kernel advisory
+   lock; bounded cross-date reconciliation precedes staging + backup/restore
+   publication, and quarantine evidence is preserved.
+5. **Memory status is explicit** — Replay writes are batch-bounded through a
+   SQLite spool and incremental Parquet writer. The Phase 7 full-day evidence
+   passed without swap/OOM but reached the exact 10 GiB limit; headroom work
+   remains separate and the new 12 GiB service template is not production-tested.
 
 ## Storage Layers
 
@@ -385,7 +396,7 @@ Converts raw JSONL.zst → replay_store Parquet with deterministic sorting.
 
 **CLI**:
 ```bash
-python -m pipeline.build_replay_store --date 2026-06-15 [--symbols BTCUSDT,ETHUSDT] [--data-root /path/to/raw] [--replay-root /path/to/replay]
+python -m pipeline.build_replay_store --date 2026-06-15 --schema-version 2 [--symbols BTCUSDT,ETHUSDT] [--data-root /path/to/raw] [--replay-root /path/to/replay]
 ```
 
 **Processing**:
@@ -394,7 +405,8 @@ python -m pipeline.build_replay_store --date 2026-06-15 [--symbols BTCUSDT,ETHUS
 3. Deterministic sort by (session_id, session_seq, raw_index)
 4. Write as Parquet with nested bids/asks
 5. Compute SHA256 checksum, write manifest
-6. Atomic move from staging → published
+6. Fsync manifest/staging, then backup/restore atomic publication under the
+   common replay lifecycle lock
 
 **Determinism**:
 - Session ID from server timestamp (e.g., hour boundary)

@@ -1,454 +1,214 @@
-# Daily Build Pipeline Operations
+# Daily Replay Build Pipeline
 
-## Overview
+## Supported contract
 
-The daily build pipeline orchestrates the conversion of raw market data into
-`replay_store`. It's designed to run once per day via systemd timer and
-supports flexible on-demand execution with custom parameters. It is
-replay-only: CryptoRecorder does not build a feature-store or label-store
-(removed, issue #17); `replay_store` is the stable external contract handed
-off to downstream repositories (e.g. KovacsTrader).
+`pipeline.daily_build` is the replay-only production orchestration boundary.
+It scans a bounded inclusive date lookback, reconciles replay lifecycle state,
+processes dates oldest-first, builds at most a configured number of incomplete
+dates, and writes atomic per-date and invocation reports. It never builds a
+feature store or persistent Nautilus catalog.
 
-## Quick Start
-
-`--date` only accepts an explicit `YYYY-MM-DD` date or the literal
-`yesterday` (previous completed UTC day). There is no `today` shortcut.
-
-### Run yesterday's build (typical cron usage)
-
-```bash
-cd /home/zsom/services/CryptoRecorder
-python -m pipeline.daily_build --date yesterday
-```
-
-### Custom date and symbols
-
-```bash
-python -m pipeline.daily_build --date 2026-06-15 --symbols BTCUSDT,ETHUSDT
-```
-
-## CLI Interface
-
-```bash
-python -m pipeline.daily_build [OPTIONS]
-```
-
-### Required Arguments
-
-```
---date DATE
-    Date to build (YYYY-MM-DD or 'yesterday')
-    
-    Special values:
-    - 'yesterday': Previous completed UTC day (e.g., if today is 2026-06-16T00:15, yesterday = 2026-06-15)
-    - YYYY-MM-DD: Explicit date (e.g., 2026-06-15)
-```
-
-### Optional Arguments
-
-```
---symbols SYMBOLS
-    Comma-separated symbols to process (default: all from raw data)
-    
-    Examples:
-    - --symbols BTCUSDT
-    - --symbols BTCUSDT,ETHUSDT,BNBUSDT
-
---data-root PATH
-    Raw data root (default: from config.DATA_ROOT)
-    
-    Use this to override config for testing
-
---replay-root PATH
-    Replay store root (default: from config.REPLAY_ROOT)
-
---report-root PATH
-    Report output root (default: from config.DAILY_REPORT_ROOT)
-```
-
-There is no `--steps`, `--timeframes`, or `--feature-root` flag. `daily_build`
-always scans raw coverage and builds the replay store; there is no feature
-step to select.
-
-## Examples
-
-### Production: Daily systemd timer
-
-The systemd timer automatically runs at 01:00 UTC:
-
-```bash
-systemctl start cryptorecorder-replay-build.timer
-systemctl status cryptorecorder-replay-build.timer
-```
-
-This executes:
-```bash
-python -m pipeline.daily_build --date yesterday
-```
-
-View logs:
-```bash
-journalctl -u cryptorecorder-replay-build.service -f
-```
-
-### Development: Run specific date with symbols
+The intended repository service invocation is explicit:
 
 ```bash
 python -m pipeline.daily_build \
-  --date 2026-06-15 \
-  --symbols BTCUSDT,ETHUSDT \
-  --data-root /tmp/test_raw
+  --date yesterday \
+  --backlog-days 7 \
+  --max-build-dates 3 \
+  --schema-version 2
 ```
 
-### Testing: Custom storage paths
+`--date` is the newest date. `yesterday` means the previous completed UTC
+date. `--backlog-days` is an inclusive lookback bounded to 1–31 days;
+`--max-build-dates` is bounded to 1–31. Defaults come from
+`CRYPTO_RECORDER_REPLAY_BACKLOG_DAYS=7`,
+`CRYPTO_RECORDER_REPLAY_MAX_BUILD_DATES=3`, and
+`CRYPTO_RECORDER_REPLAY_SCHEMA_VERSION=2`. The schema environment value is
+validated as exactly 2 for production configuration; historical validation
+callers may still explicitly request schema 0 or 1 on the direct builder.
+
+Optional arguments:
+
+- `--venues VENUE,...` restricts each inspected date to explicit venues.
+- `--symbols SYMBOL,...` restricts each inspected date to explicit symbols.
+- `--data-root`, `--replay-root`, and `--report-root` select isolated roots.
+- `--rebuild-source-changed` permits replacement only when an otherwise-valid
+  selected partition's live raw source identity changed.
+- `--replace-incompatible` permits replacement only when a selected valid
+  partition uses a legacy/incompatible schema or builder contract.
+
+The scheduled service passes neither replacement flag. It never silently
+migrates legacy partitions or overwrites source-changed data.
+
+## Exclusive ownership
+
+Every supported replay mutation boundary uses the common Linux advisory lock:
+
+```text
+<replay-root>/.lifecycle/build.lock
+```
+
+`fcntl.flock(LOCK_EX | LOCK_NB)` is the authority. A second invocation exits
+nonzero with `build already active`; a PID/timestamp file is never used to
+break ownership, and kernel process-death release is authoritative. The lock
+path must be a single-link, non-group/world-writable regular file owned by the
+current user. Symlinks, unsafe ownership, or an unsafe lifecycle directory
+fail closed.
+
+After acquiring the lock, the process records contract version, run ID, PID,
+hostname, command, start UTC, repository SHA, and exact data/replay/report
+roots. Nested orchestration receives the already-held lifecycle context and
+does not reacquire the lock.
+
+## Cross-date recovery
+
+Before raw/backlog inspection, one bounded scan covers the configured replay
+root across every date. It recognizes only canonical `date=YYYY-MM-DD`
+partitions and canonical `.staging_*`, `.backup_*`, `.quarantine_*`, and
+`.lifecycle` artifacts. It never follows symlinks.
+
+- A valid canonical partition is authoritative. A single obsolete valid
+  backup is removed only through this safe cleanup path.
+- When canonical output is missing/invalid and one valid backup exists, an
+  invalid canonical is moved to a unique quarantine path and the backup is
+  restored atomically.
+- Stale staging is moved to a unique quarantine path after the global lock
+  proves no active builder owns it.
+- Quarantine is always preserved and reported; it is never automatically
+  deleted.
+- Multiple candidates, an invalid backup, an invalid canonical with no valid
+  backup, unknown entries, symlinks, or conflicting names fail the entire run.
+
+The scan is bounded by `CRYPTO_RECORDER_REPLAY_RECOVERY_MAX_ENTRIES` (20,000)
+and `CRYPTO_RECORDER_REPLAY_RECOVERY_MAX_ACTIONS` (2,000). An interrupted
+rename leaves an explicit state the next locked run can reconcile.
+
+The per-partition writer retains its existing same-parent staging and
+backup/restore publication design. Publication refuses a pre-existing backup,
+fsyncs manifest/evidence before rename, validates the new canonical before
+removing the old valid backup, and assigns every invalid output a unique
+non-overwriting quarantine path.
+
+## Backlog and outcomes
+
+Each date derives its eligible venue/symbol inventory from current raw and
+replay artifacts. Both target-day `depth_v2` and `trade_v2` are required.
+Dates are inspected oldest to newest. Valid dates are skipped without consuming
+a build-date slot. An incomplete date consumes one slot only when a partition
+is actually built; later incomplete dates remain reported and rediscoverable.
+No unbounded queue is persisted.
+
+Every partition has exactly one outcome:
+
+| Outcome | Meaning |
+|---|---|
+| `built` | constructed and post-publication routine-valid |
+| `skipped_valid` | existing schema/source/checksum-valid partition reused |
+| `deferred_not_ready` | adjacent-depth readiness or build-date bound not satisfied |
+| `missing_required_raw` | target depth or trade channel is absent |
+| `source_changed_rebuild_required` | live source identity differs; explicit policy absent |
+| `incompatible_schema_rebuild_required` | schema/builder contract differs; explicit policy absent |
+| `recovered` | valid backup restored during this locked invocation |
+| `failed` | corrupt/ambiguous/build/validation/reporting failure |
+
+Only a nonempty scope in which every eligible partition finishes as `built`,
+`skipped_valid`, or `recovered` exits zero. Deferred, missing, source-changed,
+incompatible, corrupt, empty, and reporting-failure states are nonzero.
+
+## Source and schema policy
+
+For schema 2, reuse requires the complete replay manifest and files to pass
+routine validation, current builder identity to match, and a new strict raw
+source-identity scan to equal the stored manifest identity.
+
+- Source change defaults to `source_changed_rebuild_required`; use
+  `--rebuild-source-changed` for an intentional exact-partition replacement.
+- Legacy/incompatible schema or builder defaults to
+  `incompatible_schema_rebuild_required`; use `--replace-incompatible` for an
+  intentional exact-partition replacement.
+- Corrupt replay is `failed`; neither flag authorizes silently replacing
+  corruption.
+
+For an isolated migration, point `--replay-root` and `--report-root` at new
+empty external roots, run explicit schema 2, validate the result, then obtain
+separate owner approval for any production path change. Do not use a migration
+flag against the existing production replay root without that approval.
+
+## Atomic reports
+
+Each inspected date publishes `daily_build_<date>.json`; the invocation
+publishes `replay_backlog_<run-id>.json`. Both use same-directory temporary
+files, file fsync, `os.replace`, and directory fsync. A write failure makes the
+process nonzero.
+
+Reports include contract/run/lock/repository identity; requested/effective
+schema; date bounds; roots and replacement policies; recovery actions; dates
+inspected/selected; exact eligible inventory; every partition outcome/reason;
+separate counts for all outcomes; record counts; allocated/apparent partition
+bytes when measurable; staging observations; UTC timing/runtime; final status;
+and process-exit classification. Missing, deferred, skipped, incompatible,
+source-changed, and failed are never collapsed into `partial`.
+
+## Repository systemd template
+
+`systemd/cryptorecorder-replay-build.service` remains `Type=oneshot` and
+`Restart=no`, with `TimeoutStartSec=23h`, `MemoryMax=12G`, and
+`MemorySwapMax=0`. Its `ExecStart` explicitly supplies schema 2, seven lookback
+days, and at most three build dates. The timer remains at 01:00 UTC.
+
+This is an intended template for the known 16 GiB host. It has not been
+installed, run, or production-accepted in this checkpoint. The existing
+`/etc/cryptorecorder/cryptorecorder.env` is not modified automatically.
+Memory-headroom optimization remains a follow-up after Phase 7's accepted
+10 GiB pressure evidence.
+
+## Local isolated smoke
+
+Use fresh paths outside production data:
 
 ```bash
+SMOKE_ROOT=/external/cryptorecorder-replay-lifecycle-smoke
+
 python -m pipeline.daily_build \
-  --date 2026-06-15 \
-  --data-root /tmp/test_raw \
-  --replay-root /tmp/test_replay \
-  --report-root /tmp/test_reports
-```
-
-### Monitoring: Check daily report
-
-```bash
-cat /path/to/daily_reports/daily_build_2026-06-15.json | jq .
-```
-
-Expected output:
-```json
-{
-  "date": "2026-06-15",
-  "created_at_utc": "2026-06-16T01:02:34.567890Z",
-  "runtime_sec": 3600.0,
-  "status": "success",
-  
-  "raw_coverage": {
-    "venues": ["BINANCE_SPOT", "BINANCE_USDTF"],
-    "symbol_count": 2500
-  },
-  
-  "replay_build": {
-    "status": "success",
-    "symbols_processed": 2500,
-    "symbols_total": 2500,
-    "depth_records": 216000000,
-    "trade_records": 112300000
-  },
-  
-  "errors": []
-}
-```
-
-## Processing Steps
-
-### 1. Raw Data Manifest Scan
-
-**Time**: ~5 seconds
-
-```python
-from pipeline.raw_manifest import scan_raw_coverage
-
-coverage = scan_raw_coverage("2026-06-15", DATA_ROOT)
-# Returns: {"venues": [...], "symbol_count": N, "data": {...}}
-```
-
-Scans raw directory structure:
-- `data_raw/{VENUE}/{channel}/{SYMBOL}/{YYYY-MM-DD}/{YYYY-MM-DDTHH}.jsonl(.zst)`
-- Builds availability map for all symbols/channels
-
-**Possible issues**:
-- No raw data for date → symbols_total = 0 (skip further steps)
-- Partial venues → report with available venues
-
-### 2. Build Replay Store
-
-**Time**: ~45-120 minutes (depending on raw size and disk I/O)
-
-```bash
-python -m pipeline.build_replay_store --date 2026-06-15
-```
-
-Per symbol:
-1. Stream raw JSONL.zst
-2. Accumulate one symbol/date of records for deterministic sorting
-3. Deterministically sort by (session_id, session_seq, raw_index)
-4. Write Parquet with nested bids/asks structs
-5. Compute SHA256 checksum
-6. Atomic move from staging → published
-
-**Output structure**:
-```
-replay_store/venue=BINANCE_SPOT/symbol=BTCUSDT/date=2026-06-15/
-├── depth.parquet
-├── trades.parquet
-├── instrument.json
-└── manifest.json
-```
-
-**Possible issues**:
-- Raw file corrupt → skip symbol, continue others (per-symbol isolation)
-- Out of disk space → all symbols fail
-- Schema mismatch → error logged, retry recommended
-
-### 3. Generate Daily Report
-
-**Time**: <1 second
-
-Aggregates results from the previous steps into `daily_build_{date}.json`:
-
-```json
-{
-  "date": "2026-06-15",
-  "status": "success|partial|no_data|failed",
-  "runtime_sec": 3600.0,
-  "raw_coverage": {...},
-  "replay_build": {...},
-  "errors": [...]
-}
-```
-
-`status` semantics (checked in this order):
-- `success` — at least one venue/symbol partition was eligible and every
-  eligible partition built successfully.
-- `partial` — at least one partition was eligible, and one or more of them
-  failed while at least one succeeded.
-- `no_data` — zero venue/symbol partitions were found/eligible for the date
-  (e.g. an empty or non-existent `data_root`, or no raw data recorded for
-  that date). This is **not** treated as success even though there were no
-  failures — `0 successful == 0 eligible` is explicitly distinguished from a
-  genuine all-success build. The CLI exits with a nonzero status code for
-  `no_data` (as it does for `partial`), so scheduler/monitoring alerts fire.
-- `failed` — either (a) every venue/symbol partition that was eligible for
-  the date was attempted and none of them succeeded (zero successful, one or
-  more attempted — a `daily_build_{date}.json` report is written normally
-  with this status), or (b) an unhandled exception aborted the run before a
-  report could be generated at all (see the top-level `except` branch in
-  `pipeline/daily_build.py`'s `main()`, which logs the error and exits
-  nonzero without writing a report file). Case (a) is distinct from
-  `partial` (which requires at least one success) and from `no_data` (which
-  requires zero eligible partitions).
-
-Only `status == "success"` results in a `0` process exit code from
-`python -m pipeline.daily_build`; `partial`, `no_data`, and unhandled
-exceptions all exit nonzero.
-
-## Local Testing Workflow (temp-root smoke)
-
-Use this workflow to validate the current replay path without touching production roots.
-
-### 1. Prepare test data
-
-```bash
-# Use an existing raw data root, or point --data-root at a copied/symlinked fixture.
-BASE=/tmp/cryptorecorder-replay-validation
-rm -rf "$BASE"
-mkdir -p "$BASE"
-```
-
-### 2. Build replay_store for one tested day
-
-```bash
-python -m pipeline.build_replay_store \
-  --date 2026-06-12 \
-  --symbols ADAUSDT \
-  --data-root ./data_raw \
-  --replay-root "$BASE/replay_store"
-```
-
-### 3. Run the daily orchestrator with temp roots
-
-```bash
-python -m pipeline.daily_build \
-  --date 2026-06-12 \
-  --symbols ADAUSDT \
-  --data-root ./data_raw \
-  --replay-root "$BASE/daily_replay_store" \
-  --report-root "$BASE/daily_reports"
-```
-
-### 4. Validate outputs
-
-Check:
-- replay partitions exist under `venue=.../symbol=.../date=2026-06-12`;
-- `manifest.json` counts match Parquet metadata;
-- SHA256 checksums match the published files;
-- rows are sorted by the composite replay sort keys.
-
-### 5. Semantic equivalence check
-
-Compare against old `convert_day.py` for the same date/symbol set. There is no
-`generate_catalog` product CLI; the reusable validator drives the internal
-`validation.replay_catalog_reconstruct` helper to rebuild a temporary catalog
-from `replay_store` and compares it directly:
-
-```bash
-python convert_day.py --date 2026-06-12 --symbols ADAUSDT --staging
-
-python -m validation.validate_catalog_equivalence \
-  --date 2026-06-12 \
-  --symbols ADAUSDT \
+  --date 2026-06-11 \
   --venues BINANCE_SPOT \
-  --data-root ./data_raw \
-  --work-root /tmp/cryptorecorder-equivalence \
-  --old-catalog-root /tmp/cryptorecorder-equivalence/old_catalog \
-  --replay-root /tmp/cryptorecorder-equivalence/replay_store \
-  --new-catalog-root /tmp/cryptorecorder-equivalence/new_catalog \
-  --profile trades_only \
-  --overwrite
+  --symbols ADAUSDT \
+  --backlog-days 1 \
+  --max-build-dates 1 \
+  --schema-version 2 \
+  --data-root /path/to/read-only/data_raw \
+  --replay-root "$SMOKE_ROOT/replay" \
+  --report-root "$SMOKE_ROOT/reports"
 ```
 
-Use `--profile full_l2` for the full order-book comparison (validated on the
-ADAUSDT single-day smoke; broader top50/multi-day validation is pending — see
-[FULL_L2_REPLAY_CATALOG_PLAN.md](FULL_L2_REPLAY_CATALOG_PLAN.md)).
+Run the same command a second time: it must report `skipped_valid`, preserve
+the same source identity, and leave no staging or backup. For resource
+evidence, wrap each invocation independently with the supported cgroup wrapper
+and an explicit `12G`/zero-swap scope.
 
-### 6. Local 3-day validation recipe
+## Later owner-run production acceptance (do not execute during development)
 
-Use this only after the one-day smoke passes. Replace the dates if your local raw fixture uses different UTC days.
+1. Fetch and verify the exact approved commit; confirm the production raw,
+   replay, report, and state roots and back up the current env/unit files.
+2. Render/diff the repository service and env templates; verify schema 2,
+   backlog bounds, `Restart=no`, `TimeoutStartSec=23h`, `MemoryMax=12G`, and
+   `MemorySwapMax=0`. Do not enable/start yet.
+3. Run a dry-run deployment and a read-only backlog/source/schema inventory.
+   Resolve every legacy, source-changed, corrupt, backup, quarantine, or
+   capacity finding explicitly.
+4. Install the approved unit without starting it. Run one manually observed
+   isolated production acceptance with operator-selected exact partitions and
+   no replacement flags, then inspect the kernel lock metadata, run/date
+   reports, cgroup memory/swap/events, published checksums, and residual
+   staging/backup/quarantine.
+5. Only after a separate owner decision, enable the timer. Never combine first
+   migration/replacement authorization with routine scheduled operation.
 
-```bash
-BASE=/tmp/cryptorecorder-3day-validation
-rm -rf "$BASE"
-mkdir -p "$BASE"
+No production acceptance or deployment is claimed by this document.
 
-for date in 2026-06-12 2026-06-13 2026-06-14; do
-  python -m pipeline.build_replay_store \
-    --date "$date" \
-    --symbols ADAUSDT \
-    --data-root ./data_raw \
-    --replay-root "$BASE/replay_store"
-done
-```
-
-Run old-vs-new trades-only equivalence one day at a time:
-
-```bash
-for date in 2026-06-12 2026-06-13 2026-06-14; do
-  python -m validation.validate_catalog_equivalence \
-    --date "$date" \
-    --symbols ADAUSDT \
-    --venues BINANCE_SPOT \
-    --data-root ./data_raw \
-    --work-root "$BASE/equivalence_$date" \
-    --old-catalog-root "$BASE/equivalence_$date/old_catalog" \
-    --replay-root "$BASE/equivalence_$date/replay_store" \
-    --new-catalog-root "$BASE/equivalence_$date/new_catalog" \
-    --profile trades_only \
-    --overwrite
-done
-```
-
-## Troubleshooting
-
-### Issue: "No symbols found for date"
-
-**Symptom**: 
-```
-INFO: Date range: 2026-06-15 to 2026-06-15 (1 days)
-ERROR: No symbols available for 2026-06-15
-```
-
-**Cause**: Raw data missing or path misconfigured
-
-**Solution**:
-```bash
-# Check raw data exists
-ls -la /path/to/data_raw/BINANCE_SPOT/depth_v2/
-ls -la /path/to/data_raw/BINANCE_SPOT/trade_v2/
-
-# Verify dates have data
-find /path/to/data_raw -name "*2026-06-15*" -type f
-```
-
-### Issue: "Out of disk space during replay build"
-
-**Symptom**:
-```
-ERROR: Failed to write parquet file: No space left on device
-```
-
-**Cause**: Disk full or insufficient free space for staging
-
-**Solution**:
-```bash
-# Check available space
-df -h /path/to/replay_store
-
-# Delete old staging directories if any
-rm -rf /path/to/replay_store/.staging_*
-
-# Free up space by archiving old replay_store dates
-```
-
-### Issue: "Deterministic sort mismatch"
-
-**Symptom**: Different output files on repeated runs of same date
-
-**Cause**: Session ID or raw index calculation inconsistency
-
-**Solution**:
-```bash
-# Compare checksums in manifests
-cat /path/to/replay_store/venue=BINANCE_SPOT/symbol=BTCUSDT/date=2026-06-15/manifest.json | jq '{depth_checksum,trades_checksum}'
-
-# If different, investigate:
-# 1. Raw file changed?
-# 2. Time settings (for session_id)?
-# 3. Corrupted replay from previous run?
-
-# Rebuild from scratch
-rm -rf /path/to/replay_store/venue=BINANCE_SPOT/symbol=BTCUSDT/date=2026-06-15/
-python -m pipeline.build_replay_store --date 2026-06-15
-```
-
-## Systemd Integration
-
-### View service status
-
-```bash
-systemctl status cryptorecorder-replay-build.service
-systemctl status cryptorecorder-replay-build.timer
-```
-
-### View recent runs
-
-```bash
-journalctl -u cryptorecorder-replay-build.service -n 100
-```
-
-### View full log for latest run
-
-```bash
-journalctl -u cryptorecorder-replay-build.service --since "2 hours ago" -f
-```
-
-### Manually trigger service (for testing)
-
-```bash
-systemctl start cryptorecorder-replay-build.service
-journalctl -u cryptorecorder-replay-build.service -f
-```
-
-### Check timer schedule
-
-```bash
-systemctl list-timers cryptorecorder-replay-build.timer
-```
-
-### Edit environment variables
-
-```bash
-sudo nano /etc/cryptorecorder/cryptorecorder.env
-# Then reload:
-sudo systemctl daemon-reload
-sudo systemctl restart cryptorecorder-replay-build.timer
-```
-
-## See Also
-
-- [ARCHITECTURE.md](ARCHITECTURE.md) — Data pipeline overview
-- [REPLAY_STORE.md](REPLAY_STORE.md) — Replay store schema
-- [FULL_L2_REPLAY_CATALOG_PLAN.md](FULL_L2_REPLAY_CATALOG_PLAN.md) — Validation-only full-L2 reconstruction plan
-- [OPERATIONS.md](OPERATIONS.md) — General system operations
-
+The checkpoint-2 isolated development smoke used only
+`BINANCE_SPOT/ADAUSDT/2026-06-11`: the first invocation built 303,293 depth
+and 129,824 trade rows, routine/deep validation passed, and the second
+invocation returned `skipped_valid`. Its highest peak was 1,196,359,680 bytes
+under the 12 GiB/zero-swap wrapper, with no pressure or OOM event. This does
+not validate the installed production service.

@@ -203,9 +203,21 @@ create_data_dirs() {
   log "Step 7/9: ensure data directories under $DATA_ROOT"
   local d
   for d in data_raw replay_store state \
-           daily_build_reports catalog archive_days; do
+           daily_build_reports archive_days; do
     run mkdir -p "$DATA_ROOT/$d"
   done
+}
+
+validate_unit_templates() {
+  log "Validate replay-build unit policy (no service start)"
+  local unit="$REPO_ROOT/systemd/cryptorecorder-replay-build.service"
+  grep -q '^Type=oneshot$' "$unit" || die "replay-build unit must remain Type=oneshot"
+  grep -q '^Restart=no$' "$unit" || die "replay-build unit must retain Restart=no"
+  grep -q '^MemoryMax=12G$' "$unit" || die "replay-build unit must set MemoryMax=12G"
+  grep -q '^MemorySwapMax=0$' "$unit" || die "replay-build unit must set MemorySwapMax=0"
+  grep -q -- '--schema-version 2' "$unit" || die "replay-build unit must request schema 2"
+  grep -q -- '--backlog-days 7' "$unit" || die "replay-build unit must bound backlog lookback"
+  grep -q -- '--max-build-dates 3' "$unit" || die "replay-build unit must bound build dates"
 }
 
 run_validation() {
@@ -338,6 +350,7 @@ main() {
   create_env_file
   create_data_dirs
   run_validation
+  validate_unit_templates
   cleanup_stale_units
   install_units
   control_units

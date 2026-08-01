@@ -272,6 +272,7 @@ def test_pipeline_reconstruction_cli_stays_explicitly_scoped() -> None:
         "build_replay_store.py",
         "daily_build.py",
         "raw_manifest.py",
+        "replay_lifecycle.py",
         "reconstruct_selected_catalog.py",
     }
     for py_file in PIPELINE.glob("*.py"):

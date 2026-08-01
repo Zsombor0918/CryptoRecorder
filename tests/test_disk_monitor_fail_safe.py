@@ -48,6 +48,10 @@ class FakeConfig:
         self.META_ROOT = root / "meta"
         self.STATE_ROOT = root / "state"
         self.NAUTILUS_CATALOG_ROOT = root / "catalog"
+        self.REPLAY_ROOT = root / "replay_store"
+        self.DAILY_REPORT_ROOT = root / "reports"
+        self.RAW_RETENTION_ENABLED = False
+        self.RAW_RETENTION_DAYS = 7
         self.DISK_SOFT_LIMIT_GB = soft_limit_gb
         self.DISK_HARD_LIMIT_GB = hard_limit_gb
         self.DISK_CLEANUP_TARGET_GB = cleanup_target_gb

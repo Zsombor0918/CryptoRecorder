@@ -52,33 +52,48 @@ measurement is never reported as zero — see the safety invariant in
 | Field | Meaning |
 |-------|---------|
 | `timestamp` | Top-level, operator-facing report timestamp — always Hungary local time (`Europe/Budapest`, ISO-8601 with offset), for both a normal scan and the skipped/overlapping-scan path. Internal growth-rate/days-to-full calculations are computed from separate, UTC-based epoch values and are unaffected by this field's timezone. |
-| `components.<data_raw\|catalog\|meta\|state>.value_gb` | Current or last-known-good size in GB, or `null` if never measured |
+| `components.<data_raw\|replay_published\|replay_staging\|replay_backups\|replay_quarantine\|replay_metadata\|metadata\|state_reports>.value_gb` | Current or last-known-good allocated size in GB, or `null` if never measured. The retired persistent catalog root is not monitored. |
 | `components.<name>.measurement_ok` | `true` only if *this cycle's* scan succeeded |
 | `components.<name>.measurement_status` | `ok` / `missing` / `timeout` / `command_error` / `malformed_output` / `error` |
 | `components.<name>.stale` | `true` when `value_gb` is a last-known-good fallback, not a fresh measurement |
 | `components.<name>.measurement_age_seconds` | Age of the fallback value, or `null` |
-| `total_gb`, `percent_of_soft_limit`, `percent_of_hard_limit` | `total_gb` is a cross-root **observability** sum (`data_raw + catalog + meta + state`); `percent_of_soft_limit`/`percent_of_hard_limit` are computed from `data_raw_gb` only, and are `null` whenever this cycle's `data_raw` measurement is not fresh and successful (never derived from a stale fallback) |
-| `filesystem.*` | Independent `shutil.disk_usage()` capacity fields (total/used/free/percent), unaffected by recursive-scan failures |
-| `growth_rate_gb_day`, `days_to_full` | `null` unless the current cycle's `data_raw` measurement is itself fresh and successful, and there is a real, non-stale timestamped history spanning enough time |
+| `total_gb`, `percent_of_soft_limit`, `percent_of_hard_limit` | `total_gb` is observability-only and may span devices. Retention percentages use fresh `data_raw` only; neither authorizes deletion. |
+| `filesystem_capacity[]` | One entry per actual device (`st_dev`), with roots on that device, free space once, and combined allocated use. Shared raw/replay capacity is never double-counted; separate filesystems remain separate. |
+| `replay_artifacts` | staging/backup/quarantine counts and oldest ages; old staging/backups alert, while quarantine remains visible without automatic deletion |
+| `capacity_projection` | raw growth, replay growth, their combined rate, and current replay transient pressure; `null` when current replay measurement is unavailable |
+| `growth_rate_gb_day`, `days_to_full` | `null` unless the current cycle's raw and replay measurements are fresh and successful, and there is a real, non-stale timestamped history spanning enough time |
 | `growth_sample_interval_sec`, `growth_sample_oldest_timestamp`, `growth_sample_newest_timestamp` | Provenance of the growth estimate (based on `data_raw` history only) |
 | `monitoring_health` | `healthy` / `degraded` / `unhealthy` |
 | `alerts` | List of human-readable alert strings (measurement failure, staleness, low free space, threshold breaches, skipped overlapping scans) |
-| `retention_measurement_trustworthy` | `true` only when the current cycle's `data_raw` measurement is fresh and successful; gates automatic cleanup. Always `false` when `skipped_duplicate` is `true`, even if the previous cycle's report was trustworthy |
+| `retention_measurement_trustworthy` | Fresh raw measurement indicator. It does not authorize deletion; automatic destructive retirement is disabled. |
+| `raw_retention_enabled`, `cleanup_required` | Configuration visibility and capacity/policy alert. `cleanup_required` is not a deletion command. |
 | `skipped_duplicate` | `true` if this cycle was skipped because a previous scan was still running; the returned report is the previous cycle's, not a fresh measurement |
 
 ### Threshold semantics (kept separate)
 
 | Threshold class | Env var | Applies to |
 |---|---|---|
-| Raw-retention soft/hard limit | `CRYPTO_RECORDER_DISK_SOFT_LIMIT_GB` / `CRYPTO_RECORDER_DISK_HARD_LIMIT_GB` | fresh `data_raw` usage only — never the cross-root `total_gb` sum (which may span different filesystems), and never a stale/failed measurement; drives cleanup |
-| Raw-retention cleanup target | `CRYPTO_RECORDER_DISK_CLEANUP_TARGET_GB` | how far cleanup reduces `data_raw` |
+| Raw-retention soft/hard limit | `CRYPTO_RECORDER_DISK_SOFT_LIMIT_GB` / `CRYPTO_RECORDER_DISK_HARD_LIMIT_GB` | fresh `data_raw` policy alerts only; never authorizes cleanup |
+| Historical cleanup target | `CRYPTO_RECORDER_DISK_CLEANUP_TARGET_GB` | retained configuration compatibility only; no destructive path consumes it |
 | Filesystem free-space warn/critical | `CRYPTO_RECORDER_DISK_FS_FREE_WARN_GB` / `CRYPTO_RECORDER_DISK_FS_FREE_CRITICAL_GB` | raw filesystem free bytes, independent of retention accounting |
 
-Retention thresholds and filesystem thresholds are never conflated: a low
-filesystem-free-space alert does not by itself authorize cleanup, retention
-percentages are never computed from `filesystem_percent_used`, and `catalog`/
-`meta`/`state` sizes remain observability-only fields that never enter the
-retention threshold comparison (only `data_raw` does).
+Retention, replay-size observability, and filesystem safety stay distinct. No
+cross-filesystem total or free-space sum authorizes cleanup.
+
+### Raw retention
+
+The historical single-channel/date `shutil.rmtree` path is removed.
+`CRYPTO_RECORDER_RAW_RETENTION_ENABLED=0` is the default. Even if changed to
+`1`, current code performs no move or deletion because the required durable
+paired depth/trade transaction journal, rollback, and startup recovery are not
+implemented. The monitor reports `cleanup_required` instead.
+
+`DiskMonitor.plan_raw_retention()` is proof-only. Under the common replay
+lifecycle lock it inventories exact `venue/symbol/UTC-source-date` units,
+never exchangeInfo, and checks grace/open-day status, paired nonempty stable
+depth/trade directories, compression ambiguity, schema-v2 routine/deep-valid
+D-1/D/D+1 replay dependencies, and exact source identities. Passing proof is
+still not deletion authorization.
 
 ### Other disk-monitor environment knobs
 
@@ -88,6 +103,11 @@ retention threshold comparison (only `data_raw` does).
 | `CRYPTO_RECORDER_DISK_MEASUREMENT_STALE_AFTER_SEC` | `1800.0` | How long a last-known-good value may be reused before it triggers a staleness alert |
 | `CRYPTO_RECORDER_DISK_HISTORY_MAX_SAMPLES` | `288` | Bounded growth-history sample count |
 | `CRYPTO_RECORDER_DISK_HISTORY_MAX_AGE_SEC` | `172800.0` | Bounded growth-history max age (48h) |
+| `CRYPTO_RECORDER_REPLAY_MONITOR_MAX_ENTRIES` | `250000` | Bound for the single classified replay-tree scan |
+| `CRYPTO_RECORDER_REPLAY_TRANSIENT_WARN_AGE_SEC` | `86400` | Old staging/backup alert age |
+| `CRYPTO_RECORDER_RAW_RETENTION_ENABLED` | `0` | Destructive cleanup switch; current implementation still refuses mutation |
+| `CRYPTO_RECORDER_RAW_RETENTION_DAYS` | `7` | Minimum proof-plan grace period |
+| `CRYPTO_RECORDER_RAW_RETENTION_STABLE_AGE_SEC` | `3600` | Minimum unchanged-file age used by the proof-only retention inventory |
 
 ## Coverage Terminology
 
@@ -266,12 +286,14 @@ For the selected target, the script runs these steps (in order):
    existing env file).
 7. **Create data dirs** — create the data roots under `--data-root`.
 8. **Run validation** — `python validate.py --quick`.
-9. **Clean up stale units** — stop/disable/remove every legacy or renamed unit name this repo
+9. **Validate unit template** — verify `Type=oneshot`, `Restart=no`, schema-v2
+   backlog arguments, and 12 GiB/zero-swap limits without starting a service.
+10. **Clean up stale units** — stop/disable/remove every legacy or renamed unit name this repo
    has ever shipped (see Safety notes below). Runs for every target, before units are installed.
-10. **Install units** — render each unit file for the selected target (substituting `--user`,
+11. **Install units** — render each unit file for the selected target (substituting `--user`,
     `--app-dir`, and `--env-file`) and install it to `/etc/systemd/system/`.
-11. **Control units** — `enable`/`start`/`restart` the selected units if those flags were given.
-12. **Print target** — show which units/groups were selected and their status.
+12. **Control units** — `enable`/`start`/`restart` the selected units if those flags were given.
+13. **Print target** — show which units/groups were selected and their status.
 
 When `--no-systemd` is set, steps that touch systemd or `/etc` are skipped; the script
 still prepares the venv, dependencies, and data dirs (or prints them under `--dry-run`).
@@ -363,7 +385,7 @@ Production automatically runs **only** `cryptorecorder-recorder.service` and
 | Group | systemd unit(s) | Kind | Schedule | Command (in `.venv`) |
 |-------|-----------------|------|----------|----------------------|
 | `recorder` | `cryptorecorder-recorder.service` | long-running | always on | `python recorder.py` |
-| `replay-build` | `cryptorecorder-replay-build.service` + `.timer` | oneshot | ~01:00 UTC | `python -m pipeline.daily_build --date yesterday` |
+| `replay-build` | `cryptorecorder-replay-build.service` + `.timer` | oneshot | ~01:00 UTC | `python -m pipeline.daily_build --date yesterday --backlog-days 7 --max-build-dates 3 --schema-version 2` |
 
 Meta target **`all`** installs/controls both groups together.
 
@@ -422,16 +444,21 @@ file inside the staging directory (`staging_dir/scratch/`) via
 batches through `pyarrow.parquet.ParquetWriter`. Peak RSS is O(batch), not
 O(symbol/day). Batch size is controlled by `CRYPTO_RECORDER_REPLAY_PARQUET_BATCH`
 (default 5 000 rows). Because spool files live inside the staging directory,
-a stale-staging cleanup (triggered by the next run after a SIGKILL/OOM) removes
-both the partial Parquet output and all orphaned spool files in one
-`shutil.rmtree(.staging_*)` call — no multi-GiB orphaned SQLite files remain on
-the data filesystem.
+build-wide reconciliation moves an abandoned staging tree and its scratch
+files together to a unique quarantine directory after the kernel lock proves
+there is no active owner. It never silently deletes the interrupted evidence.
 
 **Restart policy**: The service uses `Restart=no`. A deterministic failure
 (e.g. bad raw data) will not trigger an automatic retry loop.
 `StartLimitIntervalSec=86400` / `StartLimitBurst=3` in `[Unit]` cap restarts
 if the policy is ever re-enabled. To re-run the build manually after fixing the
 root cause: `sudo systemctl start cryptorecorder-replay-build.service`.
+
+**Resource policy**: the repository template sets `MemoryMax=12G` and
+`MemorySwapMax=0` for the known 16 GiB host. This template has not been
+installed or production-validated. Phase 7's accepted full-day build reached
+its previous exact 10 GiB cgroup ceiling without swap/OOM, so the 12 GiB value
+is an explicit bounded template, not proof of production headroom.
 
 **Start timeout**: `TimeoutStartSec=23h`. A `oneshot` unit is considered
 "hung" by systemd if it does not exit before `TimeoutStartSec` elapses, at
@@ -454,22 +481,24 @@ status`/`journalctl` will show the invocation as failed; because
 journal, resolve the root cause, and rerun manually (see Recovery command
 below). The installed service only ever builds the previous completed UTC
 day via `pipeline.daily_build --date yesterday`; it does not perform
-`--force` rebuilds or arbitrary historical backfills. Those are run
-manually via the documented CLI (`python -m pipeline.build_replay_store` /
-`python -m pipeline.daily_build --date YYYY-MM-DD`) or a separately
+source/schema replacements. Those require the distinct
+`--rebuild-source-changed` or `--replace-incompatible` policy and are run
+manually against exact selected partitions via the documented CLI (preferably
+first against an isolated replay root) or a separately
 controlled transient systemd scope (e.g. `systemd-run`) where an operator
 chooses an explicit timeout appropriate to the manual job — not through this
 installed daily service or its timer. The memory-bounded writer plus
 crash-recovery state machine already make a `SIGKILL`/OOM/timeout mid-build
 safe to recover from on the next run.
 
-**Durable progress on restart**: When a build is re-run, already-complete
-partitions (manifest exists, `status=complete`, checksums match) are skipped.
-Only genuinely incomplete or missing partitions are rebuilt. A stale staging
-directory from a previous SIGKILL is removed before starting a fresh build.
-Manual `--force` rebuilds (to rebuild a complete partition after raw data has
-been repaired or backfilled) are run via the CLI directly, not via the
-installed daily service.
+**Durable progress and recovery**: one nonblocking kernel advisory lock owns
+all supported replay mutations. Before backlog scanning, a bounded all-date
+reconciliation restores one unambiguous valid backup, quarantines stale
+staging/invalid canonical evidence, safely removes an obsolete valid backup
+beside a valid canonical, preserves every quarantine, and refuses symlinked,
+unknown, corrupt, or ambiguous state. Already-valid schema/source partitions
+are `skipped_valid` without consuming a build-date slot. Every action appears
+in the per-date and run reports.
 
 **Recovery command** (after a confirmed OOM or failure):
 ```bash
@@ -477,6 +506,29 @@ sudo systemctl start cryptorecorder-replay-build.service
 # Then inspect:
 journalctl -u cryptorecorder-replay-build.service -n 100
 ```
+
+### Later owner-run isolated production acceptance (not executed)
+
+At the separately approved exact commit, the owner should first preserve the
+installed env/unit files, run `scripts/deploy_linux_server.sh --target
+replay-build --dry-run --install-only`, and diff the rendered source template.
+It must show `Restart=no`, `TimeoutStartSec=23h`, `MemoryMax=12G`,
+`MemorySwapMax=0`, `--schema-version 2`, `--backlog-days 7`, and
+`--max-build-dates 3`.
+
+Before enabling the timer, use operator-approved isolated replay/report roots
+on the production filesystem and run one exact small date/symbol through
+`pipeline.daily_build` twice: first `built`, then `skipped_valid`. Verify the
+lock metadata, atomic run/date reports, manifest/source/file checksums,
+routine/deep integrity, zero residual staging/backup, visible quarantine,
+filesystem capacity grouping, and cgroup swap/OOM/pressure telemetry. Do not
+set either replacement policy during this first acceptance. Resolve every
+legacy/source-changed/corrupt finding separately. Installing/enabling the real
+timer requires a distinct owner decision after that evidence is reviewed.
+
+No command in this checkpoint deployed, started, stopped, restarted, or
+enabled a production unit, and `/etc/cryptorecorder/cryptorecorder.env` was
+not edited.
 
 ## Explicitly out of scope
 

@@ -5503,3 +5503,168 @@ bash scripts/run_under_cgroup.sh 10G <external-cgroup-evidence> \
   evidence, and the 150-partition storage evidence were unchanged.
 - Checkpoints 2-4, PR creation, Issue #20 mutation/closure, production
   deployment, Phase 8, retention, uv, and KovacsTrader were not started.
+
+## 2026-08-01 — Issue #20 closure checkpoint 2 replay lifecycle and operations
+
+### Change summary
+- Added a single nonblocking Linux `fcntl.flock` lifecycle boundary shared by
+  direct replay builds, bounded daily/backlog orchestration, cross-date
+  recovery, exact-partition replacement, publication, and retention proof
+  planning. Kernel ownership is authoritative; unsafe lock paths and ambiguous
+  replay lifecycle state fail closed.
+- Extended daily replay construction to an oldest-first bounded lookback with
+  explicit schema/source policies, eight non-collapsed partition outcomes,
+  nonzero incomplete/deferred behavior, and fsynced atomic per-date/run
+  reports bound to run/lock/repository/root identity.
+- Preserved per-partition atomic publication while making backup/staging/
+  quarantine recovery root-wide and bounded. Quarantine is preserved and
+  corrupt/unknown/symlinked/multiple-candidate state is refused.
+- Replaced persistent-catalog monitoring with one bounded replay
+  classification scan, actual-filesystem capacity grouping, replay growth and
+  transient-pressure visibility, stale/null failure semantics, and old
+  staging/backup alerts.
+- Removed the automatic single-channel raw deletion behavior. Automatic
+  mutation is disabled even if configured; the remaining API is a proof-only
+  paired depth/trade retention plan under the common lock. Durable
+  transaction journal/move/rollback/recovery remains deliberately absent.
+- Updated the uninstalled replay-build service template to explicitly use
+  schema 2, seven lookback days, at most three build dates, `Restart=no`,
+  `MemoryMax=12G`, and `MemorySwapMax=0`; deployment dry-run validates those
+  fields without starting a service.
+
+### Files/packages touched
+- `pipeline/replay_lifecycle.py`
+- `pipeline/daily_build.py`
+- `pipeline/build_replay_store.py`
+- `stores/replay_writer.py`
+- `disk_monitor.py`
+- `config.py`
+- `scripts/deploy_linux_server.sh`
+- `systemd/cryptorecorder-replay-build.service`
+- `systemd/cryptorecorder.env.example`
+- `tests/test_replay_lifecycle.py`
+- `tests/test_daily_backlog_lifecycle.py`
+- `tests/test_replay_build_policy.py`
+- `tests/test_replay_monitoring_retention.py`
+- `tests/test_disk_monitor_cleanup.py`
+- `tests/test_disk_monitor_fail_safe.py`
+- `tests/test_agent_infrastructure.py`
+- `tests/test_repo_structure.py`
+- `README.md`
+- `docs/ARCHITECTURE.md`
+- `docs/DAILY_BUILD_PIPELINE.md`
+- `docs/REPLAY_STORE.md`
+- `docs/OPERATIONS.md`
+- `docs/PROJECT_STATUS.md`
+- `docs/IMPLEMENTATION_AUDIT.md`
+- `docs/REPO_STRUCTURE.md`
+- `CHANGELOG.md`
+- `docs/CHANGE_AUDIT.md`
+
+### Docs reviewed and updated
+- [x] AGENTS.md and `.github/copilot-instructions.md`
+- [x] `docs/REPO_STRUCTURE.md`
+- [x] `docs/PROJECT_STATUS.md`
+- [x] `docs/IMPLEMENTATION_AUDIT.md`
+- [x] `docs/FULL_L2_REPLAY_CATALOG_PLAN.md` (reviewed; no semantic-gate
+  status changed, so no edit required)
+- [x] `docs/OPERATIONS.md`
+- [x] `docs/ARCHITECTURE.md`
+- [x] `docs/DAILY_BUILD_PIPELINE.md`
+- [x] `docs/REPLAY_STORE.md`
+- [x] README.md and CHANGELOG.md
+- [x] `docs/VALIDATION.md` (reviewed; validation CLI contracts are unchanged,
+  so no edit required)
+
+### Status / validation impact
+- Repository-side schema-v2 lifecycle/backlog/reporting, monitoring, and
+  bounded service-template behavior are implemented and locally validated.
+- The service template is intended production configuration but has not been
+  installed, deployed, enabled, started, or production-accepted.
+- Existing production replay is not automatically migrated. Source-changed
+  and incompatible partitions require separate explicit exact-partition
+  policies; corrupt replay remains a hard failure.
+- Automatic raw retirement is not implemented. The old unsafe destructive
+  behavior is disabled; proof-only reporting does not authorize deletion.
+- Replay row semantics, physical schemas, ordering, precision, cross-day
+  repartitioning, recorder ingestion, raw layout, and `convert_day.py` are
+  unchanged.
+
+### Tests run
+```bash
+git diff --check
+python -m compileall -q config.py disk_monitor.py pipeline stores tests
+bash -n scripts/deploy_linux_server.sh
+bash scripts/deploy_linux_server.sh --target replay-build --dry-run --no-systemd
+
+pytest -q tests/test_replay_lifecycle.py \
+  tests/test_daily_backlog_lifecycle.py tests/test_replay_build_policy.py \
+  tests/test_replay_monitoring_retention.py tests/test_daily_build.py \
+  tests/test_disk_monitor_fail_safe.py tests/test_disk_monitor_cleanup.py \
+  tests/test_replay_store.py tests/test_replay_fail_closed_hardening.py \
+  tests/test_replay_memory_bounded.py \
+  tests/test_replay_hierarchical_integrity_v2.py \
+  tests/test_replay_depth_repartitioning.py \
+  tests/test_replay_scale_selection_and_eligibility.py \
+  tests/test_replay_sync_continuity.py \
+  tests/test_replay_trade_identifier_normalization.py \
+  tests/test_replay_catalog_reconstruct.py \
+  tests/test_reconstruct_selected_catalog.py \
+  tests/test_agent_infrastructure.py tests/test_repo_structure.py
+# 380 passed
+
+pytest -q
+# 820 passed, 3 skipped
+```
+
+No repository linter is configured/installed; none was installed for this
+checkpoint.
+
+### Validation CLIs and isolated real smoke
+The external, non-production smoke used only
+`BINANCE_SPOT/ADAUSDT/2026-06-11`, fresh replay/report roots, and four separate
+12 GiB/zero-swap cgroup scopes:
+
+```bash
+python -m pipeline.daily_build --date 2026-06-11 \
+  --venues BINANCE_SPOT --symbols ADAUSDT --backlog-days 1 \
+  --max-build-dates 1 --schema-version 2 \
+  --data-root <existing-local-data_raw> \
+  --replay-root <external-smoke-root>/replay \
+  --report-root <external-smoke-root>/reports
+
+python -m validation.audit_replay_store \
+  --replay-root <external-smoke-root>/replay --date 2026-06-11 \
+  --venues BINANCE_SPOT --symbols ADAUSDT \
+  --report-path <external-smoke-root>/audit_report.json
+
+# routine validate_partition + audit_partition_deep + anonymous-trade check
+# then the identical daily_build invocation again
+```
+
+- First run: `built`; 303,293 depth and 129,824 trade rows; 45.080917421s;
+  1,196,359,680-byte peak.
+- Replay audit and deep integrity: passed; exact manifest counts/checksums,
+  sorted streams, zero duplicates, zero deep problems, zero anonymous trades.
+- Second run: `skipped_valid`; 8.040619785s; 165,552,128-byte peak.
+- All four scopes: effective MemoryMax 12,884,901,888 bytes,
+  MemorySwapMax/swap 0, memory.low/high/max 0, OOM/OOM-kill/group-kill 0.
+- Published partition: 8,110,080 allocated / 8,101,903 apparent bytes; no
+  staging or backup remained.
+- External smoke-summary SHA-256:
+  `1aacc5f402f9a42c17fe6aac71b1c92cd3b77494d4d64e44357918be9d3c7561`.
+
+### Known limitations / out of scope
+- The smoke is one isolated venue/symbol/date lifecycle check, not top50,
+  broad multi-day semantics, v2.0.0, another representative matrix, or
+  production acceptance.
+- No production data/replay root, `/etc` environment, running unit, recorder,
+  converter, selected-catalog semantic output, or existing external evidence
+  was modified.
+- The 12 GiB service policy still needs the separately authorized owner-run
+  isolated production acceptance. Memory-headroom optimization remains a
+  follow-up.
+- Durable transactional raw retirement is not implemented; no raw data was
+  moved or deleted.
+- uv migration, PR creation, Issue #20 modification/closure, deployment,
+  Phase 8, retention execution, and KovacsTrader work were not started.

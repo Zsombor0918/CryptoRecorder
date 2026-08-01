@@ -4,11 +4,11 @@ Disk usage monitoring and estimation module.
 
 Tracks:
   - Total size of data_raw/
-  - Total size of catalog/ (Nautilus Parquet)
-  - Total size of meta/ and state/
+  - Canonical replay separately from staging, backups, and quarantine
+  - Total size of meta/ and state/report evidence
   - Filesystem-level capacity (independent of recursive directory sizing)
   - Growth rate and days-to-full, computed from real sample timestamps
-  - Automatic raw-data cleanup, gated on a trustworthy retention measurement
+  - Non-destructive raw-retention proof planning (automatic deletion disabled)
 
 Safety invariant
 -----------------
@@ -31,11 +31,13 @@ import tempfile
 import time
 from collections import deque
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date as date_type
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Deque, Dict, List, Literal, Optional, Tuple
 
 from time_utils import local_now_iso
+from stores.replay_writer import audit_partition_deep, validate_partition
 
 logger = logging.getLogger(__name__)
 
@@ -146,12 +148,18 @@ class GrowthSample:
     epoch: float
     timestamp: str  # ISO-8601
     data_raw_bytes: int
+    replay_bytes: int = 0
+    replay_transient_bytes: int = 0
+    replay_measurement_ok: bool = True
 
     def to_dict(self) -> dict:
         return {
             "epoch": self.epoch,
             "timestamp": self.timestamp,
             "data_raw_bytes": self.data_raw_bytes,
+            "replay_bytes": self.replay_bytes,
+            "replay_transient_bytes": self.replay_transient_bytes,
+            "replay_measurement_ok": self.replay_measurement_ok,
         }
 
     @classmethod
@@ -160,6 +168,128 @@ class GrowthSample:
             epoch=float(data["epoch"]),
             timestamp=str(data["timestamp"]),
             data_raw_bytes=int(data["data_raw_bytes"]),
+            replay_bytes=int(data.get("replay_bytes", 0)),
+            replay_transient_bytes=int(data.get("replay_transient_bytes", 0)),
+            # Old persisted samples predate replay-aware measurement and may
+            # not be used to prove a combined capacity projection.
+            replay_measurement_ok=bool(data.get("replay_measurement_ok", False)),
+        )
+
+
+@dataclass(frozen=True)
+class ReplayStorageScan:
+    """One bounded, non-symlink-following classification of replay storage."""
+
+    path: Path
+    ok: bool
+    status: MeasurementStatus
+    error: Optional[str]
+    measured_at: datetime
+    duration_seconds: float
+    categories: Dict[str, int]
+    transient_counts: Dict[str, int]
+    transient_oldest_age_seconds: Dict[str, Optional[float]]
+
+
+def scan_replay_storage(
+    path: Path,
+    max_entries: int = 250_000,
+    timeout_sec: float = 60.0,
+) -> ReplayStorageScan:
+    """Classify replay bytes in one bounded traversal without following links."""
+    started_at = datetime.now(timezone.utc)
+    started = time.monotonic()
+    names = ("replay_published", "replay_staging", "replay_backups", "replay_quarantine", "replay_metadata")
+    categories = {name: 0 for name in names}
+    counts = {name: 0 for name in ("staging", "backups", "quarantine")}
+    oldest_mtime: Dict[str, Optional[float]] = {name: None for name in counts}
+    path = Path(path)
+    if max_entries < 1 or timeout_sec <= 0:
+        return ReplayStorageScan(
+            path,
+            False,
+            "error",
+            "replay scan bounds must be positive",
+            started_at,
+            time.monotonic() - started,
+            categories,
+            counts,
+            {name: None for name in counts},
+        )
+    if not path.exists():
+        return ReplayStorageScan(
+            path, False, "missing", f"directory does not exist: {path}", started_at,
+            time.monotonic() - started, categories, counts,
+            {name: None for name in counts},
+        )
+    try:
+        if path.is_symlink() or not path.is_dir():
+            raise RuntimeError(f"replay root is not a safe directory: {path}")
+        seen = 0
+        stack = [path]
+        while stack:
+            if time.monotonic() - started > timeout_sec:
+                raise TimeoutError(f"replay scan exceeded {timeout_sec}s")
+            current = stack.pop()
+            with os.scandir(current) as iterator:
+                entries = sorted(iterator, key=lambda entry: entry.name)
+            for entry in entries:
+                if time.monotonic() - started > timeout_sec:
+                    raise TimeoutError(f"replay scan exceeded {timeout_sec}s")
+                seen += 1
+                if seen > max_entries:
+                    raise RuntimeError(
+                        f"replay scan exceeded configured entry bound {max_entries}"
+                    )
+                if entry.is_symlink():
+                    raise RuntimeError(f"symlink in replay tree: {entry.path}")
+                relative_parts = Path(entry.path).relative_to(path).parts
+                transient = None
+                for part in relative_parts:
+                    if part.startswith(".staging_"):
+                        transient = "staging"
+                    elif part.startswith(".backup_"):
+                        transient = "backups"
+                    elif part.startswith(".quarantine_"):
+                        transient = "quarantine"
+                if entry.is_dir(follow_symlinks=False):
+                    if transient and Path(entry.path).name.startswith(f".{transient.rstrip('s')}_"):
+                        counts[transient] += 1
+                        mtime = entry.stat(follow_symlinks=False).st_mtime
+                        previous = oldest_mtime[transient]
+                        oldest_mtime[transient] = mtime if previous is None else min(previous, mtime)
+                    stack.append(Path(entry.path))
+                    continue
+                if not entry.is_file(follow_symlinks=False):
+                    raise RuntimeError(f"non-regular replay entry: {entry.path}")
+                allocated = entry.stat(follow_symlinks=False).st_blocks * 512
+                if transient == "staging":
+                    categories["replay_staging"] += allocated
+                elif transient == "backups":
+                    categories["replay_backups"] += allocated
+                elif transient == "quarantine":
+                    categories["replay_quarantine"] += allocated
+                elif any(part.startswith("date=") for part in relative_parts):
+                    categories["replay_published"] += allocated
+                else:
+                    categories["replay_metadata"] += allocated
+        now_epoch = datetime.now(timezone.utc).timestamp()
+        ages = {
+            name: (None if mtime is None else max(0.0, now_epoch - mtime))
+            for name, mtime in oldest_mtime.items()
+        }
+        return ReplayStorageScan(
+            path, True, "ok", None, started_at, time.monotonic() - started,
+            categories, counts, ages,
+        )
+    except Exception as exc:
+        status: MeasurementStatus = (
+            "timeout" if isinstance(exc, TimeoutError) else "error"
+        )
+        return ReplayStorageScan(
+            path, False, status, f"{type(exc).__name__}: {exc}", started_at,
+            time.monotonic() - started, categories, counts,
+            {name: None for name in counts},
         )
 
 
@@ -311,7 +441,10 @@ def measure_filesystem(path: Path) -> FilesystemMeasurement:
 class DiskMonitor:
     """Monitor disk usage and growth with fail-safe measurement semantics."""
 
-    _ROOT_NAMES: Tuple[str, ...] = ("data_raw", "catalog", "meta", "state")
+    _ROOT_NAMES: Tuple[str, ...] = (
+        "data_raw", "replay_published", "replay_staging", "replay_backups",
+        "replay_quarantine", "replay_metadata", "metadata", "state_reports",
+    )
 
     def __init__(self, config):
         """
@@ -322,7 +455,9 @@ class DiskMonitor:
         self.data_root = config.DATA_ROOT
         self.meta_root = config.META_ROOT
         self.state_root = config.STATE_ROOT
-        self.catalog_root = config.NAUTILUS_CATALOG_ROOT
+        self.replay_root = Path(
+            getattr(config, "REPLAY_ROOT", self.data_root.parent / "replay_store")
+        )
 
         # Retention thresholds (GB). These apply to fresh `data_raw` usage
         # only — never to the cross-root observability total (`total_gb`,
@@ -350,6 +485,19 @@ class DiskMonitor:
         self.history_max_age_sec = float(
             getattr(config, "DISK_HISTORY_MAX_AGE_SEC", 172800.0)
         )
+        self.replay_scan_max_entries = int(
+            getattr(config, "REPLAY_MONITOR_MAX_ENTRIES", 250_000)
+        )
+        self.replay_transient_warn_age_sec = float(
+            getattr(config, "REPLAY_TRANSIENT_WARN_AGE_SEC", 86_400.0)
+        )
+        self.raw_retention_enabled = bool(
+            getattr(config, "RAW_RETENTION_ENABLED", False)
+        )
+        self.raw_retention_days = int(getattr(config, "RAW_RETENTION_DAYS", 7))
+        self.raw_retention_stable_age_sec = int(
+            getattr(config, "RAW_RETENTION_STABLE_AGE_SEC", 3600)
+        )
 
         # State directory
         self.state_root.mkdir(parents=True, exist_ok=True)
@@ -361,10 +509,10 @@ class DiskMonitor:
 
         self._roots: Dict[str, Path] = {
             "data_raw": self.data_root,
-            "catalog": self.catalog_root,
-            "meta": self.meta_root,
-            "state": self.state_root,
+            "metadata": self.meta_root,
+            "state_reports": self.state_root,
         }
+        self._last_replay_scan: Optional[ReplayStorageScan] = None
 
         self._last_known_good: Dict[str, LastKnownGood] = {}
         self._growth_history: Deque[GrowthSample] = deque(maxlen=self.history_max_samples)
@@ -454,6 +602,24 @@ class DiskMonitor:
             measurements[name] = await loop.run_in_executor(
                 None, measure_directory, path, self.scan_timeout_sec
             )
+        replay_scan = await loop.run_in_executor(
+            None,
+            scan_replay_storage,
+            self.replay_root,
+            self.replay_scan_max_entries,
+            self.scan_timeout_sec,
+        )
+        self._last_replay_scan = replay_scan
+        for name, value in replay_scan.categories.items():
+            measurements[name] = DirectoryMeasurement(
+                path=self.replay_root,
+                value_bytes=value if replay_scan.ok else None,
+                ok=replay_scan.ok,
+                status=replay_scan.status,
+                error=replay_scan.error,
+                measured_at=replay_scan.measured_at,
+                duration_seconds=replay_scan.duration_seconds,
+            )
         return measurements
 
     def _resolve_component(
@@ -528,7 +694,14 @@ class DiskMonitor:
         }
         return entry, lkg.value_bytes, False
 
-    def _record_growth_sample(self, now: datetime, data_raw_bytes: int) -> None:
+    def _record_growth_sample(
+        self,
+        now: datetime,
+        data_raw_bytes: int,
+        replay_bytes: int = 0,
+        replay_transient_bytes: int = 0,
+        replay_measurement_ok: bool = True,
+    ) -> None:
         epoch = now.timestamp()
         if self._growth_history and epoch <= self._growth_history[-1].epoch:
             logger.warning(
@@ -536,7 +709,14 @@ class DiskMonitor:
             )
             return
         self._growth_history.append(
-            GrowthSample(epoch=epoch, timestamp=now.isoformat(), data_raw_bytes=data_raw_bytes)
+            GrowthSample(
+                epoch=epoch,
+                timestamp=now.isoformat(),
+                data_raw_bytes=data_raw_bytes,
+                replay_bytes=replay_bytes,
+                replay_transient_bytes=replay_transient_bytes,
+                replay_measurement_ok=replay_measurement_ok,
+            )
         )
         self._prune_growth_history(now)
 
@@ -583,6 +763,26 @@ class DiskMonitor:
             oldest.timestamp,
             newest.timestamp,
         )
+
+    def _compute_capacity_growth(self) -> Optional[dict]:
+        if len(self._growth_history) < 2:
+            return None
+        oldest, newest = self._growth_history[0], self._growth_history[-1]
+        if not oldest.replay_measurement_ok or not newest.replay_measurement_ok:
+            return None
+        elapsed = newest.epoch - oldest.epoch
+        if elapsed < MIN_GROWTH_SPAN_SEC:
+            return None
+        day_factor = 86400.0 / elapsed
+        raw_delta = max(0, newest.data_raw_bytes - oldest.data_raw_bytes)
+        replay_delta = max(0, newest.replay_bytes - oldest.replay_bytes)
+        return {
+            "sample_interval_seconds": elapsed,
+            "raw_growth_bytes_per_day": int(raw_delta * day_factor),
+            "replay_growth_bytes_per_day": int(replay_delta * day_factor),
+            "combined_growth_bytes_per_day": int((raw_delta + replay_delta) * day_factor),
+            "current_transient_pressure_bytes": newest.replay_transient_bytes,
+        }
 
     async def check_disk_usage(self) -> Dict:
         """
@@ -636,9 +836,11 @@ class DiskMonitor:
 
         alerts: List[str] = []
         components: Dict[str, dict] = {}
+        resolved_values: Dict[str, Optional[int]] = {}
         # Combined size across all monitored roots. This is an OBSERVABILITY
-        # aggregate only: data_raw, catalog, meta, and state may live on
-        # different filesystems, so this sum must never drive retention
+        # aggregate only: raw, published/transient replay, metadata, and
+        # reports may live on different filesystems, so this sum must never
+        # drive retention
         # threshold decisions or percent-of-limit reporting — see
         # data_raw_bytes/data_raw_trustworthy below for that.
         total_bytes = 0
@@ -653,6 +855,7 @@ class DiskMonitor:
                 name, measurement, now, alerts
             )
             components[name] = entry
+            resolved_values[name] = value_bytes
             if value_bytes is None:
                 total_known = False
             else:
@@ -664,6 +867,8 @@ class DiskMonitor:
                 data_raw_bytes = value_bytes
                 if not fresh_ok:
                     unhealthy = True
+            elif name.startswith("replay_") and not fresh_ok:
+                unhealthy = True
 
         total_gb = round(total_bytes / BYTES_PER_GB, 2) if total_known else None
         total_stale = total_known and not all_fresh_ok
@@ -726,8 +931,28 @@ class DiskMonitor:
         # Growth history tracks data_raw only (the quantity the hard limit
         # actually governs) and only ever records a sample when this cycle's
         # data_raw measurement was itself fresh and successful.
+        replay_component_names = (
+            "replay_published", "replay_staging", "replay_backups",
+            "replay_quarantine", "replay_metadata",
+        )
+        replay_values = [resolved_values.get(name) for name in replay_component_names]
+        replay_trustworthy = all(
+            components.get(name, {}).get("measurement_ok") is True
+            for name in replay_component_names
+        )
+        replay_published_bytes = resolved_values.get("replay_published")
+        replay_transient_bytes = sum(
+            int(resolved_values.get(name) or 0)
+            for name in ("replay_staging", "replay_backups", "replay_quarantine")
+        )
         if data_raw_trustworthy and data_raw_bytes is not None:
-            self._record_growth_sample(now, data_raw_bytes)
+            self._record_growth_sample(
+                now,
+                data_raw_bytes,
+                int(replay_published_bytes or 0),
+                replay_transient_bytes,
+                replay_measurement_ok=replay_trustworthy,
+            )
 
         # Never report a current-looking growth rate / days-to-full derived
         # from a stale or failed current-cycle data_raw measurement, even if
@@ -743,6 +968,54 @@ class DiskMonitor:
             sample_interval_sec = None
             oldest_ts = None
             newest_ts = None
+
+        replay_artifacts = {
+            "counts": {"staging": 0, "backups": 0, "quarantine": 0},
+            "oldest_age_seconds": {"staging": None, "backups": None, "quarantine": None},
+            "measurement_ok": replay_trustworthy,
+        }
+        if self._last_replay_scan is not None:
+            replay_artifacts["counts"] = self._last_replay_scan.transient_counts
+            replay_artifacts["oldest_age_seconds"] = (
+                self._last_replay_scan.transient_oldest_age_seconds
+            )
+            if self._last_replay_scan.ok:
+                for name in ("staging", "backups"):
+                    age = self._last_replay_scan.transient_oldest_age_seconds.get(name)
+                    if age is not None and age > self.replay_transient_warn_age_sec:
+                        alerts.append(
+                            f"WARNING: replay {name} oldest age {age:.0f}s exceeds "
+                            f"{self.replay_transient_warn_age_sec:.0f}s"
+                        )
+
+        # Group logical roots by the actual filesystem device. Free capacity
+        # is measured once per device and never summed across roots.
+        root_components = {
+            "data_raw": (self.data_root, ["data_raw"]),
+            "replay": (self.replay_root, list(replay_component_names)),
+            "metadata": (self.meta_root, ["metadata"]),
+            "state_reports": (self.state_root, ["state_reports"]),
+        }
+        filesystem_groups: Dict[str, dict] = {}
+        for root_name, (root_path, component_names) in root_components.items():
+            measurement = measure_filesystem(root_path)
+            group = filesystem_groups.setdefault(
+                measurement.device,
+                {
+                    **measurement.to_dict(),
+                    "roots": [],
+                    "combined_allocated_bytes": 0,
+                    "combined_measurement_complete": True,
+                },
+            )
+            group["roots"].append(root_name)
+            values = [resolved_values.get(name) for name in component_names]
+            if any(value is None for value in values):
+                group["combined_measurement_complete"] = False
+                group["combined_allocated_bytes"] = None
+            elif group["combined_allocated_bytes"] is not None:
+                group["combined_allocated_bytes"] += sum(int(value) for value in values)
+        filesystem_capacity = sorted(filesystem_groups.values(), key=lambda group: group["filesystem_device_or_identity"])
 
         if unhealthy:
             monitoring_health = "unhealthy"
@@ -765,9 +1038,13 @@ class DiskMonitor:
             # Backward-compatible top-level fields. `None` (never `0`) when
             # the underlying measurement and every fallback are unavailable.
             "data_raw_gb": components["data_raw"]["value_gb"],
-            "catalog_gb": components["catalog"]["value_gb"],
-            "meta_gb": components["meta"]["value_gb"],
-            "state_gb": components["state"]["value_gb"],
+            "replay_published_gb": components["replay_published"]["value_gb"],
+            "replay_staging_gb": components["replay_staging"]["value_gb"],
+            "replay_backups_gb": components["replay_backups"]["value_gb"],
+            "replay_quarantine_gb": components["replay_quarantine"]["value_gb"],
+            "replay_metadata_gb": components["replay_metadata"]["value_gb"],
+            "meta_gb": components["metadata"]["value_gb"],
+            "state_gb": components["state_reports"]["value_gb"],
             # Combined observability total across all roots (may span
             # different filesystems) — NOT the retention-limit basis.
             "total_gb": total_gb,
@@ -775,6 +1052,11 @@ class DiskMonitor:
             "percent_of_soft_limit": percent_of_soft_limit,
             "percent_of_hard_limit": percent_of_hard_limit,
             "filesystem": fs_dict,
+            "filesystem_capacity": filesystem_capacity,
+            "replay_artifacts": replay_artifacts,
+            "capacity_projection": (
+                self._compute_capacity_growth() if replay_trustworthy else None
+            ),
             "growth_rate_gb_day": round(growth_rate_gb_day, 2) if growth_rate_gb_day is not None else None,
             "days_to_full": round(days_to_full, 1) if days_to_full is not None else None,
             "growth_sample_interval_sec": sample_interval_sec,
@@ -783,6 +1065,11 @@ class DiskMonitor:
             "monitoring_health": monitoring_health,
             "alerts": alerts,
             "retention_measurement_trustworthy": data_raw_trustworthy,
+            "raw_retention_enabled": self.raw_retention_enabled,
+            "cleanup_required": bool(
+                data_raw_gb_for_retention is not None
+                and data_raw_gb_for_retention > self.soft_limit_gb
+            ),
             "skipped_duplicate": False,
         }
 
@@ -824,148 +1111,227 @@ class DiskMonitor:
             return None
         return measurement.value_bytes / BYTES_PER_GB
 
-    async def get_oldest_date_dir(self) -> Optional[Path]:
-        """Get oldest date directory in data_raw/.
+    @staticmethod
+    def _raw_directory_proof(
+        path: Path, *, stable_before_epoch: float | None = None
+    ) -> tuple[bool, list[str], list[Path]]:
+        reasons: list[str] = []
+        files: list[Path] = []
+        if not path.exists() or not path.is_dir() or path.is_symlink():
+            return False, [f"missing or unsafe directory: {path}"], files
+        stems: Dict[str, set[str]] = {}
+        for entry in sorted(path.iterdir()):
+            if entry.is_symlink() or not entry.is_file():
+                reasons.append(f"unexpected non-regular entry: {entry}")
+                continue
+            stat_result = entry.stat()
+            if stat_result.st_size <= 0:
+                reasons.append(f"empty raw file: {entry}")
+            if (
+                stable_before_epoch is not None
+                and stat_result.st_mtime > stable_before_epoch
+            ):
+                reasons.append(
+                    f"raw file is not stable for {path}: {entry.name}"
+                )
+            name = entry.name
+            if name.endswith(".jsonl.zst"):
+                stem, variant = name[:-4], "zst"
+            elif name.endswith(".jsonl.gz"):
+                stem, variant = name[:-3], "gz"
+            elif name.endswith(".jsonl"):
+                stem, variant = name, "plain"
+            else:
+                reasons.append(f"unexpected raw filename: {entry}")
+                continue
+            stems.setdefault(stem, set()).add(variant)
+            files.append(entry)
+        for stem, variants in stems.items():
+            if len(variants) > 1:
+                reasons.append(
+                    f"ambiguous compressed/uncompressed variants for {stem}: {sorted(variants)}"
+                )
+        if not files:
+            reasons.append(f"no raw data files: {path}")
+        return not reasons, reasons, files
 
-        Returns the actual date directory, e.g.:
-            data_raw/BINANCE_SPOT/depth/BTCUSDT/2026-04-15/
-        Only targets directories whose name looks like YYYY-MM-DD.
-        Never returns venue, channel, or symbol directories.
+    def plan_raw_retention(self, *, max_units: int = 10_000) -> dict:
+        """Return a bounded, exact depth+trade retention proof plan.
+
+        This is deliberately non-destructive.  The paired transactional move,
+        journal, rollback, and recovery mechanism is not implemented, so even
+        fully proven units remain ``cleanup_required`` rather than being moved
+        or deleted.
         """
-        try:
-            date_dirs = []
-            
-            for venue_dir in self.data_root.glob("*/"):
-                if not venue_dir.is_dir():
-                    continue
-                for channel_dir in venue_dir.glob("*/"):
-                    if not channel_dir.is_dir():
+        from pipeline.raw_manifest import compute_raw_source_identity
+        from pipeline.replay_lifecycle import acquire_replay_build_lock
+
+        if max_units < 1:
+            raise ValueError("max_units must be positive")
+        report_root = Path(
+            getattr(self.config, "DAILY_REPORT_ROOT", self.state_root / "daily_build_reports")
+        )
+        units: list[dict] = []
+        today = datetime.now(timezone.utc).date()
+        cutoff = today - timedelta(days=self.raw_retention_days)
+        stable_before_epoch = time.time() - self.raw_retention_stable_age_sec
+        with acquire_replay_build_lock(
+            replay_root=self.replay_root,
+            data_root=self.data_root,
+            report_root=report_root,
+            command=["disk_monitor", "raw-retention-dry-run"],
+        ) as lifecycle:
+            keys: set[tuple[str, str, str]] = set()
+            for venue_dir in sorted(self.data_root.iterdir()) if self.data_root.exists() else []:
+                if venue_dir.is_symlink() or not venue_dir.is_dir():
+                    raise RuntimeError(f"unsafe raw venue entry: {venue_dir}")
+                for channel in ("depth_v2", "trade_v2"):
+                    channel_dir = venue_dir / channel
+                    if not channel_dir.exists():
                         continue
-                    for symbol_dir in channel_dir.glob("*/"):
-                        if not symbol_dir.is_dir():
-                            continue
-                        for d in symbol_dir.iterdir():
-                            if (d.is_dir()
-                                    and len(d.name) == 10
-                                    and d.name[4] == '-'
-                                    and d.name[7] == '-'):
-                                date_dirs.append(d)
-            
-            if not date_dirs:
-                return None
-            
-            # Return the single oldest date directory
-            return min(date_dirs, key=lambda x: x.name)
-        except Exception as e:
-            logger.warning(f"Could not find oldest date dir: {e}")
-            return None
+                    if channel_dir.is_symlink() or not channel_dir.is_dir():
+                        raise RuntimeError(f"unsafe raw channel entry: {channel_dir}")
+                    for symbol_dir in sorted(channel_dir.iterdir()):
+                        if symbol_dir.is_symlink() or not symbol_dir.is_dir():
+                            raise RuntimeError(f"unsafe raw symbol entry: {symbol_dir}")
+                        for date_dir in sorted(symbol_dir.iterdir()):
+                            try:
+                                date_type.fromisoformat(date_dir.name)
+                            except ValueError:
+                                raise RuntimeError(f"unexpected raw date entry: {date_dir}")
+                            keys.add((venue_dir.name, symbol_dir.name, date_dir.name))
+                            if len(keys) > max_units:
+                                raise RuntimeError(
+                                    f"raw retention scan exceeded {max_units} units"
+                                )
+
+            for venue, symbol, date_str in sorted(keys):
+                raw_date = date_type.fromisoformat(date_str)
+                depth_dir = self.data_root / venue / "depth_v2" / symbol / date_str
+                trade_dir = self.data_root / venue / "trade_v2" / symbol / date_str
+                depth_ok, depth_reasons, _depth_files = self._raw_directory_proof(
+                    depth_dir, stable_before_epoch=stable_before_epoch
+                )
+                trade_ok, trade_reasons, _trade_files = self._raw_directory_proof(
+                    trade_dir, stable_before_epoch=stable_before_epoch
+                )
+                reasons = list(depth_reasons) + list(trade_reasons)
+                if raw_date >= cutoff:
+                    reasons.append(f"inside retention grace period ending before {cutoff}")
+                if raw_date == today:
+                    reasons.append("recorder current/open UTC date")
+
+                dependencies = [
+                    (raw_date - timedelta(days=1)).isoformat(),
+                    raw_date.isoformat(),
+                    (raw_date + timedelta(days=1)).isoformat(),
+                ]
+                current_identity = None
+                if depth_ok and trade_ok:
+                    try:
+                        current_identity = compute_raw_source_identity(
+                            venue,
+                            symbol,
+                            date_str,
+                            ["depth_v2", "trade_v2"],
+                            self.data_root,
+                            strict=True,
+                        )
+                    except Exception as exc:
+                        reasons.append(f"raw source identity failed: {exc}")
+                dependency_results: list[dict] = []
+                for target_date in dependencies:
+                    partition = (
+                        self.replay_root / f"venue={venue}" / f"symbol={symbol}"
+                        / f"date={target_date}"
+                    )
+                    routine = validate_partition(partition)
+                    deep_problems = audit_partition_deep(partition) if routine else ["routine validation failed"]
+                    identity_match = False
+                    schema_ok = False
+                    if routine:
+                        try:
+                            manifest = json.loads((partition / "manifest.json").read_text())
+                            schema_ok = manifest.get("schema_version") == 2
+                            manifest_entries = manifest.get("source_identity", {}).get("channels", {})
+                            required_entries = []
+                            if current_identity is not None:
+                                required_entries.extend(current_identity["channels"]["depth_v2"])
+                                if target_date == date_str:
+                                    required_entries.extend(current_identity["channels"]["trade_v2"])
+                            available = {
+                                (entry.get("path"), entry.get("sha256"), entry.get("size_bytes"))
+                                for entries in manifest_entries.values()
+                                for entry in entries
+                            }
+                            identity_match = all(
+                                (entry["path"], entry["sha256"], entry["size_bytes"]) in available
+                                for entry in required_entries
+                            )
+                        except Exception as exc:
+                            reasons.append(f"manifest identity check failed for {partition}: {exc}")
+                    if not routine:
+                        reasons.append(f"required adjacent replay is not routine-valid: {partition}")
+                    elif deep_problems:
+                        reasons.append(f"required adjacent replay deep integrity failed: {partition}")
+                    elif not schema_ok:
+                        reasons.append(f"required adjacent replay is not schema 2: {partition}")
+                    elif not identity_match:
+                        reasons.append(f"required adjacent replay source identity mismatch: {partition}")
+                    dependency_results.append(
+                        {
+                            "date": target_date,
+                            "partition": str(partition),
+                            "routine_valid": routine,
+                            "deep_integrity_problems": deep_problems,
+                            "schema_version_2": schema_ok,
+                            "source_identity_match": identity_match,
+                        }
+                    )
+                units.append(
+                    {
+                        "venue": venue,
+                        "symbol": symbol,
+                        "source_date": date_str,
+                        "depth_directory": str(depth_dir),
+                        "trade_directory": str(trade_dir),
+                        "replay_dependencies": dependency_results,
+                        "proof_passed": not reasons,
+                        "eligible_for_transactional_retirement": False,
+                        "outcome": "cleanup_required" if not reasons else "blocked",
+                        "reasons": reasons or [
+                            "paired transactional journal/move/rollback is not implemented; no mutation performed"
+                        ],
+                    }
+                )
+            return {
+                "contract_version": 1,
+                "run_id": lifecycle.run_id,
+                "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+                "retention_enabled_configuration": self.raw_retention_enabled,
+                "mutation_performed": False,
+                "units": units,
+            }
 
     async def cleanup_old_data(self) -> bool:
-        """
-        Delete oldest data directories if raw retention usage > soft limit.
-
-        Fails closed: never runs (or continues) unless the current cycle's
-        `data_raw` measurement is fresh and successful
-        (`retention_measurement_trustworthy=True`). A missing, failed,
-        timed-out, or merely stale (last-known-good) measurement is never
-        treated as "below threshold" — cleanup is skipped and an ERROR is
-        logged instead.
-
-        Returns:
-            True if cleanup performed, False otherwise
-        """
+        """Never delete raw data; surface cleanup-required state fail closed."""
         usage = await self.check_disk_usage()
-
-        if usage.get("skipped_duplicate"):
-            logger.error(
-                "Cleanup skipped: this disk check was skipped due to an "
-                "overlapping scan already in progress; refusing to act on a "
-                "duplicate report instead of a fresh measurement"
-            )
+        if usage.get("skipped_duplicate") or not self._is_retention_measurement_trustworthy(usage):
+            logger.error("Raw retention refused: current measurement is not trustworthy")
             return False
-
-        if not self._is_retention_measurement_trustworthy(usage):
-            status = (
-                usage.get("components", {})
-                .get("data_raw", {})
-                .get("measurement_status", "unknown")
-            )
-            logger.error(
-                "Cleanup skipped: data_raw retention measurement is unavailable, "
-                f"stale, or unknown (status={status}); refusing to delete "
-                "production data based on an untrusted measurement"
-            )
-            return False
-
         raw_gb = usage.get("data_raw_gb")
         if raw_gb is None or raw_gb <= self.soft_limit_gb:
-            logger.debug("Disk usage within limits, no cleanup needed")
             return False
-
-        logger.info(
-            f"Raw data usage {raw_gb}GB > soft limit {self.soft_limit_gb}GB "
-            f"(combined observability total: {usage.get('total_gb')}GB), "
-            "cleaning up oldest raw data..."
+        if not self.raw_retention_enabled:
+            logger.error(
+                "Raw cleanup required but automatic retention is disabled; no files were moved or deleted"
+            )
+            return False
+        logger.error(
+            "Raw cleanup required, but transactional paired depth/trade retirement is not implemented; "
+            "no files were moved or deleted. Use plan_raw_retention() for proof-only evidence."
         )
-
-        # Delete oldest date directories until we hit cleanup target
-        deleted_count = 0
-        max_attempts = 10
-
-        while (
-            usage.get("data_raw_gb") is not None
-            and usage["data_raw_gb"] > self.cleanup_target_gb
-            and deleted_count < max_attempts
-        ):
-            if not self._is_retention_measurement_trustworthy(usage):
-                logger.error(
-                    "Cleanup aborted mid-run: data_raw retention measurement "
-                    "became untrusted before the next destructive phase"
-                )
-                break
-
-            oldest_dir = await self.get_oldest_date_dir()
-
-            if not oldest_dir:
-                logger.warning("Could not find old directories to delete")
-                break
-
-            try:
-                dir_size_gb = await asyncio.get_event_loop().run_in_executor(
-                    None,
-                    self.get_dir_size_gb,
-                    oldest_dir
-                )
-
-                size_desc = f"{dir_size_gb:.1f}GB" if dir_size_gb is not None else "unknown size"
-                logger.info(f"Deleting oldest date dir {oldest_dir} ({size_desc})...")
-
-                await asyncio.get_event_loop().run_in_executor(
-                    None,
-                    shutil.rmtree,
-                    oldest_dir
-                )
-
-                deleted_count += 1
-
-                # Re-check usage (also re-validates measurement trust) before
-                # the next destructive phase.
-                usage = await self.check_disk_usage()
-                logger.info(
-                    f"After cleanup: raw={usage.get('data_raw_gb')}GB, "
-                    f"total={usage.get('total_gb')}GB"
-                )
-            except Exception as e:
-                logger.error(f"Error deleting {oldest_dir}: {e}")
-                break
-
-        logger.info(
-            f"Cleanup complete: deleted {deleted_count} date directories, "
-            f"current raw size: {usage.get('data_raw_gb')}GB, "
-            f"current combined observability total: {usage.get('total_gb')}GB"
-        )
-
-        return deleted_count > 0
+        return False
 
     async def disk_check_task(self) -> None:
         """Background task for periodic disk checks."""

@@ -23,12 +23,71 @@ data_raw -> convert_day.py -> Nautilus catalog
   validated full-L2 path
 
 data_raw -> replay_store
-  implemented v0; the stable external contract for downstream repositories
+  versioned v0/v1/v2; intended production template explicitly requests v2
 
 replay_store -> pipeline.reconstruct_selected_catalog -> temporary catalog
   supported explicit development-computer CLI/API wrapping the internal
   replay_catalog_reconstruct engine; broader top50/multi-day validation pending
 ```
+
+## Issue #20 closure checkpoint 2 — replay lifecycle and operations boundary
+
+The current branch implements the repository-side replay-build lifecycle; no
+production system was changed.
+
+- `pipeline.replay_lifecycle` owns one Linux `fcntl.flock` lock per replay
+  root. It is nonblocking, validates lock type/ownership/link/mode, records
+  run/process/root/repository metadata, and relies on kernel release after
+  process death. Direct builds and daily/backlog orchestration use the same
+  context; nested code never reacquires it.
+- Before backlog/raw inspection, a bounded root-wide scan recognizes only
+  canonical partitions plus staging, backup, quarantine, and lifecycle
+  metadata. It restores one valid backup when unambiguous, quarantines stale
+  staging/invalid canonical evidence, safely removes an obsolete valid backup
+  only beside a valid canonical, preserves quarantine, and refuses corruption,
+  symlinks, unknown entries, and multiple candidates.
+- `pipeline.daily_build` scans 1–31 days oldest-first and builds no more than
+  the configured 1–31 incomplete dates. Current artifacts, not prior reports,
+  decide truth. Outcomes are `built`, `skipped_valid`,
+  `deferred_not_ready`, `missing_required_raw`,
+  `source_changed_rebuild_required`,
+  `incompatible_schema_rebuild_required`, `recovered`, or `failed`. Anything
+  outside built/skipped/recovered is nonzero.
+- Schema 2 is the validated production configuration value and explicit
+  checked-in service argument. Live source mismatch and legacy/incompatible
+  partitions require their separate exact-partition flags. Corrupt replay is
+  never an implicit rebuild candidate.
+- Per-date and invocation JSON evidence is file-fsynced, atomically replaced,
+  directory-fsynced, and includes the lock/run identity, policies, recovery,
+  exact inventory/results/counts, record/size observations, timing, and exit
+  classification. Report failure cannot produce process success.
+- Replay monitoring is one bounded classified scan of canonical, staging,
+  backup, quarantine, and lifecycle bytes. Capacity groups roots by actual
+  device and includes raw/replay growth and transient pressure without adding
+  free space twice. The retired persistent catalog root is absent.
+- The unsafe single-channel raw deletion path is removed. Automatic retirement
+  defaults disabled and remains non-mutating even if configured on; a
+  proof-only paired depth/trade planner checks grace, open day, variants,
+  D-1/D/D+1 replay validity/integrity, and exact source identity. A durable
+  paired move journal/rollback/recovery implementation is not present and must
+  be separately accepted before raw deletion can exist.
+- The repository oneshot service retains `Restart=no`/23h timeout and now sets
+  `MemoryMax=12G`, `MemorySwapMax=0`, schema 2, seven lookback days, and three
+  build dates. Deployment dry-run validates these fields. This template has
+  not been installed or production-validated, and the existing production
+  replay root is not migrated.
+
+The implementation does not change recorder ingestion, raw layout, replay
+row ordering/precision/fields, schema-v2 reconstruction, or `convert_day.py`.
+The isolated real lifecycle smoke and full practical suite evidence for this
+checkpoint are recorded in the matching `docs/CHANGE_AUDIT.md` entry. The
+focused checkpoint set passed 380 tests; the full suite passed 820 with 3
+skipped. The external schema-v2 ADAUSDT smoke built 303,293 depth and 129,824
+trade rows, passed routine/deep validation with zero anonymous trades, and
+returned `skipped_valid` on its second run. Build peak was 1,196,359,680 bytes
+under an effective 12 GiB/zero-swap scope, with zero memory pressure or OOM
+events; summary SHA-256 is
+`1aacc5f402f9a42c17fe6aac71b1c92cd3b77494d4d64e44357918be9d3c7561`.
 
 ## Issue #20 Phase 7 — BTWUSDT trade-identifier correction
 

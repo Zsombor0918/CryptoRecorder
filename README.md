@@ -10,8 +10,8 @@ data_raw -> convert_day.py -> Nautilus full-L2 catalog
   production reference full-L2 path
 
 data_raw -> replay_store
-  validated v0 replay layer; the stable external contract handed off to
-  downstream repositories (e.g. KovacsTrader)
+  v0/v1/v2-compatible replay layer; the repository production template
+  explicitly requests schema v2 through a bounded, exclusive backlog build
 
 replay_store -> pipeline.reconstruct_selected_catalog -> temporary Nautilus catalog
   supported development-computer CLI/API with explicit venue, symbol,
@@ -54,14 +54,26 @@ Convert one UTC day with the validated full-L2 converter:
 python convert_day.py --date 2026-06-12 --staging
 ```
 
-Build the replay v0 path with explicit temp roots:
+Build one explicit schema-v2 partition with isolated roots:
 
 ```bash
 python -m pipeline.build_replay_store \
   --date 2026-06-12 \
   --symbols ADAUSDT \
   --data-root ./data_raw \
-  --replay-root /tmp/replay_store
+  --replay-root /external/replay_store \
+  --schema-version 2
+```
+
+Run the intended bounded production backlog contract (the checked-in service
+template has not yet been deployed or production-accepted):
+
+```bash
+python -m pipeline.daily_build \
+  --date yesterday \
+  --backlog-days 7 \
+  --max-build-dates 3 \
+  --schema-version 2
 ```
 
 Reconstruct a selected temporary catalog on the development computer:
@@ -140,6 +152,13 @@ Agent rules: [AGENTS.md](AGENTS.md). Version: see [VERSION](VERSION) and [CHANGE
 - Replay store preserves exact price/quantity strings and depth continuity
   fields needed for full-L2 reconstruction, and is the stable external
   contract handed off to downstream repositories (e.g. KovacsTrader).
+- All supported replay-root mutation entrypoints share one nonblocking Linux
+  advisory lock. Daily builds reconcile bounded cross-date lifecycle state,
+  process backlog dates oldest-first, and publish atomic per-date/run reports.
+- Source-changed and legacy/incompatible partitions are never overwritten by
+  the scheduled default. They require distinct, exact-partition operator
+  policies. Automatic raw deletion is disabled; monitoring only reports
+  paired depth/trade retention proofs and `cleanup_required`.
 - CryptoRecorder does not build a feature-store, label-store, persistent
   catalog service, or unscoped consumer catalog from replay_store.
 - `pipeline.reconstruct_selected_catalog` is the supported development-

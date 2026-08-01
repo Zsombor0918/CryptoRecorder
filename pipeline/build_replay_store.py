@@ -18,7 +18,7 @@ from typing import Optional
 
 import zstandard as zstd
 
-from config import DATA_ROOT, REPLAY_ROOT
+from config import DATA_ROOT, DAILY_REPORT_ROOT, REPLAY_ROOT, REPLAY_SCHEMA_VERSION
 from converter.readers import stream_raw_records
 from converter.spool import DedupeSet
 from converter.depth_phase2 import (
@@ -1002,10 +1002,12 @@ def recover_partition_state(
             return _RecoveryAction("skip", "Partition is complete and valid.")
         if not output_exists:
             return _RecoveryAction("rebuild", "No partition or backup; will build.")
-        # output exists but invalid, no backup
+        # output exists but invalid, no backup: corruption is evidence, not an
+        # implicit overwrite authorization.
         return _RecoveryAction(
-            "rebuild",
-            f"Partition {partition_dir} exists but is invalid; no backup. Will rebuild."
+            "fail",
+            f"Partition {partition_dir} exists but is invalid and has no valid "
+            "backup. Preserving it for operator inspection."
         )
 
     # --- Cases with backup present ---
@@ -1020,13 +1022,11 @@ def recover_partition_state(
         return _RecoveryAction("skip", "Canonical partition is valid; stale backup cleaned up.")
 
     if output_valid and not backup_valid:
-        # Case C: canonical valid, stale/invalid backup.
-        try:
-            _shutil.rmtree(backup_dir)
-            logger.info(f"Removed invalid backup (canonical is valid): {backup_dir}")
-        except Exception as e:
-            logger.warning(f"Could not remove backup {backup_dir}: {e}")
-        return _RecoveryAction("skip", "Canonical partition is valid.")
+        return _RecoveryAction(
+            "fail",
+            f"Canonical partition is valid but backup {backup_dir} is invalid. "
+            "Preserving the ambiguous backup for operator inspection."
+        )
 
     if not output_exists and backup_valid:
         # Case A: mid-publish SIGKILL — restore valid backup.
@@ -1063,7 +1063,10 @@ def recover_partition_state(
         # Case D: canonical invalid, valid backup available — quarantine and restore.
         quarantine_dir = (
             replay_root / f"venue={venue}" / f"symbol={symbol}"
-            / f".quarantine_{date}_{symbol}"
+            / (
+                f".quarantine_{date}_{symbol}_invalid_canonical."
+                f"{datetime.now(timezone.utc):%Y%m%dT%H%M%S%fZ}.{os.getpid()}"
+            )
         )
         logger.warning(
             f"Crash-recovery (Case D): canonical {partition_dir} is invalid; "
@@ -1071,7 +1074,9 @@ def recover_partition_state(
         )
         try:
             if quarantine_dir.exists():
-                _shutil.rmtree(quarantine_dir)
+                raise RuntimeError(
+                    f"quarantine destination collision: {quarantine_dir}"
+                )
             os.replace(partition_dir, quarantine_dir)
         except Exception as qe:
             return _RecoveryAction(
@@ -1093,12 +1098,11 @@ def recover_partition_state(
                 f"{restore_err}. Manual intervention required."
             )
         logger.info(f"Crash-recovery complete: restored {partition_dir}.")
-        # Remove quarantined invalid copy best-effort.
-        try:
-            _shutil.rmtree(quarantine_dir)
-        except Exception as e:
-            logger.warning(f"Could not remove quarantined copy {quarantine_dir}: {e}")
-        return _RecoveryAction("skip", f"Restored valid backup to {partition_dir}.")
+        return _RecoveryAction(
+            "skip",
+            f"Restored valid backup to {partition_dir}; preserved invalid "
+            f"canonical at {quarantine_dir}."
+        )
 
     # Case E: output invalid (or missing), backup invalid.
     logger.error(
@@ -1113,7 +1117,7 @@ def recover_partition_state(
     )
 
 
-def build_replay_for_symbol(
+def _build_replay_for_symbol_locked(
     venue: str,
     symbol: str,
     date: str,
@@ -1126,25 +1130,23 @@ def build_replay_for_symbol(
     qty_scale: "Optional[int]" = None,
     check_repartition_readiness: bool = False,
     require_complete_next_day: bool = False,
+    lifecycle_context=None,
+    rebuild_source_changed: bool = False,
+    replace_incompatible: bool = False,
 ) -> dict:
     """
     Build replay store for a single venue/symbol/date.
 
-    Skips partitions that already have a complete, checksum-valid manifest so
-    that restarted runs make durable progress without rebuilding earlier work.
-    Pass force=True to rebuild even when a valid partition already exists (use
-    after raw data has been repaired or backfilled).
+    Skips partitions only when their manifest/files, requested schema/builder,
+    and live raw-source identity all match. Source-changed and incompatible
+    existing partitions require their separate explicit replacement policies.
 
     Args:
-        schema_version: 0 (default — legacy v0, unchanged production
-            behavior; every existing caller that omits this argument keeps
-            producing exactly today's output), 1 (the issue #20 Phase 5
-            compact prototype schema), or 2 (the issue #20 Phase 7
-            hierarchical-integrity candidate). The compact schemas are
-            intended for development validation only and are not wired into
-            a systemd unit or production config. Any other value raises
-            immediately via ``ReplayWriter``'s own constructor check — never
-            silently falls back to v0.
+        schema_version: the programmatic compatibility default remains legacy
+            v0 for historical test/validation callers; supported operator
+            CLIs and the repository service template explicitly select schema
+            v2. Schema v1 remains available only for explicit historical
+            validation. Any other value fails; no path silently falls back.
         price_scale / qty_scale: used by schema_version 1 and 2; forwarded to
             ``ReplayWriter`` (see its docstring for the derivation fallback).
         check_repartition_readiness: when True, refuse (return
@@ -1176,6 +1178,17 @@ def build_replay_for_symbol(
     Returns:
         Status dict with counts and errors.
     """
+    from pipeline.replay_lifecycle import ReplayLifecycleContext
+
+    if not isinstance(lifecycle_context, ReplayLifecycleContext):
+        raise RuntimeError("internal replay build requires a held lifecycle context")
+    lifecycle_context.assert_held(replay_root)
+    if force:
+        # Backward-compatible explicit API.  New operator CLIs expose the two
+        # narrower policies below instead of a single ambiguous overwrite flag.
+        rebuild_source_changed = True
+        replace_incompatible = True
+
     if schema_version not in (0, 1, 2):
         # Preserve the public fail-fast contract even though writer creation
         # now lives inside the staging-cleanup scope below.
@@ -1189,6 +1202,8 @@ def build_replay_for_symbol(
         "symbol": symbol,
         "date": date,
         "status": "success",
+        "outcome": "built",
+        "run_id": lifecycle_context.run_id,
         "depth_count": 0,
         "trade_count": 0,
         "errors": [],
@@ -1215,6 +1230,7 @@ def build_replay_for_symbol(
     recovery = recover_partition_state(replay_root, venue, symbol, date)
     if recovery.action == "fail":
         status["status"] = "failed"
+        status["outcome"] = "failed"
         status["errors"].append(recovery.message)
         logger.error(recovery.message)
         return status
@@ -1240,38 +1256,49 @@ def build_replay_for_symbol(
             return status
         existing_schema_version = existing_manifest.get("schema_version", 0)
         if existing_schema_version != schema_version:
-            status["status"] = "failed"
-            status["errors"].append(
-                f"Existing valid partition {venue}/{symbol}/{date} uses "
-                f"schema_version={existing_schema_version!r}, but the caller "
-                f"requested schema_version={schema_version!r}. Refusing to "
-                "reuse or overwrite it implicitly; use force=True for an "
-                "intentional replacement."
-            )
-            logger.error(status["errors"][-1])
-            return status
+            if replace_incompatible:
+                force = True
+            else:
+                status["status"] = "failed"
+                status["outcome"] = "incompatible_schema_rebuild_required"
+                status["errors"].append(
+                    f"Existing valid partition {venue}/{symbol}/{date} uses "
+                    f"schema_version={existing_schema_version!r}, but the caller "
+                    f"requested schema_version={schema_version!r}. Explicit "
+                    "--replace-incompatible is required for this exact partition."
+                )
+                logger.error(status["errors"][-1])
+                return status
+        if force:
+            # The exact partition remains protected by ReplayWriter's existing
+            # backup/restore publication state machine.
+            pass
+        else:
+            expected_builder = {
+                1: BUILDER_VERSION_V1,
+                2: BUILDER_VERSION_V2,
+            }.get(schema_version)
+            if (
+                expected_builder is not None
+                and existing_manifest.get("builder_version") != expected_builder
+            ):
+                if replace_incompatible:
+                    force = True
+                else:
+                    status["status"] = "failed"
+                    status["outcome"] = "incompatible_schema_rebuild_required"
+                    status["errors"].append(
+                        f"Existing valid partition {venue}/{symbol}/{date} uses "
+                        f"builder_version={existing_manifest.get('builder_version')!r}, "
+                        f"but the current schema_version={schema_version} builder is "
+                        f"{expected_builder!r}; the older builder records different "
+                        "normalization semantics. Explicit --replace-incompatible is "
+                        "required for this exact partition."
+                    )
+                    logger.error(status["errors"][-1])
+                    return status
 
-        expected_builder = {
-            1: BUILDER_VERSION_V1,
-            2: BUILDER_VERSION_V2,
-        }.get(schema_version)
-        if (
-            expected_builder is not None
-            and existing_manifest.get("builder_version") != expected_builder
-        ):
-            status["status"] = "failed"
-            status["errors"].append(
-                f"Existing valid partition {venue}/{symbol}/{date} uses "
-                f"builder_version={existing_manifest.get('builder_version')!r}, "
-                f"but the current schema_version={schema_version} builder is "
-                f"{expected_builder!r}. Refusing to reuse a partition built "
-                "under different normalization semantics; use force=True for "
-                "an intentional replacement."
-            )
-            logger.error(status["errors"][-1])
-            return status
-
-        if schema_version == 2:
+        if not force and schema_version == 2:
             # A v2 partition's replacement for the per-event payload hash is
             # its exact raw-source identity. Reuse therefore requires the same
             # readiness proof as a fresh build and a fresh, strict identity
@@ -1286,6 +1313,7 @@ def build_replay_for_symbol(
                 )
                 if readiness_reason is not None:
                     status["status"] = "deferred"
+                    status["outcome"] = "deferred_not_ready"
                     status["errors"].append(readiness_reason)
                     logger.info(
                         f"Deferring reuse of {venue}/{symbol}/{date}: "
@@ -1309,6 +1337,7 @@ def build_replay_for_symbol(
                 )
             except Exception as exc:
                 status["status"] = "failed"
+                status["outcome"] = "failed"
                 status["errors"].append(
                     f"Cannot reuse schema_version=2 partition "
                     f"{venue}/{symbol}/{date}: live raw source identity could "
@@ -1317,21 +1346,33 @@ def build_replay_for_symbol(
                 logger.error(status["errors"][-1])
                 return status
             if existing_manifest.get("source_identity") != live_source_identity:
-                status["status"] = "failed"
-                status["errors"].append(
-                    f"Cannot reuse schema_version=2 partition "
-                    f"{venue}/{symbol}/{date}: current selected raw source "
-                    "identity differs from the published manifest. Refusing "
-                    "silent reuse or automatic replacement."
-                )
-                logger.error(status["errors"][-1])
-                return status
+                if rebuild_source_changed:
+                    force = True
+                else:
+                    status["status"] = "failed"
+                    status["outcome"] = "source_changed_rebuild_required"
+                    status["errors"].append(
+                        f"Cannot reuse schema_version=2 partition "
+                        f"{venue}/{symbol}/{date}: current selected raw source "
+                        "identity differs from the published manifest. Explicit "
+                        "--rebuild-source-changed is required for this exact partition."
+                    )
+                    logger.error(status["errors"][-1])
+                    return status
 
-        logger.info(
-            f"Skipping already-complete partition: {venue}/{symbol}/{date}"
-        )
-        status["status"] = "skipped"
-        return status
+        if not force:
+            logger.info(
+                f"Skipping already-complete partition: {venue}/{symbol}/{date}"
+            )
+            status["status"] = "skipped"
+            status["outcome"] = "skipped_valid"
+            return status
+
+        # Explicit policy selected: fall through and build while retaining the
+        # valid canonical until replacement publication succeeds.
+    elif recovery.action == "skip" and force:
+        pass
+
     # action == "rebuild", or (action == "skip" and force) -- fall through to
     # build. In the force+skip case, recover_partition_state has already
     # resolved any crash-left backup/canonical ambiguity, and the current
@@ -1359,6 +1400,7 @@ def build_replay_for_symbol(
         )
     if readiness_reason is not None:
         status["status"] = "deferred"
+        status["outcome"] = "deferred_not_ready"
         status["errors"].append(readiness_reason)
         logger.info(f"Deferring {venue}/{symbol}/{date}: {readiness_reason}")
         return status
@@ -1580,6 +1622,7 @@ def build_replay_for_symbol(
 
     except Exception as primary_error:
         status["status"] = "failed"
+        status["outcome"] = "failed"
         status["errors"].append(str(primary_error))
         logger.error(
             f"Failed to build replay for {venue}/{symbol}/{date}: {primary_error}"
@@ -1595,6 +1638,80 @@ def build_replay_for_symbol(
             )
 
     return status
+
+
+def build_replay_for_symbol(
+    venue: str,
+    symbol: str,
+    date: str,
+    data_root: Path,
+    replay_root: Path,
+    *,
+    force: bool = False,
+    schema_version: int = 0,
+    price_scale: "Optional[int]" = None,
+    qty_scale: "Optional[int]" = None,
+    check_repartition_readiness: bool = False,
+    require_complete_next_day: bool = False,
+    lifecycle_context=None,
+    report_root: "Optional[Path]" = None,
+    rebuild_source_changed: bool = False,
+    replace_incompatible: bool = False,
+) -> dict:
+    """Build one partition under the shared build-wide lifecycle lock.
+
+    Passing ``lifecycle_context`` is the nested-orchestration path.  Direct
+    callers acquire and reconcile the common replay-root lock automatically.
+    Historical callers may still request schemas 0/1 explicitly; production
+    CLI defaults are schema 2.
+    """
+    from pipeline.replay_lifecycle import (
+        ReplayLifecycleSafetyError,
+        acquire_replay_build_lock,
+        reconcile_replay_root,
+    )
+
+    kwargs = dict(
+        force=force,
+        schema_version=schema_version,
+        price_scale=price_scale,
+        qty_scale=qty_scale,
+        check_repartition_readiness=check_repartition_readiness,
+        require_complete_next_day=require_complete_next_day,
+        rebuild_source_changed=rebuild_source_changed,
+        replace_incompatible=replace_incompatible,
+    )
+    if lifecycle_context is not None:
+        return _build_replay_for_symbol_locked(
+            venue, symbol, date, data_root, replay_root,
+            lifecycle_context=lifecycle_context,
+            **kwargs,
+        )
+
+    effective_report_root = Path(report_root or (Path(replay_root) / ".lifecycle" / "reports"))
+    try:
+        with acquire_replay_build_lock(
+            replay_root=Path(replay_root),
+            data_root=Path(data_root),
+            report_root=effective_report_root,
+        ) as context:
+            reconcile_replay_root(context)
+            return _build_replay_for_symbol_locked(
+                venue, symbol, date, data_root, replay_root,
+                lifecycle_context=context,
+                **kwargs,
+            )
+    except ReplayLifecycleSafetyError as exc:
+        return {
+            "venue": venue,
+            "symbol": symbol,
+            "date": date,
+            "status": "failed",
+            "outcome": "failed",
+            "depth_count": 0,
+            "trade_count": 0,
+            "errors": [str(exc)],
+        }
 
 
 def main():
@@ -1631,21 +1748,24 @@ Examples:
         "--force",
         action="store_true",
         default=False,
-        help="Rebuild partition even if it already has a valid complete manifest "
-             "(use after raw data has been repaired or backfilled)",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--rebuild-source-changed",
+        action="store_true",
+        help="Replace only selected valid partitions whose verified raw source identity changed",
+    )
+    parser.add_argument(
+        "--replace-incompatible",
+        action="store_true",
+        help="Replace only selected valid legacy/incompatible replay partitions",
     )
     parser.add_argument(
         "--schema-version",
         type=int,
-        default=0,
+        default=REPLAY_SCHEMA_VERSION,
         choices=(0, 1, 2),
-        help="Replay schema version to build: 0 (default, production legacy "
-             "layout), 1 (issue #20 Phase 5 compact prototype), or 2 (issue "
-             "#20 Phase 7 hierarchical-integrity candidate — compact "
-             "encoding plus a manifest-level traceability hierarchy "
-             "replacing the per-event native_payload_hash column). 1 and 2 "
-             "are for development validation only — not used by any "
-             "systemd unit or production configuration.",
+        help="Replay schema version (production default: 2; 0/1 remain available only for explicit historical validation)",
     )
     args = parser.parse_args()
 
@@ -1674,21 +1794,44 @@ Examples:
         logger.error(f"No raw data found for {date_str}")
         sys.exit(1)
 
-    # Build replay for each venue/symbol combination
+    # Build under the common replay-root mutation lock. Reconciliation covers
+    # every date before any selected partition is inspected or published.
+    from pipeline.replay_lifecycle import (
+        acquire_replay_build_lock,
+        reconcile_replay_root,
+    )
+
     results = []
-    for venue in venues:
-        for symbol in symbols_to_build:
-            if symbol in coverage["data"].get(venue, {}):
-                result = build_replay_for_symbol(
-                    venue, symbol, date_str, data_root, replay_root,
-                    force=args.force,
-                    schema_version=args.schema_version,
-                    check_repartition_readiness=True,
-                )
-                results.append(result)
+    try:
+        with acquire_replay_build_lock(
+            replay_root=replay_root,
+            data_root=data_root,
+            report_root=DAILY_REPORT_ROOT,
+        ) as lifecycle_context:
+            reconcile_replay_root(lifecycle_context)
+            for venue in venues:
+                for symbol in symbols_to_build:
+                    if symbol in coverage["data"].get(venue, {}):
+                        result = build_replay_for_symbol(
+                            venue, symbol, date_str, data_root, replay_root,
+                            force=args.force,
+                            schema_version=args.schema_version,
+                            check_repartition_readiness=True,
+                            lifecycle_context=lifecycle_context,
+                            rebuild_source_changed=args.rebuild_source_changed,
+                            replace_incompatible=args.replace_incompatible,
+                        )
+                        results.append(result)
+    except Exception as exc:
+        logger.error("Replay build lifecycle failed closed: %s", exc)
+        return 1
 
     # Summary
-    successful = sum(1 for r in results if r["status"] == "success")
+    successful = sum(
+        1
+        for result in results
+        if result.get("outcome") in {"built", "skipped_valid", "recovered"}
+    )
     failed = sum(1 for r in results if r["status"] == "failed")
     deferred = sum(1 for r in results if r["status"] == "deferred")
     total_depth = sum(r.get("depth_count", 0) for r in results)
@@ -1701,7 +1844,7 @@ Examples:
         f"{total_trades} trade records"
     )
 
-    return 0 if failed == 0 else 1
+    return 0 if results and failed == 0 and deferred == 0 else 1
 
 
 if __name__ == "__main__":

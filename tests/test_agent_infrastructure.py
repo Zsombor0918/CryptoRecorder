@@ -263,6 +263,42 @@ def test_deploy_script_dry_run_all_is_safe() -> None:
     )
     assert result.returncode == 0, result.stderr
     assert "skipped (--no-systemd)" in result.stdout
+    assert "Validate replay-build unit policy" in result.stdout
+
+
+def test_replay_build_unit_has_bounded_schema_v2_policy() -> None:
+    text = (ROOT / "systemd" / "cryptorecorder-replay-build.service").read_text()
+    for required in (
+        "Type=oneshot",
+        "Restart=no",
+        "TimeoutStartSec=23h",
+        "MemoryMax=12G",
+        "MemorySwapMax=0",
+        "--schema-version 2",
+        "--backlog-days 7",
+        "--max-build-dates 3",
+        "/.venv/bin/python",
+    ):
+        assert required in text
+
+
+def test_deployment_dry_run_validates_unit_without_starting(tmp_path: Path) -> None:
+    result = subprocess.run(
+        [
+            "bash", str(DEPLOY_SCRIPT), "--target", "replay-build", "--dry-run",
+            "--app-dir", str(tmp_path / "app"),
+            "--data-root", str(tmp_path / "data"),
+            "--env-file", str(tmp_path / "env"),
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "systemctl start" not in result.stdout
+    assert "systemctl restart" not in result.stdout
+    assert not (tmp_path / "data").exists()
 
 
 @pytest.mark.parametrize("target", DEPLOY_TARGETS)
