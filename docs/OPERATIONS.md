@@ -587,6 +587,14 @@ journalctl -u cryptorecorder-replay-build.service -n 100
 
 ### Later owner-run isolated production acceptance (not executed)
 
+This remains the manual production-acceptance condition in the owner-approved
+2026-08-01 Issue #20 closure amendment. The implementation is release-
+candidate complete, but the checked-in templates have not been deployed and
+no production unit, environment, raw source, or replay root has been changed.
+The replacement PR may close Issue #20 only after exact-head review and this
+isolated acceptance; issue #21 separately retains the original top50/multi-day
+semantic and `v2.0.0` gate.
+
 At the separately approved exact commit, the owner should first preserve the
 installed env/unit files, run `scripts/deploy_linux_server.sh --target
 replay-build --dry-run --install-only`, and diff the rendered source template.

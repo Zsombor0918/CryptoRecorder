@@ -21,14 +21,14 @@ Do not replace `convert_day.py` until equivalence is proven.
 
 > **Status (updated)**: `full_l2` is **implemented** and reuses the shared depth
 > engine in `converter/depth_phase2.py` (via the `stores/replay_depth_adapter.py`
-> adapter). It is **semantically validated on the ADAUSDT single-day smoke**
-> and now also has a completed high-volume BTCUSDT schema-v2 representative-day
-> report against `convert_day.py` (all exhaustive event streams, checkpoints,
-> continuity/fences, metadata, and source identity pass). These remain
-> single-symbol/single-day results. `convert_day.py` remains the production
-> reference until broader top50/multi-day validation passes; `v2.0.0` is **not**
-> declared. The supported selected boundary is not a persistent service and
-> there is no second independent depth converter.
+> adapter). An accepted ten-case representative matrix exhaustively matches
+> `convert_day.py` across the supported semantic components. The exact
+> date-aligned top50/multi-day gate could not execute from the only retained
+> raw fixture and is explicitly preserved in follow-up issue #21 under the
+> owner-approved Issue #20 closure amendment. `convert_day.py` remains the
+> production reference until that gate passes; `v2.0.0` is **not** declared.
+> The supported selected boundary is not a persistent service and there is no
+> second independent depth converter.
 
 ## Current Status
 
@@ -46,6 +46,19 @@ was recorded 855,983 times at the exact 10 GiB ceiling, despite zero
 swap/OOM events. The aggregate is PASS WITH OPERATIONAL CAVEATS for Phase 7
 core acceptance and does not close the broader semantic gate or declare
 v2.0.0. No further full-day rebuild is required for Phase 7 acceptance.
+
+Checkpoint 4 closure preflight (2026-08-01): the retained fixture has no
+date-aligned June 50+50 universe and cannot enclose a genuine two-day range.
+June 11 readiness was 58/100, with 32 target cases absent and 10 more missing
+D+1 depth; 68/100 schema-v2 replay partitions were available. June 9 and June
+13 depth are both absent. Preflight therefore stopped as
+`BLOCKED_SOURCE_UNAVAILABLE` before any semantic workload. The preserved
+inventory and blocker report SHA-256 values are
+`f7f4eb92d0aa5bc5e58a9ac3c5d7cf80166baa498f9a6dc9182cfcbf74d5abe2`
+and `28da7cf44bf58240bb345a8cb85dc43070b10e051ca51b4670506401927c2d2b`.
+The unchanged top50/multi-day contract and `v2.0.0` promotion now belong to
+[issue #21](https://github.com/Zsombor0918/CryptoRecorder/issues/21). This
+source blocker is not a discovered replay semantic defect.
 
 Implemented:
 
@@ -68,7 +81,8 @@ general-purpose consumer catalog from replay_store (removed, issue #17).
 Pending (NOT done):
 
 - broader `full_l2` validation across the top50 universe and multiple days
-- `v2.0.0` declaration (gated on the broader validation above)
+  (follow-up issue #21)
+- `v2.0.0` declaration (gated on issue #21)
 
 ## Semantics To Preserve
 
@@ -309,7 +323,7 @@ Milestone-complete checklist (✅ = done for the ADAUSDT smoke milestone):
 7. ✅ Reports make missing partitions, skipped records, and fenced ranges visible (`depth_diagnostics`/`fenced_ranges`/`caveats`).
 8. ✅ The old `convert_day.py` path remains available and unchanged for production fallback.
 
-Still open before `v2.0.0`:
+Still open before `v2.0.0` (explicitly tracked by issue #21):
 
 - ⬜ broader validation across the top50 universe;
 - ⬜ multi-day validation.

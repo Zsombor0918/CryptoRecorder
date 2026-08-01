@@ -68,6 +68,23 @@ passes.** Until then, broader full-L2 equivalence stays **deferred** (see
 ## [Unreleased]
 
 ### Added
+- **Issue #20 owner-approved closure amendment and replacement-PR status** —
+  checkpoint 4 stopped before semantic execution as
+  `BLOCKED_SOURCE_UNAVAILABLE`: the retained fixture has no date-aligned June
+  top50 universe, lacks 32 target cases and 10 D+1 depth cases, provides only
+  68/100 schema-v2 replay partitions, and has neither June 9 nor June 13 depth
+  required to enclose a genuine two-day range. Preserved inventory/report
+  SHA-256 values are
+  `f7f4eb92d0aa5bc5e58a9ac3c5d7cf80166baa498f9a6dc9182cfcbf74d5abe2`
+  and `28da7cf44bf58240bb345a8cb85dc43070b10e051ca51b4670506401927c2d2b`.
+  The original gate was not weakened or erased: follow-up issue #21 now owns
+  exact top50/multi-day acceptance and `v2.0.0` promotion. Issue #20's
+  implementation is release-candidate complete under its explicit amendment,
+  subject to exact-head PR review and manual isolated production acceptance.
+  `VERSION` is unchanged, `convert_day.py` remains the reference, and no
+  production deployment or semantic workload occurred in this checkpoint.
+  Fresh locked-development validation passed 834 tests with 3 skipped; the
+  focused reconstruction/lifecycle/monitoring/guard set passed 182 tests.
 - **Issue #20 closure checkpoint 3: authoritative uv dependency and
   environment migration** — committed `pyproject.toml` plus `uv.lock` now
   define explicit production, reconstruction, and development/test selections

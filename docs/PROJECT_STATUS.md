@@ -82,6 +82,34 @@ This is local environment acceptance, not production deployment, service
 control, production `.venv` migration, broader semantic acceptance, or a
 `v2.0.0` declaration.
 
+**Issue #20 release-candidate closure amendment (2026-08-01)**
+
+The repository owner accepted the Issue #20 implementation at
+`fc20d858fa80a5e3d63f0666beb13c7812bd94ae`, subject to exact-head replacement-
+PR review and the isolated production acceptance documented in
+`docs/OPERATIONS.md`. This is release-candidate implementation status, not a
+deployment or production-acceptance claim.
+
+Checkpoint 4 stopped at preflight with `BLOCKED_SOURCE_UNAVAILABLE`; no
+semantic workload launched. The latest cached 50+50 manifest is 2026-04-30
+(canonical universe digest
+`10c032c9e68fd90fc988acf5ecb441573d0a5c5676be9bf57779d452ed68e958`).
+For 2026-06-11, only 58/100 cases were ready: 32 required cases are absent
+from the target inventory, 10 more lack D+1 depth, and 68/100 schema-v2 replay
+partitions exist. Neither candidate two-day range is enclosed because no
+2026-06-09 or 2026-06-13 depth directory exists. The preserved inventory and
+blocker report SHA-256 values are respectively
+`f7f4eb92d0aa5bc5e58a9ac3c5d7cf80166baa498f9a6dc9182cfcbf74d5abe2`
+and `28da7cf44bf58240bb345a8cb85dc43070b10e051ca51b4670506401927c2d2b`.
+This is a retained-source limitation, not a replay semantic defect.
+
+The unchanged exact top50/multi-day gate and `v2.0.0` promotion are now
+tracked by [issue #21](https://github.com/Zsombor0918/CryptoRecorder/issues/21).
+Under the explicit amendment appended to Issue #20, no new semantic workload
+is required before opening the replacement PR. Issue #20 may close only via
+that PR after exact-head review and the required manual isolated production
+acceptance; editing the issue alone does not close it.
+
 - **`replay_store → pipeline.reconstruct_selected_catalog`** — supported
   development-computer CLI/API for an explicitly selected venue/symbol,
   end-exclusive UTC window, output root, job ID, and profile. It strictly
@@ -254,11 +282,13 @@ declare `v2.0.0`, production deployment, or Phase 8 completion.
 ## Deferred (NOT done — do not claim otherwise)
 
 - **Broader `full_l2` validation (top50 + multi-day)** — the replay full-L2
-  reconstruction path is implemented and **passes the ADAUSDT single-day smoke
-  plus the BTCUSDT schema-v2 representative day** against `convert_day.py` (see
-  evidence above), but it is **not** yet validated across the top50 universe or
-  multiple days. `v2.0.0` remains **ungated** until that wider validation passes.
-  See [FULL_L2_REPLAY_CATALOG_PLAN.md](FULL_L2_REPLAY_CATALOG_PLAN.md).
+  reconstruction path has an accepted ten-case exhaustive representative
+  matrix against `convert_day.py`, but the original date-aligned top50 and
+  genuine multi-day gate is **not** complete. Checkpoint 4 was
+  `BLOCKED_SOURCE_UNAVAILABLE`, not a semantic failure. The unchanged gate is
+  explicitly deferred to [issue #21](https://github.com/Zsombor0918/CryptoRecorder/issues/21),
+  and `v2.0.0` remains undeclared until it passes. See
+  [FULL_L2_REPLAY_CATALOG_PLAN.md](FULL_L2_REPLAY_CATALOG_PLAN.md).
 - **Syncthing archive / backup** — `ARCHIVE_DAYS_ROOT` is a **placeholder** env path
   only. No archive code exists.
 - **Import / restore tooling** — not implemented.
@@ -290,9 +320,9 @@ repositories (e.g. KovacsTrader).
    catalog with `python -m pipeline.reconstruct_selected_catalog` and all
    required venue/symbol/start/end/output/job/profile arguments. Use
    `validation.validate_catalog_equivalence` only for old-vs-new validation.
-5. The replay `full_l2` reconstruction path passes the ADAUSDT smoke and the
-   BTCUSDT schema-v2 representative day, but `convert_day.py` remains the
-   **production reference** for full order-book catalogs until broader
+5. The replay `full_l2` reconstruction path passes the accepted ten-case
+   representative matrix, but `convert_day.py` remains the **production
+   reference** for full order-book catalogs until issue #21's exact
    top50/multi-day validation passes.
 
 See [OPERATIONS.md](OPERATIONS.md) for the service layout that runs these steps.

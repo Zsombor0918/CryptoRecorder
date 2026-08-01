@@ -10,11 +10,11 @@ catalog-generation service (issue #17 removed the former feature-store
 subsystem and the `pipeline/generate_catalog.py` product CLI).
 
 The internal `validation.replay_catalog_reconstruct` engine (no direct CLI,
-shared by validation and `pipeline.reconstruct_selected_catalog`) is
-**semantically validated on
-the ADAUSDT single-day smoke** against `convert_day.py`. Broader top50/multi-day
-validation is still pending. Old `convert_day.py` remains the production
-reference full-L2 path.
+shared by validation and `pipeline.reconstruct_selected_catalog`) has an
+accepted ten-case exhaustive representative semantic matrix against
+`convert_day.py`. The exact top50/multi-day gate remains pending in issue #21
+after the only retained fixture blocked checkpoint 4 preflight. Old
+`convert_day.py` remains the production reference full-L2 path.
 
 Current paths:
 
@@ -29,6 +29,36 @@ replay_store -> pipeline.reconstruct_selected_catalog -> temporary catalog
   supported explicit development-computer CLI/API wrapping the internal
   replay_catalog_reconstruct engine; broader top50/multi-day validation pending
 ```
+
+## Issue #20 owner-approved closure amendment — checkpoint 4 source blocker
+
+At repository checkpoint
+`fc20d858fa80a5e3d63f0666beb13c7812bd94ae`, Issue #20's implementation is
+accepted as release-candidate complete, subject to exact-head replacement-PR
+review and the manual isolated production acceptance in `docs/OPERATIONS.md`.
+No production deployment or production acceptance has occurred.
+
+Checkpoint 4 was stopped before any semantic workload with the classification
+`BLOCKED_SOURCE_UNAVAILABLE`. The latest cached 50+50 manifest is 2026-04-30,
+with canonical universe digest
+`10c032c9e68fd90fc988acf5ecb441573d0a5c5676be9bf57779d452ed68e958`.
+The retained June fixture proves only 58/100 ready top50 cases for June 11:
+32 cases are absent from the target inventory, 10 additional cases lack D+1
+depth, and 68/100 schema-v2 replay partitions exist. A June 10–11 range lacks
+June 9 depth, while June 11–12 lacks June 13 depth. There is therefore no
+genuine two-day range with both outer boundaries enclosed.
+
+The external inventory SHA-256 is
+`f7f4eb92d0aa5bc5e58a9ac3c5d7cf80166baa498f9a6dc9182cfcbf74d5abe2`;
+the blocker Markdown SHA-256 is
+`28da7cf44bf58240bb345a8cb85dc43070b10e051ca51b4670506401927c2d2b`.
+This is a retained-source limitation, not evidence of a replay semantic
+defect. The original exact top50/multi-day gate and `v2.0.0` promotion are
+preserved without reinterpretation in
+[issue #21](https://github.com/Zsombor0918/CryptoRecorder/issues/21).
+Until it passes, `VERSION` remains below `v2.0.0` and `convert_day.py` remains
+the production semantic reference. No additional semantic workload is needed
+before opening the replacement Issue #20 PR.
 
 ## Issue #20 closure checkpoint 3 — authoritative uv environments
 

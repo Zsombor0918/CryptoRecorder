@@ -93,6 +93,128 @@ An entry may be skipped **only** for:
 - <or "none — task fully completed">
 ```
 
+## 2026-08-01 — Issue #20 owner-approved closure amendment and PR preparation
+
+### Change summary
+- Verified and preserved the checkpoint-4 preflight evidence as
+  `BLOCKED_SOURCE_UNAVAILABLE`: no semantic supervisor or workload launched,
+  and the exact inventory/blocker hashes remained unchanged.
+- Preserved the original Issue #20 contract and appended the dated owner-
+  approved closure amendment. Created follow-up issue #21 to retain the exact
+  top50/multi-day semantic gate and `v2.0.0` promotion without weakening the
+  deferred acceptance criteria.
+- Updated current status, plan, implementation audit, operations, README, and
+  changelog text to record release-candidate implementation status, the source
+  blocker, the still-deferred gate, and the remaining exact-head/manual
+  production-acceptance boundary.
+
+### Files/packages touched
+- `README.md`
+- `CHANGELOG.md`
+- `docs/PROJECT_STATUS.md`
+- `docs/FULL_L2_REPLAY_CATALOG_PLAN.md`
+- `docs/IMPLEMENTATION_AUDIT.md`
+- `docs/OPERATIONS.md`
+- `docs/CHANGE_AUDIT.md`
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] `.github/copilot-instructions.md`
+- [x] docs/REPO_STRUCTURE.md
+- [x] docs/PROJECT_STATUS.md
+- [x] docs/IMPLEMENTATION_AUDIT.md
+- [x] relevant feature docs:
+  - `docs/FULL_L2_REPLAY_CATALOG_PLAN.md`
+  - `docs/OPERATIONS.md`
+  - `docs/VALIDATION.md`
+  - `docs/AI_WORKFLOW.md`
+  - `README.md`, `CHANGELOG.md`
+
+### Docs updated
+- [x] CHANGELOG.md
+- [x] README.md
+- [x] docs/PROJECT_STATUS.md
+- [ ] docs/REPO_STRUCTURE.md — no structure or file-contract change
+- [x] relevant feature docs:
+  - `docs/FULL_L2_REPLAY_CATALOG_PLAN.md`
+  - `docs/IMPLEMENTATION_AUDIT.md`
+  - `docs/OPERATIONS.md`
+
+### Status / validation impact
+- Validated status changed: yes — Issue #20 implementation is recorded as
+  release-candidate complete under the explicit owner amendment, subject to
+  exact-head PR review and manual isolated production acceptance.
+- Deferred status changed: yes — the unchanged top50/multi-day semantic gate
+  and `v2.0.0` promotion are explicitly transferred to follow-up issue #21.
+- New claims added: no new replay, semantic, production, or deployment claim;
+  this records accepted existing evidence and an objective source blocker.
+- Evidence for any new validation claim:
+  - External checkpoint-4 inventory SHA-256:
+    `f7f4eb92d0aa5bc5e58a9ac3c5d7cf80166baa498f9a6dc9182cfcbf74d5abe2`.
+  - External checkpoint-4 blocker Markdown SHA-256:
+    `28da7cf44bf58240bb345a8cb85dc43070b10e051ca51b4670506401927c2d2b`.
+  - `FAILED` remains present, `COMPLETE` absent, and persisted state records
+    `supervisor_launched=false`.
+
+### Tests run
+```bash
+UV_PROJECT_ENVIRONMENT=<fresh-external-development-env> \
+  uv sync --frozen --no-default-groups --extra reconstruction --group dev
+
+<fresh-external-development-env>/bin/python -m pytest -q
+# 834 passed, 3 skipped, 2 third-party deprecation warnings
+
+<fresh-external-development-env>/bin/python -m pytest -q \
+  tests/test_repo_structure.py \
+  tests/test_agent_infrastructure.py \
+  tests/test_reconstruct_selected_catalog.py \
+  tests/test_replay_catalog_reconstruct.py \
+  tests/test_replay_lifecycle.py \
+  tests/test_daily_backlog_lifecycle.py \
+  tests/test_daily_build.py \
+  tests/test_replay_build_policy.py \
+  tests/test_replay_monitoring_retention.py \
+  tests/test_disk_monitor_fail_safe.py \
+  tests/test_disk_monitor_cleanup.py
+# 182 passed, 2 third-party deprecation warnings
+
+bash -n scripts/*.sh .githooks/pre-commit .githooks/commit-msg
+bash scripts/deploy_linux_server.sh --target all --dry-run --no-systemd \
+  --install-only --uv-bin "$(command -v uv)" \
+  --app-dir <new-external-app-path> \
+  --data-root <new-external-data-path> \
+  --env-file <new-external-env-path>
+# PASS; no requested path was created
+```
+
+### Validation CLIs run
+```bash
+uv lock --check
+<fresh-external-development-env>/bin/python \
+  -m validation.validate_dependency_environment --kind development \
+  --uv-bin "$(command -v uv)" --json-output <new-external-report>
+# PASS; CPython 3.12.3, uv 0.11.29, Nautilus 1.225.0
+# uv.lock SHA-256 before/after:
+# 976451a3c49b0098bc6e620acb889aa9fb6aa8aaf8098d20db0416721ed1b5af
+
+<fresh-external-development-env>/bin/python \
+  -m validation.audit_change_compliance --base main
+# PASS
+
+git diff --check
+# PASS
+```
+
+### Known limitations / out of scope
+- No semantic matrix, replay build, raw-data scan, production mutation,
+  deployment, service control, replay-semantic change, `convert_day.py`
+  change, or `v2.0.0` declaration was performed.
+- The exact top50/multi-day gate remains deferred to issue #21 because the
+  retained fixture lacks the required universe/date enclosure.
+- Production templates and uv migration remain locally validated but not
+  manually accepted on the production host; the exact operator checklist
+  remains in `docs/OPERATIONS.md`.
+
 ## 2026-08-01 — Issue #20 closure checkpoint 3 authoritative uv environments
 
 ### Change summary

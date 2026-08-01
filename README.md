@@ -25,11 +25,14 @@ permanent or unscoped consumer catalog from `replay_store` (removed, issue
 #17). Feature, strategy, risk, execution, and backtest orchestration remain
 downstream responsibilities.
 
-The `full_l2` reconstruction reuses the old converter's shared depth engine. It
-passes the ADAUSDT single-day smoke against `convert_day.py`, but **broader
-top50/multi-day validation is still pending** — that wider validation is the
-`v2.0.0` gate, and `v2.0.0` is not declared. `convert_day.py` remains the
-production reference for full-L2 Nautilus catalogs.
+The `full_l2` reconstruction reuses the old converter's shared depth engine.
+Issue #20 has an accepted ten-case exhaustive representative semantic matrix,
+but its exact top50/multi-day gate was blocked before execution because the
+only retained fixture cannot provide the required date-aligned universe and
+adjacent-day enclosure. The repository owner preserved that original gate in
+[follow-up issue #21](https://github.com/Zsombor0918/CryptoRecorder/issues/21)
+rather than weakening it. `v2.0.0` is not declared, and `convert_day.py`
+remains the production reference for full-L2 Nautilus catalogs.
 
 ## Quick Start
 
@@ -175,7 +178,8 @@ Agent rules: [AGENTS.md](AGENTS.md). Version: see [VERSION](VERSION) and [CHANGE
 - The internal `validation.replay_catalog_reconstruct` `trades_only` profile
   can be validated against the old converter for TradeTick semantic equality
   via `validation.validate_catalog_equivalence`.
-- The `full_l2` profile of the same validation-only helper is implemented and
-  semantically validated on the ADAUSDT single-day smoke against `convert_day.py`
-  (trades, OrderBookDeltas, OrderBookDepth10, and book checkpoints all match).
-  Broader top50/multi-day validation is pending before `v2.0.0`.
+- The `full_l2` profile of the same validation-only helper is implemented. Its
+  accepted ten-case representative matrix exhaustively matches
+  `convert_day.py` for trades, OrderBookDeltas, Depth10, checkpoints,
+  continuity, fences, metadata, and source identity. The exact top50/multi-day
+  gate remains pending in issue #21 before `v2.0.0`.
