@@ -53,8 +53,8 @@ def run_stage(
     disk (never buffered through a Python `PIPE`/`capture_output=True`),
     so parent memory usage does not grow with how much a stage logs.
 
-    A non-zero exit code, a missing result fragment, or an unparseable
-    result fragment are all reported as `status: "failed"` with a short
+    A timeout, non-zero exit code, missing result fragment, or unparseable
+    result fragment is reported as `status: "failed"` with a short bounded
     `error` message — this function does not retry; the caller
     (`run_serial_gate`) is likewise required to stop rather than retry.
     """
@@ -76,15 +76,33 @@ def run_stage(
 
     start = time.monotonic()
     with open(log_path, "wb") as log_file:
-        proc = subprocess.run(
-            cmd,
-            cwd=str(cwd),
-            env=env,
-            stdout=log_file,
-            stderr=subprocess.STDOUT,
-            timeout=timeout,
-            check=False,
-        )
+        try:
+            proc = subprocess.run(
+                cmd,
+                cwd=str(cwd),
+                env=env,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                timeout=timeout,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            wall_seconds = time.monotonic() - start
+            return {
+                "stage": stage_name,
+                "cmd": cmd,
+                "returncode": None,
+                "status": "failed",
+                "timed_out": True,
+                "timeout_seconds": timeout,
+                "wall_seconds": wall_seconds,
+                "error": (
+                    f"stage {stage_name!r} exceeded timeout {timeout} seconds; "
+                    f"see {log_path} for details"
+                ),
+                "log_path": str(log_path),
+                "result_path": str(result_path),
+            }
     wall_seconds = time.monotonic() - start
 
     stage_result: dict[str, Any] = {

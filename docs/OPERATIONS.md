@@ -506,8 +506,22 @@ Create the external output root first and keep it outside production
 `catalog/` and its cryptographic `job_manifest.json`. The interval is
 end-exclusive. Every venue, symbol, endpoint, output root, job ID, and profile
 must be explicit; empty scope never means everything. Use `--overwrite` only
-for intentional replacement of that exact completed job. No unit, timer, or
-unattended catalog lifecycle is installed for this command.
+for intentional replacement of that exact completed job. The command owns
+`<output-root>/.claim_<job-id>/` from preflight through publication. A second
+same-job invocation fails before work; different job IDs remain independent.
+Normal completion or handled failure removes only its exact claim. A process
+crash preserves the claim and its durable publication state; do not delete it
+based only on PID or age—inspect the recorded staging/backup/final paths and
+manifests before an explicit manual recovery.
+
+First publication uses a Linux atomic no-replace rename. An overwrite uses
+Linux `renameat2(RENAME_EXCHANGE)`, so the old completed job remains visible
+while the new job becomes canonical; the prior job is then moved to an exact
+`.replaced_<job-id>_<nonce>` backup. Backup deletion occurs only after the new
+job validates. Cleanup failure preserves that backup and adds a warning to the
+completed job manifest; it does not turn the already-valid publication into a
+false reconstruction failure. No unit, timer, or unattended catalog lifecycle
+is installed for this command.
 
 > The replay-build service invokes `pipeline.daily_build` because
 > `pipeline.build_replay_store` requires an explicit `YYYY-MM-DD` date and does
@@ -571,12 +585,18 @@ safe to recover from on the next run.
 
 **Durable progress and recovery**: one nonblocking kernel advisory lock owns
 all supported replay mutations. Before backlog scanning, a bounded all-date
-reconciliation restores one unambiguous valid backup, quarantines stale
+reconciliation streams ordinary canonical history without counting it against
+the transient recovery-work bound or revalidating unrelated old partitions.
+It validates a canonical only when a transient for that exact date requires a
+decision, restores one unambiguous valid backup, quarantines stale
 staging/invalid canonical evidence, safely removes an obsolete valid backup
 beside a valid canonical, preserves every quarantine, and refuses symlinked,
 unknown, corrupt, or ambiguous state. Already-valid schema/source partitions
 are `skipped_valid` without consuming a build-date slot. Every action appears
-in the per-date and run reports.
+in the per-date and run reports. Before a replay partition rename, both closed
+Parquet files, optional instrument metadata, the manifest, and the staging
+directory are explicitly fsynced; each backup/canonical rename and successful
+backup removal is followed by a parent-directory fsync.
 
 **Recovery command** (after a confirmed OOM or failure):
 ```bash

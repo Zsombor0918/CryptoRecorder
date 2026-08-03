@@ -93,6 +93,140 @@ An entry may be skipped **only** for:
 - <or "none — task fully completed">
 ```
 
+## 2026-08-01 — Resolve PR #22 exact-head replay safety findings
+
+### Change summary
+- Kept retained canonical history outside the bounded transient-recovery
+  candidate inventory while preserving bounded actions, strict structural
+  checks, quarantine visibility, and exact-date canonical validation when a
+  transient requires it.
+- Made replay publication durable by fsyncing the closed Parquet and metadata
+  files, staging directory, and parent-directory rename transitions before a
+  partition is reported as published.
+- Added one atomic exact-job selected-reconstruction claim, Linux atomic
+  no-replace/exchange publication, recoverable overwrite transition state, and
+  honest post-publication backup-cleanup warnings.
+- Converted a serial semantic-gate subprocess timeout into one persisted failed
+  stage result which stops the gate without retry.
+
+### Files/packages touched
+- `pipeline/replay_lifecycle.py`
+- `stores/replay_writer.py`
+- `pipeline/reconstruct_selected_catalog.py`
+- `validation/serial_gate.py`
+- `tests/test_replay_lifecycle.py`
+- `tests/test_replay_memory_bounded.py`
+- `tests/test_reconstruct_selected_catalog.py`
+- `tests/test_serial_gate.py`
+- `docs/PROJECT_STATUS.md`
+- `docs/OPERATIONS.md`
+- `CHANGELOG.md`
+- `docs/CHANGE_AUDIT.md`
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] docs/REPO_STRUCTURE.md
+- [x] docs/PROJECT_STATUS.md
+- [x] docs/IMPLEMENTATION_AUDIT.md
+- [x] relevant feature docs:
+  - `docs/FULL_L2_REPLAY_CATALOG_PLAN.md`
+  - `docs/OPERATIONS.md`
+  - `docs/AI_WORKFLOW.md`
+  - `docs/REPLAY_STORE.md`
+  - `docs/DAILY_BUILD_PIPELINE.md`
+  - `docs/VALIDATION.md`
+  - `CHANGELOG.md`
+
+### Docs updated
+- [x] CHANGELOG.md
+- [ ] README.md — no user invocation or ownership boundary changed
+- [x] docs/PROJECT_STATUS.md
+- [ ] docs/REPO_STRUCTURE.md — no file or package contract changed
+- [x] relevant feature docs:
+  - `docs/OPERATIONS.md`
+
+### Status / validation impact
+- Validated status changed: no.
+- Deferred status changed: no.
+- New claims added: yes — focused synthetic and fault-injection coverage proves
+  the six exact-head safety corrections described above.
+- Evidence for any new validation claim:
+  - The locked focused suite passed 250 tests; the locked full suite passed
+    850 tests with 3 skips and only 2 third-party Nautilus deprecation warnings.
+  - A fresh synthetic replay build passed
+    `validation.audit_replay_store` with matching rows/checksums and sorted
+    depth/trade data.
+  - No market-data, production, deployment, or service mutation was performed.
+
+### Tests run
+```bash
+UV_PROJECT_ENVIRONMENT=/tmp/cr-pr22-review-fix-dev-env-offline \
+  UV_CACHE_DIR=/tmp/cr-review-uv-cache-full \
+  uv sync --offline --frozen --no-default-groups \
+    --extra reconstruction --group dev
+
+UV_CACHE_DIR=/tmp/cr-review-uv-cache-full \
+  /tmp/cr-pr22-review-fix-dev-env-offline/bin/python -m pytest -q \
+    tests/test_replay_lifecycle.py \
+    tests/test_daily_build.py \
+    tests/test_replay_build_policy.py \
+    tests/test_replay_memory_bounded.py \
+    tests/test_replay_store.py \
+    tests/test_replay_fail_closed_hardening.py \
+    tests/test_reconstruct_selected_catalog.py \
+    tests/test_replay_catalog_reconstruct.py \
+    tests/test_serial_gate.py \
+    tests/test_stage_runner_cli.py \
+    tests/test_repo_structure.py \
+    tests/test_agent_infrastructure.py
+# 250 passed
+
+# The managed command sandbox denies asyncio's worker-thread self-pipe wakeup.
+# The full run therefore used a process-local 50 ms EpollSelector heartbeat;
+# repository code, dependencies, collection, and assertions were unchanged.
+UV_CACHE_DIR=/tmp/cr-review-uv-cache-full \
+  /tmp/cr-pr22-review-fix-dev-env-offline/bin/python <pytest-heartbeat-harness>
+# 850 passed, 3 skipped, 2 third-party Nautilus deprecation warnings
+
+UV_CACHE_DIR=/tmp/cr-review-uv-cache-full \
+  /tmp/cr-pr22-review-fix-dev-env-offline/bin/python \
+    -m validation.validate_dependency_environment \
+    --kind development --uv-bin /home/z0055upd/.local/bin/uv \
+    --json-output /tmp/cr-pr22-review-dependency-validation.json
+# PASS; exact_locked_environment=true; Python 3.12.3; uv 0.11.29
+```
+
+### Validation CLIs run
+```bash
+UV_CACHE_DIR=/tmp/cr-review-uv-cache-full uv lock --check
+# PASS; uv.lock SHA-256 remained
+# 976451a3c49b0098bc6e620acb889aa9fb6aa8aaf8098d20db0416721ed1b5af
+
+/tmp/cr-pr22-review-fix-dev-env-offline/bin/python \
+  -m validation.audit_replay_store \
+  --replay-root /tmp/cr-pr22-replay-audit-y5jjg9m_/replay \
+  --date 2026-06-12 --symbols ADAUSDT --venues BINANCE_SPOT \
+  --report-path /tmp/cr-pr22-replay-audit-y5jjg9m_/audit.json
+# PASS; one synthetic partition, exact counts/checksums, sorted streams
+
+UV_CACHE_DIR=/tmp/cr-review-uv-cache-full \
+  bash scripts/deploy_linux_server.sh --target all --dry-run --no-systemd \
+  --uv-bin /home/z0055upd/.local/bin/uv
+# PASS; no mutation
+
+bash -n scripts/*.sh .githooks/pre-commit .githooks/commit-msg
+git diff --check
+# PASS
+```
+
+### Known limitations / out of scope
+- Automatic raw retirement remains unchanged and disabled.
+- No replay semantics, raw ingestion, `convert_day.py`, schema, ordering,
+  precision, production data/service, deployment, real-data gate, top50,
+  multi-day, or version declaration was changed or run.
+- The asyncio heartbeat is solely a managed-sandbox execution workaround and
+  is not part of the repository.
+
 ## 2026-08-01 — Issue #20 owner-approved closure amendment and PR preparation
 
 ### Change summary

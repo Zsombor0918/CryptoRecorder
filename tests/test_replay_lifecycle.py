@@ -7,6 +7,7 @@ import signal
 import subprocess
 import sys
 import time
+from datetime import date, timedelta
 from pathlib import Path
 
 import pytest
@@ -206,6 +207,54 @@ def test_reconciliation_bounds_fail_closed(tmp_path: Path) -> None:
     with _lock(tmp_path) as context:
         with pytest.raises(ReplayLifecycleSafetyError, match="max entries"):
             reconcile_replay_root(context, max_entries=1)
+
+
+def test_retained_canonical_history_does_not_consume_recovery_budget(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    """More than 25,000 retained canonical partitions remain ordinary history."""
+    replay = tmp_path / "replay"
+    first = date(2025, 1, 1)
+    for symbol_index in range(100):
+        symbol_dir = (
+            replay
+            / "venue=BINANCE_SPOT"
+            / f"symbol=S{symbol_index:03d}USDT"
+        )
+        symbol_dir.mkdir(parents=True)
+        for day_index in range(251):
+            day = (first + timedelta(days=day_index)).isoformat()
+            (symbol_dir / f"date={day}").mkdir()
+
+    def unexpected_validation(_path: Path) -> bool:
+        raise AssertionError("ordinary retained canonicals must not be revalidated")
+
+    monkeypatch.setattr(
+        "pipeline.replay_lifecycle.validate_partition", unexpected_validation
+    )
+    with _lock(tmp_path, "long-history") as context:
+        assert reconcile_replay_root(context) == []
+
+
+def test_transient_candidates_still_consume_recovery_budget(tmp_path: Path) -> None:
+    symbol_dir = (
+        tmp_path
+        / "replay"
+        / "venue=BINANCE_SPOT"
+        / "symbol=ADAUSDT"
+    )
+    symbol_dir.mkdir(parents=True)
+    for index in range(3):
+        (
+            symbol_dir
+            / f".quarantine_2026-01-0{index + 1}_ADAUSDT_evidence"
+        ).mkdir()
+
+    # .lifecycle + venue + symbol consume three structural entries; only two
+    # transient candidates fit under five.
+    with _lock(tmp_path, "bounded-transients") as context:
+        with pytest.raises(ReplayLifecycleSafetyError, match="max entries 5"):
+            reconcile_replay_root(context, max_entries=5, max_actions=10)
 
 
 def test_atomic_report_write_leaves_no_temp_and_rejects_symlink(tmp_path: Path) -> None:

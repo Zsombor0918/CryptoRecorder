@@ -226,6 +226,66 @@ sys.exit(1)
     assert counter_path.read_text() == "1"  # exactly one invocation, no retry
 
 
+def test_timeout_is_a_bounded_failed_stage_result(tmp_path: Path) -> None:
+    script = tmp_path / "timeout.py"
+    script.write_text("import time\ntime.sleep(10)\n")
+    result_path = tmp_path / "timeout_result.json"
+    result = run_stage(
+        stage_name="timeout",
+        cmd=[sys.executable, str(script)],
+        log_path=tmp_path / "timeout.log",
+        result_path=result_path,
+        cwd=tmp_path,
+        timeout=0.05,
+    )
+
+    assert result["status"] == "failed"
+    assert result["timed_out"] is True
+    assert result["timeout_seconds"] == 0.05
+    assert result["returncode"] is None
+    assert "exceeded timeout" in result["error"]
+    assert result["wall_seconds"] < 2
+
+
+def test_timeout_stops_serial_gate_without_retry_or_later_stage(tmp_path: Path) -> None:
+    counter = tmp_path / "timeout_invocations.txt"
+    timeout_script = tmp_path / "count_timeout.py"
+    timeout_script.write_text(
+        "import pathlib, time\n"
+        f"p = pathlib.Path({str(counter)!r})\n"
+        "p.write_text(str(int(p.read_text()) + 1) if p.exists() else '1')\n"
+        "time.sleep(10)\n"
+    )
+    later_marker = tmp_path / "later-ran"
+    report = run_serial_gate([
+        {
+            "name": "timeout",
+            "cmd": [sys.executable, str(timeout_script)],
+            "log_path": tmp_path / "timeout-gate.log",
+            "result_path": tmp_path / "timeout-gate-result.json",
+            "cwd": tmp_path,
+            "timeout": 0.05,
+        },
+        {
+            "name": "later",
+            "cmd": [
+                sys.executable,
+                "-c",
+                f"from pathlib import Path; Path({str(later_marker)!r}).touch()",
+            ],
+            "log_path": tmp_path / "later.log",
+            "result_path": tmp_path / "later-result.json",
+            "cwd": tmp_path,
+        },
+    ])
+
+    assert report["status"] == "failed"
+    assert report["failed_stage"] == "timeout"
+    assert report["stages"][0]["timed_out"] is True
+    assert counter.read_text() == "1"
+    assert not later_marker.exists()
+
+
 def test_parent_process_memory_stays_small_regardless_of_child_output_size(tmp_path: Path) -> None:
     """A stage that produces a LARGE amount of stdout (megabytes) must not
     cause the parent orchestrator to hold that output in memory — the

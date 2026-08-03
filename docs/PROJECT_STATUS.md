@@ -39,7 +39,12 @@ validated without recorded evidence.
   incremental Parquet write). Supported mutation entrypoints share one
   nonblocking kernel advisory lock; the daily path reconciles bounded
   cross-date staging/backup/quarantine state, builds a bounded oldest-first
-  backlog, and writes atomic per-date/run reports. The intended repository
+  backlog, and writes atomic per-date/run reports. Ordinary retained canonical
+  history is streamed and type-checked but does not consume the transient
+  recovery-candidate/action budget or trigger exhaustive old-partition
+  validation. Replay publication closes the Parquet writers, explicitly
+  fsyncs both Parquet files plus instrument/manifest metadata and staging,
+  then fsyncs parent-directory rename transitions. The intended repository
   service explicitly requests schema 2 and keeps `Restart=no`, 12 GiB, and
   zero swap, but it has not been installed or production-accepted.
 
@@ -115,8 +120,15 @@ acceptance; editing the issue alone does not close it.
   end-exclusive UTC window, output root, job ID, and profile. It strictly
   preflights complete replay manifests, checksums, schema/builder contracts,
   and instrument metadata; binds every target/carry partition and final
-  catalog file into a deterministic job manifest; and atomically publishes
-  only `<output-root>/<job-id>/`. It is not a Linux service/timer and owns no
+  catalog file into a deterministic job manifest; and holds an atomic
+  exact-job claim for the complete operation. First publication is no-replace;
+  overwrite uses Linux atomic directory exchange plus durable transition state,
+  so a prior completed job never disappears during replacement. Normal
+  completion/handled failure removes only the owned claim; crash residue is
+  preserved and blocks mutation for manual inspection. Obsolete-backup cleanup
+  is post-publication best effort and is recorded as a manifest warning rather
+  than misreporting a valid published job as failed. It publishes only
+  `<output-root>/<job-id>/`. It is not a Linux service/timer and owns no
   feature, strategy, backtest, risk, or execution orchestration.
   `validation.replay_catalog_reconstruct` remains the shared internal engine
   also used by `validation.validate_catalog_equivalence` to reconstruct a Nautilus

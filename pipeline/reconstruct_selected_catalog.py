@@ -10,12 +10,15 @@ all-history catalog builder.
 from __future__ import annotations
 
 import argparse
+import ctypes
 import hashlib
 import importlib.metadata
 import json
 import os
 import re
 import shutil
+import socket
+import stat
 import subprocess
 import sys
 import uuid
@@ -31,6 +34,7 @@ from validation.artifact_identity import load_json_object
 MANIFEST_VERSION = "cryptorecorder-selected-catalog-job-v1"
 INVENTORY_DIGEST_ALGORITHM = "sha256-canonical-json-v1"
 CATALOG_DIGEST_ALGORITHM = "sha256-catalog-tree-v1"
+CLAIM_CONTRACT_VERSION = 1
 SUPPORTED_PROFILES = ("full_l2", "trades_only")
 _JOB_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -38,6 +42,17 @@ _REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 
 class SelectedCatalogError(RuntimeError):
     """The selected reconstruction request failed closed."""
+
+
+class _PreserveClaimError(SelectedCatalogError):
+    """Publication evidence is ambiguous and its exact claim must remain."""
+
+
+@dataclass
+class _JobClaim:
+    path: Path
+    document: dict[str, Any]
+    released: bool = False
 
 
 @dataclass(frozen=True)
@@ -213,6 +228,237 @@ def _load_stable_json(path: Path, label: str) -> tuple[dict[str, Any], str, int]
     if (before_sha, before_size) != (after_sha, after_size):
         raise SelectedCatalogError(f"{label} changed while it was validated")
     return document, after_sha, after_size
+
+
+def _fsync_directory(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _atomic_write_json(path: Path, document: Mapping[str, Any]) -> None:
+    """Write one owned JSON file durably within its existing directory."""
+    if path.is_symlink() or path.parent.is_symlink() or not path.parent.is_dir():
+        raise SelectedCatalogError(f"unsafe JSON publication path: {path}")
+    temporary = path.parent / f".{path.name}.{uuid.uuid4().hex}.tmp"
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(temporary, flags, 0o600)
+        try:
+            encoded = (
+                json.dumps(
+                    document,
+                    sort_keys=True,
+                    indent=2,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                )
+                + "\n"
+            ).encode("utf-8")
+            offset = 0
+            while offset < len(encoded):
+                offset += os.write(fd, encoded[offset:])
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(temporary, path)
+        _fsync_directory(path.parent)
+    except Exception:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def _claim_path(request: _NormalizedRequest) -> Path:
+    path = request.output_root / f".claim_{request.job_id}"
+    if path.parent != request.output_root:
+        raise SelectedCatalogError("selected-job claim escapes output_root")
+    return path
+
+
+def _validate_claim_directory(path: Path) -> None:
+    if path.is_symlink() or not path.is_dir():
+        raise SelectedCatalogError(
+            f"selected-job claim is unsafe; manual inspection required: {path}"
+        )
+    info = path.stat(follow_symlinks=False)
+    if info.st_uid != os.getuid() or (stat.S_IMODE(info.st_mode) & 0o077) != 0:
+        raise SelectedCatalogError(
+            f"selected-job claim ownership/mode is ambiguous: {path}"
+        )
+
+
+def _claim_state(claim: _JobClaim, state: str, **updates: Any) -> None:
+    document = dict(claim.document)
+    document.update(updates)
+    document["state"] = state
+    document["updated_at_utc"] = _utc_text(datetime.now(timezone.utc))
+    _atomic_write_json(claim.path / "claim.json", document)
+    claim.document = document
+
+
+def _validate_claim_contents(claim_path: Path) -> None:
+    allowed = {"claim.json"}
+    actual: set[str] = set()
+    for entry in claim_path.iterdir():
+        if entry.is_symlink() or not entry.is_file():
+            raise SelectedCatalogError(
+                f"selected-job claim contains unsafe evidence: {entry}"
+            )
+        info = entry.stat(follow_symlinks=False)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.getuid()
+            or info.st_nlink != 1
+            or (stat.S_IMODE(info.st_mode) & 0o022) != 0
+        ):
+            raise SelectedCatalogError(
+                f"selected-job claim contains unsafe ownership/type/mode: {entry}"
+            )
+        actual.add(entry.name)
+    if actual != allowed:
+        raise SelectedCatalogError(
+            f"selected-job claim has unknown or missing entries {sorted(actual)}; "
+            "manual inspection required"
+        )
+
+
+def _remove_claim(claim: _JobClaim) -> None:
+    if claim.released:
+        return
+    _validate_claim_contents(claim.path)
+    (claim.path / "claim.json").unlink()
+    claim.path.rmdir()
+    _fsync_directory(claim.path.parent)
+    claim.released = True
+
+
+def _new_job_claim(request: _NormalizedRequest) -> _JobClaim:
+    claim_path = _claim_path(request)
+    try:
+        claim_path.mkdir(mode=0o700)
+    except FileExistsError:
+        _validate_claim_directory(claim_path)
+        _validate_claim_contents(claim_path)
+        document, _claim_sha, _claim_size = _load_stable_json(
+            claim_path / "claim.json", "selected-job claim metadata"
+        )
+        if (
+            document.get("claim_contract_version") != CLAIM_CONTRACT_VERSION
+            or document.get("job_id") != request.job_id
+            or document.get("output_root") != str(request.output_root)
+        ):
+            raise SelectedCatalogError(
+                f"selected-job claim identity is contradictory; manual inspection required: "
+                f"{claim_path}"
+            )
+        raise SelectedCatalogError(
+            f"selected-catalog job is already claimed by an active invocation or "
+            f"preserved crash evidence; manual recovery is required before "
+            f"mutation: {claim_path}"
+        )
+    try:
+        document = {
+            "claim_contract_version": CLAIM_CONTRACT_VERSION,
+            "job_id": request.job_id,
+            "pid": os.getpid(),
+            "hostname": socket.gethostname(),
+            "start_utc": _utc_text(datetime.now(timezone.utc)),
+            "repository_sha": _repository_commit(),
+            "output_root": str(request.output_root),
+            "state": "claimed",
+            "staging_name": None,
+            "failed_name": None,
+            "backup_name": None,
+            "new_manifest_sha256": None,
+            "updated_at_utc": None,
+        }
+        document["updated_at_utc"] = document["start_utc"]
+        claim = _JobClaim(claim_path, document)
+        _atomic_write_json(claim_path / "claim.json", document)
+        _fsync_directory(request.output_root)
+        return claim
+    except Exception:
+        # Only clean the directory created by this invocation, and only while
+        # it contains the exact initialization files we could have created.
+        try:
+            for child in claim_path.iterdir():
+                if child.name != "claim.json":
+                    raise SelectedCatalogError(
+                        f"claim initialization left ambiguous evidence: {claim_path}"
+                    )
+                child.unlink()
+            claim_path.rmdir()
+            _fsync_directory(request.output_root)
+        except OSError:
+            pass
+        raise
+
+
+def _renameat2(left: Path, right: Path, flags: int, operation: str) -> None:
+    """Apply one required Linux atomic-rename operation without fallback."""
+    if left.is_symlink() or right.is_symlink() or left.parent != right.parent:
+        raise SelectedCatalogError(
+            f"selected-job {operation} requires safe sibling paths: {left}, {right}"
+        )
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is None:
+        raise SelectedCatalogError(
+            f"selected-job publication requires Linux renameat2 for {operation}; "
+            "no job was replaced"
+        )
+    renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    renameat2.restype = ctypes.c_int
+    at_fdcwd = -100
+    if renameat2(
+        at_fdcwd,
+        os.fsencode(left),
+        at_fdcwd,
+        os.fsencode(right),
+        flags,
+    ) != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(
+            error_number,
+            os.strerror(error_number),
+            f"{left} <-> {right}",
+        )
+
+
+def _rename_exchange(left: Path, right: Path) -> None:
+    """Atomically exchange two existing same-parent directories."""
+    if not left.is_dir() or not right.is_dir():
+        raise SelectedCatalogError(
+            f"selected-job exchange requires two directories: {left}, {right}"
+        )
+    _renameat2(left, right, 2, "exchange")
+
+
+def _rename_noreplace(left: Path, right: Path) -> None:
+    """Atomically publish a directory only when the destination is absent."""
+    if not left.is_dir() or right.exists() or right.is_symlink():
+        raise SelectedCatalogError(
+            f"selected-job no-replace publication state is unsafe: {left}, {right}"
+        )
+    _renameat2(left, right, 1, "no-replace rename")
+
+
+def _job_manifest_sha(path: Path) -> str:
+    return _hash_file(path / "job_manifest.json")[0]
+
+
+def _job_has_manifest_sha(path: Path, expected_sha256: str) -> bool:
+    try:
+        return path.is_dir() and not path.is_symlink() and _job_manifest_sha(path) == expected_sha256
+    except (OSError, SelectedCatalogError):
+        return False
 
 
 def _assert_safe_descendant(root: Path, path: Path) -> None:
@@ -518,42 +764,156 @@ def _validate_existing_job(path: Path, job_id: str) -> None:
         raise SelectedCatalogError("existing job is not a completed selected-catalog job")
 
 
-def _write_json(path: Path, document: Mapping[str, Any]) -> None:
-    path.write_text(
-        json.dumps(document, sort_keys=True, indent=2, ensure_ascii=False, allow_nan=False) + "\n",
-        encoding="utf-8",
+def _preserve_failed_staging(
+    *,
+    claim: _JobClaim,
+    staging: Path,
+    failed: Path,
+    error: BaseException,
+) -> None:
+    """Durably preserve this invocation's staging evidence, or fail closed."""
+    if not staging.exists():
+        return
+    if staging.is_symlink() or not staging.is_dir():
+        raise _PreserveClaimError(
+            f"selected-job staging is unsafe; claim preserved for inspection: {staging}"
+        )
+    if failed.exists() or failed.is_symlink():
+        raise _PreserveClaimError(
+            f"selected-job failure-evidence destination is ambiguous: {failed}"
+        )
+    _atomic_write_json(staging / "failure.json", {
+        "manifest_version": MANIFEST_VERSION,
+        "job_id": claim.document["job_id"],
+        "status": "failed",
+        "failed_at_utc": _utc_text(datetime.now(timezone.utc)),
+        "error_type": type(error).__name__,
+        "error": str(error),
+    })
+    _rename_noreplace(staging, failed)
+    _fsync_directory(failed.parent)
+    _claim_state(
+        claim,
+        "failed_evidence_preserved",
+        staging_name=None,
+        failed_name=failed.name,
     )
 
 
-def reconstruct_selected_catalog(*, request: SelectedCatalogRequest) -> Path:
-    """Build and atomically publish one explicitly selected temporary catalog.
+def _rollback_selected_publication(
+    *,
+    claim: _JobClaim,
+    final_job: Path,
+    staging: Path,
+    backup: Path | None,
+    initial_manifest_sha256: str | None,
+    new_manifest_sha256: str,
+) -> None:
+    """Restore the pre-publication job state after a handled failure.
 
-    Returns the final ``<output-root>/<job-id>`` path.  Any exception is
-    fail-closed: the final path is not created or replaced, and staging is
-    preserved as a sibling ``.failed_*`` evidence directory when possible.
+    Every overwrite location is recorded in the claim before mutation.  The
+    atomic exchange keeps one complete job at the canonical path throughout;
+    this helper exchanges the old job back when later validation/state work
+    fails.  Any contradiction preserves the claim for manual recovery.
+    """
+    if _job_has_manifest_sha(final_job, new_manifest_sha256):
+        if initial_manifest_sha256 is None:
+            if staging.exists() or staging.is_symlink():
+                raise _PreserveClaimError(
+                    "cannot withdraw first publication because staging reappeared"
+                )
+            os.replace(final_job, staging)
+            _fsync_directory(final_job.parent)
+        else:
+            old_location: Path | None = None
+            for candidate in (staging, backup):
+                if candidate is not None and _job_has_manifest_sha(
+                    candidate, initial_manifest_sha256
+                ):
+                    old_location = candidate
+                    break
+            if old_location is None:
+                raise _PreserveClaimError(
+                    "cannot locate the prior completed job for rollback; claim preserved"
+                )
+            _rename_exchange(old_location, final_job)
+            _fsync_directory(final_job.parent)
+            if old_location == backup:
+                if staging.exists() or staging.is_symlink():
+                    raise _PreserveClaimError(
+                        "cannot preserve withdrawn candidate because staging is ambiguous"
+                    )
+                _rename_noreplace(backup, staging)
+                _fsync_directory(final_job.parent)
+
+    if initial_manifest_sha256 is None:
+        if final_job.exists() or final_job.is_symlink():
+            raise _PreserveClaimError(
+                "first-publication rollback left a canonical job; claim preserved"
+            )
+    elif not _job_has_manifest_sha(final_job, initial_manifest_sha256):
+        raise _PreserveClaimError(
+            "overwrite rollback did not restore the exact prior job; claim preserved"
+        )
+    _claim_state(claim, "rolled_back", staging_name=staging.name)
+
+
+def reconstruct_selected_catalog(*, request: SelectedCatalogRequest) -> Path:
+    """Build and recoverably publish one explicitly selected temporary catalog.
+
+    One atomic exact-job claim is held from preflight through publication.
+    First publication is a no-replace rename; overwrite uses Linux atomic
+    directory exchange plus a durable claim state, so the previous completed
+    job remains canonical throughout and every crash location is explicit.
     """
     normalized = _normalize_request(request)
     final_job = normalized.output_root / normalized.job_id
-    if final_job.exists():
-        if not normalized.overwrite:
-            raise SelectedCatalogError(f"job already exists: {final_job}")
-        _validate_existing_job(final_job, normalized.job_id)
-    elif final_job.is_symlink():
-        raise SelectedCatalogError("final job path must not be a symlink")
+    claim = _new_job_claim(normalized)
+    preserve_claim = False
+    staging: Path | None = None
+    failed: Path | None = None
+    backup: Path | None = None
+    initial_manifest_sha256: str | None = None
+    new_manifest_sha256: str | None = None
+    publication_prepared = False
+    try:
+        if final_job.exists():
+            if not normalized.overwrite:
+                raise SelectedCatalogError(f"job already exists: {final_job}")
+            _validate_existing_job(final_job, normalized.job_id)
+            initial_manifest_sha256 = _job_manifest_sha(final_job)
+        elif final_job.is_symlink():
+            raise SelectedCatalogError("final job path must not be a symlink")
 
-    try:
-        preflight = _preflight(normalized)
-        engine = _load_engine()
-    except SelectedCatalogError:
-        raise
-    except Exception as exc:
-        raise SelectedCatalogError(f"selected reconstruction preflight failed: {exc}") from exc
-    created = datetime.now(timezone.utc)
-    nonce = uuid.uuid4().hex
-    staging = normalized.output_root / f".staging_{normalized.job_id}_{nonce}"
-    failed = normalized.output_root / f".failed_{normalized.job_id}_{created.strftime('%Y%m%dT%H%M%SZ')}_{nonce}"
-    staging.mkdir(mode=0o700)
-    try:
+        try:
+            preflight = _preflight(normalized)
+            engine = _load_engine()
+        except SelectedCatalogError:
+            raise
+        except Exception as exc:
+            raise SelectedCatalogError(
+                f"selected reconstruction preflight failed: {exc}"
+            ) from exc
+
+        created = datetime.now(timezone.utc)
+        nonce = uuid.uuid4().hex
+        staging = normalized.output_root / f".staging_{normalized.job_id}_{nonce}"
+        failed = normalized.output_root / (
+            f".failed_{normalized.job_id}_{created.strftime('%Y%m%dT%H%M%SZ')}_{nonce}"
+        )
+        backup = normalized.output_root / f".replaced_{normalized.job_id}_{nonce}"
+        if any(path.exists() or path.is_symlink() for path in (staging, failed, backup)):
+            raise SelectedCatalogError("selected-job temporary path collision")
+        staging.mkdir(mode=0o700)
+        _fsync_directory(normalized.output_root)
+        _claim_state(
+            claim,
+            "building",
+            staging_name=staging.name,
+            failed_name=failed.name,
+            backup_name=backup.name,
+        )
+
         status = engine.generate_catalog_from_replay(
             normalized.replay_root,
             staging,
@@ -619,43 +979,129 @@ def reconstruct_selected_catalog(*, request: SelectedCatalogRequest) -> Path:
             "carry_resolution": preflight.get("carry_resolution", []),
             "warnings": list(status.get("warnings", [])),
         }
-        _write_json(staging / "job_manifest.json", manifest)
+        _atomic_write_json(staging / "job_manifest.json", manifest)
         final_catalog_files, final_catalog_digest = _catalog_inventory(catalog)
         if final_catalog_files != catalog_files or final_catalog_digest != catalog_digest:
             raise SelectedCatalogError("catalog output changed before publication")
         _rehash_preflight(normalized, preflight)
 
-        backup: Path | None = None
+        new_manifest_sha256 = _job_manifest_sha(staging)
+        # Recheck both authorization and the exact original job immediately
+        # before mutation while the exclusive claim remains held.
         if final_job.exists():
+            if not normalized.overwrite:
+                raise SelectedCatalogError(f"job already exists: {final_job}")
             _validate_existing_job(final_job, normalized.job_id)
-            backup = normalized.output_root / f".replaced_{normalized.job_id}_{nonce}"
-            final_job.rename(backup)
-        try:
-            staging.rename(final_job)
-        except Exception:
-            if backup is not None and backup.exists() and not final_job.exists():
-                backup.rename(final_job)
-            raise
-        if backup is not None:
-            shutil.rmtree(backup)
+            current_manifest_sha256 = _job_manifest_sha(final_job)
+            if initial_manifest_sha256 is None:
+                raise SelectedCatalogError(
+                    "job appeared during reconstruction; refusing unapproved replacement"
+                )
+            if current_manifest_sha256 != initial_manifest_sha256:
+                raise SelectedCatalogError(
+                    "existing job changed during reconstruction; refusing replacement"
+                )
+        elif final_job.is_symlink():
+            raise SelectedCatalogError("final job path must not be a symlink")
+        elif initial_manifest_sha256 is not None:
+            raise SelectedCatalogError(
+                "existing job disappeared during reconstruction; refusing publication"
+            )
+
+        publication_prepared = True
+        _claim_state(
+            claim,
+            "publication_prepared",
+            new_manifest_sha256=new_manifest_sha256,
+        )
+        if initial_manifest_sha256 is None:
+            _rename_noreplace(staging, final_job)
+            _fsync_directory(normalized.output_root)
+        else:
+            _rename_exchange(staging, final_job)
+            _fsync_directory(normalized.output_root)
+            _claim_state(claim, "jobs_exchanged")
+
+        if not _job_has_manifest_sha(final_job, new_manifest_sha256):
+            raise SelectedCatalogError(
+                "published selected job failed exact manifest validation"
+            )
+        _validate_existing_job(final_job, normalized.job_id)
+        _claim_state(claim, "published_valid")
+
+        if initial_manifest_sha256 is not None:
+            # After atomic exchange, staging contains the old completed job.
+            _rename_noreplace(staging, backup)
+            _fsync_directory(normalized.output_root)
+            _claim_state(claim, "obsolete_backup_preserved", staging_name=None)
+            cleanup_error: Exception | None = None
+            try:
+                shutil.rmtree(backup)
+                _fsync_directory(normalized.output_root)
+            except Exception as cleanup_exc:
+                cleanup_error = cleanup_exc
+            if cleanup_error is None:
+                _claim_state(claim, "complete", backup_name=None)
+            else:
+                warning = (
+                    f"published job is complete, but obsolete backup cleanup/durability "
+                    f"failed; inspect {backup.name}: {cleanup_error}"
+                )
+                manifest["warnings"].append(warning)
+                _atomic_write_json(final_job / "job_manifest.json", manifest)
+                new_manifest_sha256 = _job_manifest_sha(final_job)
+                _claim_state(
+                    claim,
+                    "complete_with_backup_warning",
+                    new_manifest_sha256=new_manifest_sha256,
+                    cleanup_warning=warning,
+                )
+        else:
+            _claim_state(claim, "complete", staging_name=None, backup_name=None)
         return final_job
     except Exception as exc:
-        if staging.exists():
+        if publication_prepared and staging is not None and new_manifest_sha256 is not None:
             try:
-                _write_json(staging / "failure.json", {
-                    "manifest_version": MANIFEST_VERSION,
-                    "job_id": normalized.job_id,
-                    "status": "failed",
-                    "failed_at_utc": _utc_text(datetime.now(timezone.utc)),
-                    "error_type": type(exc).__name__,
-                    "error": str(exc),
-                })
-                staging.rename(failed)
-            except Exception:
-                pass
+                _rollback_selected_publication(
+                    claim=claim,
+                    final_job=final_job,
+                    staging=staging,
+                    backup=backup,
+                    initial_manifest_sha256=initial_manifest_sha256,
+                    new_manifest_sha256=new_manifest_sha256,
+                )
+            except Exception as rollback_exc:
+                preserve_claim = True
+                raise _PreserveClaimError(
+                    f"selected-job publication failed and automatic rollback is "
+                    f"ambiguous; claim preserved at {claim.path}: {rollback_exc}"
+                ) from exc
+        if staging is not None and failed is not None:
+            try:
+                _preserve_failed_staging(
+                    claim=claim,
+                    staging=staging,
+                    failed=failed,
+                    error=exc,
+                )
+            except Exception as evidence_exc:
+                preserve_claim = True
+                raise _PreserveClaimError(
+                    f"selected-job failure evidence is ambiguous; claim preserved at "
+                    f"{claim.path}: {evidence_exc}"
+                ) from exc
         if isinstance(exc, SelectedCatalogError):
             raise
         raise SelectedCatalogError(str(exc)) from exc
+    finally:
+        if not preserve_claim:
+            try:
+                _remove_claim(claim)
+            except Exception as claim_exc:
+                raise SelectedCatalogError(
+                    f"selected-job claim cleanup failed; manual inspection required: "
+                    f"{claim.path}: {claim_exc}"
+                ) from claim_exc
 
 
 def _parser() -> argparse.ArgumentParser:

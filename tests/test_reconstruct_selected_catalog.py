@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import shutil
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,9 +15,11 @@ from pipeline.reconstruct_selected_catalog import (
     MANIFEST_VERSION,
     SelectedCatalogError,
     SelectedCatalogRequest,
+    _new_job_claim,
     _normalize_request,
     _parser,
     _preflight,
+    _remove_claim,
     reconstruct_selected_catalog,
 )
 from tests.test_replay_catalog_reconstruct import (
@@ -383,3 +387,204 @@ def test_missing_optional_dependency_has_actionable_guidance(monkeypatch, tmp_pa
     )
     with pytest.raises(SelectedCatalogError, match="uv sync --frozen"):
         reconstruct_selected_catalog(request=_request(tmp_path, replay))
+
+
+def test_same_job_concurrent_invocation_is_rejected(monkeypatch, tmp_path: Path) -> None:
+    replay = tmp_path / "replay"
+    replay.mkdir()
+    started = threading.Event()
+    release = threading.Event()
+    base_engine = _fake_engine()
+
+    def generate(*args, **kwargs):
+        started.set()
+        assert release.wait(timeout=5)
+        return base_engine.generate_catalog_from_replay(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "pipeline.reconstruct_selected_catalog._preflight",
+        lambda request: _fake_preflight(),
+    )
+    monkeypatch.setattr(
+        "pipeline.reconstruct_selected_catalog._rehash_preflight",
+        lambda request, original: original,
+    )
+    monkeypatch.setattr(
+        "pipeline.reconstruct_selected_catalog._load_engine",
+        lambda: SimpleNamespace(generate_catalog_from_replay=generate),
+    )
+    monkeypatch.setattr(
+        "pipeline.reconstruct_selected_catalog._repository_commit",
+        lambda: "1" * 40,
+    )
+    request = _request(tmp_path, replay)
+    result: list[Path] = []
+    errors: list[BaseException] = []
+
+    def first_invocation() -> None:
+        try:
+            result.append(reconstruct_selected_catalog(request=request))
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    worker = threading.Thread(target=first_invocation)
+    worker.start()
+    assert started.wait(timeout=5)
+    with pytest.raises(SelectedCatalogError, match="already claimed"):
+        reconstruct_selected_catalog(request=request)
+    release.set()
+    worker.join(timeout=5)
+    assert not worker.is_alive()
+    assert errors == []
+    assert result == [request.output_root / request.job_id]
+    assert not (request.output_root / f".claim_{request.job_id}").exists()
+
+
+def test_different_job_claims_are_independent(monkeypatch, tmp_path: Path) -> None:
+    replay = tmp_path / "replay"
+    replay.mkdir()
+    _patch_fast_success(monkeypatch)
+    first = _normalize_request(_request(tmp_path, replay, job_id="first"))
+    claim = _new_job_claim(first)
+    try:
+        second = reconstruct_selected_catalog(
+            request=_request(tmp_path, replay, job_id="second")
+        )
+        assert second.name == "second"
+        assert claim.path.exists()
+    finally:
+        _remove_claim(claim)
+
+
+def test_non_overwrite_rechecks_before_publication(monkeypatch, tmp_path: Path) -> None:
+    replay = tmp_path / "replay"
+    replay.mkdir()
+    request = _request(tmp_path, replay)
+    engine = _fake_engine()
+    original = engine.generate_catalog_from_replay
+
+    def concurrent_completion(*args, **kwargs):
+        final = request.output_root / request.job_id
+        final.mkdir()
+        (final / "job_manifest.json").write_text(json.dumps({
+            "manifest_version": MANIFEST_VERSION,
+            "job_id": request.job_id,
+            "status": "complete",
+        }))
+        (final / "owner-marker").write_text("other invocation")
+        return original(*args, **kwargs)
+
+    _patch_fast_success(monkeypatch)
+    monkeypatch.setattr(
+        "pipeline.reconstruct_selected_catalog._load_engine",
+        lambda: SimpleNamespace(generate_catalog_from_replay=concurrent_completion),
+    )
+    with pytest.raises(SelectedCatalogError, match="already exists"):
+        reconstruct_selected_catalog(request=request)
+    final = request.output_root / request.job_id
+    assert (final / "owner-marker").read_text() == "other invocation"
+    assert not list(request.output_root.glob(".replaced_*"))
+
+
+def test_handled_failure_releases_exact_claim(monkeypatch, tmp_path: Path) -> None:
+    replay = tmp_path / "replay"
+    replay.mkdir()
+    monkeypatch.setattr(
+        "pipeline.reconstruct_selected_catalog._preflight",
+        lambda request: _fake_preflight(),
+    )
+    monkeypatch.setattr(
+        "pipeline.reconstruct_selected_catalog._load_engine",
+        lambda: _fake_engine(fail=True),
+    )
+    request = _request(tmp_path, replay)
+    with pytest.raises(SelectedCatalogError, match="injected failure"):
+        reconstruct_selected_catalog(request=request)
+    assert not (request.output_root / f".claim_{request.job_id}").exists()
+
+
+def test_crash_claim_residue_blocks_mutation(monkeypatch, tmp_path: Path) -> None:
+    replay = tmp_path / "replay"
+    replay.mkdir()
+    _patch_fast_success(monkeypatch)
+    request = _request(tmp_path, replay)
+    claim = _new_job_claim(_normalize_request(request))
+
+    with pytest.raises(SelectedCatalogError, match="manual recovery"):
+        reconstruct_selected_catalog(request=request)
+    assert claim.path.exists()
+    assert set(path.name for path in claim.path.iterdir()) == {
+        "claim.json",
+    }
+
+
+def test_unsafe_claim_symlink_fails_closed(monkeypatch, tmp_path: Path) -> None:
+    replay = tmp_path / "replay"
+    replay.mkdir()
+    _patch_fast_success(monkeypatch)
+    request = _request(tmp_path, replay)
+    outside = tmp_path / "outside-claim"
+    outside.mkdir()
+    claim_path = request.output_root / f".claim_{request.job_id}"
+    claim_path.symlink_to(outside, target_is_directory=True)
+    with pytest.raises(SelectedCatalogError, match="claim is unsafe"):
+        reconstruct_selected_catalog(request=request)
+    assert claim_path.is_symlink()
+
+
+def test_overwrite_exchange_failure_rolls_back_exact_job(monkeypatch, tmp_path: Path) -> None:
+    replay = tmp_path / "replay"
+    replay.mkdir()
+    _patch_fast_success(monkeypatch)
+    request = _request(tmp_path, replay)
+    final = reconstruct_selected_catalog(request=request)
+    marker = final / "old-marker"
+    marker.write_text("preserve old job")
+    original_claim_state = __import__(
+        "pipeline.reconstruct_selected_catalog", fromlist=["_claim_state"]
+    )._claim_state
+
+    def fail_after_exchange(claim, state, **updates):
+        if state == "jobs_exchanged":
+            raise OSError("injected state-write failure")
+        return original_claim_state(claim, state, **updates)
+
+    monkeypatch.setattr(
+        "pipeline.reconstruct_selected_catalog._claim_state", fail_after_exchange
+    )
+    with pytest.raises(SelectedCatalogError, match="injected state-write failure"):
+        reconstruct_selected_catalog(
+            request=_request(tmp_path, replay, overwrite=True)
+        )
+    assert marker.read_text() == "preserve old job"
+    assert json.loads((final / "job_manifest.json").read_text())["status"] == "complete"
+    assert not list(request.output_root.glob(".replaced_*"))
+
+
+def test_backup_cleanup_failure_is_success_with_manifest_warning(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    replay = tmp_path / "replay"
+    replay.mkdir()
+    _patch_fast_success(monkeypatch)
+    request = _request(tmp_path, replay)
+    final = reconstruct_selected_catalog(request=request)
+    original_rmtree = shutil.rmtree
+
+    def fail_backup_cleanup(path, *args, **kwargs):
+        if Path(path).name.startswith(".replaced_"):
+            raise OSError("injected obsolete-backup cleanup failure")
+        return original_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(
+        "pipeline.reconstruct_selected_catalog.shutil.rmtree", fail_backup_cleanup
+    )
+    replaced = reconstruct_selected_catalog(
+        request=_request(tmp_path, replay, overwrite=True)
+    )
+    assert replaced == final
+    manifest = json.loads((final / "job_manifest.json").read_text())
+    assert manifest["status"] == "complete"
+    assert any("obsolete backup cleanup" in warning for warning in manifest["warnings"])
+    assert len(list(request.output_root.glob(".replaced_*"))) == 1
+    assert not (request.output_root / f".claim_{request.job_id}").exists()

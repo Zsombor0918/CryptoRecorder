@@ -547,6 +547,159 @@ def test_publish_preserves_existing_partition_on_replace_error(tmp_path: Path) -
     assert (partition / "depth.parquet").stat().st_size == original_depth_size
 
 
+def test_publish_fsyncs_all_files_and_staging_before_first_rename(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    import stores.replay_writer as writer_module
+
+    replay_root = tmp_path / "replay"
+    writer = ReplayWriter(replay_root, "BINANCE_SPOT", "TESTUSDT", "2026-07-01")
+    writer.write_depth_batch([_depth_record(session=1, seq=1, raw_idx=1)])
+    writer.write_trades_batch([_trade_record(session=1, seq=1, raw_idx=1)])
+    writer.finalize_staging()
+    events: list[str] = []
+    real_replace = writer_module.os.replace
+
+    monkeypatch.setattr(
+        writer_module,
+        "_fsync_regular_file",
+        lambda path: events.append(f"file:{Path(path).name}"),
+    )
+    monkeypatch.setattr(
+        writer_module,
+        "_fsync_directory",
+        lambda path: events.append(
+            "dir:staging" if Path(path) == writer.staging_dir else "dir:parent"
+        ),
+    )
+
+    def tracked_replace(source, destination):
+        events.append(f"replace:{Path(source).name}->{Path(destination).name}")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(writer_module.os, "replace", tracked_replace)
+    monkeypatch.setattr(
+        writer_module,
+        "validate_partition",
+        lambda path: events.append("validate") or True,
+    )
+    writer.publish(instrument_metadata={"id": "TESTUSDT.BINANCE"})
+
+    rename_index = next(i for i, value in enumerate(events) if value.startswith("replace:"))
+    assert events[:rename_index] == [
+        "file:depth.parquet",
+        "file:trades.parquet",
+        "file:instrument.json",
+        "file:manifest.json",
+        "dir:staging",
+    ]
+    assert events[rename_index + 1:] == ["dir:parent", "validate"]
+
+
+def test_overwrite_fsyncs_parent_around_renames_and_backup_removal(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    import stores.replay_writer as writer_module
+
+    replay_root = tmp_path / "replay"
+    first = ReplayWriter(replay_root, "BINANCE_SPOT", "TESTUSDT", "2026-07-01")
+    first.write_depth_batch([_depth_record(session=1, seq=1, raw_idx=1)])
+    first.publish()
+
+    writer = ReplayWriter(replay_root, "BINANCE_SPOT", "TESTUSDT", "2026-07-01")
+    writer.write_depth_batch([_depth_record(session=1, seq=2, raw_idx=2)])
+    writer.finalize_staging()
+    events: list[str] = []
+    real_replace = writer_module.os.replace
+    real_rmtree = writer_module.shutil.rmtree
+
+    monkeypatch.setattr(writer_module, "_fsync_regular_file", lambda path: None)
+    monkeypatch.setattr(
+        writer_module,
+        "_fsync_directory",
+        lambda path: events.append(
+            "dir:staging" if Path(path) == writer.staging_dir else "dir:parent"
+        ),
+    )
+
+    def tracked_replace(source, destination):
+        events.append(f"replace:{Path(source).name}->{Path(destination).name}")
+        return real_replace(source, destination)
+
+    def tracked_rmtree(path, *args, **kwargs):
+        events.append(f"rmtree:{Path(path).name}")
+        return real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(writer_module.os, "replace", tracked_replace)
+    monkeypatch.setattr(writer_module.shutil, "rmtree", tracked_rmtree)
+    monkeypatch.setattr(
+        writer_module,
+        "validate_partition",
+        lambda path: events.append("validate") or True,
+    )
+    writer.publish()
+
+    assert events == [
+        "dir:staging",
+        "replace:date=2026-07-01->.backup_2026-07-01_TESTUSDT",
+        "dir:parent",
+        "replace:.staging_2026-07-01_TESTUSDT->date=2026-07-01",
+        "dir:parent",
+        "validate",
+        "rmtree:.backup_2026-07-01_TESTUSDT",
+        "dir:parent",
+    ]
+
+
+def test_parquet_fsync_failure_prevents_first_publication(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    import stores.replay_writer as writer_module
+
+    replay_root = tmp_path / "replay"
+    writer = ReplayWriter(replay_root, "BINANCE_SPOT", "TESTUSDT", "2026-07-01")
+    writer.write_depth_batch([_depth_record(session=1, seq=1, raw_idx=1)])
+    writer.finalize_staging()
+
+    def fail_depth(path):
+        if Path(path).name == "depth.parquet":
+            raise OSError("injected parquet fsync failure")
+
+    monkeypatch.setattr(writer_module, "_fsync_regular_file", fail_depth)
+    with pytest.raises(OSError, match="injected parquet fsync failure"):
+        writer.publish()
+    assert not writer.output_dir.exists()
+    assert writer.staging_dir.exists()
+
+
+def test_parquet_fsync_failure_preserves_existing_canonical(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    import stores.replay_writer as writer_module
+
+    replay_root = tmp_path / "replay"
+    first = ReplayWriter(replay_root, "BINANCE_SPOT", "TESTUSDT", "2026-07-01")
+    first.write_depth_batch([_depth_record(session=1, seq=1, raw_idx=1)])
+    canonical = first.publish()
+    original_manifest_sha = hashlib.sha256(
+        (canonical / "manifest.json").read_bytes()
+    ).hexdigest()
+
+    writer = ReplayWriter(replay_root, "BINANCE_SPOT", "TESTUSDT", "2026-07-01")
+    writer.write_depth_batch([_depth_record(session=1, seq=2, raw_idx=2)])
+    writer.finalize_staging()
+
+    def fail_trades(path):
+        if Path(path).name == "trades.parquet":
+            raise OSError("injected parquet fsync failure")
+
+    monkeypatch.setattr(writer_module, "_fsync_regular_file", fail_trades)
+    with pytest.raises(OSError, match="injected parquet fsync failure"):
+        writer.publish()
+    assert hashlib.sha256((canonical / "manifest.json").read_bytes()).hexdigest() == original_manifest_sha
+    assert not list(canonical.parent.glob(".backup_*"))
+
+
 def test_force_rebuild_overrides_valid_partition(tmp_path: Path) -> None:
     """force=True must rebuild even when the partition is already valid."""
     raw_root = _make_raw_root(tmp_path, "BINANCE_SPOT", "TESTUSDT", "2026-07-01", 5, 5)

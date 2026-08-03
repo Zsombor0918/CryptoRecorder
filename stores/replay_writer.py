@@ -27,6 +27,7 @@ import json
 import logging
 import os
 import shutil
+import stat
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Optional
@@ -806,6 +807,30 @@ def _compute_sha256(file_path: Path) -> str:
         for byte_block in iter(lambda: f.read(65536), b""):
             sha256_hash.update(byte_block)
     return sha256_hash.hexdigest()
+
+
+def _fsync_regular_file(path: Path) -> None:
+    """Durably flush one required publication file without following links."""
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise RuntimeError(f"publication path is not a regular file: {path}")
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _fsync_directory(path: Path) -> None:
+    """Durably flush directory entries used by atomic publication."""
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def validate_partition(partition_dir: Path) -> bool:
@@ -2205,50 +2230,71 @@ class ReplayWriter:
             with open(instrument_path, "w") as f:
                 json.dump(instrument_metadata, f, indent=2)
                 f.flush()
-                os.fsync(f.fileno())
             logger.info(f"Wrote instrument metadata: {instrument_path}")
 
         manifest = self._manifest
         if manifest is None:
             manifest = self.finalize_staging()
 
+        # ParquetWriter.close() completes the files but does not make their
+        # contents durable. Flush both closed data files before persisting a
+        # manifest which claims the partition is complete. Instrument metadata
+        # is part of the published set when present and receives the same
+        # durability treatment.
+        _fsync_regular_file(self.staging_dir / "depth.parquet")
+        _fsync_regular_file(self.staging_dir / "trades.parquet")
+        instrument_path = self.staging_dir / "instrument.json"
+        if instrument_path.exists() or instrument_path.is_symlink():
+            _fsync_regular_file(instrument_path)
+
         manifest_path = self.staging_dir / "manifest.json"
         with open(manifest_path, "w") as f:
             json.dump(manifest, f, indent=2)
             f.flush()
-            os.fsync(f.fileno())
+        _fsync_regular_file(manifest_path)
         logger.info(f"Wrote manifest: {manifest_path}")
 
-        staging_fd = os.open(self.staging_dir, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(staging_fd)
-        finally:
-            os.close(staging_fd)
+        _fsync_directory(self.staging_dir)
 
         # Atomic publication with backup/restore so the existing valid partition
         # is never lost if the replacement fails (I/O error, permissions, etc.).
         backup_dir = self.output_dir.parent / f".backup_{self.date}_{self.symbol}"
         self.output_dir.parent.mkdir(parents=True, exist_ok=True)
 
-        # Step 1: rename existing output to backup (if it exists).
-        if self.output_dir.exists():
-            if backup_dir.exists():
-                raise RuntimeError(
-                    f"Ambiguous publication state: backup already exists at "
-                    f"{backup_dir}. Run build-wide reconciliation while holding "
-                    "the replay lifecycle lock; refusing to delete it."
-                )
-            os.replace(self.output_dir, backup_dir)
-
+        new_installed = False
         try:
-            # Step 2: rename staging to canonical output.
+            # Step 1: rename existing output to backup (if it exists), then
+            # durably record that parent-directory transition.
+            if self.output_dir.exists():
+                if backup_dir.exists() or backup_dir.is_symlink():
+                    raise RuntimeError(
+                        f"Ambiguous publication state: backup already exists at "
+                        f"{backup_dir}. Run build-wide reconciliation while holding "
+                        "the replay lifecycle lock; refusing to delete it."
+                    )
+                os.replace(self.output_dir, backup_dir)
+                _fsync_directory(self.output_dir.parent)
+
+            # Step 2: rename staging to canonical output and fsync its parent.
             os.replace(self.staging_dir, self.output_dir)
+            new_installed = True
+            _fsync_directory(self.output_dir.parent)
         except Exception:
-            # Canonical publication failed — restore backup so the last-known-
-            # good partition is not lost.
+            # Durability preparation/publication failed. Move a newly installed
+            # candidate back to staging before restoring the prior canonical.
+            if new_installed and self.output_dir.exists() and not self.staging_dir.exists():
+                try:
+                    os.replace(self.output_dir, self.staging_dir)
+                    _fsync_directory(self.output_dir.parent)
+                except Exception as unpublish_err:
+                    logger.error(
+                        f"Could not withdraw unpublished candidate {self.output_dir}: "
+                        f"{unpublish_err}"
+                    )
             if backup_dir.exists() and not self.output_dir.exists():
                 try:
                     os.replace(backup_dir, self.output_dir)
+                    _fsync_directory(self.output_dir.parent)
                     logger.warning(
                         f"Publication failed; restored previous partition: {self.output_dir}"
                     )
@@ -2280,6 +2326,7 @@ class ReplayWriter:
                     )
                 if self.output_dir.exists():
                     os.replace(self.output_dir, quarantine_dir)
+                    _fsync_directory(self.output_dir.parent)
             except Exception as qe:
                 logger.error(
                     f"Could not quarantine invalid output {self.output_dir}: {qe}"
@@ -2287,6 +2334,7 @@ class ReplayWriter:
             if backup_dir.exists() and not self.output_dir.exists():
                 try:
                     os.replace(backup_dir, self.output_dir)
+                    _fsync_directory(self.output_dir.parent)
                     logger.warning(
                         f"Restored previous valid partition after invalid publish: "
                         f"{self.output_dir}"
@@ -2310,6 +2358,7 @@ class ReplayWriter:
         if backup_dir.exists():
             try:
                 shutil.rmtree(backup_dir)
+                _fsync_directory(self.output_dir.parent)
             except Exception as backup_del_err:
                 logger.warning(
                     f"Could not delete obsolete backup {backup_dir}: {backup_del_err}. "

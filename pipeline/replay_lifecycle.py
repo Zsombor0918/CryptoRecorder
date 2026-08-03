@@ -235,16 +235,80 @@ def acquire_replay_build_lock(
             os.close(fd)
 
 
-def _iter_entries_bounded(directory: Path, counter: list[int], max_entries: int) -> list[Path]:
+def _iter_structure_entries_bounded(
+    directory: Path,
+    counter: list[int],
+    max_entries: int,
+) -> list[Path]:
+    """Return one shallow structural level under the recovery-entry bound.
+
+    Venue and symbol directories are finite orchestration structure, so they
+    consume the configured scan budget. Canonical date directories are handled
+    by the streaming symbol scan below and deliberately do not: retained valid
+    history may grow without turning into recovery work.
+    """
     if directory.is_symlink():
         raise ReplayLifecycleSafetyError(f"symlink is forbidden in replay lifecycle scan: {directory}")
-    entries = sorted(directory.iterdir(), key=lambda path: path.name)
-    counter[0] += len(entries)
-    if counter[0] > max_entries:
-        raise ReplayLifecycleSafetyError(
-            f"replay lifecycle scan exceeded configured max entries {max_entries}"
-        )
+    entries: list[Path] = []
+    with os.scandir(directory) as iterator:
+        for raw_entry in iterator:
+            counter[0] += 1
+            if counter[0] > max_entries:
+                raise ReplayLifecycleSafetyError(
+                    f"replay lifecycle scan exceeded configured max entries {max_entries}"
+                )
+            entries.append(Path(raw_entry.path))
+    entries.sort(key=lambda path: path.name)
     return entries
+
+
+def _transients_for_symbol(
+    symbol_dir: Path,
+    symbol: str,
+    counter: list[int],
+    max_entries: int,
+) -> dict[tuple[str, str], list[Path]]:
+    """Stream one symbol directory and retain only bounded recovery artifacts.
+
+    Ordinary ``date=...`` directories are type/name checked in place but are
+    neither counted as recovery candidates nor retained in memory. A canonical
+    is derived and validated later only when a transient for its date requires
+    a recovery decision.
+    """
+    if symbol_dir.is_symlink():
+        raise ReplayLifecycleSafetyError(
+            f"symlink is forbidden in replay lifecycle scan: {symbol_dir}"
+        )
+    transients: dict[tuple[str, str], list[Path]] = {}
+    with os.scandir(symbol_dir) as iterator:
+        for raw_entry in iterator:
+            entry = Path(raw_entry.path)
+            if raw_entry.is_symlink():
+                raise ReplayLifecycleSafetyError(f"symlink in replay tree: {entry}")
+            date_match = _DATE_RE.fullmatch(raw_entry.name)
+            if date_match:
+                if not raw_entry.is_dir(follow_symlinks=False):
+                    raise ReplayLifecycleSafetyError(
+                        f"canonical replay entry is not a directory: {entry}"
+                    )
+                continue
+            transient_match = _TRANSIENT_RE.fullmatch(raw_entry.name)
+            if not transient_match or not raw_entry.is_dir(follow_symlinks=False):
+                raise ReplayLifecycleSafetyError(f"unknown replay artifact: {entry}")
+            counter[0] += 1
+            if counter[0] > max_entries:
+                raise ReplayLifecycleSafetyError(
+                    f"replay lifecycle scan exceeded configured max entries {max_entries}"
+                )
+            kind, date, remainder = transient_match.groups()
+            if remainder != symbol and not remainder.startswith(f"{symbol}_"):
+                raise ReplayLifecycleSafetyError(
+                    f"transient symbol contradicts parent: {entry}"
+                )
+            transients.setdefault((kind, date), []).append(entry)
+    for paths in transients.values():
+        paths.sort(key=lambda path: path.name)
+    return transients
 
 
 def _unique_quarantine(parent: Path, date: str, symbol: str, reason: str, run_id: str) -> Path:
@@ -273,51 +337,34 @@ def reconcile_replay_root(
     actions: list[dict] = []
     counter = [0]
 
-    def record(action: str, path: Path, **extra: object) -> None:
-        if len(actions) >= max_actions:
+    def require_action_slots(count: int = 1) -> None:
+        if len(actions) + count > max_actions:
             raise ReplayLifecycleSafetyError(
                 f"reconciliation exceeded configured max actions {max_actions}"
             )
+
+    def record(action: str, path: Path, **extra: object) -> None:
+        require_action_slots()
         actions.append({"action": action, "path": str(path), **extra})
 
-    for venue_dir in _iter_entries_bounded(root, counter, max_entries):
+    for venue_dir in _iter_structure_entries_bounded(root, counter, max_entries):
         if venue_dir.name == ".lifecycle":
             continue
         venue_match = _VENUE_RE.fullmatch(venue_dir.name)
         if not venue_match or venue_dir.is_symlink() or not venue_dir.is_dir():
             raise ReplayLifecycleSafetyError(f"unknown/unsafe replay-root entry: {venue_dir}")
         venue = venue_match.group(1)
-        for symbol_dir in _iter_entries_bounded(venue_dir, counter, max_entries):
+        for symbol_dir in _iter_structure_entries_bounded(venue_dir, counter, max_entries):
             symbol_match = _SYMBOL_RE.fullmatch(symbol_dir.name)
             if not symbol_match or symbol_dir.is_symlink() or not symbol_dir.is_dir():
                 raise ReplayLifecycleSafetyError(f"unknown/unsafe venue entry: {symbol_dir}")
             symbol = symbol_match.group(1)
-            canonicals: dict[str, Path] = {}
-            transients: dict[tuple[str, str], list[Path]] = {}
-            for entry in _iter_entries_bounded(symbol_dir, counter, max_entries):
-                if entry.is_symlink():
-                    raise ReplayLifecycleSafetyError(f"symlink in replay tree: {entry}")
-                date_match = _DATE_RE.fullmatch(entry.name)
-                if date_match and entry.is_dir():
-                    date = date_match.group(1)
-                    if date in canonicals:
-                        raise ReplayLifecycleSafetyError(f"duplicate canonical date: {entry}")
-                    canonicals[date] = entry
-                    continue
-                transient_match = _TRANSIENT_RE.fullmatch(entry.name)
-                if transient_match and entry.is_dir():
-                    kind, date, remainder = transient_match.groups()
-                    if remainder != symbol and not remainder.startswith(f"{symbol}_"):
-                        raise ReplayLifecycleSafetyError(
-                            f"transient symbol contradicts parent: {entry}"
-                        )
-                    transients.setdefault((kind, date), []).append(entry)
-                    continue
-                raise ReplayLifecycleSafetyError(f"unknown replay artifact: {entry}")
-
-            all_dates = sorted(set(canonicals) | {date for _kind, date in transients})
+            transients = _transients_for_symbol(
+                symbol_dir, symbol, counter, max_entries
+            )
+            all_dates = sorted({date for _kind, date in transients})
             for date in all_dates:
-                canonical = canonicals.get(date)
+                canonical = symbol_dir / f"date={date}"
                 backups = transients.get(("backup", date), [])
                 stagings = transients.get(("staging", date), [])
                 quarantines = transients.get(("quarantine", date), [])
@@ -332,6 +379,7 @@ def reconcile_replay_root(
                         f"ambiguous multiple staging artifacts for {symbol}/{date}: {stagings}"
                     )
                 for staging in stagings:
+                    require_action_slots()
                     destination = _unique_quarantine(
                         symbol_dir, date, symbol, "stale_staging", context.run_id
                     )
@@ -341,7 +389,13 @@ def reconcile_replay_root(
                         destination=str(destination), venue=venue, date=date, symbol=symbol,
                     )
 
-                canonical_exists = canonical is not None and canonical.exists()
+                canonical_exists = canonical.exists()
+                if canonical.is_symlink() or (
+                    canonical_exists and not canonical.is_dir()
+                ):
+                    raise ReplayLifecycleSafetyError(
+                        f"canonical replay entry is unsafe: {canonical}"
+                    )
                 canonical_valid = bool(canonical_exists and validate_partition(canonical))
                 backup = backups[0] if backups else None
                 backup_valid = bool(backup and validate_partition(backup))
@@ -353,6 +407,7 @@ def reconcile_replay_root(
                             f"non-canonical backup name is ambiguous: {backup}"
                         )
                     if canonical_valid and backup_valid:
+                        require_action_slots()
                         shutil.rmtree(backup)
                         record("obsolete_valid_backup_removed", backup, venue=venue, date=date, symbol=symbol)
                     elif canonical_valid and not backup_valid:
@@ -360,7 +415,8 @@ def reconcile_replay_root(
                             f"invalid backup beside valid canonical requires inspection: {backup}"
                         )
                     elif backup_valid:
-                        if canonical_exists and canonical is not None:
+                        require_action_slots(2 if canonical_exists else 1)
+                        if canonical_exists:
                             destination = _unique_quarantine(
                                 symbol_dir, date, symbol, "invalid_canonical", context.run_id
                             )

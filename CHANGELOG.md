@@ -67,6 +67,25 @@ passes.** Until then, broader full-L2 equivalence stays **deferred** (see
 
 ## [Unreleased]
 
+### Fixed
+- **PR #22 exact-head replay safety review** — replay lifecycle recovery now
+  bounds only structural/transient recovery work, not ordinary retained
+  canonical history, and validates an old canonical only when a transient for
+  that exact date requires a decision. Replay publication explicitly fsyncs
+  the closed depth/trade Parquet files, optional instrument metadata,
+  manifest, staging directory, and parent-directory rename transitions before
+  reporting a durable partition. Selected reconstruction now holds an atomic
+  exact-job claim for the full operation, uses no-replace first publication
+  and Linux atomic directory exchange for overwrite, records recoverable crash
+  state, rechecks overwrite authorization immediately before publication, and
+  reports obsolete-backup cleanup failures as successful publication warnings
+  while preserving the backup. Serial semantic-gate timeouts now return one
+  bounded failed-stage fragment and stop without retry instead of escaping as
+  `TimeoutExpired`. Automatic raw retirement remains disabled. These are
+  safety/reporting corrections only: no replay semantics, raw ingestion,
+  `convert_day.py`, production data/service, deployment, or real-data gate was
+  changed or run.
+
 ### Added
 - **Issue #20 owner-approved closure amendment and replacement-PR status** —
   checkpoint 4 stopped before semantic execution as
