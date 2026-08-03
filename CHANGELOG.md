@@ -68,6 +68,14 @@ passes.** Until then, broader full-L2 equivalence stays **deferred** (see
 ## [Unreleased]
 
 ### Fixed
+- **PR #22 selected-job claim-cleanup reporting follow-up** — once selected
+  reconstruction has published and validated the completed job, failure to
+  remove or durability-sync its exact-job claim no longer reverses the
+  successful result. The job remains canonical, claim residue remains visible
+  when present, and the operator receives a manifest/runtime warning requiring
+  manual inspection. Cleanup failure before completed publication remains
+  fail-closed. No reconstruction data, manifest schema, exchange protocol, or
+  locking scope changed.
 - **PR #22 exact-head replay safety review** — replay lifecycle recovery now
   bounds only structural/transient recovery work, not ordinary retained
   canonical history, and validates an old canonical only when a transient for

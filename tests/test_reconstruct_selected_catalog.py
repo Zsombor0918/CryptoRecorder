@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import shutil
 import threading
+import warnings
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -20,6 +21,7 @@ from pipeline.reconstruct_selected_catalog import (
     _parser,
     _preflight,
     _remove_claim,
+    _validate_existing_job,
     reconstruct_selected_catalog,
 )
 from tests.test_replay_catalog_reconstruct import (
@@ -588,3 +590,152 @@ def test_backup_cleanup_failure_is_success_with_manifest_warning(
     assert any("obsolete backup cleanup" in warning for warning in manifest["warnings"])
     assert len(list(request.output_root.glob(".replaced_*"))) == 1
     assert not (request.output_root / f".claim_{request.job_id}").exists()
+
+
+def test_first_publication_claim_cleanup_failure_preserves_success_and_residue(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    replay = tmp_path / "replay"
+    replay.mkdir()
+    _patch_fast_success(monkeypatch)
+    request = _request(tmp_path, replay)
+    claim_path = request.output_root / f".claim_{request.job_id}"
+
+    def fail_claim_cleanup(claim) -> None:
+        raise OSError("injected claim directory deletion failure")
+
+    monkeypatch.setattr(
+        "pipeline.reconstruct_selected_catalog._remove_claim",
+        fail_claim_cleanup,
+    )
+    with pytest.warns(RuntimeWarning, match="complete and validated"):
+        final = reconstruct_selected_catalog(request=request)
+
+    assert final == request.output_root / request.job_id
+    _validate_existing_job(final, request.job_id)
+    assert claim_path.is_dir()
+    manifest = json.loads((final / "job_manifest.json").read_text())
+    assert any(
+        str(claim_path) in warning
+        and "manual claim inspection/cleanup is required" in warning
+        and "OSError: injected claim directory deletion failure" in warning
+        for warning in manifest["warnings"]
+    )
+    with pytest.raises(SelectedCatalogError, match="manual recovery"):
+        reconstruct_selected_catalog(request=request)
+
+
+def test_overwrite_claim_cleanup_failure_keeps_new_job_canonical(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    replay = tmp_path / "replay"
+    replay.mkdir()
+    _patch_fast_success(monkeypatch)
+    request = _request(tmp_path, replay)
+    final = reconstruct_selected_catalog(request=request)
+    (final / "old-job-marker").write_text("must not be restored")
+    claim_path = request.output_root / f".claim_{request.job_id}"
+
+    monkeypatch.setattr(
+        "pipeline.reconstruct_selected_catalog._remove_claim",
+        lambda claim: (_ for _ in ()).throw(
+            PermissionError("injected overwrite claim cleanup failure")
+        ),
+    )
+    with pytest.warns(RuntimeWarning, match="complete and validated"):
+        replaced = reconstruct_selected_catalog(
+            request=_request(tmp_path, replay, overwrite=True)
+        )
+
+    assert replaced == final
+    _validate_existing_job(final, request.job_id)
+    assert not (final / "old-job-marker").exists()
+    assert claim_path.is_dir()
+    assert not list(request.output_root.glob(".replaced_*"))
+    manifest = json.loads((final / "job_manifest.json").read_text())
+    assert any(
+        "PermissionError: injected overwrite claim cleanup failure" in warning
+        and "manual claim inspection/cleanup is required" in warning
+        for warning in manifest["warnings"]
+    )
+
+
+def test_claim_parent_fsync_failure_preserves_completed_publication(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    replay = tmp_path / "replay"
+    replay.mkdir()
+    _patch_fast_success(monkeypatch)
+    request = _request(tmp_path, replay)
+    claim_path = request.output_root / f".claim_{request.job_id}"
+    original_fsync_directory = __import__(
+        "pipeline.reconstruct_selected_catalog", fromlist=["_fsync_directory"]
+    )._fsync_directory
+
+    def fail_cleanup_durability(path: Path) -> None:
+        if Path(path) == request.output_root and not claim_path.exists():
+            raise OSError("injected claim parent fsync failure")
+        original_fsync_directory(path)
+
+    monkeypatch.setattr(
+        "pipeline.reconstruct_selected_catalog._fsync_directory",
+        fail_cleanup_durability,
+    )
+    with pytest.warns(RuntimeWarning, match="cleanup/durability failed"):
+        final = reconstruct_selected_catalog(request=request)
+
+    _validate_existing_job(final, request.job_id)
+    assert not claim_path.exists()
+    manifest = json.loads((final / "job_manifest.json").read_text())
+    assert any(
+        "OSError: injected claim parent fsync failure" in warning
+        and "manual claim inspection/cleanup is required" in warning
+        for warning in manifest["warnings"]
+    )
+
+
+def test_claim_cleanup_failure_before_publication_remains_fail_closed(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    replay = tmp_path / "replay"
+    replay.mkdir()
+    monkeypatch.setattr(
+        "pipeline.reconstruct_selected_catalog._preflight",
+        lambda request: _fake_preflight(),
+    )
+    monkeypatch.setattr(
+        "pipeline.reconstruct_selected_catalog._load_engine",
+        lambda: _fake_engine(fail=True),
+    )
+    monkeypatch.setattr(
+        "pipeline.reconstruct_selected_catalog._remove_claim",
+        lambda claim: (_ for _ in ()).throw(
+            OSError("injected pre-publication claim cleanup failure")
+        ),
+    )
+    request = _request(tmp_path, replay)
+
+    with pytest.raises(SelectedCatalogError, match="claim cleanup failed"):
+        reconstruct_selected_catalog(request=request)
+
+    assert not (request.output_root / request.job_id).exists()
+    assert (request.output_root / f".claim_{request.job_id}").is_dir()
+
+
+def test_ordinary_success_removes_claim_without_cleanup_warning(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    replay = tmp_path / "replay"
+    replay.mkdir()
+    _patch_fast_success(monkeypatch)
+    request = _request(tmp_path, replay)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        final = reconstruct_selected_catalog(request=request)
+
+    _validate_existing_job(final, request.job_id)
+    assert not (request.output_root / f".claim_{request.job_id}").exists()
+    manifest = json.loads((final / "job_manifest.json").read_text())
+    assert not any("claim cleanup" in warning for warning in manifest["warnings"])
+    assert not any("claim cleanup" in str(item.message) for item in caught)

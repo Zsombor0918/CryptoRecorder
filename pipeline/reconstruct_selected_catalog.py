@@ -22,6 +22,7 @@ import stat
 import subprocess
 import sys
 import uuid
+import warnings
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -337,6 +338,52 @@ def _remove_claim(claim: _JobClaim) -> None:
     claim.path.rmdir()
     _fsync_directory(claim.path.parent)
     claim.released = True
+
+
+def _report_completed_claim_cleanup_failure(
+    *,
+    final_job: Path,
+    claim: _JobClaim,
+    error: BaseException,
+) -> None:
+    """Report post-publication claim cleanup failure without reversing success.
+
+    The selected job is already complete and validated at this boundary.  The
+    manifest is updated when safely possible, while the runtime warning remains
+    the reporting fallback if that update cannot be made durable.  This helper
+    never recreates a partially removed claim and never raises.
+    """
+    warning = (
+        f"selected job is complete and validated, but exact-job claim cleanup/"
+        f"durability failed for {claim.path}: {type(error).__name__}: {error}; "
+        "manual claim inspection/cleanup is required"
+    )
+    warning_to_emit = warning
+    try:
+        manifest_path = final_job / "job_manifest.json"
+        manifest, _manifest_sha, _manifest_size = _load_stable_json(
+            manifest_path,
+            "completed selected-job manifest",
+        )
+        manifest_warnings = manifest.get("warnings")
+        if not isinstance(manifest_warnings, list):
+            raise SelectedCatalogError(
+                "completed selected-job manifest warnings must be a list"
+            )
+        manifest["warnings"] = [*manifest_warnings, warning]
+        _atomic_write_json(manifest_path, manifest)
+    except Exception as manifest_error:
+        warning_to_emit = (
+            f"{warning}; the warning could not be appended durably to the job "
+            f"manifest: {type(manifest_error).__name__}: {manifest_error}"
+        )
+    try:
+        warnings.warn(warning_to_emit, RuntimeWarning, stacklevel=2)
+    except Exception:
+        # A warnings filter configured as "error" must not reverse an already
+        # completed publication. The durable manifest warning remains the
+        # primary report whenever it could be written.
+        pass
 
 
 def _new_job_claim(request: _NormalizedRequest) -> _JobClaim:
@@ -876,6 +923,7 @@ def reconstruct_selected_catalog(*, request: SelectedCatalogRequest) -> Path:
     initial_manifest_sha256: str | None = None
     new_manifest_sha256: str | None = None
     publication_prepared = False
+    publication_complete = False
     try:
         if final_job.exists():
             if not normalized.overwrite:
@@ -1058,6 +1106,7 @@ def reconstruct_selected_catalog(*, request: SelectedCatalogRequest) -> Path:
                 )
         else:
             _claim_state(claim, "complete", staging_name=None, backup_name=None)
+        publication_complete = True
         return final_job
     except Exception as exc:
         if publication_prepared and staging is not None and new_manifest_sha256 is not None:
@@ -1098,10 +1147,17 @@ def reconstruct_selected_catalog(*, request: SelectedCatalogRequest) -> Path:
             try:
                 _remove_claim(claim)
             except Exception as claim_exc:
-                raise SelectedCatalogError(
-                    f"selected-job claim cleanup failed; manual inspection required: "
-                    f"{claim.path}: {claim_exc}"
-                ) from claim_exc
+                if publication_complete:
+                    _report_completed_claim_cleanup_failure(
+                        final_job=final_job,
+                        claim=claim,
+                        error=claim_exc,
+                    )
+                else:
+                    raise SelectedCatalogError(
+                        f"selected-job claim cleanup failed; manual inspection required: "
+                        f"{claim.path}: {claim_exc}"
+                    ) from claim_exc
 
 
 def _parser() -> argparse.ArgumentParser:

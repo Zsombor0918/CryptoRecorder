@@ -93,6 +93,86 @@ An entry may be skipped **only** for:
 - <or "none — task fully completed">
 ```
 
+## 2026-08-03 — Preserve selected-job success on claim cleanup failure
+
+### Change summary
+- Added an explicit completed-and-validated publication boundary to selected
+  reconstruction claim cleanup.
+- Kept cleanup failure fail-closed before that boundary, while reporting a
+  post-publication manifest/runtime warning and returning the completed job
+  after that boundary.
+- Preserved real claim residue for manual inspection and kept later same-job
+  invocations fail-closed; a partially removed claim is never recreated.
+
+### Files/packages touched
+- `pipeline/reconstruct_selected_catalog.py`
+- `tests/test_reconstruct_selected_catalog.py`
+- `CHANGELOG.md`
+- `docs/CHANGE_AUDIT.md`
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] docs/REPO_STRUCTURE.md
+- [x] docs/PROJECT_STATUS.md
+- [x] docs/IMPLEMENTATION_AUDIT.md
+- [x] relevant feature docs:
+  - `docs/OPERATIONS.md`
+  - `docs/VALIDATION.md`
+  - `CHANGELOG.md`
+
+### Docs updated
+- [x] CHANGELOG.md
+- [ ] README.md — no invocation or user-facing scope changed
+- [ ] docs/PROJECT_STATUS.md — no validated/deferred status changed
+- [ ] docs/REPO_STRUCTURE.md — no file/package contract changed
+- [ ] relevant feature docs — existing exact-job lifecycle remains unchanged;
+  this correction narrows only success/error reporting after publication
+- No docs update required because: existing selected-reconstruction operations
+  and lifecycle documentation already describe the exact-job claim; this fix
+  changes only post-publication cleanup result reporting.
+
+### Status / validation impact
+- Validated status changed: no.
+- Deferred status changed: no.
+- New claims added: yes — claim-cleanup faults after completed publication are
+  warnings rather than false reconstruction failures; pre-publication cleanup
+  faults remain errors.
+- Evidence for any new validation claim:
+  - Focused selected reconstruction tests passed 41 tests.
+  - The four-file replay/reconstruction safety set passed 120 tests.
+  - The full practical suite passed 855 tests with 3 skips.
+
+### Tests run
+```bash
+.venv/bin/python -m py_compile pipeline/reconstruct_selected_catalog.py
+
+.venv/bin/python -m pytest -q tests/test_reconstruct_selected_catalog.py
+# 41 passed
+
+.venv/bin/python -m pytest -q \
+  tests/test_replay_lifecycle.py \
+  tests/test_replay_memory_bounded.py \
+  tests/test_reconstruct_selected_catalog.py \
+  tests/test_serial_gate.py
+# 120 passed
+
+.venv/bin/python -m pytest -q
+# 855 passed, 3 skipped
+```
+
+### Validation CLIs run
+```bash
+uv lock --check
+git diff --check
+# PASS
+```
+
+### Known limitations / out of scope
+- No replay/catalog semantics, manifest schema, locking scope, overwrite
+  exchange protocol, replay publication, serial gate, VERSION, raw retention,
+  production configuration, deployment, or real-data workload changed.
+- The six previously resolved PR #22 findings were not reopened.
+
 ## 2026-08-01 — Resolve PR #22 exact-head replay safety findings
 
 ### Change summary
