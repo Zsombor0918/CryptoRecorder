@@ -173,7 +173,9 @@ either version):
   `PRICE_FILTER.tickSize`/`LOT_SIZE.stepSize` (spot and futures
   independently) and recorded in the manifest (`price_scale`/`qty_scale`).
   Encoding/decoding uses `Decimal` only — never a binary float
-  intermediate.
+  intermediate. Raw exchangeInfo parsing and scale-helper lookup use the
+  dependency-free `converter.exchange_info` module, so production compact
+  replay construction does not require Nautilus.
 - `native_payload_hash` is stored as 32 raw bytes (`fixed_size_binary[32]`)
   instead of a 64-character hex string — the hash itself is retained (the
   Phase 2 Section 3 traceability replacement remains design-only, so hash

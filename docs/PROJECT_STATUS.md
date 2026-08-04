@@ -74,6 +74,13 @@ deep validation with neither Nautilus nor pytest installed. Reconstruction
 adds exact `nautilus_trader==1.225.0` and excludes pytest; development adds the
 two test dependencies.
 
+Generic Binance exchangeInfo loading, filter lookup, and decimal-precision
+helpers live once in dependency-free `converter.exchange_info`. Compact replay
+scale derivation imports that module directly, while
+`converter.instruments` re-exports the helpers for the unchanged
+reconstruction/converter API. Production replay building therefore does not
+import Nautilus merely to read exchangeInfo.
+
 Three fresh external environments passed on Linux/WSL with CPython 3.12.3 and
 uv 0.11.29. The final lock SHA-256 is
 `976451a3c49b0098bc6e620acb889aa9fb6aa8aaf8098d20db0416721ed1b5af`

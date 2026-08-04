@@ -10,6 +10,7 @@ Run with normal pytest; no real data required.
 from __future__ import annotations
 
 import re
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -500,6 +501,30 @@ def test_replay_build_units_do_not_reference_legacy_converter() -> None:
         assert "cryptorecorder-convert" not in text, (
             f"{path.relative_to(ROOT)} must not reference a converter systemd unit"
         )
+
+
+def test_replay_build_timer_uses_supported_utc_calendar(tmp_path: Path) -> None:
+    text = REPLAY_BUILD_TIMER.read_text()
+    assert "OnCalendar=*-*-* 01:00:00 UTC" in text
+    assert not re.search(r"^Timezone=", text, flags=re.MULTILINE)
+
+    systemd_analyze = shutil.which("systemd-analyze")
+    if systemd_analyze is None:
+        pytest.skip("systemd-analyze is unavailable")
+
+    service = tmp_path / "cryptorecorder-replay-build.service"
+    service.write_text(
+        "[Service]\nType=oneshot\nExecStart=/usr/bin/true\n",
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [systemd_analyze, "verify", str(service), str(REPLAY_BUILD_TIMER)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "Unknown key" not in result.stderr
 
 
 def test_no_converter_systemd_unit_files_exist() -> None:

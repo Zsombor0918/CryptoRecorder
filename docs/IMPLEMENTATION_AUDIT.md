@@ -94,6 +94,14 @@ unchanged; the import boundary lets recorder/lifecycle/replay production
 modules load without Nautilus. The selected reconstruction error points to
 `uv sync --frozen --no-default-groups --extra reconstruction`.
 
+The compact writer's scale derivation has the same strict production boundary:
+generic Binance exchangeInfo loading, filter lookup, and decimal-precision
+parsing live once in dependency-free `converter.exchange_info`.
+`stores.replay_writer` imports those helpers directly;
+`converter.instruments` imports/re-exports them and retains only the
+Nautilus-specific instrument construction. Replay schemas, scale selection,
+manifest fields, ordering, and `convert_day.py` callers are unchanged.
+
 `validation.validate_dependency_environment` checks lock freshness and hash,
 required/forbidden packages, imports, CLI help, exact Nautilus version, and an
 optional tiny external schema-v2 production build/integrity smoke. The deploy

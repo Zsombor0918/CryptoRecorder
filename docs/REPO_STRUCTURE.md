@@ -75,8 +75,10 @@ These are the only top-level packages permitted:
 
 **`converter/`** — The legacy full-L2 converter implementation. This includes
 `depth_phase2.py`, `trades.py`, `readers.py`, `catalog.py`, `instruments.py`,
-`universe.py`, `spool.py`, and `trade_coverage.py`. Do not add replay pipeline
-logic here; this package is the old-converter boundary.
+`exchange_info.py`, `universe.py`, `spool.py`, and `trade_coverage.py`. The
+dependency-free `exchange_info.py` helper is shared with the production replay
+builder; Nautilus object construction remains in `instruments.py`. Do not add
+replay pipeline logic here; this package is the old-converter boundary.
 
 `converter/depth_repartition.py` is the dependency-free shared event-time
 selection/deduplication primitive used by both the legacy converter and the

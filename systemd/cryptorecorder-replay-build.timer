@@ -4,7 +4,6 @@ Description=CryptoRecorder Replay Store Build Timer (daily, 01:00 UTC)
 [Timer]
 # Run at 01:00 UTC, after the previous UTC recording day has closed.
 OnCalendar=*-*-* 01:00:00 UTC
-Timezone=UTC
 Unit=cryptorecorder-replay-build.service
 
 Persistent=true

@@ -322,7 +322,7 @@ def test_derive_fixed_point_scales_uses_exchange_filters(tmp_path, monkeypatch):
             {"filterType": "LOT_SIZE", "stepSize": "0.00001000"},
         ]}}
 
-    monkeypatch.setattr("converter.instruments.load_exchange_info", _fake_load_exchange_info)
+    monkeypatch.setattr("converter.exchange_info.load_exchange_info", _fake_load_exchange_info)
 
     spot_price_scale, spot_qty_scale = _derive_fixed_point_scales("BINANCE_SPOT", "BTCUSDT", "2026-06-10")
     fut_price_scale, fut_qty_scale = _derive_fixed_point_scales("BINANCE_USDTF", "BTCUSDT", "2026-06-10")
@@ -334,7 +334,7 @@ def test_derive_fixed_point_scales_uses_exchange_filters(tmp_path, monkeypatch):
 
 
 def test_derive_fixed_point_scales_raises_clearly_when_exchange_info_missing(monkeypatch):
-    monkeypatch.setattr("converter.instruments.load_exchange_info", lambda venue, date, data_root=None: {})
+    monkeypatch.setattr("converter.exchange_info.load_exchange_info", lambda venue, date, data_root=None: {})
     with pytest.raises(ValueError, match="exchangeInfo"):
         _derive_fixed_point_scales("BINANCE_SPOT", "UNKNOWNUSDT", "2026-06-10")
 

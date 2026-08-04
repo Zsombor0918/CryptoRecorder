@@ -6,76 +6,18 @@ Futures → CryptoPerpetual (e.g. BTCUSDT-PERP.BINANCE)
 """
 from __future__ import annotations
 
-import json
 import logging
-from pathlib import Path
-from typing import Dict, List, Optional
-
-import zstandard as zstd
+from typing import Dict, List
 
 from nautilus_trader.model.identifiers import InstrumentId, Symbol, Venue
 from nautilus_trader.model.instruments import CryptoPerpetual, CurrencyPair
 from nautilus_trader.model.objects import Currency, Money, Price, Quantity
 
-from config import DATA_ROOT
+from converter.exchange_info import _get_filter, _precision_from_str, load_exchange_info
 
 logger = logging.getLogger(__name__)
 
 BINANCE_VENUE = Venue("BINANCE")
-
-
-# ── helpers ──────────────────────────────────────────────────────────
-
-def _precision_from_str(s: str) -> int:
-    """Count decimal precision from a Binance filter string like '0.01000000'."""
-    s = s.rstrip("0")
-    if "." not in s:
-        return 0
-    return len(s.split(".")[1])
-
-
-def _get_filter(filters: list, filter_type: str) -> dict:
-    for f in filters:
-        if f.get("filterType") == filter_type:
-            return f
-    return {}
-
-
-# ── exchangeInfo loading ─────────────────────────────────────────────
-
-def load_exchange_info(venue: str, date_str: str, data_root: "Path | None" = None) -> Dict[str, dict]:
-    """Load exchangeInfo and return ``{symbol_str: info_dict}``.
-
-    Args:
-        data_root: raw data root to read from. Defaults to
-            ``config.DATA_ROOT`` for backward compatibility with existing
-            callers, but callers that have an explicit, non-global
-            ``data_root`` (e.g. a custom ``--data-root`` build) must pass it
-            here rather than relying on the process-wide default.
-    """
-    root = Path(data_root) if data_root is not None else DATA_ROOT
-    info_dir = root / venue / "exchangeinfo" / "EXCHANGEINFO" / date_str
-    if not info_dir.exists():
-        return {}
-
-    sym_map: Dict[str, dict] = {}
-    files = sorted(info_dir.glob("*.jsonl*"), reverse=True)
-    for fpath in files:
-        try:
-            if fpath.suffix == ".zst":
-                opener = lambda p=fpath: zstd.open(p, "rt", errors="ignore")
-            else:
-                opener = lambda p=fpath: open(p, "r", errors="ignore")
-            with opener() as fh:
-                for line in fh:
-                    d = json.loads(line.strip())
-                    for s in d.get("symbols", []):
-                        sym_map[s["symbol"]] = s
-                    if sym_map:
-                        return sym_map
-        except Exception:
-            continue
-    return sym_map
 
 
 # ── instrument ID helpers ────────────────────────────────────────────

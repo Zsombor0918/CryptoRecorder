@@ -165,7 +165,7 @@ def _derive_fixed_point_scales(
     required filters are not available for this venue/symbol/date — a compact
     v1/v2 build must not proceed without an exact, source-derived scale.
     """
-    from converter.instruments import load_exchange_info, _get_filter, _precision_from_str
+    from converter.exchange_info import load_exchange_info, _get_filter, _precision_from_str
 
     exchange_info = load_exchange_info(venue, date, data_root=data_root)
     info = exchange_info.get(symbol)

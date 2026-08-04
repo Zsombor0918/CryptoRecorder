@@ -68,6 +68,16 @@ passes.** Until then, broader full-L2 equivalence stays **deferred** (see
 ## [Unreleased]
 
 ### Fixed
+- **Production replay exchangeInfo dependency boundary** — generic Binance
+  exchangeInfo loading, filter lookup, and decimal-precision helpers now live
+  once in dependency-free `converter.exchange_info`. The compact replay writer
+  imports that module directly, while `converter.instruments` re-exports the
+  same helpers and retains Nautilus-specific object construction. Production
+  schema-v2 scale derivation no longer imports `nautilus_trader`; replay
+  schemas, manifests, ordering, `convert_day.py` behavior, and the pinned
+  reconstruction dependency are unchanged. The replay timer template also
+  drops the unsupported redundant `Timezone=UTC` key while retaining the
+  UTC-qualified `OnCalendar=*-*-* 01:00:00 UTC` schedule.
 - **PR #22 selected-job claim-cleanup reporting follow-up** — once selected
   reconstruction has published and validated the completed job, failure to
   remove or durability-sync its exact-job claim no longer reverses the

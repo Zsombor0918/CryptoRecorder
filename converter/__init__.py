@@ -3,6 +3,7 @@ converter — Transform raw JSONL data → Nautilus ParquetDataCatalog.
 
 Modules:
   readers       Streaming JSONL/zst/gz decompression
+  exchange_info Dependency-free Binance exchangeInfo parsing/filter helpers
   instruments   Build Nautilus Instrument objects from exchangeInfo
   trades        Raw trade_v2 records → TradeTick
   depth_phase2  Deterministic depth_v2 replay → OrderBookDeltas / OrderBookDepth10

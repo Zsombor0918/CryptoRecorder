@@ -405,6 +405,11 @@ tools. The development selection adds only pytest and pytest-asyncio. Frozen
 syncs must leave `uv.lock` byte-identical; `requirements.txt` is intentionally
 absent so there is no second hand-maintained dependency authority.
 
+Production replay scale derivation reads raw Binance exchangeInfo through the
+dependency-free `converter.exchange_info` module. The reconstruction-only
+`converter.instruments` module re-exports those helpers for compatibility but
+is not imported by the production replay writer.
+
 Services continue to execute `<app-dir>/.venv/bin/python`. They never execute
 uv, resolve dependencies, update the lock, or access a package index at
 startup. Repository templates have not yet been deployed or production-

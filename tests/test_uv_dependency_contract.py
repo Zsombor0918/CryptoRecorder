@@ -71,6 +71,7 @@ def test_direct_third_party_imports_are_classified() -> None:
         ROOT / "converter" / "readers.py",
         ROOT / "converter" / "spool.py",
         ROOT / "converter" / "depth_repartition.py",
+        ROOT / "converter" / "exchange_info.py",
     ]
     reconstruction_files = [
         ROOT / "convert_day.py",
@@ -120,6 +121,64 @@ import validation.audit_replay_store
         [sys.executable, "-c", code], cwd=ROOT, capture_output=True, text=True, check=False
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_production_scale_derivation_does_not_require_nautilus(tmp_path: Path) -> None:
+    code = r"""
+import builtins
+import json
+import sys
+from pathlib import Path
+
+real_import = builtins.__import__
+
+def import_without_nautilus(name, globals=None, locals=None, fromlist=(), level=0):
+    if name == "nautilus_trader" or name.startswith("nautilus_trader."):
+        raise ModuleNotFoundError("nautilus_trader intentionally unavailable")
+    return real_import(name, globals, locals, fromlist, level)
+
+builtins.__import__ = import_without_nautilus
+raw_root = Path(sys.argv[1])
+info_dir = raw_root / "BINANCE_SPOT" / "exchangeinfo" / "EXCHANGEINFO" / "2026-06-10"
+info_dir.mkdir(parents=True)
+payload = {
+    "symbols": [{
+        "symbol": "ADAUSDT",
+        "filters": [
+            {"filterType": "PRICE_FILTER", "tickSize": "0.01000000"},
+            {"filterType": "LOT_SIZE", "stepSize": "0.00010000"},
+            {"filterType": "MARKET_LOT_SIZE", "stepSize": "0.00100000"},
+        ],
+    }],
+}
+(info_dir / "exchangeinfo.jsonl").write_text(json.dumps(payload) + "\n", encoding="utf-8")
+
+from stores.replay_writer import _derive_fixed_point_scales
+
+assert _derive_fixed_point_scales(
+    "BINANCE_SPOT", "ADAUSDT", "2026-06-10", data_root=raw_root
+) == (2, 4)
+assert "converter.instruments" not in sys.modules
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", code, str(tmp_path / "raw")],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_reconstruction_instruments_reexport_shared_exchange_info_helpers() -> None:
+    pytest.importorskip("nautilus_trader")
+    from converter import exchange_info, instruments
+
+    assert instruments.load_exchange_info is exchange_info.load_exchange_info
+    assert instruments._get_filter is exchange_info._get_filter
+    assert instruments._precision_from_str is exchange_info._precision_from_str
+    built = instruments.build_instruments("BINANCE_SPOT", ["ADAUSDT"], {})
+    assert [str(instrument.id) for instrument in built] == ["ADAUSDT.BINANCE"]
 
 
 def test_lock_is_fresh_tracked_and_contains_no_unsafe_sources() -> None:

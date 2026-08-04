@@ -93,6 +93,139 @@ An entry may be skipped **only** for:
 - <or "none — task fully completed">
 ```
 
+## 2026-08-04 — Decouple production replay scale derivation from Nautilus
+
+### Change summary
+- Extracted Binance exchangeInfo loading, filter lookup, and decimal-precision
+  helpers into dependency-free `converter.exchange_info`.
+- Rewired the compact replay writer to the dependency-free module while
+  preserving the existing `converter.instruments` helper API by re-export.
+- Removed the unsupported redundant `Timezone=UTC` timer key while preserving
+  the UTC-qualified 01:00 `OnCalendar` schedule.
+- Added focused production-import, schema-v2 scale-derivation,
+  reconstruction-compatibility, and systemd timer regression coverage.
+
+### Files/packages touched
+- `converter/exchange_info.py`
+- `converter/instruments.py`
+- `converter/__init__.py`
+- `stores/replay_writer.py`
+- `systemd/cryptorecorder-replay-build.timer`
+- `tests/test_uv_dependency_contract.py`
+- `tests/test_replay_schema_v1.py`
+- `tests/test_agent_infrastructure.py`
+- `docs/REPO_STRUCTURE.md`
+- `docs/PROJECT_STATUS.md`
+- `docs/IMPLEMENTATION_AUDIT.md`
+- `docs/REPLAY_STORE.md`
+- `docs/DAILY_BUILD_PIPELINE.md`
+- `docs/OPERATIONS.md`
+- `CHANGELOG.md`
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] docs/REPO_STRUCTURE.md
+- [x] docs/PROJECT_STATUS.md
+- [x] docs/IMPLEMENTATION_AUDIT.md
+- [x] relevant feature docs:
+  - `docs/FULL_L2_REPLAY_CATALOG_PLAN.md`
+  - `docs/REPLAY_STORE.md`
+  - `docs/DAILY_BUILD_PIPELINE.md`
+  - `docs/OPERATIONS.md`
+  - `docs/AI_WORKFLOW.md`
+  - `CHANGELOG.md`
+
+### Docs updated
+- [x] CHANGELOG.md
+- [ ] README.md — no CLI, layout, or operator invocation changed
+- [x] docs/PROJECT_STATUS.md
+- [x] docs/REPO_STRUCTURE.md
+- [x] relevant feature docs:
+  - `docs/IMPLEMENTATION_AUDIT.md`
+  - `docs/REPLAY_STORE.md`
+  - `docs/DAILY_BUILD_PIPELINE.md`
+  - `docs/OPERATIONS.md`
+
+### Status / validation impact
+- Validated status changed: no.
+- Deferred status changed: no.
+- New claims added: yes — production compact replay scale derivation works
+  without importing or installing Nautilus.
+- Evidence for any new validation claim:
+  - A fresh frozen production environment contained neither
+    `nautilus_trader` nor pytest; imported `stores.replay_writer` and
+    `pipeline.daily_build`; and passed
+    `validation.validate_dependency_environment --kind production`.
+  - Focused regression coverage passed, including scale derivation from raw
+    exchangeInfo with Nautilus imports deliberately blocked and reconstruction
+    compatibility with pinned Nautilus 1.225.0.
+  - `uv.lock` remained byte-identical at
+    `976451a3c49b0098bc6e620acb889aa9fb6aa8aaf8098d20db0416721ed1b5af`.
+
+### Tests run
+```bash
+env UV_PROJECT_ENVIRONMENT="$PWD/.venv-production-check" \
+  /home/zsombor0918/.local/bin/uv sync --frozen --no-default-groups
+
+env PYTHONPATH="$PWD" .venv-production-check/bin/python -c \
+  'import importlib.util; assert importlib.util.find_spec("nautilus_trader") is None; assert importlib.util.find_spec("pytest") is None; import stores.replay_writer; import pipeline.daily_build'
+
+env UV_PROJECT_ENVIRONMENT="$PWD/.venv-test" \
+  /home/zsombor0918/.local/bin/uv sync --frozen --extra reconstruction --group dev
+
+.venv-test/bin/python -m pytest -q \
+  tests/test_uv_dependency_contract.py \
+  tests/test_replay_store.py \
+  tests/test_replay_schema_v1.py \
+  tests/test_replay_schema_v1_corrections.py \
+  tests/test_replay_hierarchical_integrity_v2.py \
+  tests/test_daily_build.py \
+  tests/test_agent_infrastructure.py \
+  tests/test_repo_structure.py
+# 198 passed; two environment-only failures were rerun below.
+
+.venv-test/bin/python -m pytest -q \
+  tests/test_agent_infrastructure.py::test_replay_build_timer_uses_supported_utc_calendar
+# 1 passed outside the restricted sandbox.
+
+.venv/bin/python -m pytest -q tests/test_repo_structure.py
+# 23 passed while the temporary test environment used the contract-ignored
+# .venv name; it was restored to .venv-test immediately afterward.
+
+.venv-test/bin/python -m compileall -q converter stores pipeline validation
+# PASS
+```
+
+### Validation CLIs run
+```bash
+env PYTHONPATH="$PWD" .venv-production-check/bin/python \
+  -m validation.validate_dependency_environment \
+  --kind production \
+  --uv-bin /home/zsombor0918/.local/bin/uv
+# status: passed; exact locked environment; forbidden dependencies absent
+
+/home/zsombor0918/.local/bin/uv lock --check
+# PASS; lock unchanged
+
+systemd-analyze verify \
+  systemd/cryptorecorder-recorder.service \
+  systemd/cryptorecorder-replay-build.service \
+  systemd/cryptorecorder-replay-build.timer
+# Exit 0; repository templates parsed. Final installed paths are verified
+# separately after production promotion.
+
+git diff --check
+# PASS
+```
+
+### Known limitations / out of scope
+- No recorder/raw code, raw schema/layout/data, replay schema, manifest,
+  ordering, builder identity, dependency pin, or `convert_day.py` behavior
+  changed.
+- No full pytest suite was run, per the operator's focused-test instruction.
+- No Nautilus dependency was added to production and no catalog reconstruction
+  workload was run.
+
 ## 2026-08-03 — Preserve selected-job success on claim cleanup failure
 
 ### Change summary

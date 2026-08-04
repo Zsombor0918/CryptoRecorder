@@ -8,6 +8,10 @@ processes dates oldest-first, builds at most a configured number of incomplete
 dates, and writes atomic per-date and invocation reports. It never builds a
 feature store or persistent Nautilus catalog.
 
+Its raw exchangeInfo parsing and compact fixed-point scale derivation are
+dependency-free production operations. Nautilus remains confined to explicit
+reconstruction/converter environments and is not required by this pipeline.
+
 The intended repository service invocation is explicit:
 
 ```bash
