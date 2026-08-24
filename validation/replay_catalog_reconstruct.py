@@ -1,20 +1,23 @@
 """
-pipeline.generate_catalog — On-demand Nautilus catalog generation from replay_store.
+validation.replay_catalog_reconstruct — Internal replay -> Nautilus catalog
+reconstruction helper.
 
-Reads replay_store data and generates temporary Nautilus ParquetDataCatalog
-for specific symbols, venues, and time windows.
+**This module is an internal engine and has no CLI entrypoint.** It serves both
+``validation.validate_catalog_equivalence`` and the supported, strictly scoped
+development-computer boundary ``pipeline.reconstruct_selected_catalog``.
+Callers outside this repository must use that boundary rather than this helper.
 
-Critical for semantic equivalence validation:
-  old: raw → convert_day.py → catalog
-  new: raw → replay_store → generate_catalog → catalog
+Per the CryptoRecorder/KovacsTrader ownership boundary
+(see ``docs/ARCHITECTURE.md``), CryptoRecorder does not offer a general-purpose
+persistent catalog-generation service. The supported boundary produces only
+explicitly selected, job-scoped temporary catalogs; feature, strategy,
+backtest, risk, and execution orchestration stay outside CryptoRecorder.
 """
 from __future__ import annotations
 
-import argparse
 import json
 import logging
 import shutil
-import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -29,14 +32,12 @@ try:
 except ImportError:
     NAUTILUS_AVAILABLE = False
     logger = logging.getLogger(__name__)
-    logger.warning("Nautilus not available; generate_catalog will not work")
+    logger.warning("Nautilus not available; replay_catalog_reconstruct will not work")
 
 from config import (
-    CATALOG_JOBS_ROOT,
     DEPTH10_INTERVAL_SEC,
     DERIVED_DEPTH_SNAPSHOT_LEVELS,
     EMIT_DEPTH10_DEFAULT,
-    REPLAY_ROOT,
 )
 from converter.depth_phase2 import replay_records_to_depth_streaming
 from converter.instruments import build_instruments
@@ -48,21 +49,38 @@ logger = logging.getLogger(__name__)
 
 WRITE_BATCH_SIZE = 5000
 
-# Supported catalog profiles:
+# Supported reconstruction profiles:
 #   trades_only — instruments + TradeTick (validated equivalent path)
 #   full_l2     — instruments + TradeTick + OrderBookDeltas (+ optional Depth10)
 #   depth_only  — instruments + OrderBookDeltas (+ optional Depth10), no trades
 #   depth10     — instruments + OrderBookDepth10 only
 SUPPORTED_PROFILES = ("trades_only", "full_l2", "depth_only", "depth10")
 
-# Documented equivalence caveats for the replay-based full_l2 path. These stem
-# from replay_store v0 NOT persisting sync_state/stream_lifecycle records and
-# NOT performing cross-day repartitioning/carry recovery. See
-# docs/FULL_L2_REPLAY_CATALOG_PLAN.md for the full equivalence boundary.
+# Documented equivalence caveats for the replay-based full_l2 reconstruction.
+# See docs/FULL_L2_REPLAY_CATALOG_PLAN.md for the full equivalence boundary.
+#
+# issue #20 Phase 7: "UTC-boundary repartitioning of clock-skewed records is
+# not applied" and "cross-day carry / synthetic opening snapshot is not
+# reproduced (no prev/next repartitioning)" were REMOVED from this list only
+# after implementation and evidence: depth_v2 raw records are now
+# repartitioned across D-1/D/D+1 by canonical event time in
+# ``pipeline.build_replay_store._stream_repartitioned_depth_records``,
+# reusing convert_day.py's own reference rule
+# (``converter.depth_phase2._spool_repartitioned_records``) exactly — proven
+# via the full exhaustive `validate_catalog_equivalence` gate (TradeTicks,
+# OrderBookDeltas, OrderBookDepth10, book checkpoints, continuity
+# diagnostics, fenced ranges, raw-to-replay metadata — all 8 components) on
+# BINANCE_SPOT/ADAUSDT for 2026-06-10, 2026-06-11 (the specific day that
+# exposed a 47-event OrderBookDeltas gap before this correction — now
+# old=new=1,071,997 exactly), and 2026-06-12, for both schema_version=0 and
+# schema_version=2. See ``pipeline.build_replay_store.check_depth_repartition_readiness``
+# for the readiness dependency: offline equivalence construction requires a
+# closed full D+1 scope, while the production 01:00 build uses a narrower
+# closed-first-hour operational policy documented there.
+# ``sync_state``/``stream_lifecycle`` records are preserved by current replay
+# schemas and the accepted ADA/BTC gates proved continuity and canonical
+# fenced-range results exact; they are therefore not listed as caveats.
 FULL_L2_CAVEATS = [
-    "sync_state-driven fenced ranges are not regenerated (replay v0 drops sync_state records)",
-    "cross-day carry / synthetic opening snapshot is not reproduced (no prev/next repartitioning)",
-    "UTC-boundary repartitioning of clock-skewed records is not applied",
     "duplicate depth suppression relies on the replay builder, not the converter spool",
 ]
 
@@ -109,30 +127,46 @@ def _window_from_date(date_str: str) -> tuple[datetime, datetime]:
     return start, start + timedelta(days=1)
 
 
+class ReplayTradeIdentifierError(ValueError):
+    """A replay row cannot produce a semantically identified TradeTick."""
+
+
 def _convert_trade_to_nautilus(
     trade: dict,
     instrument_id: InstrumentId,
     venue: str,
 ) -> Optional[TradeTick]:
-    """Convert replay trade record to Nautilus TradeTick."""
+    """Convert an identified replay trade record to Nautilus TradeTick.
+
+    A missing identifier is a replay contract violation, not an ordinary
+    invalid market value which may be counted and skipped. Raise so injected
+    or historical anonymous rows cannot turn into a successful shorter
+    catalog.
+    """
     if not NAUTILUS_AVAILABLE:
         return None
-    
+
     try:
-        trade_id = trade.get("trade_id") or trade.get("agg_trade_id")
-        if not trade_id:
-            return None
-        
+        trade_id = trade.get("trade_id")
+        if trade_id is None or str(trade_id) == "":
+            trade_id = trade.get("agg_trade_id")
+        if trade_id is None or str(trade_id) == "":
+            raise ReplayTradeIdentifierError(
+                "Replay trade row has no supported identifier "
+                "(trade_id or agg_trade_id); refusing to reconstruct an "
+                "anonymous TradeTick"
+            )
+
         price = trade.get("price_str") or trade.get("price", 0)
         quantity = trade.get("quantity_str") or trade.get("quantity", 0)
         ts_ns = int(trade.get("ts_exchange_ns", 0))
         ts_recv_ns = int(trade.get("ts_receive_ns", ts_ns))
-        
+
         if float(price) <= 0 or float(quantity) <= 0:
             return None
-        
+
         side = AggressorSide.BUYER if not trade.get("buyer_maker", False) else AggressorSide.SELLER
-        
+
         tick = TradeTick(
             instrument_id=instrument_id,
             price=Price.from_str(str(price)),
@@ -143,9 +177,16 @@ def _convert_trade_to_nautilus(
             ts_init=ts_recv_ns,
         )
         return tick
+    except ReplayTradeIdentifierError:
+        raise
     except Exception as e:
         logger.warning(f"Error converting trade: {e}")
         return None
+
+
+def _date_shift(date_str: str, days: int) -> str:
+    base = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    return (base + timedelta(days=days)).strftime("%Y-%m-%d")
 
 
 def _write_depth_for_partition(
@@ -215,6 +256,21 @@ def _write_depth_for_partition(
                 depth10_ordinal = depth10_spool.insert_many(kept, start_ordinal=depth10_ordinal)
 
         records = iter_replay_depth_records(reader.iter_depths(venue, symbol, date))
+
+        # Cross-day carry recovery (mirrors convert_depth_v2_streaming()'s raw
+        # carry mechanism exactly, reusing the same depth_phase2 helpers): if
+        # the previous day's replay partition exists for this venue/symbol,
+        # its depth rows are consumed transiently (never persisted/copied
+        # into this partition) so a session that began on the prior day can
+        # be recovered from its last snapshot_seed forward, matching the
+        # reference's fenced-range/continuity behavior across a UTC day
+        # boundary. If no such partition exists, carry_records stays None
+        # and behavior is unchanged (no carry recovery attempted).
+        prev_date = _date_shift(date, -1)
+        carry_records = None
+        if prev_date in set(reader.iter_dates(venue, symbol)):
+            carry_records = iter_replay_depth_records(reader.iter_depths(venue, symbol, prev_date))
+
         metrics = replay_records_to_depth_streaming(
             records,
             venue,
@@ -228,6 +284,7 @@ def _write_depth_for_partition(
             emit_depth10=writes_depth10,
             depth10_interval_sec=depth10_interval_sec,
             derived_depth_snapshot_levels=derived_depth_snapshot_levels,
+            carry_records=carry_records,
         )
 
         deltas_written = 0
@@ -274,11 +331,15 @@ def generate_catalog_from_replay(
     time_filter: str = "ts_init",
 ) -> dict:
     """
-    Generate Nautilus catalog from replay_store.
+    Reconstruct a temporary Nautilus catalog from replay_store.
+
+    Internal helper shared by validation equivalence and the supported
+    ``pipeline.reconstruct_selected_catalog`` boundary. It has no direct CLI
+    and is not itself a supported downstream runtime API.
 
     Args:
         replay_root: Path to replay_store
-        catalog_root: Output path for catalog_jobs
+        catalog_root: Output path for the temporary catalog job
         job_id: Unique job identifier
         symbols: List of symbols to include
         venues: List of venues to include
@@ -310,6 +371,7 @@ def generate_catalog_from_replay(
         "found_partitions": [],
         "missing_partitions": [],
         "date_partitions_scanned": [],
+        "partition_record_counts": [],
         "records_read": {
             "trades": 0,
             "depth": 0,
@@ -345,7 +407,7 @@ def generate_catalog_from_replay(
     if not NAUTILUS_AVAILABLE:
         status["status"] = "failed"
         status["errors"].append("Nautilus not installed")
-        logger.error("Nautilus not available for catalog generation")
+        logger.error("Nautilus not available for catalog reconstruction")
         return status
 
     if profile not in SUPPORTED_PROFILES:
@@ -371,7 +433,7 @@ def generate_catalog_from_replay(
             if not overwrite:
                 status["status"] = "failed"
                 status["errors"].append(
-                    f"Catalog job already exists: {job_dir}. Use overwrite=True or --overwrite."
+                    f"Catalog job already exists: {job_dir}. Use overwrite=True."
                 )
                 return status
             shutil.rmtree(job_dir)
@@ -430,6 +492,7 @@ def generate_catalog_from_replay(
                         continue
 
                     logger.info(f"Processing {venue}/{symbol}/{date}...")
+                    counts_before = dict(status["records_written"])
                     partition_key = f"{venue}:{symbol}:{date}"
                     status["found_partitions"].append({
                         "venue": venue,
@@ -468,33 +531,66 @@ def generate_catalog_from_replay(
 
                     # Stream and convert trades
                     if writes_trades:
-                        trade_batch = []
-                        for trade in reader.iter_trades(venue, symbol, date):
-                            status["records_read"]["trades"] += 1
-                            ts_init_ns = int(trade.get("ts_receive_ns") or trade.get("ts_exchange_ns", 0))
+                        # issue #20 Phase 7 semantic-oracle diagnosis fix:
+                        # TradeTick objects must be buffered through a
+                        # ts_init-sorted ObjectSpool before being written to
+                        # the catalog, exactly like convert_day.py's own
+                        # _write_object_spool() does and exactly like this
+                        # same function already does for deltas/depth10 in
+                        # _write_depth_for_partition() below. Writing
+                        # directly from reader.iter_trades()'s physical
+                        # replay order (sorted by
+                        # (trade_stream_session_id, trade_session_seq,
+                        # raw_index)) is CORRECT for that layer but is not
+                        # chronological: trade_stream_session_id is a
+                        # simple in-process counter (native_trades.py)
+                        # that resets on every recorder process restart, so
+                        # a session started late in the day after a restart
+                        # can have a SMALLER session id than an
+                        # earlier-in-the-day session from a longer-running
+                        # process — session-key order is intentionally not
+                        # wall-clock order (this is what the whole
+                        # replay/convert_day stack relies on for per-session
+                        # continuity/fencing). Nautilus's ParquetDataCatalog
+                        # requires a stream to be ts_init-monotonic, so the
+                        # FINAL write order must be re-sorted by ts_init —
+                        # bounded memory via ObjectSpool's disk-backed
+                        # SQLite `ORDER BY ts_init, ordinal` (see
+                        # converter/spool.py), never a full-day in-RAM sort.
+                        # TradeTicks have no sequential book-state
+                        # dependency (unlike deltas), so re-sorting them by
+                        # ts_init before writing changes only their
+                        # on-disk/write order, never their values, counts,
+                        # or any other content.
+                        trade_ordinal = 0
+                        with ObjectSpool(prefix="cryptorecorder-gc-trade-") as trade_spool:
+                            for trade in reader.iter_trades(venue, symbol, date):
+                                status["records_read"]["trades"] += 1
+                                ts_init_ns = int(trade.get("ts_receive_ns") or trade.get("ts_exchange_ns", 0))
 
-                            # Nautilus catalog bounded reads are based on ts_init.
-                            if ts_init_ns < start_ns:
-                                status["records_skipped"]["outside_window"] += 1
-                                continue
-                            if ts_init_ns >= end_ns:
-                                status["records_skipped"]["outside_window"] += 1
-                                continue
+                                # Nautilus catalog bounded reads are based on ts_init.
+                                if ts_init_ns < start_ns:
+                                    status["records_skipped"]["outside_window"] += 1
+                                    continue
+                                if ts_init_ns >= end_ns:
+                                    status["records_skipped"]["outside_window"] += 1
+                                    continue
 
-                            trade_tick = _convert_trade_to_nautilus(
-                                trade, instrument_id, venue
-                            )
-                            if trade_tick:
-                                trade_batch.append(trade_tick)
-                                status["records_written"]["trade_ticks"] += 1
-                                if len(trade_batch) >= 5000:
-                                    catalog.write_data(trade_batch)
-                                    trade_batch = []
-                            else:
-                                status["records_skipped"]["invalid_trade"] += 1
-                                status["skipped_invalid_records"] += 1
-                        if trade_batch:
-                            catalog.write_data(trade_batch)
+                                trade_tick = _convert_trade_to_nautilus(
+                                    trade, instrument_id, venue
+                                )
+                                if trade_tick:
+                                    trade_ordinal = trade_spool.insert_many(
+                                        [trade_tick], start_ordinal=trade_ordinal
+                                    )
+                                    status["records_written"]["trade_ticks"] += 1
+                                else:
+                                    status["records_skipped"]["invalid_trade"] += 1
+                                    status["skipped_invalid_records"] += 1
+                            if trade_spool.count:
+                                trade_spool.commit()
+                                for spool_batch in trade_spool.iter_batches(5000):
+                                    catalog.write_data(spool_batch)
 
                     # Depth records (OrderBookDeltas / OrderBookDepth10) via the
                     # shared, validated converter engine + replay adapter.
@@ -546,6 +642,23 @@ def generate_catalog_from_replay(
                         f"deltas={status['records_written']['order_book_deltas']}, "
                         f"depth10={status['records_written']['order_book_depth10']}"
                     )
+                    status["partition_record_counts"].append({
+                        "venue": venue,
+                        "symbol": symbol,
+                        "date": date,
+                        "trade_ticks": (
+                            status["records_written"]["trade_ticks"]
+                            - counts_before["trade_ticks"]
+                        ),
+                        "order_book_deltas": (
+                            status["records_written"]["order_book_deltas"]
+                            - counts_before["order_book_deltas"]
+                        ),
+                        "order_book_depth10": (
+                            status["records_written"]["order_book_depth10"]
+                            - counts_before["order_book_depth10"]
+                        ),
+                    })
 
         if writes_trades and status["records_written"]["trade_ticks"] == 0:
             status["warnings"].append(
@@ -574,6 +687,7 @@ def generate_catalog_from_replay(
             },
             "records_read": status["records_read"],
             "record_counts": status["records_written"],
+            "partition_record_counts": status["partition_record_counts"],
             "records_skipped": status["records_skipped"],
             "skipped_invalid_records": status["skipped_invalid_records"],
             "instrument_count": len(instruments_written),
@@ -589,7 +703,7 @@ def generate_catalog_from_replay(
             json.dump(manifest, f, indent=2)
 
         logger.info(
-            f"✓ Catalog generated: job_id={job_id}, profile={profile}, "
+            f"Catalog reconstructed: job_id={job_id}, profile={profile}, "
             f"symbols={len(status['symbols_processed'])}, "
             f"trades={status['records_written']['trade_ticks']}, "
             f"deltas={status['records_written']['order_book_deltas']}, "
@@ -599,172 +713,6 @@ def generate_catalog_from_replay(
     except Exception as e:
         status["status"] = "failed"
         status["errors"].append(str(e))
-        logger.error(f"Failed to generate catalog: {e}")
+        logger.error(f"Failed to reconstruct catalog: {e}")
 
     return status
-
-
-def main():
-    """CLI entry point for generate_catalog."""
-    parser = argparse.ArgumentParser(
-        description="Generate Nautilus catalog from replay_store",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python -m pipeline.generate_catalog --input /path/to/replay_store --symbols BTCUSDT --venues BINANCE_SPOT --start 2026-06-15T12:00:00Z --end 2026-06-15T13:00:00Z
-  python -m pipeline.generate_catalog --input /path/to/replay_store --symbols BTCUSDT --venues BINANCE_SPOT --date 2026-06-15 --job-id validation_day --overwrite
-  python -m pipeline.generate_catalog --input /path/to/replay_store --symbols BTCUSDT,ETHUSDT --start 2026-06-15T00:00:00Z --end 2026-06-17T00:00:00Z --output /path/to/catalog_jobs --job-id validation_new --overwrite
-        """,
-    )
-    parser.add_argument(
-        "--input",
-        type=Path,
-        default=None,
-        help=f"Replay store root (default: {REPLAY_ROOT})",
-    )
-    parser.add_argument(
-        "--symbols",
-        required=True,
-        help="Comma-separated symbols (e.g., BTCUSDT,ETHUSDT)",
-    )
-    parser.add_argument(
-        "--venues",
-        default="BINANCE_SPOT,BINANCE_USDTF",
-        help="Comma-separated venues (default: BINANCE_SPOT,BINANCE_USDTF)",
-    )
-    parser.add_argument(
-        "--start",
-        default=None,
-        help="Start time (ISO 8601 UTC, e.g., 2026-06-15T12:00:00Z)",
-    )
-    parser.add_argument(
-        "--end",
-        default=None,
-        help="End time (ISO 8601 UTC, e.g., 2026-06-15T13:00:00Z)",
-    )
-    parser.add_argument(
-        "--date",
-        default=None,
-        help="UTC date shortcut (YYYY-MM-DD), equivalent to that full half-open UTC day.",
-    )
-    parser.add_argument(
-        "--output",
-        type=Path,
-        default=None,
-        help=f"Catalog output root (default: {CATALOG_JOBS_ROOT})",
-    )
-    parser.add_argument(
-        "--job-id",
-        default=None,
-        help="Deterministic job id. Output directory is job_{job_id}.",
-    )
-    parser.add_argument(
-        "--overwrite",
-        action="store_true",
-        help="Delete and recreate job_{job_id} if it already exists.",
-    )
-    parser.add_argument(
-        "--profile",
-        choices=list(SUPPORTED_PROFILES),
-        default="trades_only",
-        help=(
-            "Catalog profile (default: trades_only). "
-            "full_l2 = trades + OrderBookDeltas (+ Depth10); "
-            "depth_only = OrderBookDeltas (+ Depth10); "
-            "depth10 = OrderBookDepth10 only."
-        ),
-    )
-    parser.add_argument(
-        "--emit-depth10",
-        dest="emit_depth10",
-        action="store_true",
-        default=EMIT_DEPTH10_DEFAULT,
-        help="Emit derived OrderBookDepth10 snapshots (full_l2/depth_only). Default: on.",
-    )
-    parser.add_argument(
-        "--no-emit-depth10",
-        dest="emit_depth10",
-        action="store_false",
-        help="Do not emit derived OrderBookDepth10 snapshots (full_l2/depth_only).",
-    )
-    parser.add_argument(
-        "--depth10-interval-sec",
-        type=float,
-        default=DEPTH10_INTERVAL_SEC,
-        help=f"Minimum seconds between derived Depth10 snapshots (default: {DEPTH10_INTERVAL_SEC}).",
-    )
-    parser.add_argument(
-        "--derived-depth-snapshot-levels",
-        type=int,
-        default=DERIVED_DEPTH_SNAPSHOT_LEVELS,
-        help=f"Levels per derived Depth10 snapshot, <=10 (default: {DERIVED_DEPTH_SNAPSHOT_LEVELS}).",
-    )
-    parser.add_argument(
-        "--time-filter",
-        choices=["ts_init", "ts_event"],
-        default="ts_init",
-        help="Window filter field for catalog reads (default: ts_init).",
-    )
-    args = parser.parse_args()
-
-    replay_root = args.input or REPLAY_ROOT
-    catalog_root = args.output or CATALOG_JOBS_ROOT
-
-    if args.date and (args.start or args.end):
-        parser.error("Use either --date or --start/--end, not both.")
-    if args.date:
-        try:
-            start, end = _window_from_date(args.date)
-        except ValueError as e:
-            parser.error(str(e))
-    else:
-        if not args.start or not args.end:
-            parser.error("Either --date or both --start and --end are required.")
-        try:
-            start = _parse_iso_datetime(args.start)
-            end = _parse_iso_datetime(args.end)
-        except ValueError as e:
-            logger.error(f"Invalid datetime format: {e}")
-            sys.exit(1)
-    if end <= start:
-        parser.error("--end must be after --start.")
-
-    symbols = [s.strip().upper() for s in args.symbols.split(",")]
-    venues = [v.strip().upper() for v in args.venues.split(",")]
-
-    job_id = args.job_id or datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-
-    logger.info(
-        f"Generating catalog: job_id={job_id}, symbols={symbols}, "
-        f"venues={venues}, start={start}, end={end}"
-    )
-
-    result = generate_catalog_from_replay(
-        replay_root,
-        catalog_root,
-        job_id,
-        symbols,
-        venues,
-        start,
-        end,
-        profile=args.profile,
-        overwrite=args.overwrite,
-        emit_depth10=args.emit_depth10,
-        depth10_interval_sec=args.depth10_interval_sec,
-        derived_depth_snapshot_levels=args.derived_depth_snapshot_levels,
-        time_filter=args.time_filter,
-    )
-
-    if result["status"] != "success":
-        logger.error(f"Catalog generation failed: {result['errors']}")
-        sys.exit(1)
-
-    return 0
-
-
-if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    )
-    sys.exit(main())

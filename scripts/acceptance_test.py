@@ -7,8 +7,10 @@ This script verifies the existing validated recorder/converter path:
   2. convert_day.py can process data into Nautilus catalog
   3. Catalog is queryable and valid
 
-It does not validate replay_store -> generate_catalog --profile full_l2.
-That path is deferred and planned separately.
+It does not validate the internal replay full-L2 reconstruction helper used by
+``validation.validate_catalog_equivalence``. That broader equivalence check is
+validated on a single-symbol/single-day smoke only; see
+docs/FULL_L2_REPLAY_CATALOG_PLAN.md.
 
 Usage:
     python scripts/acceptance_test.py

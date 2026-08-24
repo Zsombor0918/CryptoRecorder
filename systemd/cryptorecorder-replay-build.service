@@ -2,6 +2,10 @@
 Description=CryptoRecorder Replay Store Build (previous UTC day)
 Documentation=file:///home/zsom/services/CryptoRecorder/docs/REPLAY_STORE.md
 After=network.target
+# Hard restart-burst guard: cap at 3 attempts per 24 hours so a deterministic
+# failure cannot loop forever even if Restart is ever re-enabled.
+StartLimitIntervalSec=86400
+StartLimitBurst=3
 
 [Service]
 Type=oneshot
@@ -9,16 +13,37 @@ User=zsom
 Group=zsom
 WorkingDirectory=/home/zsom/services/CryptoRecorder
 EnvironmentFile=-/etc/cryptorecorder/cryptorecorder.env
-# build_replay_store requires an explicit YYYY-MM-DD date; daily_build resolves
-# 'yesterday' to the previous completed UTC day and runs the replay step only.
-ExecStart=/home/zsom/services/CryptoRecorder/.venv/bin/python -m pipeline.daily_build --steps replay --date yesterday
+# daily_build requires an explicit YYYY-MM-DD date or the 'yesterday' shortcut,
+# which resolves to the previous completed UTC day. It always builds the
+# replay store (there is no --steps flag; daily_build is replay-only).
+ExecStart=/home/zsom/services/CryptoRecorder/.venv/bin/python -m pipeline.daily_build --date yesterday --backlog-days 7 --max-build-dates 3 --schema-version 2
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=cryptorecorder-replay-build
 
-Restart=on-failure
+Restart=no
 RestartSec=300
-TimeoutStartSec=3600
+# Bounded start timeout, not infinite: the daily timer fires once at 01:00
+# UTC and systemd will not start a new instance while this service is still
+# active, so a genuinely stuck invocation must not be allowed to remain
+# active indefinitely (that would silently block every subsequent scheduled
+# run). 1 hour (the previous value) was too short for a full-universe
+# replay build. 23 hours gives ample room for a long daily build (large
+# symbol universe, slow I/O, etc.) while still guaranteeing systemd
+# terminates a stuck/hung run before the next 01:00 UTC activation.
+# Restart=no is unchanged, so a timeout failure cannot create a restart
+# loop; the crash-safe staging/backup recovery in pipeline.build_replay_store
+# already protects replay data if systemd terminates the build mid-run.
+# Explicit source-changed or incompatible-schema replacements and historical
+# backfills are run via the documented isolated operator flow (or a separately
+# controlled transient systemd scope) -- not via this installed daily service.
+TimeoutStartSec=23h
+
+# Repository template for the known 16 GiB host. This has not yet been
+# installed or production-validated; the later owner acceptance must confirm
+# real headroom under the 12 GiB ceiling.
+MemoryMax=12G
+MemorySwapMax=0
 
 # Security hardening
 NoNewPrivileges=yes

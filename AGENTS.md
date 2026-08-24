@@ -41,13 +41,14 @@ If any of these contradict the task you were given, **stop and ask** instead of 
   **ADAUSDT single-day smoke** against `convert_day.py`. Do **not** claim broader
   top50/multi-day equivalence (the `v2.0.0` gate) until that wider validation
   passes; `convert_day.py` remains the production reference.
-- Do **not** describe Syncthing, archive, or import features as implemented.
-  `ARCHIVE_DAYS_ROOT` and `LABEL_ROOT` in `config.py` are **placeholders only**.
+- Do **not** describe Syncthing or archive features as implemented.
+  `ARCHIVE_DAYS_ROOT` in `config.py` is a **placeholder only**. `LABEL_ROOT` was
+  removed entirely (issue #17) — do not reintroduce a label/target store.
 - Never mark a deferred item as done.
 
 ### No New Docs Files Without Contract Amendment
 
-The docs structure is intentionally **fixed at 14 files**. Before creating any
+The docs structure is intentionally **fixed at 12 files**. Before creating any
 new file in `docs/`, you **must** identify which existing file is the right home
 for the content, add it as a new section there, and (only if no existing file
 fits) amend `docs/REPO_STRUCTURE.md` with a justification.
@@ -64,12 +65,14 @@ fits) amend `docs/REPO_STRUCTURE.md` with a justification.
 | Requirements audit / storage size measurement | `docs/IMPLEMENTATION_AUDIT.md` |
 | Validation layers and CLI reference | `docs/VALIDATION.md` |
 | Feature reference (replay) | `docs/REPLAY_STORE.md` |
-| Feature reference (features) | `docs/FEATURE_STORE.md` |
-| Feature reference (catalog) | `docs/GENERATE_CATALOG.md` |
 | Feature reference (daily build) | `docs/DAILY_BUILD_PIPELINE.md` |
 | Full-L2 plan / gate status | `docs/FULL_L2_REPLAY_CATALOG_PLAN.md` |
 | Change audit entries | `docs/CHANGE_AUDIT.md` (append-only) |
 | Version history | `CHANGELOG.md` |
+
+There is no `docs/FEATURE_STORE.md` or `docs/GENERATE_CATALOG.md` (removed,
+issue #17) — CryptoRecorder does not own a feature-store or a product-facing
+catalog-generation CLI. Do not recreate either file.
 
 If the agent is unsure which file to update, **stop and ask** rather than
 creating a new file.
@@ -80,9 +83,11 @@ creating a new file.
 - `pipeline/` = build/transform CLIs only. **No audit/compare/inspect CLIs here.**
 - `validation/` = audit/compare/inspect CLIs only. **No build CLIs here.**
 - `converter/` = legacy full-L2 raw→Nautilus converter internals.
-- `stores/` = replay/feature schemas, readers, writers.
+- `stores/` = replay schemas, readers, writers (no feature/label schemas).
 - `scripts/` = thin operator wrappers only. **No business logic in scripts/.**
-- Do **not** recreate the deleted `validators/` package.
+- Do **not** recreate the deleted `validators/` package or the deleted
+  feature-store subsystem (`stores/feature_*.py`, `pipeline/build_feature_store.py`,
+  `validation/audit_feature_store.py`).
 
 ---
 
@@ -93,10 +98,10 @@ A change is **not** done until all of the following are true:
 1. Relevant docs are updated (`docs/`, `README.md`, and `docs/PROJECT_STATUS.md`
    if status changed).
 2. [CHANGELOG.md](CHANGELOG.md) `## [Unreleased]` section is updated.
-3. `pytest` passes locally (`source .venv/bin/activate && pytest`).
-4. If you touched replay / feature / catalog code, you ran the relevant
-   audit/validation CLI (`validation/audit_replay_store.py`,
-   `validation/audit_feature_store.py`, or
+3. `pytest` passes from the explicit locked development environment
+   (`uv sync --frozen --no-default-groups --extra reconstruction --group dev`).
+4. If you touched replay or catalog-reconstruction code, you ran the relevant
+   audit/validation CLI (`validation/audit_replay_store.py` or
    `validation/validate_catalog_equivalence.py`) and reported the result.
 5. Status stays **honest**: validated stays validated, deferred stays deferred.
 6. You stated explicitly **what was not done** / out of scope.
@@ -112,8 +117,7 @@ A change is **not** done until all of the following are true:
 |-----------|----------------|
 | Repo structure / file moves | `pytest tests/test_repo_structure.py` |
 | Replay store changes | `pytest tests/test_replay_store.py` + `validation/audit_replay_store.py` |
-| Feature store changes | `pytest tests/test_feature_store.py` + `validation/audit_feature_store.py` |
-| Catalog generation | `pytest tests/test_generate_catalog.py tests/test_catalog_equivalence.py` |
+| Catalog reconstruction (validation-only) | `pytest tests/test_replay_catalog_reconstruct.py tests/test_catalog_equivalence.py` |
 | Converter / raw (only if explicitly allowed) | full `pytest` + `validation/validate_catalog_equivalence.py` |
 | AI / deployment infrastructure | `pytest tests/test_agent_infrastructure.py tests/test_repo_structure.py` |
 | Anything else | full `pytest` |
@@ -124,12 +128,20 @@ A change is **not** done until all of the following are true:
 
 - **Stop and ask** if you are uncertain about a path, a destructive action, or
   whether raw-side changes are in scope.
-- Do **not** invent production paths. The canonical prod layout lives in
-  [docs/LINUX_SERVER.md](docs/OPERATIONS.md) in the `## Linux Server Layout` section of [docs/OPERATIONS.md](docs/OPERATIONS.md); use those values, do not guess.
-- Do **not** delete data directories (`data_raw/`, `replay_store/`, `feature_store/`,
-  `state/`, catalog outputs).
+- Do **not** invent production paths. The canonical prod layout lives in the
+  `## Linux Server Layout` section of [docs/OPERATIONS.md](docs/OPERATIONS.md);
+  use those values, do not guess.
+- Do **not** delete data directories (`data_raw/`, `replay_store/`,
+  `state/`, catalog outputs, or any pre-existing local `feature_store/` left
+  over from before issue #17 — even though CryptoRecorder no longer writes to
+  it).
 - Do **not** mark deferred work as done to "close" a task.
 - Prefer **small, reviewable changes** over large sweeping rewrites.
+- `pyproject.toml` plus the committed `uv.lock` are the only dependency
+  authority. Never restore a hand-maintained `requirements.txt`, use pip for
+  deployment installation, or run an unfrozen deployment sync. Production is
+  `uv sync --frozen --no-default-groups`; reconstruction adds
+  `--extra reconstruction`; development adds that extra plus `--group dev`.
 - When in doubt about whether a folder/file is allowed, consult
   [docs/REPO_STRUCTURE.md](docs/REPO_STRUCTURE.md) first.
 
@@ -146,7 +158,8 @@ complete.
 
 An entry is required for **any** commit that touches:
 - Python source files (`*.py`) anywhere in the repo
-- Schema, config, or deployment files (`config.py`, `systemd/`, `requirements.txt`)
+- Schema, dependency, config, or deployment files (`config.py`,
+  `pyproject.toml`, `uv.lock`, `systemd/`)
 - Documentation files if the change affects status claims, validated/deferred state,
   or the repo structure contract
 

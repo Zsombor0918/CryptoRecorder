@@ -50,18 +50,17 @@ _CORE_CODE_PREFIXES: tuple[str, ...] = (
 _DEPLOYMENT_PREFIXES: tuple[str, ...] = (
     "systemd/",
     "scripts/",
-    "requirements.txt",
+    "pyproject.toml",
+    "uv.lock",
+    "requirements.txt",  # deletion/restoration remains compliance-relevant
 )
 
 _REPLAY_CATALOG_PATTERNS: tuple[str, ...] = (
     "stores/replay",
-    "stores/feature",
     "pipeline/build_replay",
-    "pipeline/build_feature",
-    "pipeline/generate_catalog",
+    "validation/replay_catalog_reconstruct",
     "validation/validate_catalog",
     "validation/audit_replay",
-    "validation/audit_feature",
 )
 
 # Paths whose changes are considered "docs-only" (may be exempt with

@@ -1,18 +1,702 @@
 """Semantic comparison utilities for Nautilus ParquetDataCatalog outputs."""
 from __future__ import annotations
 
+import calendar
+import hashlib
+import importlib.metadata
+import inspect
+import itertools
 import json
 import math
+import re
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from decimal import Decimal
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
 
+import pyarrow as pa
+import pyarrow.compute as pc
+import pyarrow.parquet as pq
 from nautilus_trader.persistence.catalog import ParquetDataCatalog
+from nautilus_trader.model.data import TradeTick
+
+from converter.depth_phase2 import canonical_fence_digest
+
+# Sentinel used by the exhaustive streaming comparators below to detect
+# length divergence via itertools.zip_longest without confusing a genuine
+# `None` field value for "this stream ran out of events here".
+_MISSING = object()
+
+
+# ---------------------------------------------------------------------------
+# Batch-bounded catalog reader
+# ---------------------------------------------------------------------------
+#
+# Nautilus 1.225.0's catalog query adds a global ``ORDER BY ts_init`` before
+# yielding query results. A full-day, multi-file DataFusion query therefore
+# cannot provide a hard streaming-memory bound. The bounded reader bypasses
+# that query path:
+# it selects candidate files, validates the complete selected layout, then
+# reads one file and one row group at a time with PyArrow. This relies on a
+# deliberately narrow compatibility boundary:
+#
+# - `ParquetDataCatalog._query_files(...)` is PRIVATE Nautilus API (the
+#   leading underscore is significant). It is used because it applies the
+#   catalog's own class/instrument/time filename pruning without invoking the
+#   memory-unbounded DataFusion query. There is no supported public Nautilus
+#   API in 1.225.0 which exposes this file selection while avoiding the
+#   unconditional global `ORDER BY ts_init`.
+# - This code is tested only against, and the project dependency is pinned
+#   to, nautilus_trader==1.225.0. Runtime version and private-method signature
+#   checks run before file selection. An incompatible version raises
+#   `CatalogStreamingCompatibilityError`; there is intentionally NO fallback
+#   to `catalog.query()`, `_query_rust()`, or `backend_session()`.
+# - Both CryptoRecorder validation catalog writers pass ts_init/ordinal-sorted
+#   ObjectSpool batches to `ParquetDataCatalog.write_data()`. In Nautilus
+#   1.225.0, `_objects_to_table()` rejects internally decreasing ts_init and
+#   `_write_chunk()` rejects overlapping CLOSED file intervals. No caller in
+#   either validation path opts out with `skip_disjoint_check=True`.
+# - The reader does not merely trust those private writer details. Before it
+#   yields one object, it checks every selected file's class/instrument,
+#   schema, filename-vs-content range, row-group order, and full internal
+#   non-decreasing ts_init order, then rejects any adjacent closed intervals
+#   for which `next.first_ts <= previous.last_ts`. Equality at a file
+#   boundary is therefore an unsupported overlap and fails closed. Equal
+#   ts_init values inside one file retain their physical row order because
+#   row groups and batches are traversed by ascending numeric index.
+#
+# The preflight and decode passes each keep at most one Parquet file open and
+# one bounded Arrow batch live. The second pass filters objects with inclusive
+# `start <= ts_init <= end`, matching Nautilus's existing query contract.
+DEFAULT_STREAM_BATCH_SIZE = 10_000
+TESTED_NAUTILUS_VERSION = "1.225.0"
+
+
+class CatalogStreamingCompatibilityError(RuntimeError):
+    """The pinned private Nautilus file-selection contract is unavailable."""
+
+
+class CatalogFileLayoutError(ValueError):
+    """A selected catalog file layout cannot be streamed in canonical order."""
+
+
+@dataclass(frozen=True)
+class _ValidatedCatalogFile:
+    path: Path
+    first_ts: int
+    last_ts: int
+    row_count: int
+    stat_identity: tuple[int, int, int, int]
+
+
+_CATALOG_DIRECTORY_BY_CLASS = {
+    "OrderBookDelta": "order_book_deltas",
+    "OrderBookDepth10": "order_book_depths",
+    "TradeTick": "trade_tick",
+}
+
+_CATALOG_FILENAME_RE = re.compile(
+    r"^(?P<sy>\d{4})-(?P<smo>\d{2})-(?P<sd>\d{2})T"
+    r"(?P<sh>\d{2})-(?P<smi>\d{2})-(?P<ss>\d{2})-(?P<sn>\d{9})Z_"
+    r"(?P<ey>\d{4})-(?P<emo>\d{2})-(?P<ed>\d{2})T"
+    r"(?P<eh>\d{2})-(?P<emi>\d{2})-(?P<es>\d{2})-(?P<en>\d{9})Z\.parquet$"
+)
+
+
+def _catalog_filename_interval_ns(path: Path) -> tuple[int, int]:
+    match = _CATALOG_FILENAME_RE.fullmatch(path.name)
+    if match is None:
+        raise CatalogFileLayoutError(
+            f"Selected catalog file has an unsupported Nautilus timestamp filename: {path}. "
+            "Refusing lexical/path-order guesses."
+        )
+
+    def to_ns(prefix: str) -> int:
+        try:
+            dt = datetime(
+                int(match.group(f"{prefix}y")),
+                int(match.group(f"{prefix}mo")),
+                int(match.group(f"{prefix}d")),
+                int(match.group(f"{prefix}h")),
+                int(match.group(f"{prefix}mi")),
+                int(match.group(f"{prefix}s")),
+                tzinfo=timezone.utc,
+            )
+        except ValueError as exc:
+            raise CatalogFileLayoutError(
+                f"Selected catalog file has an invalid timestamp filename: {path}: {exc}"
+            ) from exc
+        whole_seconds = calendar.timegm(dt.utctimetuple())
+        return whole_seconds * 1_000_000_000 + int(match.group(f"{prefix}n"))
+
+    return to_ns("s"), to_ns("e")
+
+
+def _file_stat_identity(path: Path) -> tuple[int, int, int, int]:
+    stat = path.stat()
+    return (int(stat.st_dev), int(stat.st_ino), int(stat.st_size), int(stat.st_mtime_ns))
+
+
+def _expected_catalog_schema(data_cls: type) -> pa.Schema:
+    """Return the exact pinned Nautilus 1.225.0 physical schema for a class."""
+    fixed_decimal = pa.binary(16)
+    if data_cls.__name__ == "TradeTick":
+        field_specs = [
+            ("price", fixed_decimal),
+            ("size", fixed_decimal),
+            ("aggressor_side", pa.uint8()),
+            ("trade_id", pa.string()),
+            ("ts_event", pa.uint64()),
+            ("ts_init", pa.uint64()),
+        ]
+    elif data_cls.__name__ == "OrderBookDelta":
+        field_specs = [
+            ("action", pa.uint8()),
+            ("side", pa.uint8()),
+            ("price", fixed_decimal),
+            ("size", fixed_decimal),
+            ("order_id", pa.uint64()),
+            ("flags", pa.uint8()),
+            ("sequence", pa.uint64()),
+            ("ts_event", pa.uint64()),
+            ("ts_init", pa.uint64()),
+        ]
+    elif data_cls.__name__ == "OrderBookDepth10":
+        field_specs = [
+            *[(f"bid_price_{index}", fixed_decimal) for index in range(10)],
+            *[(f"ask_price_{index}", fixed_decimal) for index in range(10)],
+            *[(f"bid_size_{index}", fixed_decimal) for index in range(10)],
+            *[(f"ask_size_{index}", fixed_decimal) for index in range(10)],
+            *[(f"bid_count_{index}", pa.uint32()) for index in range(10)],
+            *[(f"ask_count_{index}", pa.uint32()) for index in range(10)],
+            ("flags", pa.uint8()),
+            ("sequence", pa.uint64()),
+            ("ts_event", pa.uint64()),
+            ("ts_init", pa.uint64()),
+        ]
+    else:
+        raise CatalogStreamingCompatibilityError(
+            f"Bounded catalog reader does not support data class {data_cls.__name__!r}."
+        )
+    return pa.schema(
+        [pa.field(name, field_type, nullable=False) for name, field_type in field_specs]
+    )
+
+
+def _require_pinned_nautilus_file_api(catalog: ParquetDataCatalog) -> None:
+    try:
+        installed = importlib.metadata.version("nautilus_trader")
+    except importlib.metadata.PackageNotFoundError as exc:
+        raise CatalogStreamingCompatibilityError(
+            "Cannot verify the Nautilus version required by the bounded catalog reader. "
+            "Refusing to fall back to the DataFusion query."
+        ) from exc
+
+    if installed != TESTED_NAUTILUS_VERSION:
+        raise CatalogStreamingCompatibilityError(
+            "The bounded catalog reader uses private "
+            "ParquetDataCatalog._query_files() behavior tested only with "
+            f"nautilus_trader=={TESTED_NAUTILUS_VERSION}; found {installed}. "
+            "Refusing to use an unverified private API and refusing to fall back "
+            "to the memory-unbounded DataFusion query."
+        )
+
+    method = getattr(type(catalog), "_query_files", None)
+    if not callable(method):
+        raise CatalogStreamingCompatibilityError(
+            "nautilus_trader=="
+            f"{TESTED_NAUTILUS_VERSION} does not expose the expected private "
+            "ParquetDataCatalog._query_files() method. Refusing the "
+            "memory-unbounded DataFusion fallback."
+        )
+    try:
+        parameter_names = list(inspect.signature(method).parameters)
+    except (TypeError, ValueError) as exc:
+        raise CatalogStreamingCompatibilityError(
+            "Could not verify the private ParquetDataCatalog._query_files() "
+            "signature. Refusing the memory-unbounded DataFusion fallback."
+        ) from exc
+    expected_parameters = ["self", "data_cls", "identifiers", "start", "end", "files"]
+    if parameter_names[: len(expected_parameters)] != expected_parameters:
+        raise CatalogStreamingCompatibilityError(
+            "Private ParquetDataCatalog._query_files() has an incompatible "
+            f"signature {parameter_names}; expected prefix {expected_parameters}. "
+            "Refusing the memory-unbounded DataFusion fallback."
+        )
+
+    if getattr(catalog, "fs_protocol", None) != "file":
+        raise CatalogStreamingCompatibilityError(
+            "The bounded catalog reader is validated only for local file-backed "
+            "ParquetDataCatalog instances. Refusing an unverified remote-filesystem "
+            "path and refusing the memory-unbounded DataFusion fallback."
+        )
+
+
+def _validate_catalog_file(
+    *,
+    catalog: ParquetDataCatalog,
+    file_path: str,
+    query_data_cls: type,
+    instrument_id: str,
+    batch_size: int,
+) -> _ValidatedCatalogFile:
+    try:
+        catalog_root = Path(catalog.path).resolve(strict=True)
+        path = Path(file_path).resolve(strict=True)
+        relative = path.relative_to(catalog_root)
+    except (OSError, ValueError) as exc:
+        raise CatalogFileLayoutError(
+            f"Selected catalog file is missing or outside catalog root {catalog.path!r}: "
+            f"{file_path!r}"
+        ) from exc
+
+    expected_directory = _CATALOG_DIRECTORY_BY_CLASS.get(query_data_cls.__name__)
+    if expected_directory is None:
+        raise CatalogStreamingCompatibilityError(
+            f"Bounded catalog reader does not support data class {query_data_cls.__name__!r}."
+        )
+    if (
+        len(relative.parts) != 4
+        or relative.parts[0] != "data"
+        or relative.parts[1] != expected_directory
+        or relative.suffix != ".parquet"
+    ):
+        raise CatalogFileLayoutError(
+            f"Selected file {path} does not belong to requested data class "
+            f"{query_data_cls.__name__}; expected catalog layout "
+            f"data/{expected_directory}/<instrument>/<timestamps>.parquet."
+        )
+
+    stat_before = _file_stat_identity(path)
+    parquet_file = pq.ParquetFile(path)
+    try:
+        schema = parquet_file.schema_arrow
+        metadata = schema.metadata or {}
+        encoded_instrument = metadata.get(b"instrument_id")
+        try:
+            file_instrument_id = (
+                encoded_instrument.decode("utf-8") if encoded_instrument is not None else None
+            )
+        except UnicodeDecodeError as exc:
+            raise CatalogFileLayoutError(
+                f"Selected file {path} has invalid UTF-8 instrument_id schema metadata."
+            ) from exc
+        if file_instrument_id != instrument_id:
+            raise CatalogFileLayoutError(
+                f"Selected file {path} belongs to instrument {file_instrument_id!r}, "
+                f"not requested instrument {instrument_id!r}."
+            )
+
+        expected_schema = _expected_catalog_schema(query_data_cls)
+        if not schema.equals(expected_schema, check_metadata=False):
+            raise CatalogFileLayoutError(
+                f"Selected file {path} physical Arrow schema does not match "
+                f"requested data class {query_data_cls.__name__} under the pinned "
+                f"Nautilus {TESTED_NAUTILUS_VERSION} contract. "
+                f"Expected fields {expected_schema.names}; found {schema.names}."
+            )
+
+        ts_field_index = schema.get_field_index("ts_init")
+        if ts_field_index < 0:
+            raise CatalogFileLayoutError(f"Selected file {path} has no ts_init column.")
+        ts_type = schema.field(ts_field_index).type
+        if not pa.types.is_integer(ts_type):
+            raise CatalogFileLayoutError(
+                f"Selected file {path} has non-integer ts_init type {ts_type}."
+            )
+
+        row_count = 0
+        first_ts: int | None = None
+        previous_ts: int | None = None
+        # Numeric row-group order is explicit; no filesystem/footer ordering
+        # assumption is used.
+        for row_group_index in range(parquet_file.num_row_groups):
+            for batch in parquet_file.iter_batches(
+                batch_size=batch_size,
+                row_groups=[row_group_index],
+                columns=["ts_init"],
+                use_threads=False,
+            ):
+                ts_values = batch.column(0)
+                if ts_values.null_count:
+                    raise CatalogFileLayoutError(
+                        f"Selected file {path} row group {row_group_index} "
+                        "contains null ts_init values."
+                    )
+                if len(ts_values) == 0:
+                    continue
+                batch_first = int(ts_values[0].as_py())
+                batch_last = int(ts_values[-1].as_py())
+                if previous_ts is not None and batch_first < previous_ts:
+                    raise CatalogFileLayoutError(
+                        f"Selected file {path} is internally unsorted by ts_init "
+                        f"across a batch/row-group boundary: {batch_first} < {previous_ts}."
+                    )
+                if len(ts_values) > 1:
+                    has_decrease = pc.any(
+                        pc.less(ts_values.slice(1), ts_values.slice(0, len(ts_values) - 1))
+                    ).as_py()
+                    if has_decrease:
+                        raise CatalogFileLayoutError(
+                            f"Selected file {path} is internally unsorted by ts_init "
+                            f"inside row group {row_group_index}."
+                        )
+                if first_ts is None:
+                    first_ts = batch_first
+                previous_ts = batch_last
+                row_count += len(ts_values)
+                del ts_values, batch
+
+        expected_rows = int(parquet_file.metadata.num_rows)
+        if row_count == 0 or first_ts is None or previous_ts is None:
+            raise CatalogFileLayoutError(f"Selected catalog file is empty: {path}.")
+        if row_count != expected_rows:
+            raise CatalogFileLayoutError(
+                f"Selected file {path} yielded {row_count} ts_init rows but its "
+                f"Parquet footer declares {expected_rows}."
+            )
+    finally:
+        parquet_file.close()
+
+    stat_after = _file_stat_identity(path)
+    if stat_after != stat_before:
+        raise CatalogFileLayoutError(
+            f"Selected catalog file changed while its layout was being validated: {path}."
+        )
+
+    filename_start, filename_end = _catalog_filename_interval_ns(path)
+    if (filename_start, filename_end) != (first_ts, previous_ts):
+        raise CatalogFileLayoutError(
+            f"Selected file {path} filename interval "
+            f"[{filename_start}, {filename_end}] does not match actual ts_init "
+            f"range [{first_ts}, {previous_ts}]."
+        )
+
+    return _ValidatedCatalogFile(
+        path=path,
+        first_ts=first_ts,
+        last_ts=previous_ts,
+        row_count=row_count,
+        stat_identity=stat_after,
+    )
+
+
+def _select_and_validate_catalog_files(
+    catalog: ParquetDataCatalog,
+    query_data_cls: type,
+    identifiers: list[str],
+    start: int | None,
+    end: int | None,
+    *,
+    batch_size: int,
+) -> list[_ValidatedCatalogFile]:
+    _require_pinned_nautilus_file_api(catalog)
+    if len(identifiers) != 1 or not isinstance(identifiers[0], str) or not identifiers[0]:
+        raise CatalogFileLayoutError(
+            "The bounded catalog reader requires exactly one non-empty instrument "
+            "identifier per stream; multi-instrument file concatenation is not ordered."
+        )
+    if batch_size <= 0:
+        raise ValueError(f"batch_size must be positive, got {batch_size}")
+    if start is not None and end is not None and end < start:
+        return []
+
+    try:
+        selected = catalog._query_files(  # noqa: SLF001 - pinned private compatibility boundary
+            query_data_cls,
+            identifiers,
+            start,
+            end,
+        )
+    except Exception as exc:
+        raise CatalogStreamingCompatibilityError(
+            "Private ParquetDataCatalog._query_files() failed under the pinned "
+            f"nautilus_trader=={TESTED_NAUTILUS_VERSION} contract: "
+            f"{type(exc).__name__}: {exc}. Refusing the memory-unbounded "
+            "DataFusion fallback."
+        ) from exc
+    if not isinstance(selected, list) or not all(isinstance(path, str) for path in selected):
+        raise CatalogStreamingCompatibilityError(
+            "Private ParquetDataCatalog._query_files() returned an incompatible "
+            f"value {type(selected).__name__}; expected list[str]. Refusing the "
+            "memory-unbounded DataFusion fallback."
+        )
+    if len(selected) != len(set(selected)):
+        raise CatalogFileLayoutError(
+            "Private ParquetDataCatalog._query_files() returned duplicate file paths."
+        )
+
+    validated = [
+        _validate_catalog_file(
+            catalog=catalog,
+            file_path=file_path,
+            query_data_cls=query_data_cls,
+            instrument_id=identifiers[0],
+            batch_size=batch_size,
+        )
+        for file_path in selected
+    ]
+    if len({item.path for item in validated}) != len(validated):
+        raise CatalogFileLayoutError(
+            "Selected catalog paths resolve to duplicate physical files."
+        )
+
+    # Actual timestamp ranges, not glob order, mtimes, or unverified lexical
+    # filename order, define deterministic file traversal.
+    validated.sort(key=lambda item: (item.first_ts, item.last_ts, item.path.as_posix()))
+    for item in validated:
+        if start is not None and item.last_ts < start:
+            raise CatalogStreamingCompatibilityError(
+                f"Private _query_files selected non-intersecting file {item.path} "
+                f"ending at {item.last_ts} before inclusive start {start}."
+            )
+        if end is not None and item.first_ts > end:
+            raise CatalogStreamingCompatibilityError(
+                f"Private _query_files selected non-intersecting file {item.path} "
+                f"starting at {item.first_ts} after inclusive end {end}."
+            )
+
+    for previous, current in zip(validated, validated[1:]):
+        if current.first_ts <= previous.last_ts:
+            relationship = (
+                "equal ts_init file boundary"
+                if current.first_ts == previous.last_ts
+                else "overlapping ts_init ranges"
+            )
+            raise CatalogFileLayoutError(
+                f"Cannot stream selected catalog files in canonical order: {relationship}: "
+                f"{previous.path}=[{previous.first_ts}, {previous.last_ts}], "
+                f"{current.path}=[{current.first_ts}, {current.last_ts}]. "
+                "CryptoRecorder validation catalogs require strictly disjoint closed "
+                "file intervals; refusing silent concatenation."
+            )
+    return validated
+
+
+# Nautilus's own pyo3->Cython conversion table (mirrors
+# ParquetDataCatalog._handle_table_nautilus()'s identical mapping) — needed
+# because ArrowSerializer.deserialize() always returns nautilus_pyo3
+# objects, and the rest of this codebase (comparators, tests, fixtures)
+# consistently uses the Cython classes.
+def _pyo3_to_cython_cls(data_cls: type) -> type | None:
+    from nautilus_trader.model.data import (
+        Bar,
+        OrderBookDelta,
+        OrderBookDeltas,
+        OrderBookDepth10,
+        QuoteTick,
+        TradeTick,
+    )
+
+    return {
+        "OrderBookDelta": OrderBookDelta,
+        "OrderBookDeltas": OrderBookDelta,
+        "OrderBookDepth10": OrderBookDepth10,
+        "QuoteTick": QuoteTick,
+        "TradeTick": TradeTick,
+        "Bar": Bar,
+    }.get(data_cls.__name__)
+
+
+def _iter_catalog_files_bounded(
+    catalog: ParquetDataCatalog,
+    data_cls: type,
+    identifiers: list[str],
+    start: int,
+    end: int,
+    *,
+    batch_size: int = DEFAULT_STREAM_BATCH_SIZE,
+) -> Iterator[Any]:
+    """Yield one instrument/class stream in canonical ts_init order.
+
+    ``batch_size`` bounds each PyArrow ``RecordBatch`` row count (an
+    effective PyArrow reader bound) — peak live decoded-object count is
+    bounded by this batch size, never by total file/day size or event
+    count. This implementation never invokes the Rust/DataFusion global
+    query.
+
+    For ``OrderBookDeltas`` requests this yields individual, ungrouped
+    ``OrderBookDelta`` objects. Both bounded consumers flatten either shape
+    identically, so materializing grouped containers would add no semantic
+    value.
+    """
+    from nautilus_trader.model.data import OrderBookDelta, OrderBookDeltas
+    from nautilus_trader.serialization.arrow.serializer import ArrowSerializer
+
+    query_data_cls = OrderBookDelta if data_cls is OrderBookDeltas else data_cls
+    cython_cls = _pyo3_to_cython_cls(query_data_cls)
+    files = _select_and_validate_catalog_files(
+        catalog,
+        query_data_cls,
+        identifiers,
+        start,
+        end,
+        batch_size=batch_size,
+    )
+
+    previous_decoded_ts: int | None = None
+    for validated_file in files:
+        if _file_stat_identity(validated_file.path) != validated_file.stat_identity:
+            raise CatalogFileLayoutError(
+                f"Selected catalog file changed after layout preflight: {validated_file.path}."
+            )
+        parquet_file = pq.ParquetFile(validated_file.path)
+        try:
+            # Row-group traversal order is numeric and explicit. PyArrow may
+            # split one row group into several bounded RecordBatches, whose
+            # physical order is retained.
+            for row_group_index in range(parquet_file.num_row_groups):
+                for batch in parquet_file.iter_batches(
+                    batch_size=batch_size,
+                    row_groups=[row_group_index],
+                    use_threads=False,
+                ):
+                    ts_column: pa.Array | None = None
+                    pyo3_decoded = ArrowSerializer.deserialize(
+                        data_cls=query_data_cls,
+                        batch=batch,
+                    )
+                    if (
+                        cython_cls is not None
+                        and pyo3_decoded
+                        and "nautilus_pyo3" in pyo3_decoded[0].__class__.__module__
+                    ):
+                        decoded = cython_cls.from_pyo3_list(pyo3_decoded)
+                        del pyo3_decoded
+                    else:
+                        decoded = pyo3_decoded
+                    try:
+                        if len(decoded) != batch.num_rows:
+                            raise CatalogFileLayoutError(
+                                f"Nautilus deserialized {len(decoded)} "
+                                f"{query_data_cls.__name__} objects from a "
+                                f"{batch.num_rows}-row Arrow batch in "
+                                f"{validated_file.path}. Refusing partial output."
+                            )
+
+                        # Validate the entire bounded decoded batch before
+                        # yielding its first object. This prevents a decoder
+                        # regression such as [1, 3, 2] from leaking the first
+                        # two objects before the inversion is noticed.
+                        ts_column = batch.column(batch.schema.get_field_index("ts_init"))
+                        batch_previous_ts = previous_decoded_ts
+                        for index, obj in enumerate(decoded):
+                            ts = int(obj.ts_init)
+                            arrow_ts = int(ts_column[index].as_py())
+                            if ts != arrow_ts:
+                                raise CatalogFileLayoutError(
+                                    "Nautilus deserializer changed Arrow row order or "
+                                    f"ts_init in {validated_file.path} at batch index "
+                                    f"{index}: Arrow ts_init={arrow_ts}, decoded "
+                                    f"ts_init={ts}."
+                                )
+                            if batch_previous_ts is not None and ts < batch_previous_ts:
+                                raise CatalogFileLayoutError(
+                                    "Catalog order changed after preflight while decoding "
+                                    f"{validated_file.path}: {ts} < {batch_previous_ts}."
+                                )
+                            if str(obj.instrument_id) != identifiers[0]:
+                                raise CatalogFileLayoutError(
+                                    "Nautilus deserializer returned the wrong instrument "
+                                    f"from {validated_file.path} at batch index {index}: "
+                                    f"{obj.instrument_id!s} != {identifiers[0]}."
+                                )
+                            batch_previous_ts = ts
+                        previous_decoded_ts = batch_previous_ts
+
+                        for obj in decoded:
+                            ts = int(obj.ts_init)
+                            if start is not None and ts < start:
+                                continue
+                            if end is not None and ts > end:
+                                continue
+                            yield obj
+                        if decoded:
+                            del obj
+                    finally:
+                        if ts_column is not None:
+                            del ts_column
+                        del decoded
+                    del batch
+        finally:
+            parquet_file.close()
+        if _file_stat_identity(validated_file.path) != validated_file.stat_identity:
+            raise CatalogFileLayoutError(
+                f"Selected catalog file changed while it was being decoded: "
+                f"{validated_file.path}."
+            )
 
 
 def load_instrument_ids(catalog_root: Path) -> list[str]:
     """Return sorted instrument ids from a Nautilus catalog."""
     catalog = ParquetDataCatalog(str(catalog_root))
     return sorted(str(instrument.id) for instrument in catalog.instruments())
+
+
+def load_instruments(catalog_root: Path) -> dict[str, Any]:
+    """Return {instrument_id: Instrument object} for a Nautilus catalog.
+
+    Unlike load_instrument_ids(), this keeps the full Instrument object so
+    precision/increment fields can be compared, not just identity.
+    """
+    catalog = ParquetDataCatalog(str(catalog_root))
+    return {str(instrument.id): instrument for instrument in catalog.instruments()}
+
+
+def _instrument_to_record(instrument: Any) -> dict[str, Any]:
+    """Normalize the subset of Instrument fields required for exact full-L2
+    reconstruction: precision and price/size increment (tick/step size).
+    `price_precision`/`size_precision` alone do not define valid tick/step
+    sizes (per issue #20's explicit correction) — `price_increment` and
+    `size_increment` are the authoritative Binance PRICE_FILTER.tickSize /
+    LOT_SIZE.stepSize-derived values Nautilus actually uses for rounding."""
+    return {
+        "instrument_id": str(instrument.id),
+        "price_precision": int(instrument.price_precision),
+        "size_precision": int(instrument.size_precision),
+        "price_increment": str(instrument.price_increment),
+        "size_increment": str(instrument.size_increment),
+    }
+
+
+def compare_instruments_semantic(
+    old_instruments: dict[str, Any],
+    new_instruments: dict[str, Any],
+) -> dict[str, Any]:
+    """Compare instrument identity AND precision/increment metadata.
+
+    load_instrument_ids()-based comparison only proves the *set* of
+    instrument ids matches; it does not prove the reconstructed instrument
+    has the same price/size precision or tick/step size as the reference,
+    which would silently corrupt exact-decimal reconstruction downstream.
+    This closes that gap (issue #20 Phase 1 oracle coverage audit finding).
+    """
+    old_ids = set(old_instruments)
+    new_ids = set(new_instruments)
+    missing_in_new = sorted(old_ids - new_ids)
+    extra_in_new = sorted(new_ids - old_ids)
+
+    mismatches: list[dict[str, Any]] = []
+    for instrument_id in sorted(old_ids & new_ids):
+        old_record = _instrument_to_record(old_instruments[instrument_id])
+        new_record = _instrument_to_record(new_instruments[instrument_id])
+        field_mismatches = {
+            field: {"old": old_record[field], "new": new_record[field]}
+            for field in ("price_precision", "size_precision", "price_increment", "size_increment")
+            if old_record[field] != new_record[field]
+        }
+        if field_mismatches:
+            mismatches.append({"instrument_id": instrument_id, "fields": field_mismatches})
+
+    return {
+        "instrument_count_old": len(old_ids),
+        "instrument_count_new": len(new_ids),
+        "missing_in_new": missing_in_new,
+        "extra_in_new": extra_in_new,
+        "precision_mismatches": mismatches,
+        "passed": not missing_in_new and not extra_in_new and not mismatches,
+    }
 
 
 def load_trade_ticks(
@@ -30,6 +714,32 @@ def load_trade_ticks(
         kwargs["end"] = end
     ticks = catalog.trade_ticks(**kwargs)
     return list(ticks or [])
+
+
+def iter_trade_ticks_bounded(
+    catalog_root: Path,
+    instrument_id: str,
+    start_ns: int,
+    end_ns: int,
+) -> Iterator[Any]:
+    """Yield TradeTick objects for one instrument across the half-open
+    caller range [start_ns, end_ns), streamed directly from validated
+    Parquet files in bounded PyArrow batches (see
+    `_iter_catalog_files_bounded()`).
+
+    Peak live objects is bounded by the configured PyArrow batch size and
+    is independent of total requested time range or event count.
+
+    `catalog.trade_ticks(start=a, end=b)` is INCLUSIVE on both `a` and `b`
+    (verified in tests/test_catalog_reader_boundaries.py); this function
+    queries the caller's half-open range as the single closed range
+    `[start_ns, end_ns - 1]`, matching that inclusive interface exactly
+    (no internal sub-windowing is needed because the file reader itself is
+    batch-bounded)."""
+    if end_ns <= start_ns:
+        return
+    catalog = ParquetDataCatalog(str(catalog_root))
+    yield from _iter_catalog_files_bounded(catalog, TradeTick, [instrument_id], start_ns, end_ns - 1)
 
 
 def _enum_name(value: Any) -> str:
@@ -197,6 +907,110 @@ def compare_trade_ticks_semantic(
     return result
 
 
+def compare_trade_ticks_exhaustive(
+    old_ticks: Iterable[Any],
+    new_ticks: Iterable[Any],
+    *,
+    numeric_tolerance: float = 0.0,
+    max_reported_mismatches: int = 200,
+) -> dict[str, Any]:
+    """Exhaustively compare every TradeTick between two streams, in original
+    (deterministic arrival) order — no sampling, no re-sorting.
+
+    Unlike compare_trade_ticks_semantic() (which samples up to
+    `sample_count` positions after re-sorting both streams by
+    `(ts_event, trade_id)`), this function:
+
+    - compares EVERY event at its original stream position, so a
+      difference anywhere in the stream is detected, not only at one of a
+      fixed number of sampled positions;
+    - does NOT re-sort before comparing, so a reordering of two otherwise-
+      valid events is detected (the swapped positions will each show a
+      mismatch) instead of disappearing into a re-sorted canonical order —
+      compare_trade_ticks_semantic()'s sort-then-sample approach cannot
+      detect a pure reordering of the same set of trades;
+    - accepts and streams *iterables* (including one-shot generators) for
+      both `old_ticks` and `new_ticks` and never materializes either into a
+      list internally, so memory use is independent of total event count —
+      suitable for a complete production day's tens/hundreds of millions of
+      trades when paired with iter_trade_ticks_bounded() as the loader,
+      and runs in O(N) time (a single pass, no per-event bookkeeping
+      structure beyond position counters), so it remains practical at
+      200M+ events.
+
+    Duplicate-event semantics: equivalence means the reference and
+    candidate streams are identical, INCLUDING any identical duplicate
+    occurrences either side may (legitimately or not) contain. Two streams
+    that both contain the exact same duplicate event at the exact same
+    position are, by definition, equivalent, and this function reports
+    `passed=True` for that case. An extra, missing, or differently
+    positioned duplicate is not given special-cased duplicate detection —
+    it is caught the same way any other insertion/deletion/reorder is
+    caught: it shifts every subsequent position, producing
+    `first_length_divergence_position` and/or `position_mismatches` from
+    that point on, which already fails `passed`. A prior version of this
+    function additionally flagged "a duplicate exists on either side" as
+    an independent failure condition and used an O(window)-per-event
+    bookkeeping structure to do so; that was incorrect (identical
+    duplicates present on both sides do not indicate non-equivalence) and
+    has been removed rather than merely made more efficient, since the
+    positional/length comparison already provides full detection power for
+    every duplicate-related discrepancy that can actually indicate
+    non-equivalence.
+    """
+    position_mismatches: list[dict[str, Any]] = []
+
+    old_count = 0
+    new_count = 0
+    first_length_divergence_position: int | None = None
+    position = -1
+
+    for position, (old_tick, new_tick) in enumerate(
+        itertools.zip_longest(old_ticks, new_ticks, fillvalue=_MISSING)
+    ):
+        old_present = old_tick is not _MISSING
+        new_present = new_tick is not _MISSING
+        if old_present:
+            old_count += 1
+        if new_present:
+            new_count += 1
+        if old_present != new_present and first_length_divergence_position is None:
+            first_length_divergence_position = position
+
+        if old_present and new_present:
+            old_record = _tick_to_record(old_tick)
+            new_record = _tick_to_record(new_tick)
+            mismatches: dict[str, Any] = {}
+            for field in ("instrument_id", "trade_id", "aggressor_side", "ts_event", "ts_init"):
+                if old_record[field] != new_record[field]:
+                    mismatches[field] = {"old": old_record[field], "new": new_record[field]}
+            for field in ("price", "size"):
+                equal, _used_numeric = _compare_decimal_field(field, old_record, new_record, numeric_tolerance)
+                if not equal:
+                    mismatches[field] = {"old": old_record[field], "new": new_record[field]}
+            if mismatches and len(position_mismatches) < max_reported_mismatches:
+                position_mismatches.append(
+                    {"position": position, "old": old_record, "new": new_record, "fields": mismatches}
+                )
+
+    positions_compared = position + 1
+    passed = (
+        old_count == new_count
+        and first_length_divergence_position is None
+        and not position_mismatches
+    )
+    return {
+        "positions_compared": positions_compared,
+        "trade_count_old": old_count,
+        "trade_count_new": new_count,
+        "trade_count_match": old_count == new_count,
+        "first_length_divergence_position": first_length_divergence_position,
+        "position_mismatches": position_mismatches,
+        "position_mismatch_count_capped_at": max_reported_mismatches,
+        "passed": passed,
+    }
+
+
 # ---------------------------------------------------------------------------
 # OrderBookDeltas
 # ---------------------------------------------------------------------------
@@ -219,6 +1033,37 @@ def load_order_book_deltas(
     return list(deltas or [])
 
 
+def iter_order_book_deltas_bounded(
+    catalog_root: Path,
+    instrument_id: str,
+    start_ns: int,
+    end_ns: int,
+) -> Iterator[Any]:
+    """Yield individual (ungrouped) OrderBookDelta objects for one
+    instrument across the half-open caller range [start_ns, end_ns),
+    streamed directly via `_iter_catalog_files_bounded()` (see that
+    function's docstring for the file/row-group-bounded reader this uses).
+    Peak live objects is bounded by the configured batch size, not by day
+    length, window size, or total event count.
+
+    This matches the PREVIOUS default behavior exactly (both before and
+    after the round-1/round-2/round-5 memory-bounding corrections):
+    `catalog.order_book_deltas(...)` defaults to `batched=False`, i.e. a
+    flat individual-`OrderBookDelta` stream, not grouped `OrderBookDeltas`
+    objects — grouping was never part of this loader's contract. Pass the
+    result directly to compare_order_book_deltas_exhaustive() /
+    compare_book_checkpoints_streaming(), both of which flatten either
+    shape (flat `OrderBookDelta` or grouped `OrderBookDeltas`) identically
+    via `_iter_flatten_deltas()`, so this is a distinction without a
+    difference for those comparators."""
+    if end_ns <= start_ns:
+        return
+    catalog = ParquetDataCatalog(str(catalog_root))
+    from nautilus_trader.model.data import OrderBookDelta
+
+    yield from _iter_catalog_files_bounded(catalog, OrderBookDelta, [instrument_id], start_ns, end_ns - 1)
+
+
 def _flatten_deltas(objects: Iterable[Any]) -> list[Any]:
     """Flatten grouped OrderBookDeltas into individual OrderBookDelta objects."""
     flat: list[Any] = []
@@ -229,6 +1074,19 @@ def _flatten_deltas(objects: Iterable[Any]) -> list[Any]:
         else:
             flat.append(obj)
     return flat
+
+
+def _iter_flatten_deltas(objects: Iterable[Any]) -> Iterator[Any]:
+    """Streaming (generator) equivalent of _flatten_deltas(): yields each
+    individual OrderBookDelta one at a time without ever materializing the
+    flattened stream into a list. Used by
+    compare_order_book_deltas_exhaustive() to keep memory bounded."""
+    for obj in objects:
+        inner = getattr(obj, "deltas", None)
+        if inner is not None:
+            yield from inner
+        else:
+            yield obj
 
 
 def _book_order_record(order: Any) -> dict[str, Any]:
@@ -365,6 +1223,112 @@ def compare_order_book_deltas_semantic(
         and not result["sample_mismatches"]
     )
     return result
+
+
+def compare_order_book_deltas_exhaustive(
+    old_objects: Iterable[Any],
+    new_objects: Iterable[Any],
+    *,
+    numeric_tolerance: float = 0.0,
+    max_reported_mismatches: int = 200,
+) -> dict[str, Any]:
+    """Exhaustively compare every OrderBookDelta between two streams, in
+    original (deterministic emission) order — no sampling, no re-sorting.
+
+    Unlike compare_order_book_deltas_semantic() (a multiset comparison
+    that re-sorts both streams by a canonical key before comparing, so two
+    streams containing the exact same deltas in a different order are
+    reported as equal), this function compares every delta at its original
+    stream position. Two deltas that touch different, independent book
+    levels ("commutative-looking" — applying them in either order yields
+    the same eventual book state) are still positionally distinct events;
+    a reordering between them is detected here even though it would be
+    invisible both to compare_order_book_deltas_semantic() and to
+    compare_book_checkpoints()'s deterministic book-state reconstruction at
+    checkpoint granularity (the final book state can be identical while the
+    emission order differs — this function is the one that actually
+    detects that class of difference).
+
+    Streams both inputs lazily via _iter_flatten_deltas() (never
+    materializes the flattened delta stream into a list), so memory is
+    bounded and independent of total event count — suitable for a complete
+    production day's tens/hundreds of millions of depth events when paired
+    with iter_order_book_deltas_bounded() as the loader, and runs in O(N)
+    time (a single pass, no per-event bookkeeping structure), remaining
+    practical at 200M+ events.
+
+    Duplicate-event semantics: identical to compare_trade_ticks_exhaustive()
+    — two identical ordered streams pass even if both contain the same
+    duplicate delta at the same position; equivalence means the two streams
+    are identical, including identical duplicate occurrences. An extra,
+    missing, or differently positioned duplicate delta is caught by the
+    positional/length comparison, not by a separate duplicate-presence
+    check (removed; see compare_trade_ticks_exhaustive()'s docstring for
+    the full rationale, which applies identically here).
+    """
+    old_stream = _iter_flatten_deltas(old_objects)
+    new_stream = _iter_flatten_deltas(new_objects)
+
+    position_mismatches: list[dict[str, Any]] = []
+
+    old_count = 0
+    new_count = 0
+    first_length_divergence_position: int | None = None
+    position = -1
+
+    for position, (old_delta, new_delta) in enumerate(
+        itertools.zip_longest(old_stream, new_stream, fillvalue=_MISSING)
+    ):
+        old_present = old_delta is not _MISSING
+        new_present = new_delta is not _MISSING
+        if old_present:
+            old_count += 1
+        if new_present:
+            new_count += 1
+        if old_present != new_present and first_length_divergence_position is None:
+            first_length_divergence_position = position
+
+        if old_present and new_present:
+            old_record = _delta_to_record(old_delta)
+            new_record = _delta_to_record(new_delta)
+            mismatches: dict[str, Any] = {}
+            for field in (
+                "instrument_id",
+                "action",
+                "side",
+                "order_id",
+                "flags",
+                "sequence",
+                "ts_event",
+                "ts_init",
+            ):
+                if old_record[field] != new_record[field]:
+                    mismatches[field] = {"old": old_record[field], "new": new_record[field]}
+            for field in ("price", "size"):
+                equal, _used_numeric = _compare_decimal_field(field, old_record, new_record, numeric_tolerance)
+                if not equal:
+                    mismatches[field] = {"old": old_record[field], "new": new_record[field]}
+            if mismatches and len(position_mismatches) < max_reported_mismatches:
+                position_mismatches.append(
+                    {"position": position, "old": old_record, "new": new_record, "fields": mismatches}
+                )
+
+    positions_compared = position + 1
+    passed = (
+        old_count == new_count
+        and first_length_divergence_position is None
+        and not position_mismatches
+    )
+    return {
+        "positions_compared": positions_compared,
+        "delta_count_old": old_count,
+        "delta_count_new": new_count,
+        "delta_count_match": old_count == new_count,
+        "first_length_divergence_position": first_length_divergence_position,
+        "position_mismatches": position_mismatches,
+        "position_mismatch_count_capped_at": max_reported_mismatches,
+        "passed": passed,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -665,8 +1629,622 @@ def compare_book_checkpoints(
     }
 
 
+def _book_state_hash(book: dict[str, list[list[str]]]) -> str:
+    """Deterministic SHA-256 digest of a top-N book snapshot, for a
+    cheap-to-compare, order-independent-within-the-snapshot fingerprint."""
+    payload = json.dumps(book, sort_keys=True).encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _canonical_decimal_str(value_str: str) -> str:
+    """Return the exact decimal value of ``value_str`` with insignificant
+    lexical padding (trailing/leading zeros) removed, never through a float
+    intermediate and never rounding/quantizing to a different numeric value
+    — only its zero-padding is normalized. E.g. ``"0.17130000"`` and
+    ``"0.1713"`` both canonicalize to ``"0.1713"``; ``"0.17131"`` remains
+    distinct from both. Used only to make the book-checkpoint comparison/
+    hash value-aware instead of literal-string-aware — different physical
+    schemas (v0's literal Binance wire-format strings vs v1's
+    instrument-required-scale fixed-point strings) may format the exact
+    same numeric value with a different, but numerically irrelevant,
+    number of fractional digits."""
+    if not value_str:
+        return value_str
+    normalized = Decimal(value_str).normalize()
+    return format(normalized, "f")
+
+
+def _canonical_book_state(book: dict[str, list[list[str]]]) -> dict[str, list[list[str]]]:
+    """Apply :func:`_canonical_decimal_str` to every price/size string in a
+    top-N book snapshot (as produced by
+    :func:`reconstruct_book_checkpoints_streaming`/
+    :func:`reconstruct_book_checkpoints_from_deltas`), leaving level order
+    and level count untouched."""
+    return {
+        side: [[_canonical_decimal_str(price), _canonical_decimal_str(size)] for price, size in book.get(side, [])]
+        for side in ("bids", "asks")
+    }
+
+
+def reconstruct_book_checkpoints_streaming(
+    objects: Iterable[Any],
+    checkpoint_tss: Iterable[int],
+    *,
+    ts_field: str = "ts_init",
+    levels: int = 10,
+) -> dict[int, dict[str, list[list[str]]]]:
+    """Bounded-memory equivalent of reconstruct_book_checkpoints_from_deltas():
+    processes `objects` (an iterable/generator of OrderBookDeltas, e.g. from
+    iter_order_book_deltas_bounded()) sequentially, one flattened delta at
+    a time via _iter_flatten_deltas(), retaining only the current top-N
+    book state (`bids`/`asks` dicts) plus the handful of already-captured
+    checkpoint snapshots — never the full-day delta list.
+
+    This relies on `objects` arriving in non-decreasing `ts_field` order.
+    The active file reader proves that order with a whole-selection preflight
+    before yielding and rejects internally unsorted or overlapping files.
+    It does not perform the original function's extra
+    `(ts, sequence, read_index)` sort — that additional sort assumed an
+    unordered input; it is unneeded and would itself require full
+    materialization, defeating the point of this function.
+    """
+    sorted_cps = sorted(set(int(ts) for ts in checkpoint_tss))
+    snapshots: dict[int, dict[str, list[list[str]]]] = {}
+    bids: dict[str, str] = {}
+    asks: dict[str, str] = {}
+    cp_idx = 0
+
+    for delta in _iter_flatten_deltas(objects):
+        ts = int(delta.ts_init) if ts_field == "ts_init" else int(delta.ts_event)
+        while cp_idx < len(sorted_cps) and ts > sorted_cps[cp_idx]:
+            snapshots[sorted_cps[cp_idx]] = _top_of_book(bids, asks, levels)
+            cp_idx += 1
+        if cp_idx >= len(sorted_cps):
+            break
+        _apply_delta_to_book(bids, asks, delta)
+
+    while cp_idx < len(sorted_cps):
+        snapshots[sorted_cps[cp_idx]] = _top_of_book(bids, asks, levels)
+        cp_idx += 1
+
+    return snapshots
+
+
+def compare_book_checkpoints_streaming(
+    old_objects: Iterable[Any],
+    new_objects: Iterable[Any],
+    start_ns: int,
+    end_ns: int,
+    *,
+    ts_field: str = "ts_init",
+    levels: int = 10,
+) -> dict[str, Any]:
+    """Bounded-memory equivalent of compare_book_checkpoints(): reconstructs
+    and compares top-N book state at canonical checkpoints using
+    reconstruct_book_checkpoints_streaming() instead of materializing
+    `old_objects`/`new_objects` into full-day lists. Adds a deterministic
+    SHA-256 hash per checkpoint (`old_hash`/`new_hash`/`hash_match`) as a
+    compact, deterministic book-state fingerprint alongside the full
+    top-of-book comparison.
+
+    This is the GATING book-checkpoint comparison for the real acceptance
+    path (issue #20 follow-up correction) — compare_book_checkpoints()
+    remains available for other callers/tests but must not be used by
+    validation.validate_catalog_equivalence, since it requires full-day
+    list materialization of both delta streams.
+
+    The comparison and hash are computed over the *canonical* Decimal value
+    of each price/size string (see :func:`_canonical_decimal_str`), not the
+    literal formatted string — two physical replay schemas may format the
+    exact same numeric value with a different (but numerically
+    irrelevant) number of fractional digits (e.g. v0 preserves Binance's
+    literal 8-decimal wire padding, v1 formats at the instrument's exact
+    required scale), and that must not be treated as a semantic mismatch.
+    A genuinely different value (e.g. "0.17131" vs "0.1713") still compares
+    and hashes as different. This canonicalization never rounds/quantizes
+    unequal values into equality and never uses a float intermediate.
+    """
+    labeled = _checkpoint_labels(start_ns, end_ns)
+    checkpoint_tss = [ts for _, ts in labeled]
+
+    old_snaps = reconstruct_book_checkpoints_streaming(
+        old_objects, checkpoint_tss, ts_field=ts_field, levels=levels
+    )
+    new_snaps = reconstruct_book_checkpoints_streaming(
+        new_objects, checkpoint_tss, ts_field=ts_field, levels=levels
+    )
+
+    empty_book = {"bids": [], "asks": []}
+    results: list[dict[str, Any]] = []
+    all_match = True
+    for label, ts in labeled:
+        old_book = old_snaps.get(ts, empty_book)
+        new_book = new_snaps.get(ts, empty_book)
+        old_book_canonical = _canonical_book_state(old_book)
+        new_book_canonical = _canonical_book_state(new_book)
+        old_hash = _book_state_hash(old_book_canonical)
+        new_hash = _book_state_hash(new_book_canonical)
+        match = old_book_canonical == new_book_canonical
+        if not match:
+            all_match = False
+        results.append(
+            {
+                "label": label,
+                "ts": ts,
+                "match": match,
+                "old_hash": old_hash,
+                "new_hash": new_hash,
+                "hash_match": old_hash == new_hash,
+                "old_bid_levels": len(old_book["bids"]),
+                "old_ask_levels": len(old_book["asks"]),
+                "new_bid_levels": len(new_book["bids"]),
+                "new_ask_levels": len(new_book["asks"]),
+                "old_best_bid": old_book["bids"][0] if old_book["bids"] else None,
+                "new_best_bid": new_book["bids"][0] if new_book["bids"] else None,
+                "old_best_ask": old_book["asks"][0] if old_book["asks"] else None,
+                "new_best_ask": new_book["asks"][0] if new_book["asks"] else None,
+                "old_crossed": _is_crossed(old_book),
+                "new_crossed": _is_crossed(new_book),
+            }
+        )
+
+    return {
+        "passed": all_match,
+        "checkpoint_count": len(labeled),
+        "any_crossed_old": any(item["old_crossed"] for item in results),
+        "any_crossed_new": any(item["new_crossed"] for item in results),
+        "checkpoints": results,
+    }
+
+
+# ---------------------------------------------------------------------------
+# OrderBookDepth10 — bounded reader + exhaustive comparator
+# ---------------------------------------------------------------------------
+
+
+def iter_order_book_depth10_bounded(
+    catalog_root: Path,
+    instrument_id: str,
+    start_ns: int,
+    end_ns: int,
+) -> Iterator[Any]:
+    """Yield OrderBookDepth10 objects for one instrument across the
+    half-open caller range [start_ns, end_ns), streamed from preflighted
+    Parquet files via `_iter_catalog_files_bounded()`. Depth10 volume is
+    normally small relative to raw deltas, but the acceptance path still
+    avoids an unbounded materialization."""
+    if end_ns <= start_ns:
+        return
+    catalog = ParquetDataCatalog(str(catalog_root))
+    from nautilus_trader.model.data import OrderBookDepth10
+
+    yield from _iter_catalog_files_bounded(catalog, OrderBookDepth10, [instrument_id], start_ns, end_ns - 1)
+
+
+def compare_order_book_depth10_exhaustive(
+    old_objects: Iterable[Any],
+    new_objects: Iterable[Any],
+    *,
+    numeric_tolerance: float = 0.0,
+    max_reported_mismatches: int = 200,
+) -> dict[str, Any]:
+    """Exhaustively compare every OrderBookDepth10 snapshot between two
+    streams, in original (deterministic emission) order — no sampling, no
+    re-sorting. Detects missing/extra snapshots (via length divergence)
+    and reordered or field-different snapshots (via positional field
+    comparison, including a full per-level bid/ask comparison), the same
+    way compare_trade_ticks_exhaustive()/compare_order_book_deltas_exhaustive()
+    do for their respective streams. Duplicate-event semantics are
+    identical to those functions: an identical duplicate at the same
+    position on both sides is equivalent and passes; any other duplicate-
+    shaped difference is caught positionally.
+    """
+    position_mismatches: list[dict[str, Any]] = []
+    old_count = 0
+    new_count = 0
+    first_length_divergence_position: int | None = None
+    position = -1
+
+    for position, (old_depth, new_depth) in enumerate(
+        itertools.zip_longest(old_objects, new_objects, fillvalue=_MISSING)
+    ):
+        old_present = old_depth is not _MISSING
+        new_present = new_depth is not _MISSING
+        if old_present:
+            old_count += 1
+        if new_present:
+            new_count += 1
+        if old_present != new_present and first_length_divergence_position is None:
+            first_length_divergence_position = position
+
+        if old_present and new_present:
+            old_record = _depth10_to_record(old_depth)
+            new_record = _depth10_to_record(new_depth)
+            mismatches: dict[str, Any] = {}
+            for field in ("instrument_id", "sequence", "flags", "ts_event", "ts_init"):
+                if old_record[field] != new_record[field]:
+                    mismatches[field] = {"old": old_record[field], "new": new_record[field]}
+            for side_key in ("bids", "asks"):
+                old_levels = old_record[side_key]
+                new_levels = new_record[side_key]
+                if len(old_levels) != len(new_levels):
+                    mismatches[f"{side_key}_len"] = {"old": len(old_levels), "new": len(new_levels)}
+                else:
+                    for level_index, (old_level, new_level) in enumerate(zip(old_levels, new_levels)):
+                        for field in ("side", "order_id"):
+                            if old_level[field] != new_level[field]:
+                                mismatches[f"{side_key}[{level_index}].{field}"] = {
+                                    "old": old_level[field], "new": new_level[field],
+                                }
+                        for field in ("price", "size"):
+                            equal, _used = _compare_decimal_field(field, old_level, new_level, numeric_tolerance)
+                            if not equal:
+                                mismatches[f"{side_key}[{level_index}].{field}"] = {
+                                    "old": old_level[field], "new": new_level[field],
+                                }
+            if mismatches and len(position_mismatches) < max_reported_mismatches:
+                position_mismatches.append(
+                    {"position": position, "old": old_record, "new": new_record, "fields": mismatches}
+                )
+
+    positions_compared = position + 1
+    passed = (
+        old_count == new_count
+        and first_length_divergence_position is None
+        and not position_mismatches
+    )
+    return {
+        "positions_compared": positions_compared,
+        "depth10_count_old": old_count,
+        "depth10_count_new": new_count,
+        "depth10_count_match": old_count == new_count,
+        "first_length_divergence_position": first_length_divergence_position,
+        "position_mismatches": position_mismatches,
+        "position_mismatch_count_capped_at": max_reported_mismatches,
+        "passed": passed,
+    }
+
+
 def write_validation_report(report: dict[str, Any], output_path: Path) -> Path:
     """Write a validation report as pretty JSON."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(report, indent=2, default=str))
     return output_path
+
+
+# ---------------------------------------------------------------------------
+# Continuity / sync-desync-resync / fenced-range diagnostics
+# ---------------------------------------------------------------------------
+#
+# The Nautilus catalog itself (TradeTick / OrderBookDeltas / Depth10) never
+# stores snapshot-seed, sync/desync/resync, or fenced-range bookkeeping —
+# those are process-level diagnostics emitted alongside the catalog by the
+# converter engine (converter/depth_phase2.py's shared Phase2ReplayMetrics),
+# not catalog contents. Comparing only the Nautilus objects (as
+# compare_order_book_deltas_semantic() etc. do) therefore cannot detect a
+# difference in continuity/quality behavior between the reference and
+# candidate routes even though the issue's contract explicitly requires it.
+# This is the Phase 1 oracle-coverage gap closed here.
+#
+# Reference-side (convert_day.py) per-symbol shape:
+#   report["per_symbol_depth"]["VENUE/SYMBOL"] = {
+#       "snapshot_seed_count": int, "resync_count": int,
+#       "desync_events": int, "fenced_ranges": int, ...
+#   }
+# Candidate-side (validation/replay_catalog_reconstruct.py) manifest shape:
+#   manifest["depth_diagnostics"] = {
+#       "snapshot_seeds": int, "resyncs": int, "desyncs": int,
+#       "fenced_range_count": int, ...
+#   }
+#   manifest["fenced_ranges"] = [ {..fence dict with venue/symbol/date..}, ... ]
+#
+# Both ultimately originate from the same shared
+# converter.depth_phase2.Phase2ReplayMetrics dataclass, but the two call
+# sites (convert_day.py vs. replay_catalog_reconstruct.py) independently
+# renamed the aggregated fields when assembling their own report/manifest
+# dicts — this comparator normalizes both naming conventions rather than
+# assuming either one.
+
+_CONTINUITY_FIELD_ALIASES: dict[str, tuple[str, ...]] = {
+    "snapshot_seed_count": ("snapshot_seed_count", "snapshot_seeds"),
+    "resync_count": ("resync_count", "resyncs"),
+    "desync_events": ("desync_events", "desyncs"),
+    "fenced_range_count": ("fenced_ranges", "fenced_range_count"),
+}
+
+
+def _extract_continuity_value(source: dict[str, Any], canonical_field: str) -> Any:
+    for alias in _CONTINUITY_FIELD_ALIASES[canonical_field]:
+        if alias in source:
+            value = source[alias]
+            # convert_day.py's "fenced_ranges" field is an int *count*
+            # (`len(depth_metrics.fenced_ranges)`), not the list itself —
+            # but guard defensively in case a caller passes the raw list.
+            if canonical_field == "fenced_range_count" and isinstance(value, list):
+                return len(value)
+            return value
+    return None
+
+
+def compare_continuity_diagnostics_semantic(
+    old_per_symbol_depth: dict[str, Any],
+    new_depth_diagnostics: dict[str, Any],
+) -> dict[str, Any]:
+    """Compare snapshot/resync/desync/fenced-range *counts* between the
+    reference route's per-symbol depth report and the candidate route's
+    depth_diagnostics manifest section.
+
+    This is a count-level comparison (both sides already aggregate to a
+    scalar count per symbol/day); a stronger content-level comparison of
+    individual fenced-range boundaries is provided by
+    compare_fenced_ranges_semantic() below.
+    """
+    result: dict[str, Any] = {"field_mismatches": {}}
+    for canonical_field in _CONTINUITY_FIELD_ALIASES:
+        old_value = _extract_continuity_value(old_per_symbol_depth, canonical_field)
+        new_value = _extract_continuity_value(new_depth_diagnostics, canonical_field)
+        result[f"{canonical_field}_old"] = old_value
+        result[f"{canonical_field}_new"] = new_value
+        if old_value is None or new_value is None:
+            result["field_mismatches"][canonical_field] = {
+                "old": old_value,
+                "new": new_value,
+                "reason": "missing on one side",
+            }
+        elif old_value != new_value:
+            result["field_mismatches"][canonical_field] = {"old": old_value, "new": new_value}
+
+    result["passed"] = not result["field_mismatches"]
+    return result
+
+
+def _fence_key(fence: dict[str, Any]) -> tuple[Any, ...]:
+    """A fence's identity should not depend on wall-clock diagnostic
+    metadata (e.g. detection time); key on the boundary itself."""
+    return (
+        fence.get("venue"),
+        fence.get("symbol"),
+        fence.get("start_ts_ns", fence.get("start")),
+        fence.get("end_ts_ns", fence.get("end")),
+        fence.get("severity"),
+        fence.get("reason", fence.get("kind")),
+    )
+
+
+def compare_fenced_ranges_semantic(
+    old_fenced_ranges: Iterable[dict[str, Any]],
+    new_fenced_ranges: Iterable[dict[str, Any]],
+) -> dict[str, Any]:
+    """Compare individual fenced (unrecovered discontinuity) ranges by
+    content, not just by count. Only meaningful when both the reference and
+    candidate routes expose a per-fence list (convert_day.py's own
+    per-symbol report today only exposes a count — see
+    compare_continuity_diagnostics_semantic() for that case); this function
+    is for routes/versions that do expose the list (e.g. the candidate
+    manifest's `fenced_ranges`), and is forward-looking for a reference-side
+    fenced-range list export."""
+    old_list = list(old_fenced_ranges)
+    new_list = list(new_fenced_ranges)
+    old_keys = {_fence_key(f) for f in old_list}
+    new_keys = {_fence_key(f) for f in new_list}
+    missing = sorted(str(k) for k in (old_keys - new_keys))
+    extra = sorted(str(k) for k in (new_keys - old_keys))
+    return {
+        "count_old": len(old_list),
+        "count_new": len(new_list),
+        "count_match": len(old_list) == len(new_list),
+        "missing_in_new": missing,
+        "extra_in_new": extra,
+        "passed": len(old_list) == len(new_list) and not missing and not extra,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Quality-flag behavior
+# ---------------------------------------------------------------------------
+
+
+def compare_quality_flags_semantic(
+    old_quality_flags: Iterable[Any],
+    new_quality_flags: Iterable[Any],
+) -> dict[str, Any]:
+    """Compare per-event quality-flag payloads by decoded content (multiset
+    of parsed JSON dicts), not raw string equality — the underlying replay
+    schema stores `quality_flags` as a JSON-encoded string
+    (`stores/replay_schema.py`), and two logically identical flag sets could
+    differ in key ordering or whitespace without differing semantically.
+
+    Per issue #20 Phase 1: quality-flag behavior is part of the required
+    semantic comparison and must remain reconstructable — this proves the
+    oracle can actually detect a difference in quality-flag content, ahead
+    of any decision about whether/how to compact that field's physical
+    representation.
+
+    SUPERSEDED for the real acceptance path (issue #20 follow-up
+    correction): this function (a) requires both inputs be fully
+    materialized into Python lists by the caller, and (b) is a pure
+    multiset comparison that cannot detect a quality flag moved from one
+    event to another while the overall multiset of values is unchanged —
+    a real equivalence bug this comparator would silently pass. See
+    compare_event_metadata_exhaustive() below, which validation.
+    validate_catalog_equivalence now uses instead: it keeps quality/
+    continuity information associated with its source event via a
+    canonical per-event identity key, and remains bounded-memory via
+    streaming generators. This function remains available for lightweight/
+    Tier-1 ad-hoc comparisons where full multiset equivalence is a
+    sufficient quick check."""
+
+    def _parse(value: Any) -> Any:
+        if value is None:
+            return None
+        if isinstance(value, (dict, list)):
+            return value
+        try:
+            return json.loads(value)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return value
+
+    old_parsed = [_parse(v) for v in old_quality_flags]
+    new_parsed = [_parse(v) for v in new_quality_flags]
+
+    def _to_comparable(value: Any) -> str:
+        if isinstance(value, (dict, list)):
+            return json.dumps(value, sort_keys=True)
+        return str(value)
+
+    old_counter: dict[str, int] = {}
+    for value in old_parsed:
+        key = _to_comparable(value)
+        old_counter[key] = old_counter.get(key, 0) + 1
+    new_counter: dict[str, int] = {}
+    for value in new_parsed:
+        key = _to_comparable(value)
+        new_counter[key] = new_counter.get(key, 0) + 1
+
+    all_keys = set(old_counter) | set(new_counter)
+    mismatches = {
+        key: {"old_count": old_counter.get(key, 0), "new_count": new_counter.get(key, 0)}
+        for key in all_keys
+        if old_counter.get(key, 0) != new_counter.get(key, 0)
+    }
+    return {
+        "count_old": len(old_parsed),
+        "count_new": len(new_parsed),
+        "distinct_values_old": len(old_counter),
+        "distinct_values_new": len(new_counter),
+        "mismatches": mismatches,
+        "passed": not mismatches,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Fenced ranges — canonical digest comparison (gating)
+# ---------------------------------------------------------------------------
+
+
+def compare_fenced_ranges_digest(
+    old_canonical_count: int,
+    old_canonical_digest: str,
+    new_fenced_ranges: Iterable[dict[str, Any]],
+) -> dict[str, Any]:
+    """Compare the reference route's complete fenced-range collection (as a
+    bounded count + SHA-256 digest — see
+    converter.depth_phase2.canonical_fence_digest()) against the candidate
+    route's actual fenced-range list for one symbol.
+
+    Replaces compare_fenced_ranges_semantic() as the GATING fenced-range
+    comparison for the real acceptance path (issue #20 follow-up
+    correction): the reference route's own report only ever persisted up
+    to 3 example fences per symbol, which cannot prove equivalence for a
+    symbol with more fences, and a prior version of this validator's
+    wiring incorrectly treated any candidate `extra_in_new` fence as
+    expected/non-gating. Neither limitation applies here: `old_canonical_count`/
+    `old_canonical_digest` are computed by convert_day.py over the
+    COMPLETE fenced-range collection, so ANY difference in count or
+    content — including a fence the candidate has that the reference does
+    not, and including a difference that only shows up after the 3rd
+    fence — changes the digest and fails this comparison.
+    """
+    new_list = list(new_fenced_ranges)
+    new_count = len(new_list)
+    new_digest = canonical_fence_digest(new_list)
+    return {
+        "count_old": old_canonical_count,
+        "count_new": new_count,
+        "count_match": old_canonical_count == new_count,
+        "digest_old": old_canonical_digest,
+        "digest_new": new_digest,
+        "digest_match": old_canonical_digest == new_digest,
+        "passed": old_canonical_count == new_count and old_canonical_digest == new_digest,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Generic bounded-memory, event-identity-keyed metadata comparison
+# ---------------------------------------------------------------------------
+
+
+def compare_event_metadata_exhaustive(
+    old_records: Iterable[dict[str, Any]],
+    new_records: Iterable[dict[str, Any]],
+    *,
+    compare_fields: tuple[str, ...],
+    max_reported_mismatches: int = 200,
+) -> dict[str, Any]:
+    """Exhaustively compare two streams of normalized event-metadata
+    dicts (e.g. raw depth_v2/trade_v2 records vs. their replay_store
+    counterparts) at each position, keeping quality/continuity information
+    associated with its source event rather than reducing it to an
+    order-independent multiset.
+
+    Both `old_records` and `new_records` MUST already be delivered in the
+    SAME canonical order (e.g. `(stream_session_id, session_seq,
+    raw_index)` for depth, `(trade_stream_session_id, trade_session_seq,
+    raw_index)` for trades) before being passed here — this function does
+    not sort; see validation.validate_catalog_equivalence's raw-side
+    callers, which use converter.spool.RawRecordSpool (an existing
+    disk-backed bounded spool) to establish that canonical order for the
+    raw side, while the replay_store side is read via
+    stores.replay_reader.ReplayReader, which is already guaranteed sorted
+    in that same canonical order by the replay-store contract.
+
+    `compare_fields` should include the canonical identity fields
+    themselves (e.g. `raw_index`, `session_seq`) alongside the actual
+    content fields to compare (e.g. `quality_flags`, `U`, `u`, `pu`,
+    `is_desync`) — including the identity fields in the comparison is what
+    detects a quality flag or continuity marker that moved to a
+    DIFFERENT event: if a value moves from the event at position i to the
+    event at position j, both positions' identity+content fields no
+    longer match position-for-position between old and new, and this
+    function reports a mismatch at both positions, even though a pure
+    multiset comparison of just the moved value would see no difference
+    at all.
+
+    Streams both inputs lazily (never materializes either into a list
+    internally) and runs in O(N) time, remaining bounded-memory and
+    practical for a complete production day's event volume.
+    """
+    position_mismatches: list[dict[str, Any]] = []
+    old_count = 0
+    new_count = 0
+    first_length_divergence_position: int | None = None
+    position = -1
+
+    for position, (old_rec, new_rec) in enumerate(
+        itertools.zip_longest(old_records, new_records, fillvalue=_MISSING)
+    ):
+        old_present = old_rec is not _MISSING
+        new_present = new_rec is not _MISSING
+        if old_present:
+            old_count += 1
+        if new_present:
+            new_count += 1
+        if old_present != new_present and first_length_divergence_position is None:
+            first_length_divergence_position = position
+
+        if old_present and new_present:
+            mismatches: dict[str, Any] = {}
+            for field in compare_fields:
+                old_value = old_rec.get(field)
+                new_value = new_rec.get(field)
+                if old_value != new_value:
+                    mismatches[field] = {"old": old_value, "new": new_value}
+            if mismatches and len(position_mismatches) < max_reported_mismatches:
+                position_mismatches.append({"position": position, "fields": mismatches})
+
+    positions_compared = position + 1
+    passed = (
+        old_count == new_count
+        and first_length_divergence_position is None
+        and not position_mismatches
+    )
+    return {
+        "positions_compared": positions_compared,
+        "count_old": old_count,
+        "count_new": new_count,
+        "count_match": old_count == new_count,
+        "first_length_divergence_position": first_length_divergence_position,
+        "position_mismatches": position_mismatches,
+        "position_mismatch_count_capped_at": max_reported_mismatches,
+        "passed": passed,
+    }

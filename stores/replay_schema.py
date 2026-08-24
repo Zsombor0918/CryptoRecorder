@@ -3,12 +3,261 @@ stores.replay_schema — Parquet schema definitions for replay_store.
 
 Defines deterministic normalized replay layer schemas for depth and trade events.
 Uses Parquet nested structures for bids/asks lists.
+
+Versioning (issue #20 Phase 5 — revised-plan phase numbering, see
+docs/CHANGE_AUDIT.md): a manifest with no ``schema_version`` field is accepted
+as historical v0 only when both physical Parquet channels exactly match the
+original schemas below, including their exact-string fields. A compact layout
+always requires an explicit supported ``schema_version``; missing/malformed
+manifests and manifest/physical-schema contradictions fail before decoding.
+v1 (``DEPTH_REPLAY_SCHEMA_V1`` /
+``TRADE_REPLAY_SCHEMA_V1``) is the first compact prototype schema, built only
+from compaction levers the checked-in Phase 3 field/consumer/integrity matrix
+(``docs/IMPLEMENTATION_AUDIT.md``) explicitly approves:
+
+  - ``venue``/``symbol``/``date`` (matrix: partition-constant "Yes") move to
+    partition/manifest metadata instead of being repeated on every row.
+  - ``record_type`` (depth: snapshot_seed/depth_update/sync_state; trade:
+    trade/agg_trade) is stored as a small int8 enum code instead of a
+    string.
+  - The 5 depth boolean columns (``is_snapshot_seed``, ``is_depth_update``,
+    ``is_sync_state``, ``is_desync``, ``is_resync``) are packed into a single
+    int8 bitmask (matrix: "packed flags byte/enum" — proof of lossless
+    round-trip is provided by tests/test_replay_schema_v1.py).
+  - ``price``/``size``/``quantity`` float64 + lexical ``*_str`` columns are
+    replaced by an exact fixed-point integer mantissa (int64) whose scale is
+    derived from date-specific Binance ``PRICE_FILTER.tickSize`` /
+    ``LOT_SIZE.stepSize`` (spot and futures independently) and recorded once
+    per partition in the manifest — never a binary float intermediate.
+  - ``native_payload_hash`` is stored as 32 raw bytes instead of a 64-character
+    hex string (the Phase 2 Section 3 traceability design remains
+    unimplemented/unresolved, so the hash itself is *retained*, only its
+    physical encoding is compacted — see docs/IMPLEMENTATION_AUDIT.md).
+
+Deliberately NOT compacted in v1 (deferred, per the matrix's own "pending
+proof"/"benchmark-needed" caveats — not because they were overlooked):
+``U``/``u``/``pu`` continuity ids, ``trade_id``/``agg_trade_id``,
+``market_type``, and ``quality_flags`` all remain in their v0 lexical/JSON
+representations.
 """
 from __future__ import annotations
 
-from typing import Any
+from decimal import Decimal
+from typing import Any, Optional
 
 import pyarrow as pa
+
+# ============================================================================
+# Version constants
+# ============================================================================
+
+FORMAT_VERSION_V1 = 1
+SCHEMA_VERSION_V1 = 1
+# v1.2.0: issue #20 Phase 7 measured Parquet encoding profile -- ZSTD level
+# 6 (was 3), dictionary encoding disabled (was enabled), DELTA_BINARY_PACKED
+# for monotonic session/sequence/timestamp integer columns, and
+# BYTE_STREAM_SPLIT for the int64 fixed-point mantissa columns (including
+# the nested bids/asks list-of-struct mantissas), plus larger measured
+# row-group batch sizes. Selected via a representative-symbol sweep (see
+# docs/CHANGE_AUDIT.md for the full measured comparison). Purely a physical
+# Parquet encoding change -- every field's logical type/nullability/meaning
+# is unchanged, so FORMAT_VERSION_V1/SCHEMA_VERSION_V1 (the reader contract)
+# are unchanged; only the builder version is bumped.
+# v1.2.1: replay trade normalization now recovers the exact Binance native
+# identifier used by the unchanged reference converter when normalized
+# top-level identifiers are absent, and refuses anonymous trade rows before
+# publication. The physical schema and Parquet encoding are unchanged.
+BUILDER_VERSION_V1 = "cryptorecorder-replay-writer-v1.2.1"
+
+# ============================================================================
+# Schema v2 (issue #20 Phase 7 hierarchical-integrity candidate)
+# ============================================================================
+#
+# Replaces the per-event native_payload_hash column (a 32-byte SHA-256 hash
+# recorded on every row, ~54% of the measured optimized-v1 candidate's total
+# size, per docs/CHANGE_AUDIT.md) with the manifest-level traceability
+# hierarchy already documented as "planned" in docs/IMPLEMENTATION_AUDIT.md's
+# Phase 2 Section 3 ("Traceability design"):
+#   1. raw file/chunk identity + SHA-256 checksum per partition (manifest
+#      ``integrity.source_identity``, extended with a per-file record_count
+#      so a replay event's raw_index can be mapped back to its source file
+#      deterministically without a per-event value);
+#   2. bounded per-block (Parquet row-group) first/last sort key, row count,
+#      and SHA-256 of the block's canonical row content (manifest
+#      ``integrity.depth_blocks``/``integrity.trade_blocks``);
+#   3. the existing whole-file ``depth_checksum``/``trades_checksum``
+#      (unchanged, still mandatory);
+#   4. a documented, deterministic raw_index -> source-file mapping method
+#      (see ``stores.replay_writer.resolve_source_record``).
+# This was proven safe to remove per-event by directly verifying zero
+# internal consumers read the hash's *value* anywhere in the codebase
+# (writer/reader only round-trip it; validation/audit_replay_store.py checks
+# only whole-file checksums, never the per-event hash) -- see the
+# corresponding docs/CHANGE_AUDIT.md entry for the full consumer inventory
+# and threat/integrity matrix.
+FORMAT_VERSION_V2 = 2
+SCHEMA_VERSION_V2 = 2
+# v2.0.1: same normalization-only correction as v1.2.1. This does not change
+# FORMAT_VERSION_V2 or SCHEMA_VERSION_V2 because the physical row layout is
+# identical. The prior builder remains readable/auditable as a known physical
+# producer, but current artifact-bound gates require the current builder.
+BUILDER_VERSION_V2_LEGACY = "cryptorecorder-replay-writer-v2.0.0"
+BUILDER_VERSION_V2 = "cryptorecorder-replay-writer-v2.0.1"
+SUPPORTED_BUILDER_VERSIONS_V2 = (
+    BUILDER_VERSION_V2_LEGACY,
+    BUILDER_VERSION_V2,
+)
+
+# The only schema_version values ReplayReader/ReplayWriter know how to
+# produce/consume. A manifest with schema_version outside this set (or an
+# unrecognized value) must fail with a clear "found vs supported" error, not
+# be silently misread.
+SUPPORTED_SCHEMA_VERSIONS = (0, 1, 2)
+
+# ============================================================================
+# v1 enum code maps (record_type / aggressor_side)
+# ============================================================================
+
+DEPTH_RECORD_TYPE_CODES = {"snapshot_seed": 0, "depth_update": 1, "sync_state": 2, "stream_lifecycle": 3}
+DEPTH_RECORD_TYPE_CODES_REV = {v: k for k, v in DEPTH_RECORD_TYPE_CODES.items()}
+
+TRADE_RECORD_TYPE_CODES = {"trade": 0, "agg_trade": 1}
+TRADE_RECORD_TYPE_CODES_REV = {v: k for k, v in TRADE_RECORD_TYPE_CODES.items()}
+
+AGGRESSOR_SIDE_CODES = {"BUY": 0, "SELL": 1}
+AGGRESSOR_SIDE_CODES_REV = {v: k for k, v in AGGRESSOR_SIDE_CODES.items()}
+
+
+def encode_aggressor_side(value: Optional[str]) -> Optional[int]:
+    if value is None:
+        return None
+    return AGGRESSOR_SIDE_CODES[value]
+
+
+def decode_aggressor_side(code: Optional[int]) -> Optional[str]:
+    if code is None:
+        return None
+    return AGGRESSOR_SIDE_CODES_REV[int(code)]
+
+
+# ============================================================================
+# v1 depth flag bitmask (packs the 5 v0 boolean columns into one int8)
+# ============================================================================
+
+_FLAG_IS_SNAPSHOT_SEED = 1 << 0
+_FLAG_IS_DEPTH_UPDATE = 1 << 1
+_FLAG_IS_SYNC_STATE = 1 << 2
+_FLAG_IS_DESYNC = 1 << 3
+_FLAG_IS_RESYNC = 1 << 4
+
+
+def pack_depth_flags(
+    is_snapshot_seed: bool,
+    is_depth_update: bool,
+    is_sync_state: bool,
+    is_desync: bool,
+    is_resync: bool,
+) -> int:
+    code = 0
+    if is_snapshot_seed:
+        code |= _FLAG_IS_SNAPSHOT_SEED
+    if is_depth_update:
+        code |= _FLAG_IS_DEPTH_UPDATE
+    if is_sync_state:
+        code |= _FLAG_IS_SYNC_STATE
+    if is_desync:
+        code |= _FLAG_IS_DESYNC
+    if is_resync:
+        code |= _FLAG_IS_RESYNC
+    return code
+
+
+def unpack_depth_flags(code: int) -> "tuple[bool, bool, bool, bool, bool]":
+    code = int(code)
+    return (
+        bool(code & _FLAG_IS_SNAPSHOT_SEED),
+        bool(code & _FLAG_IS_DEPTH_UPDATE),
+        bool(code & _FLAG_IS_SYNC_STATE),
+        bool(code & _FLAG_IS_DESYNC),
+        bool(code & _FLAG_IS_RESYNC),
+    )
+
+
+# ============================================================================
+# v1 exact fixed-point mantissa encode/decode (Decimal only, never float)
+# ============================================================================
+
+# int64 range (Parquet/Arrow int64, matching DEPTH_REPLAY_SCHEMA_V1's/
+# TRADE_REPLAY_SCHEMA_V1's *_mantissa field types).
+_INT64_MIN = -(2 ** 63)
+_INT64_MAX = 2 ** 63 - 1
+
+
+def normalized_decimal_scale(value_str: str) -> int:
+    """Return the minimum number of fractional decimal digits required to
+    represent ``value_str`` *exactly* — i.e. its true decimal scale with
+    insignificant trailing zeros removed.
+
+    Uses ``Decimal`` exclusively (never ``float``, never lexical string
+    length) so the result is exact for any valid decimal string Binance can
+    emit, including plain fixed-point ("0.0795760"), integer ("100"), zero
+    ("0", "0.000"), and scientific-notation forms ("1.23E-4"). The naive
+    "count characters after the decimal point" approach is deliberately NOT
+    used: it would treat an insignificant trailing zero (e.g. the trailing
+    "0" in "0.0795760", which encodes the exact same value as "0.079576")
+    as if it added real precision, silently inflating the required scale.
+
+    Raises ``ValueError`` for non-finite values (``NaN``/``Infinity``),
+    which can never be valid instrument prices/sizes/quantities.
+    """
+    d = Decimal(value_str)
+    normalized = d.normalize()
+    exponent = normalized.as_tuple().exponent
+    if not isinstance(exponent, int):
+        # Decimal encodes NaN/sNaN/Infinity as a non-integer exponent
+        # sentinel ('n'/'N'/'F') — never a valid price/size/quantity value.
+        raise ValueError(f"value {value_str!r} is not a finite decimal number")
+    return max(0, -exponent)
+
+
+def encode_fixed_point(value_str: str, scale: int) -> int:
+    """Convert an exact decimal string to an integer mantissa at ``scale``.
+
+    Raises ``ValueError`` if ``value_str`` carries more fractional precision
+    than ``scale`` allows (i.e. the value cannot be represented exactly at
+    this scale) — this must never silently truncate. Also raises
+    ``ValueError`` if the resulting mantissa does not fit in a signed int64
+    (the physical Parquet/Arrow field type for every ``*_mantissa`` column) —
+    this must fail clearly rather than silently wrap/overflow. Never uses a
+    binary float intermediate.
+    """
+    d = Decimal(value_str)
+    scaled = d.scaleb(scale)
+    if scaled != scaled.to_integral_value():
+        raise ValueError(
+            f"value {value_str!r} cannot be represented exactly at scale "
+            f"{scale} (would lose precision)"
+        )
+    mantissa = int(scaled)
+    if mantissa < _INT64_MIN or mantissa > _INT64_MAX:
+        raise ValueError(
+            f"value {value_str!r} at scale {scale} produces mantissa "
+            f"{mantissa}, which does not fit in a signed int64 "
+            f"[{_INT64_MIN}, {_INT64_MAX}]"
+        )
+    return mantissa
+
+
+def decode_fixed_point(mantissa: int, scale: int) -> str:
+    """Reconstruct the exact decimal string for ``mantissa`` at ``scale``.
+
+    Always formatted with exactly ``scale`` fractional digits (matching the
+    instrument's required precision), using Decimal arithmetic only.
+    """
+    d = Decimal(int(mantissa)).scaleb(-int(scale))
+    if scale <= 0:
+        return str(int(d))
+    return f"{d:.{scale}f}"
 
 
 # ============================================================================
@@ -61,6 +310,70 @@ DEPTH_REPLAY_SCHEMA = pa.schema([
 
 
 # ============================================================================
+# Depth Replay Schema — v1 (compact prototype, issue #20 Phase 5)
+# ============================================================================
+
+# venue/symbol/date removed (partition-constant, moved to manifest).
+# record_type -> record_type_code (int8 enum). 5 bool columns -> flags (int8
+# bitmask). price/size float64+str -> price_mantissa/size_mantissa (int64,
+# scale recorded once per partition in the manifest). native_payload_hash
+# hex string -> 32 raw bytes.
+_bid_ask_struct_v1 = pa.struct([
+    pa.field("price_mantissa", pa.int64(), nullable=False),
+    pa.field("size_mantissa", pa.int64(), nullable=False),
+])
+
+DEPTH_REPLAY_SCHEMA_V1 = pa.schema([
+    pa.field("stream_session_id", pa.uint64(), nullable=False),
+    pa.field("session_seq", pa.uint64(), nullable=False),
+    pa.field("raw_index", pa.uint32(), nullable=False),
+
+    pa.field("record_type_code", pa.int8(), nullable=False),
+    pa.field("U", pa.string(), nullable=True),
+    pa.field("u", pa.string(), nullable=True),
+    pa.field("pu", pa.string(), nullable=True),
+
+    pa.field("ts_exchange_ns", pa.int64(), nullable=False),
+    pa.field("ts_receive_ns", pa.int64(), nullable=False),
+
+    pa.field("bids", pa.list_(_bid_ask_struct_v1), nullable=False),
+    pa.field("asks", pa.list_(_bid_ask_struct_v1), nullable=False),
+
+    pa.field("flags", pa.int8(), nullable=False),
+    pa.field("quality_flags", pa.string(), nullable=True),
+    pa.field("native_payload_hash", pa.binary(32), nullable=True),
+])
+
+
+# ============================================================================
+# Depth Replay Schema — v2 (issue #20 Phase 7 hierarchical-integrity
+# candidate: identical to v1 except native_payload_hash is removed and
+# replaced by the manifest-level traceability hierarchy — see the module
+# docstring near FORMAT_VERSION_V2 above)
+# ============================================================================
+
+DEPTH_REPLAY_SCHEMA_V2 = pa.schema([
+    pa.field("stream_session_id", pa.uint64(), nullable=False),
+    pa.field("session_seq", pa.uint64(), nullable=False),
+    pa.field("raw_index", pa.uint32(), nullable=False),
+
+    pa.field("record_type_code", pa.int8(), nullable=False),
+    pa.field("U", pa.string(), nullable=True),
+    pa.field("u", pa.string(), nullable=True),
+    pa.field("pu", pa.string(), nullable=True),
+
+    pa.field("ts_exchange_ns", pa.int64(), nullable=False),
+    pa.field("ts_receive_ns", pa.int64(), nullable=False),
+
+    pa.field("bids", pa.list_(_bid_ask_struct_v1), nullable=False),
+    pa.field("asks", pa.list_(_bid_ask_struct_v1), nullable=False),
+
+    pa.field("flags", pa.int8(), nullable=False),
+    pa.field("quality_flags", pa.string(), nullable=True),
+])
+
+
+# ============================================================================
 # Trade Replay Schema
 # ============================================================================
 
@@ -98,6 +411,69 @@ TRADE_REPLAY_SCHEMA = pa.schema([
     # Quality & diagnostics
     pa.field("quality_flags", pa.string(), nullable=True),  # JSON-encoded diagnostic flags
     pa.field("native_payload_hash", pa.string(), nullable=True),  # SHA256 hex
+])
+
+
+# ============================================================================
+# Trade Replay Schema — v1 (compact prototype, issue #20 Phase 5)
+# ============================================================================
+
+# venue/symbol/date removed (partition-constant, moved to manifest).
+# market_type is kept as-is in v1: the matrix marks its partition-constancy
+# as "pending an invariant proof" (not yet done), so it is deliberately NOT
+# compacted in this prototype. trade_id/agg_trade_id similarly remain
+# lexical strings (matrix: "benchmark-needed" before any numeric packing).
+TRADE_REPLAY_SCHEMA_V1 = pa.schema([
+    pa.field("trade_stream_session_id", pa.uint64(), nullable=False),
+    pa.field("trade_session_seq", pa.uint64(), nullable=False),
+    pa.field("raw_index", pa.uint32(), nullable=False),
+
+    pa.field("record_type_code", pa.int8(), nullable=False),
+    pa.field("market_type", pa.string(), nullable=False),
+
+    pa.field("trade_id", pa.string(), nullable=True),
+    pa.field("agg_trade_id", pa.string(), nullable=True),
+
+    pa.field("ts_exchange_ns", pa.int64(), nullable=False),
+    pa.field("ts_receive_ns", pa.int64(), nullable=False),
+
+    pa.field("price_mantissa", pa.int64(), nullable=False),
+    pa.field("quantity_mantissa", pa.int64(), nullable=False),
+    pa.field("buyer_maker", pa.bool_(), nullable=False),
+    pa.field("aggressor_side_code", pa.int8(), nullable=True),
+
+    pa.field("quality_flags", pa.string(), nullable=True),
+    pa.field("native_payload_hash", pa.binary(32), nullable=True),
+])
+
+
+# ============================================================================
+# Trade Replay Schema — v2 (issue #20 Phase 7 hierarchical-integrity
+# candidate: identical to v1 except native_payload_hash is removed and
+# replaced by the manifest-level traceability hierarchy — see the module
+# docstring near FORMAT_VERSION_V2 above)
+# ============================================================================
+
+TRADE_REPLAY_SCHEMA_V2 = pa.schema([
+    pa.field("trade_stream_session_id", pa.uint64(), nullable=False),
+    pa.field("trade_session_seq", pa.uint64(), nullable=False),
+    pa.field("raw_index", pa.uint32(), nullable=False),
+
+    pa.field("record_type_code", pa.int8(), nullable=False),
+    pa.field("market_type", pa.string(), nullable=False),
+
+    pa.field("trade_id", pa.string(), nullable=True),
+    pa.field("agg_trade_id", pa.string(), nullable=True),
+
+    pa.field("ts_exchange_ns", pa.int64(), nullable=False),
+    pa.field("ts_receive_ns", pa.int64(), nullable=False),
+
+    pa.field("price_mantissa", pa.int64(), nullable=False),
+    pa.field("quantity_mantissa", pa.int64(), nullable=False),
+    pa.field("buyer_maker", pa.bool_(), nullable=False),
+    pa.field("aggressor_side_code", pa.int8(), nullable=True),
+
+    pa.field("quality_flags", pa.string(), nullable=True),
 ])
 
 

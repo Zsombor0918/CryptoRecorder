@@ -11,6 +11,8 @@ committed canonical ordering from the recorder.  Book state uses exact
 """
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -32,14 +34,64 @@ from config import (
     DERIVED_DEPTH_SNAPSHOT_LEVELS,
 )
 from converter.readers import stream_raw_records
+from converter.depth_repartition import (
+    date_shift as _date_shift,
+    dedupe_key as _dedupe_key,
+    is_epoch_like_ns as _is_epoch_like_ns,
+    target_bounds_ns as _target_bounds_ns,
+    ts_event_ns as _ts_event_ns,
+)
 from converter.spool import DedupeSet, RawRecordSpool
 
 logger = logging.getLogger(__name__)
 
 F_LAST = 1 << 7
 F_SNAPSHOT = 1 << 5
-EPOCH_LIKE_NS_MIN = 946684800000000000  # 2000-01-01T00:00:00Z
 DEFAULT_CONVERTER_BATCH_SIZE = 5000
+
+
+def fence_canonical_key(fence: Dict[str, Any]) -> Tuple[Any, ...]:
+    """Canonical identity for one fenced (unrecovered discontinuity) range,
+    independent of wall-clock diagnostic metadata (e.g. detection time) or
+    display-only annotations (e.g. `classification` added by
+    convert_day.py's `_annotated_fence_examples()`). Used both to key
+    set-difference comparison (validation.catalog_compare.compare_fenced_ranges_semantic())
+    and to compute a stable digest over a complete fence collection
+    (canonical_fence_digest() below), so both the reference (convert_day.py)
+    and candidate (replay_catalog_reconstruct.py) sides agree on what
+    "the same fence" means."""
+    return (
+        fence.get("venue"),
+        fence.get("symbol"),
+        fence.get("start_ts_ns", fence.get("start")),
+        fence.get("end_ts_ns", fence.get("end")),
+        fence.get("severity"),
+        fence.get("reason", fence.get("kind")),
+    )
+
+
+def canonical_fence_digest(fences: Iterable[Dict[str, Any]]) -> str:
+    """Deterministic SHA-256 hex digest over the complete canonical identity
+    of every fence in `fences`, sorted for order-independence.
+
+    Issue #20 Phase 1 correction: convert_day.py's own report JSON only
+    persists up to 3 example fences per symbol (a human-readability
+    truncation), which cannot by itself prove candidate/reference
+    equivalence for symbols with more than 3 fences. This digest is
+    computed over the COMPLETE in-memory `Phase2ReplayMetrics.fenced_ranges`
+    list (already fully materialized by the existing depth-conversion
+    engine for the day being converted — this digest adds no new
+    full-day materialization) and is a bounded, constant-size stand-in for
+    the full fence list: any difference in count, content, or a single
+    additional/missing fence anywhere in the collection (including beyond
+    the first 3 examples) changes the digest.
+    """
+    keys = sorted(
+        (fence_canonical_key(fence) for fence in fences),
+        key=lambda key: json.dumps(list(key), sort_keys=True, default=str),
+    )
+    payload = json.dumps([list(key) for key in keys], sort_keys=True, default=str).encode()
+    return hashlib.sha256(payload).hexdigest()
 
 
 @dataclass
@@ -103,53 +155,12 @@ class ReplayState:
         self.asks.clear()
 
 
-def _ts_event_ns(rec: dict) -> int:
-    # Adapter-normalized records (e.g. replay_store rows) may carry a
-    # pre-computed nanosecond event timestamp; honour it exactly so the
-    # replay path reproduces the raw path's ts_event without re-deriving
-    # from milliseconds. Raw records never set ``ts_event_ns``.
-    pre_ns = rec.get("ts_event_ns")
-    if pre_ns is not None:
-        return int(pre_ns)
-    ts_event_ms = rec.get("ts_event_ms") or rec.get("exchange_ts_ms")
-    ts_recv_ns = int(rec.get("ts_recv_ns", 0))
-    return int(ts_event_ms) * 1_000_000 if ts_event_ms else ts_recv_ns
-
-
-def _date_shift(date_str: str, days: int) -> str:
-    base = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-    return (base + timedelta(days=days)).strftime("%Y-%m-%d")
-
-
-def _target_bounds_ns(date_str: str) -> Tuple[int, int]:
-    start = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-    end = start + timedelta(days=1)
-    return int(start.timestamp() * 1_000_000_000), int(end.timestamp() * 1_000_000_000)
-
-
-def _is_epoch_like_ns(ts_ns: int) -> bool:
-    return ts_ns >= EPOCH_LIKE_NS_MIN
-
-
 def _sort_key(raw_index: int, rec: dict) -> Tuple[int, int, int]:
     """Sort by committed canonical order: (session, session_seq, raw_index fallback)."""
     return (
         int(rec.get("stream_session_id", 0)),
         int(rec.get("session_seq", rec.get("connection_seq", 0))),
         raw_index,
-    )
-
-
-def _dedupe_key(rec: dict) -> Tuple[object, ...]:
-    return (
-        rec.get("record_type", "depth_update"),
-        rec.get("stream_session_id"),
-        rec.get("session_seq", rec.get("connection_seq")),
-        rec.get("U"),
-        rec.get("u"),
-        rec.get("pu"),
-        rec.get("lastUpdateId"),
-        _ts_event_ns(rec),
     )
 
 
@@ -919,15 +930,39 @@ def replay_records_to_depth_streaming(
     emit_depth10: bool = False,
     depth10_interval_sec: float = DEPTH10_INTERVAL_SEC,
     derived_depth_snapshot_levels: int = DERIVED_DEPTH_SNAPSHOT_LEVELS,
+    carry_records: Optional[Iterable[dict]] = None,
+    temp_dir: Optional[str] = None,
 ) -> Phase2ReplayMetrics:
     """Replay adapter-normalized depth records through the shared depth engine.
 
-    Unlike :func:`convert_depth_v2_streaming` this performs NO raw repartitioning
-    and NO cross-day carry recovery: the caller supplies the already-ordered
-    normalized record stream (e.g. adapter-mapped replay_store rows). Edge-case
-    behaviors that depend on raw repartitioning / carry / sync_state records are
-    therefore intentionally NOT reproduced here. See
-    ``docs/FULL_L2_REPLAY_CATALOG_PLAN.md`` for the documented equivalence caveats.
+    Unlike :func:`convert_depth_v2_streaming` this performs NO raw
+    repartitioning: the caller supplies the already-ordered normalized
+    record stream for exactly one target date (e.g. adapter-mapped
+    replay_store rows for that date). Clock-skewed records that a
+    different day's raw partition would have repartitioned into this
+    target window (or out of it) are NOT reproduced here — see
+    ``docs/FULL_L2_REPLAY_CATALOG_PLAN.md`` for that documented caveat.
+
+    ``carry_records``, when supplied, enables the SAME cross-day carry
+    recovery ``convert_depth_v2_streaming()`` performs for the raw path
+    (reusing its exact ``_recover_carry_state_from_spool()``/
+    ``_emit_synthetic_opening_snapshot()`` helpers): if the target
+    session's first record has no preceding ``snapshot_seed`` within the
+    target date itself (i.e. the session began on a prior day), the most
+    recent ``snapshot_seed`` for that session found in ``carry_records``
+    is replayed forward (bounded, disk-backed via
+    ``converter.spool.RawRecordSpool`` — never a full-day Python list) to
+    reconstruct book state/continuity ids, and a synthetic opening
+    snapshot is emitted before the target date's own records — exactly
+    mirroring the raw path's behavior, so a replay-reconstructed
+    fenced-range list matches the reference even when a session spans a
+    UTC day boundary. The caller (``validation.replay_catalog_reconstruct``)
+    supplies the previous day's REPLAY partition's own depth rows (via
+    ``ReplayReader``/the depth adapter) as ``carry_records`` when that
+    partition exists — this consumes it transiently to derive carry
+    state; it is never copied or persisted into the target partition.
+    If ``carry_records`` is omitted (the previous default), behavior is
+    unchanged: no carry recovery is attempted.
     """
     batch_size = max(1, int(batch_size))
     metrics = Phase2ReplayMetrics()
@@ -940,16 +975,71 @@ def replay_records_to_depth_streaming(
         size_prec=size_prec,
     )
     interval_ns = int(depth10_interval_sec * 1e9)
-    _run_depth_replay_loop(
-        records,
-        venue=venue,
-        symbol=symbol,
-        state=state,
-        metrics=metrics,
-        on_deltas_batch=on_deltas_batch,
-        on_depth10_batch=on_depth10_batch,
-        batch_size=batch_size,
-        emit_depth10=emit_depth10,
-        interval_ns=interval_ns,
-    )
+
+    if carry_records is None:
+        _run_depth_replay_loop(
+            records,
+            venue=venue,
+            symbol=symbol,
+            state=state,
+            metrics=metrics,
+            on_deltas_batch=on_deltas_batch,
+            on_depth10_batch=on_depth10_batch,
+            batch_size=batch_size,
+            emit_depth10=emit_depth10,
+            interval_ns=interval_ns,
+        )
+        return metrics
+
+    with (
+        RawRecordSpool(temp_dir=temp_dir, prefix="cryptorecorder-replay-carrytarget-") as target_spool,
+        RawRecordSpool(temp_dir=temp_dir, prefix="cryptorecorder-replay-carry-") as carry_spool,
+    ):
+        target_index = 0
+        for rec in records:
+            sort_key = _sort_key(target_index, rec)
+            target_spool.insert(rec, sort_key, target_index)
+            target_index += 1
+        target_spool.commit()
+
+        carry_index = 0
+        for rec in carry_records:
+            sort_key = _sort_key(carry_index, rec)
+            carry_spool.insert(rec, sort_key, carry_index)
+            carry_index += 1
+        carry_spool.commit()
+
+        def _prime(
+            delta_batch: List[OrderBookDeltas],
+            depth10_batch: List[OrderBookDepth10],
+        ) -> None:
+            first_update = target_spool.first_record(record_type="depth_update")
+            if first_update is not None and not target_spool.has_record_before(
+                "snapshot_seed",
+                _sort_key(0, first_update),
+            ):
+                if _recover_carry_state_from_spool(state, carry_spool, first_update, metrics):
+                    _emit_synthetic_opening_snapshot(
+                        state,
+                        first_update,
+                        metrics,
+                        delta_batch,
+                        depth10_batch,
+                        emit_depth10=emit_depth10,
+                    )
+
+        _run_depth_replay_loop(
+            target_spool.iter_records(),
+            venue=venue,
+            symbol=symbol,
+            state=state,
+            metrics=metrics,
+            on_deltas_batch=on_deltas_batch,
+            on_depth10_batch=on_depth10_batch,
+            batch_size=batch_size,
+            emit_depth10=emit_depth10,
+            interval_ns=interval_ns,
+            prime=_prime,
+        )
+
     return metrics

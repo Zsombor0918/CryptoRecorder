@@ -3,14 +3,14 @@ stores.replay_depth_adapter — Map replay_store depth rows into the normalized
 record shape consumed by the shared depth replay engine
 (``converter.depth_phase2._run_depth_replay_loop``).
 
-This adapter lets the ``replay_store -> generate_catalog --profile full_l2``
-path reuse the *exact* validated depth-conversion semantics of the
+This adapter lets the validation-only ``validation.replay_catalog_reconstruct``
+full_l2 helper reuse the *exact* validated depth-conversion semantics of the
 ``data_raw -> convert_day.py`` path, instead of re-implementing a weaker,
 independent depth converter.
 
 Field mapping (replay ``depth.parquet`` row -> normalized engine record)::
 
-    record_type            -> record_type ('snapshot_seed' | 'depth_update')
+    record_type            -> record_type ('snapshot_seed' | 'depth_update' | 'sync_state')
     stream_session_id      -> stream_session_id (int)
     session_seq            -> session_seq (int)
     raw_index              -> raw_index (int)
@@ -24,6 +24,14 @@ Field mapping (replay ``depth.parquet`` row -> normalized engine record)::
     ts_receive_ns  (int)   -> ts_recv_ns  (int)   [engine ts_init]
     bids/asks structs      -> payload.bids / payload.asks as [price_str, size_str]
                               pairs (EXACT decimal strings preserved)
+    quality_flags          -> state / reason / previous_state / last_update_id /
+                              prev_update_id  for sync_state rows only (see
+                              :func:`_sync_state_transition`) — sync_state
+                              records carry no book payload or U/u/pu, so
+                              their state-transition fields are round-tripped
+                              through the existing, already-nullable
+                              ``quality_flags`` JSON column instead of a new
+                              physical schema field.
 
 Ordering: replay rows are stored in raw-file order. The validated raw path
 re-sorts by ``(stream_session_id, session_seq, raw_index)`` via a disk-backed
@@ -35,8 +43,12 @@ memory-bounded.
 NOT reproduced here (documented equivalence caveats — replay v0 does not store
 the inputs required):
 
-  * ``sync_state`` / ``stream_lifecycle`` records (dropped by the replay
-    builder), so sync_state-driven fenced ranges are not regenerated;
+  * ``sync_state`` and ``stream_lifecycle`` records are now BOTH preserved
+    and replayed (see the field mapping above), so sync_state-driven and
+    session-boundary-driven fenced ranges ARE regenerated, matching the
+    reference exactly (verified via the canonical Tier-2
+    `validate_catalog_equivalence` gate: full fenced-range digest match on
+    the ADAUSDT 2026-06-12 smoke, not merely a matching count);
   * cross-day carry / synthetic opening snapshot (no prev/next repartitioning);
   * UTC-boundary repartitioning of clock-skewed records;
   * duplicate suppression.
@@ -45,6 +57,7 @@ See ``docs/FULL_L2_REPLAY_CATALOG_PLAN.md`` for the full equivalence boundary.
 """
 from __future__ import annotations
 
+import json
 from typing import Iterable, Iterator, List, Optional
 
 from converter.spool import RawRecordSpool
@@ -71,13 +84,44 @@ def _levels(structs: object) -> List[List[str]]:
     return out
 
 
+def _sync_state_transition(quality_flags: object) -> dict:
+    """Recover the ``sync_state`` record's state-transition fields
+    (``state``/``previous_state``/``reason``/``last_update_id``/
+    ``prev_update_id``) from the replay row's ``quality_flags`` JSON column
+    — the ONLY place these are preserved (see
+    ``pipeline.build_replay_store._convert_depth_record()``'s docstring for
+    why no new physical schema field was added)."""
+    if not quality_flags:
+        return {}
+    try:
+        parsed = json.loads(quality_flags) if isinstance(quality_flags, str) else quality_flags
+    except (TypeError, ValueError):
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    transition = parsed.get("sync_state_transition")
+    return transition if isinstance(transition, dict) else {}
+
+
 def replay_row_to_depth_record(row: dict) -> dict:
     """Map a single replay_store depth row to a normalized engine record.
 
     The returned dict is JSON-serializable and carries exactly the fields the
     shared depth engine reads. ``snapshot_seed`` rows expose ``lastUpdateId``
     (recovered from the replay ``u`` column); ``depth_update`` rows expose the
-    Binance continuity ids ``U`` / ``u`` / ``pu``.
+    Binance continuity ids ``U`` / ``u`` / ``pu``; ``sync_state`` rows expose
+    ``state``/``reason`` (recovered from ``quality_flags`` — see
+    :func:`_sync_state_transition`), which is exactly what the shared depth
+    engine's ``record_type == "sync_state"`` branch reads to drive
+    synchronization/desync/resync state and fenced-range open/close.
+    ``stream_lifecycle`` rows pass through with empty bids/asks and no
+    U/u/pu — the shared engine does not read their content, but their
+    ``record_type``/``stream_session_id``/timestamp ARE read by its
+    unconditional session-change detection, which both opens/closes fences
+    on session boundaries using whichever record is first observed for a
+    new session — since ``stream_lifecycle`` records are the actual first/
+    last record of every raw session, they must be present for the
+    fence-close/open timestamp to match the reference exactly.
     """
     record_type = row.get("record_type", "depth_update")
     rec: dict = {
@@ -101,6 +145,13 @@ def replay_row_to_depth_record(row: dict) -> dict:
     else:
         rec["u"] = _opt_int(row.get("u"))
         rec["lastUpdateId"] = None
+    if record_type == "sync_state":
+        transition = _sync_state_transition(row.get("quality_flags"))
+        rec["state"] = transition.get("state")
+        rec["reason"] = transition.get("reason")
+        rec["previous_state"] = transition.get("previous_state")
+        rec["last_update_id"] = transition.get("last_update_id")
+        rec["prev_update_id"] = transition.get("prev_update_id")
     return rec
 
 

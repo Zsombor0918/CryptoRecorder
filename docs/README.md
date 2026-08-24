@@ -1,7 +1,7 @@
 # CryptoRecorder — Docs Index
 
 This directory contains all project documentation. The structure is **fixed at
-14 files**. Before creating a new file, use the "Where to update what" table
+12 files**. Before creating a new file, use the "Where to update what" table
 below to find the right home for your content.
 
 ---
@@ -19,8 +19,6 @@ below to find the right home for your content.
 | [VALIDATION.md](VALIDATION.md) | Validation layers, test commands, audit CLIs | Validating changes |
 | [IMPLEMENTATION_AUDIT.md](IMPLEMENTATION_AUDIT.md) | Ground-truth of what exists, cleanup history, requirements audit, storage sizes | Auditing status |
 | [REPLAY_STORE.md](REPLAY_STORE.md) | Replay store schema, build CLI, audit CLI | Working on replay |
-| [FEATURE_STORE.md](FEATURE_STORE.md) | Feature store schema, build CLI, audit CLI | Working on features |
-| [GENERATE_CATALOG.md](GENERATE_CATALOG.md) | Catalog generation CLI, profiles, options | Working on catalog |
 | [DAILY_BUILD_PIPELINE.md](DAILY_BUILD_PIPELINE.md) | Daily orchestrator, systemd timers | Working on daily pipeline |
 | [FULL_L2_REPLAY_CATALOG_PLAN.md](FULL_L2_REPLAY_CATALOG_PLAN.md) | Full-L2 replay plan and gate status | full_l2 work only |
 
@@ -50,8 +48,6 @@ When making a change, use this table to find the right file for your update.
 | Requirements status (met / partial / deferred) | `IMPLEMENTATION_AUDIT.md` |
 | Storage size measurements | `IMPLEMENTATION_AUDIT.md` |
 | Replay store schema, CLI, behavior | `REPLAY_STORE.md` |
-| Feature store schema, CLI, behavior | `FEATURE_STORE.md` |
-| Catalog generation options, profiles | `GENERATE_CATALOG.md` |
 | Daily build orchestrator, timers | `DAILY_BUILD_PIPELINE.md` |
 | Full-L2 plan, gate progress | `FULL_L2_REPLAY_CATALOG_PLAN.md` |
 | Change audit entries | `CHANGE_AUDIT.md` (append-only) |
@@ -63,7 +59,7 @@ When making a change, use this table to find the right file for your update.
 
 ## The No New Docs rule
 
-The 14-file structure above is designed to be **comprehensive and permanent**.
+The 12-file structure above is designed to be **comprehensive and permanent**.
 
 Before creating any new file in `docs/`:
 1. Find the matching row in the table above.

@@ -9,8 +9,8 @@ CryptoRecorder currently:
 - converts one UTC day at a time with `convert_day.py`
 - stores operational health/readiness as JSON files, not web pages
 - exposes an in-repo CLI catalog inspector, not a browser catalog viewer
-- uses `requirements.txt` plus a virtual environment; there is no `pyproject.toml`,
-  `uv.lock`, or Node/npm dependency in this repository
+- uses committed `pyproject.toml` plus `uv.lock` as its only Python dependency
+  authority; the application remains a flat, non-packaged uv virtual project
 
 ## Assumptions Used Below
 
@@ -20,7 +20,8 @@ These commands assume:
 - the deploy user is the current shell user, exported as `APP_USER="$USER"`
 - project code lives at `~/services/CryptoRecorder`
 - optional large data storage lives at `/data/cryptorecorder`
-- Python `3.10+`
+- CPython `>=3.12,<3.15`
+- an operator-installed `uv` executable (checkpoint validated with uv 0.11.29)
 - outbound network access to Binance REST and WebSocket endpoints
 
 Adjust the exported variables once if your server differs.
@@ -44,13 +45,15 @@ sudo apt install -y \
   ca-certificates \
   build-essential \
   python3 \
-  python3-venv \
-  python3-pip
+  python3-venv
 
 python3 --version
+uv --version
 ```
 
-`python3 --version` must show Python `3.10` or newer.
+`python3 --version` must satisfy `>=3.12,<3.15`. Install uv through the
+operator's approved host-management process before deployment; the repository
+deploy script never downloads uv or accesses an installer URL itself.
 
 ## 2. Clone the Repository
 
@@ -68,41 +71,56 @@ pwd
 git status --short
 ```
 
-## 3. Choose Python Environment Setup
+## 3. Create an Explicit Locked Environment
 
-### Option A: repo-native `venv` + `pip`
-
-```bash
-cd "$APP_DIR"
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-```
-
-### Option B: optional `uv`
-
-`uv` is optional. The repository does not require it, but it can manage the same
-virtual environment and dependency installation workflow.
-
-```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
-export PATH="$HOME/.local/bin:$PATH"
-
-cd "$APP_DIR"
-uv venv .venv --python python3
-source .venv/bin/activate
-uv pip install -r requirements.txt
-```
-
-Verification for either option:
+First verify that project metadata and the committed lock agree:
 
 ```bash
 cd "$APP_DIR"
-source .venv/bin/activate
-python --version
-python -m pip --version || true
+uv lock --check
 ```
+
+### Production environment
+
+The canonical server environment stays at `<app-dir>/.venv`, preserving all
+systemd `ExecStart` paths. It intentionally excludes Nautilus and test tools:
+
+```bash
+cd "$APP_DIR"
+UV_PROJECT_ENVIRONMENT="$APP_DIR/.venv" \
+  uv sync --frozen --no-default-groups
+```
+
+### Reconstruction environment
+
+Selected catalog reconstruction and the unchanged reference converter require
+the exact Nautilus extra. Keep this environment external to the production
+`.venv`:
+
+```bash
+cd "$APP_DIR"
+UV_PROJECT_ENVIRONMENT=/external/cryptorecorder-reconstruction-env \
+  uv sync --frozen --no-default-groups --extra reconstruction
+```
+
+### Development/test environment
+
+Tests are also explicit and external:
+
+```bash
+cd "$APP_DIR"
+UV_PROJECT_ENVIRONMENT=/external/cryptorecorder-development-env \
+  uv sync --frozen --no-default-groups \
+    --extra reconstruction \
+    --group dev
+```
+
+Frozen syncs never update `uv.lock`. Production contains only the recorder,
+replay lifecycle/build/validation dependencies; reconstruction adds
+`nautilus_trader==1.225.0`; development adds pytest tooling. `VERSION` remains
+the sole application release value. The neutral `project.version = "0"` in
+the non-packaged virtual project is dependency-environment metadata, not an
+application version.
 
 ## 4. Understand Current Paths Before First Import
 
@@ -199,16 +217,19 @@ These are safe local checks. They do not start the live recorder.
 
 ```bash
 cd "$APP_DIR"
-source .venv/bin/activate
 
-python validate.py
-python -m pytest tests/
-python convert_day.py --help
+.venv/bin/python validate.py
+PYTHONPATH="$APP_DIR" .venv/bin/python \
+  -m validation.validate_dependency_environment --kind production
+/external/cryptorecorder-development-env/bin/python -m pytest tests/
+/external/cryptorecorder-reconstruction-env/bin/python convert_day.py --help
 ```
 
 Expected:
 
-- `validate.py` reports dependency/import/path checks
+- `validate.py` reports production dependency/import/path checks
+- the dependency validator proves the production environment excludes
+  Nautilus and pytest
 - the unit test suite passes
 - `convert_day.py --help` exits successfully and documents `--staging`
 
@@ -304,15 +325,71 @@ Do not copy the repository unit files unchanged. They still contain the
 development checkout path `/home/zsom/services/CryptoRecorder` and
 `User=zsom`.
 
-Generate host-specific units with path/user substitution:
+The repository ships `scripts/deploy_linux_server.sh`, a thin operator wrapper
+that substitutes the path/user, installs the unit files for a chosen target,
+and removes any stale units from a previous deploy. It contains no business
+logic. Prefer it over manual `sed`/`cp`:
+
+```bash
+cd "$APP_DIR"
+./scripts/deploy_linux_server.sh \
+  --target all \
+  --user "$APP_USER" \
+  --app-dir "$APP_DIR" \
+  --data-root "$DATA_BASE" \
+  --uv-bin "$(command -v uv)" \
+  --dry-run
+```
+
+Drop `--dry-run` once the printed actions look correct. Valid `--target`
+values are `all`, `recorder`, and `replay-build`
+(`scripts/deploy_linux_server.sh --help` documents every flag).
+
+The script runs `uv lock --check`, uses a same-parent candidate environment,
+performs the production import validator through that candidate, and promotes
+only the validated frozen production selection. It never invokes pip and
+never runs uv from a service. An existing `.venv` must carry the matching
+lock/selection marker; an unrecognized legacy environment is refused unless
+the operator explicitly supplies `--migrate-venv`.
+
+Legacy environment migration is deliberately manual and recoverable:
+
+```bash
+# 1. Stop supported units yourself; the deploy script will not do this for you.
+sudo systemctl stop cryptorecorder-recorder.service
+sudo systemctl stop cryptorecorder-replay-build.timer
+sudo systemctl stop cryptorecorder-replay-build.service || true
+
+# 2. Inspect a non-mutating plan.
+./scripts/deploy_linux_server.sh --target all --dry-run --install-only \
+  --uv-bin "$(command -v uv)" --migrate-venv
+
+# 3. Build, validate, and promote the candidate; do not start services yet.
+./scripts/deploy_linux_server.sh --target all --install-only \
+  --uv-bin "$(command -v uv)" --migrate-venv
+
+# 4. Inspect the preserved .venv.backup.<UTC>.<PID> and active .venv,
+#    then start/restart units only with a separate explicit command.
+```
+
+Promotion renames the old environment to a timestamped sibling backup and
+does not delete it. Candidate or post-promotion failure preserves evidence and
+restores the prior `.venv` where unambiguous. A symlink, unsafe ownership,
+collision, active supported unit, or interrupted candidate/failed directory
+blocks migration. Manual rollback is an inactive-service rename restoring the
+preserved backup to exactly `.venv`; inspect all sibling migration evidence
+first and never overwrite a collision.
+
+If you prefer manual installation, generate host-specific units with the same
+path/user substitution:
 
 ```bash
 cd "$APP_DIR"
 
 for unit in \
-  crypto-recorder.service \
-  nautilus-convert.service \
-  nautilus-convert.timer
+  cryptorecorder-recorder.service \
+  cryptorecorder-replay-build.service \
+  cryptorecorder-replay-build.timer
 do
   sed \
     -e "s|User=zsom|User=$APP_USER|g" \
@@ -322,26 +399,38 @@ done
 
 sudo systemctl daemon-reload
 sudo systemd-analyze verify \
-  /etc/systemd/system/crypto-recorder.service \
-  /etc/systemd/system/nautilus-convert.service \
-  /etc/systemd/system/nautilus-convert.timer
+  /etc/systemd/system/cryptorecorder-recorder.service \
+  /etc/systemd/system/cryptorecorder-replay-build.service \
+  /etc/systemd/system/cryptorecorder-replay-build.timer
 ```
 
-Current unit behavior:
+> **Note:** `systemd/cryptorecorder-convert.{service,timer}` were **deleted from
+> the repository** in PR #18 — converter systemd automation is not part of the
+> supported production architecture. Manual reconstruction uses documented CLI
+> commands (e.g. `python convert_day.py --date YYYY-MM-DD --staging`), not systemd
+> templates. Any previously installed converter units on an existing server are
+> stopped, disabled, and removed automatically by `scripts/deploy_linux_server.sh`
+> on the next deploy run.
 
-- `crypto-recorder.service` runs `recorder.py`
-- `nautilus-convert.service` runs `convert_day.py --staging`
-- `nautilus-convert.timer` schedules conversion once daily at `00:10 UTC`
-- both services write stdout/stderr to `journald`
-- both services load `/etc/cryptorecorder/cryptorecorder.env` if present
+Current production unit behavior:
+
+- `cryptorecorder-recorder.service` runs `recorder.py` (live recording)
+- `cryptorecorder-replay-build.service` runs
+  `python -m pipeline.daily_build --date yesterday` (builds `replay_store`)
+- `cryptorecorder-replay-build.timer` schedules the replay build once daily
+  at `01:00 UTC`
+- all services write stdout/stderr to `journald`
+- all services load `/etc/cryptorecorder/cryptorecorder.env` if present
+- all services execute `.venv/bin/python`; service startup never resolves,
+  synchronizes, or invokes uv
 
 Inspect the installed units:
 
 ```bash
-systemctl cat crypto-recorder.service
-systemctl cat nautilus-convert.service
-systemctl cat nautilus-convert.timer
-systemctl list-timers --all nautilus-convert.timer
+systemctl cat cryptorecorder-recorder.service
+systemctl cat cryptorecorder-replay-build.service
+systemctl cat cryptorecorder-replay-build.timer
+systemctl list-timers --all cryptorecorder-replay-build.timer
 ```
 
 ## 10. Start Services Only When Live Recording Is Intended
@@ -351,38 +440,38 @@ These commands begin real server operation.
 Enable automatic startup:
 
 ```bash
-sudo systemctl enable crypto-recorder.service
-sudo systemctl enable nautilus-convert.timer
+sudo systemctl enable cryptorecorder-recorder.service
+sudo systemctl enable cryptorecorder-replay-build.timer
 ```
 
 Start live operation:
 
 ```bash
-sudo systemctl start crypto-recorder.service
-sudo systemctl start nautilus-convert.timer
+sudo systemctl start cryptorecorder-recorder.service
+sudo systemctl start cryptorecorder-replay-build.timer
 ```
 
 Stop/restart later:
 
 ```bash
-sudo systemctl stop crypto-recorder.service
-sudo systemctl restart crypto-recorder.service
-sudo systemctl stop nautilus-convert.timer
-sudo systemctl start nautilus-convert.timer
+sudo systemctl stop cryptorecorder-recorder.service
+sudo systemctl restart cryptorecorder-recorder.service
+sudo systemctl stop cryptorecorder-replay-build.timer
+sudo systemctl start cryptorecorder-replay-build.timer
 ```
 
 Status and logs:
 
 ```bash
-systemctl status crypto-recorder.service
-systemctl status nautilus-convert.timer
-systemctl status nautilus-convert.service
+systemctl status cryptorecorder-recorder.service
+systemctl status cryptorecorder-replay-build.timer
+systemctl status cryptorecorder-replay-build.service
 
-journalctl -u crypto-recorder.service -f
-journalctl -u nautilus-convert.service -f
+journalctl -u cryptorecorder-recorder.service -f
+journalctl -u cryptorecorder-replay-build.service -f
 ```
 
-## 10. Manual Commands
+## 11. Manual Commands
 
 ### Live recorder
 
@@ -416,7 +505,7 @@ python convert_day.py --date YYYY-MM-DD --staging
 Do not use `--allow-partial-overwrite` casually. It bypasses the converter’s
 low-depth-coverage refusal guard for direct overwrite mode.
 
-## 11. Validation, Readiness, and Catalog Inspection
+## 12. Validation, Readiness, and Catalog Inspection
 
 Health/readiness output is file-based:
 
@@ -428,7 +517,8 @@ Health/readiness output is file-based:
 | `state/universe_health/symbol_health.json` | aggregated universe-health state |
 | `state/convert_reports/YYYY-MM-DD.json` | converter report |
 | `../nautilus_data/convert_reports/YYYY-MM-DD.json` | sibling converter report copy |
-| `state/disk_usage.json` | disk usage snapshot |
+| `state/disk_usage.json` | disk usage + monitoring-health snapshot (see docs/OPERATIONS.md) |
+| `state/disk_monitor_state.json` | last-known-good disk measurements + growth history (restart-safe) |
 | `state/reconnects.log` | reconnect events |
 
 Useful checks after real data exists:
@@ -450,7 +540,7 @@ python -m validation.catalog_inspect \
   BTCUSDT.BINANCE
 ```
 
-## 12. Live Smoke and Acceptance Tests
+## 13. Live Smoke and Acceptance Tests
 
 These scripts start the recorder unless you use the documented skip mode.
 Run them only when live Binance test recording is acceptable.
@@ -466,21 +556,26 @@ python scripts/acceptance_test.py --runtime 300
 python scripts/acceptance_test.py --skip-recorder
 ```
 
-## 13. Disk Cleanup Warning
+## 14. Disk Cleanup Warning
 
 While the live recorder is running, `disk_monitor.py` can delete the oldest raw
 date directories after raw data storage crosses:
 
 - raw soft limit: `750 GB`
 - raw cleanup target: `700 GB`
-- total tracked hard alert threshold: `850 GB`
+- raw hard alert threshold: `850 GB`
+
+All three thresholds apply to fresh `data_raw` disk usage only — never to
+filesystem capacity, and never to the cross-root observability total
+(`data_raw + catalog + meta + state`), which may span different filesystems
+and never drives cleanup decisions.
 
 Review those constants in `config.py` before a long-running server deployment.
 `RAW_RETENTION_DAYS = 7` exists in `config.py`, but the active cleanup logic is
 currently size-triggered. Catalog, `meta`, and `state` sizes are still reported
 for observability, but only raw data size triggers raw cleanup.
 
-## 14. Troubleshooting
+## 15. Troubleshooting
 
 ### `validate.py` created repo-local directories before symlinks
 
@@ -499,26 +594,15 @@ decided how to migrate them.
 Check path/user substitution first:
 
 ```bash
-systemctl cat crypto-recorder.service
-systemctl cat nautilus-convert.service
+systemctl cat cryptorecorder-recorder.service
+systemctl cat cryptorecorder-replay-build.service
 ```
 
 Then inspect logs:
 
 ```bash
-journalctl -u crypto-recorder.service -n 200 --no-pager
-journalctl -u nautilus-convert.service -n 200 --no-pager
-```
-
-### converter timer date seems wrong
-
-The timer is meant to run at `00:10 UTC`, and the converter default date is
-“yesterday UTC.” Confirm the installed timer rather than relying on local wall
-clock intuition:
-
-```bash
-systemctl cat nautilus-convert.timer
-systemctl list-timers --all nautilus-convert.timer
+journalctl -u cryptorecorder-recorder.service -n 200 --no-pager
+journalctl -u cryptorecorder-replay-build.service -n 200 --no-pager
 ```
 
 ### converter refuses partial overwrite
@@ -530,7 +614,7 @@ report instead of forcing conversion:
 python -m json.tool state/convert_reports/YYYY-MM-DD.json | sed -n '1,220p'
 ```
 
-## 15. Data Sync / Syncthing Later
+## 16. Data Sync / Syncthing Later
 
 Data sync is intentionally not configured here.
 
@@ -543,13 +627,13 @@ Placeholder for the future deployment phase:
 
 ## Linux Server Deployment Checklist
 
-- [ ] Linux host has Python `3.10+`, `git`, and build tools
+- [ ] Linux host has CPython `>=3.12,<3.15`, `git`, build tools, and operator-installed uv
 - [ ] repository cloned to the intended deploy path
-- [ ] `.venv` created and dependencies installed
+- [ ] `uv lock --check` passes and the production-only frozen `.venv` is validated
 - [ ] large data directories and symlinks reviewed before first import
 - [ ] `python validate.py` passes
-- [ ] `python -m pytest tests/` passes
-- [ ] `python convert_day.py --help` works
+- [ ] full tests pass from an explicit external development environment
+- [ ] `convert_day.py --help` works from an explicit reconstruction environment
 - [ ] `/etc/cryptorecorder/cryptorecorder.env` reviewed
 - [ ] systemd units generated with the correct user/path
 - [ ] `systemd-analyze verify` passes

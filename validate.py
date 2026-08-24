@@ -10,7 +10,7 @@ Usage:
     python validate.py --quick   # Quick dependency check only
 
 What it checks:
-    1. Python dependencies (cryptofeed, nautilus_trader, etc.)
+    1. Production Python dependencies (aiohttp, numpy, zstandard, pyarrow)
     2. Project structure (required directories exist)
     3. Configuration (config.py loads correctly)
     4. Core modules (can be imported)
@@ -63,24 +63,21 @@ class Colors:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def check_python_version() -> tuple[bool, str]:
-    """Check Python version is 3.10+."""
+    """Check the locked project's supported Python range."""
     version = sys.version_info
-    ok = version >= (3, 10)
+    ok = (3, 12) <= version[:2] < (3, 15)
     msg = f"Python {version.major}.{version.minor}.{version.micro}"
     if not ok:
-        msg += " (need 3.10+)"
+        msg += " (need >=3.12,<3.15)"
     return ok, msg
 
 
 def check_dependencies() -> list[tuple[str, bool, str]]:
     """Check required Python packages."""
     packages = [
-        ("cryptofeed", "cryptofeed"),
-        ("nautilus_trader", "nautilus_trader"),
         ("aiohttp", "aiohttp"),
+        ("numpy", "numpy"),
         ("zstandard", "zstandard"),
-        ("yaml", "yaml (PyYAML)"),
-        ("pandas", "pandas"),
         ("pyarrow", "pyarrow"),
     ]
 
@@ -97,19 +94,21 @@ def check_dependencies() -> list[tuple[str, bool, str]]:
 
 def check_directories() -> list[tuple[str, bool, str]]:
     """Check required directories exist."""
+    sys.path.insert(0, str(PROJECT_ROOT))
+    from config import DATA_ROOT, META_ROOT, STATE_ROOT
+
     required = [
-        ("data_raw", "Raw data storage"),
-        ("state", "Runtime state"),
-        ("meta", "Metadata storage"),
-        ("converter", "Converter package"),
-        ("tests", "Unit tests"),
+        (DATA_ROOT, "data_raw", "Raw data storage"),
+        (STATE_ROOT, "state", "Runtime state"),
+        (META_ROOT, "meta", "Metadata storage"),
+        (PROJECT_ROOT / "converter", "converter", "Converter package"),
+        (PROJECT_ROOT / "tests", "tests", "Unit tests"),
     ]
 
     results = []
-    for dirname, desc in required:
-        path = PROJECT_ROOT / dirname
+    for path, name, desc in required:
         exists = path.exists()
-        results.append((dirname, exists, desc if exists else "MISSING"))
+        results.append((name, exists, desc if exists else f"MISSING: {path}"))
 
     return results
 
@@ -136,10 +135,10 @@ def check_core_modules() -> list[tuple[str, bool, str]]:
         ("storage", "Storage manager"),
         ("health_monitor", "Health monitor"),
         ("binance_universe", "Universe selector"),
-        ("convert_day", "Converter CLI"),
-        ("converter.book", "Book reconstruction"),
-        ("converter.trades", "Trade conversion"),
-        ("converter.instruments", "Instrument builder"),
+        ("pipeline.build_replay_store", "Replay builder"),
+        ("pipeline.daily_build", "Replay lifecycle"),
+        ("stores.replay_reader", "Replay reader"),
+        ("validation.audit_replay_store", "Replay validation"),
     ]
 
     results = []
@@ -213,7 +212,7 @@ def run_validation(quick: bool = False) -> bool:
     else:
         print(Colors.fail("Some checks failed. Please fix the issues above."))
         print("\nCommon fixes:")
-        print("  • Install dependencies: pip install -r requirements.txt")
+        print("  • Install dependencies: uv sync --frozen --no-default-groups")
         print("  • Create directories:   mkdir -p data_raw state meta")
     print("═" * 60)
 

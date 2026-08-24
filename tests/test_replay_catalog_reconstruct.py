@@ -1,5 +1,10 @@
-"""End-to-end tests for the ``full_l2`` (and ``depth_only`` / ``depth10``)
-catalog-generation profiles.
+"""End-to-end tests for ``validation.replay_catalog_reconstruct`` (the
+``full_l2`` / ``depth_only`` / ``depth10`` reconstruction profiles).
+
+This is validation-only tooling: it exists so
+``validation.validate_catalog_equivalence`` can compare a replay-reconstructed
+catalog against the reference ``convert_day.py`` converter. It is not a
+supported downstream runtime API.
 
 These build a tiny synthetic ``data_raw`` tree (snapshot_seed + depth_updates +
 trades), run ``build_replay_for_symbol`` then ``generate_catalog_from_replay``,
@@ -13,7 +18,7 @@ import json
 from pathlib import Path
 
 from pipeline.build_replay_store import build_replay_for_symbol
-from pipeline.generate_catalog import _parse_iso_datetime, generate_catalog_from_replay
+from validation.replay_catalog_reconstruct import _parse_iso_datetime, generate_catalog_from_replay
 from validation.catalog_compare import (
     load_order_book_deltas,
     load_order_book_depth10,

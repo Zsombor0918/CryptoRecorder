@@ -16,15 +16,19 @@ This is a short pointer file. The full, binding rules live in:
 - **Never** claim broader top50/multi-day `full_l2` equivalence (the `v2.0.0` gate)
   until that wider validation passes. The `full_l2` path is implemented and passes
   the ADAUSDT single-day smoke vs `convert_day.py`, which stays the production reference.
-- **Never** implement Syncthing, archive, or import features. `ARCHIVE_DAYS_ROOT` and
-  `LABEL_ROOT` are placeholders only.
+- **Never** implement Syncthing, archive, or import features. `ARCHIVE_DAYS_ROOT` is
+  a placeholder only. `LABEL_ROOT` was removed entirely (issue #17); do not
+  reintroduce a label/target store.
+- **Never** reintroduce `requirements.txt` or pip-based deployment installation.
+  `pyproject.toml` and committed `uv.lock` are authoritative; deployment syncs
+  are explicit, frozen, and install no default dependency groups.
 
 ## Package boundaries
 
 - `converter/` — legacy full-L2 raw→Nautilus converter internals.
 - `pipeline/` — build/transform CLIs only (no audit CLIs).
 - `validation/` — audit/compare/inspect CLIs only (no build CLIs).
-- `stores/` — replay/feature schemas, readers, writers.
+- `stores/` — replay schemas, readers, writers (no feature/label schemas).
 - `scripts/` — thin operator wrappers only (no business logic).
 
 When unsure: **stop and ask**. Keep status honest. Prefer small PRs.

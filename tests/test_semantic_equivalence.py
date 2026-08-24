@@ -11,14 +11,15 @@ def test_convert_day_remains_legacy_full_l2_entrypoint() -> None:
 
     assert convert_day.exists()
     assert "pipeline.build_replay_store" not in content
-    assert "pipeline.generate_catalog" not in content
+    assert "validation.replay_catalog_reconstruct" not in content
     assert "ReplayReader" not in content
 
 
 def test_replay_full_l2_catalog_generation_is_implemented() -> None:
-    """full_l2 is no longer deferred: generate_catalog supports it and the
-    profile write-flags must emit OrderBookDeltas (and depth10 when enabled)."""
-    from pipeline.generate_catalog import SUPPORTED_PROFILES, _profile_write_flags
+    """full_l2 is no longer deferred: validation.replay_catalog_reconstruct
+    supports it and the profile write-flags must emit OrderBookDeltas (and
+    depth10 when enabled). This is a validation-only helper, not a product CLI."""
+    from validation.replay_catalog_reconstruct import SUPPORTED_PROFILES, _profile_write_flags
 
     assert "full_l2" in SUPPORTED_PROFILES
     writes_trades, writes_deltas, writes_depth10 = _profile_write_flags("full_l2", True)

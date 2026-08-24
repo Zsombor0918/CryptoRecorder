@@ -17,13 +17,13 @@ Systemd units are in `systemd/`.
 
 ```bash
 # Control recorder service
-sudo systemctl start crypto-recorder
-sudo systemctl stop crypto-recorder
-sudo systemctl restart crypto-recorder
-sudo systemctl status crypto-recorder
+sudo systemctl start cryptorecorder-recorder
+sudo systemctl stop cryptorecorder-recorder
+sudo systemctl restart cryptorecorder-recorder
+sudo systemctl status cryptorecorder-recorder
 
 # View logs
-journalctl -u crypto-recorder -f
+journalctl -u cryptorecorder-recorder -f
 ```
 
 ## Important Runtime Files
@@ -33,12 +33,84 @@ journalctl -u crypto-recorder -f
 | `state/heartbeat.json` | Live recorder status (architecture=deterministic_native) |
 | `state/startup_coverage.json` | Startup symbol coverage |
 | `state/convert_reports/YYYY-MM-DD.json` | Conversion reports |
+| `state/disk_usage.json` | Disk usage + monitoring-health report (see Disk Monitoring below) |
+| `state/disk_monitor_state.json` | Last-known-good measurements + bounded growth history (restart-safe) |
 | `recorder.log` | Recorder log file |
 
 Report timestamps use Hungary local time (`Europe/Budapest`).
 Day-scoped dates in file names remain UTC.
 
+## Disk Monitoring
+
+`disk_monitor.py` runs every `DISK_CHECK_INTERVAL_SEC` (default 600s) and
+writes `state/disk_usage.json`. A failed or unavailable directory-size
+measurement is never reported as zero — see the safety invariant in
+`docs/ARCHITECTURE.md`.
+
+### `disk_usage.json` fields
+
+| Field | Meaning |
+|-------|---------|
+| `timestamp` | Top-level, operator-facing report timestamp — always Hungary local time (`Europe/Budapest`, ISO-8601 with offset), for both a normal scan and the skipped/overlapping-scan path. Internal growth-rate/days-to-full calculations are computed from separate, UTC-based epoch values and are unaffected by this field's timezone. |
+| `components.<data_raw\|replay_published\|replay_staging\|replay_backups\|replay_quarantine\|replay_metadata\|metadata\|state_reports>.value_gb` | Current or last-known-good allocated size in GB, or `null` if never measured. The retired persistent catalog root is not monitored. |
+| `components.<name>.measurement_ok` | `true` only if *this cycle's* scan succeeded |
+| `components.<name>.measurement_status` | `ok` / `missing` / `timeout` / `command_error` / `malformed_output` / `error` |
+| `components.<name>.stale` | `true` when `value_gb` is a last-known-good fallback, not a fresh measurement |
+| `components.<name>.measurement_age_seconds` | Age of the fallback value, or `null` |
+| `total_gb`, `percent_of_soft_limit`, `percent_of_hard_limit` | `total_gb` is observability-only and may span devices. Retention percentages use fresh `data_raw` only; neither authorizes deletion. |
+| `filesystem_capacity[]` | One entry per actual device (`st_dev`), with roots on that device, free space once, and combined allocated use. Shared raw/replay capacity is never double-counted; separate filesystems remain separate. |
+| `replay_artifacts` | staging/backup/quarantine counts and oldest ages; old staging/backups alert, while quarantine remains visible without automatic deletion |
+| `capacity_projection` | raw growth, replay growth, their combined rate, and current replay transient pressure; `null` when current replay measurement is unavailable |
+| `growth_rate_gb_day`, `days_to_full` | `null` unless the current cycle's raw and replay measurements are fresh and successful, and there is a real, non-stale timestamped history spanning enough time |
+| `growth_sample_interval_sec`, `growth_sample_oldest_timestamp`, `growth_sample_newest_timestamp` | Provenance of the growth estimate (based on `data_raw` history only) |
+| `monitoring_health` | `healthy` / `degraded` / `unhealthy` |
+| `alerts` | List of human-readable alert strings (measurement failure, staleness, low free space, threshold breaches, skipped overlapping scans) |
+| `retention_measurement_trustworthy` | Fresh raw measurement indicator. It does not authorize deletion; automatic destructive retirement is disabled. |
+| `raw_retention_enabled`, `cleanup_required` | Configuration visibility and capacity/policy alert. `cleanup_required` is not a deletion command. |
+| `skipped_duplicate` | `true` if this cycle was skipped because a previous scan was still running; the returned report is the previous cycle's, not a fresh measurement |
+
+### Threshold semantics (kept separate)
+
+| Threshold class | Env var | Applies to |
+|---|---|---|
+| Raw-retention soft/hard limit | `CRYPTO_RECORDER_DISK_SOFT_LIMIT_GB` / `CRYPTO_RECORDER_DISK_HARD_LIMIT_GB` | fresh `data_raw` policy alerts only; never authorizes cleanup |
+| Historical cleanup target | `CRYPTO_RECORDER_DISK_CLEANUP_TARGET_GB` | retained configuration compatibility only; no destructive path consumes it |
+| Filesystem free-space warn/critical | `CRYPTO_RECORDER_DISK_FS_FREE_WARN_GB` / `CRYPTO_RECORDER_DISK_FS_FREE_CRITICAL_GB` | raw filesystem free bytes, independent of retention accounting |
+
+Retention, replay-size observability, and filesystem safety stay distinct. No
+cross-filesystem total or free-space sum authorizes cleanup.
+
+### Raw retention
+
+The historical single-channel/date `shutil.rmtree` path is removed.
+`CRYPTO_RECORDER_RAW_RETENTION_ENABLED=0` is the default. Even if changed to
+`1`, current code performs no move or deletion because the required durable
+paired depth/trade transaction journal, rollback, and startup recovery are not
+implemented. The monitor reports `cleanup_required` instead.
+
+`DiskMonitor.plan_raw_retention()` is proof-only. Under the common replay
+lifecycle lock it inventories exact `venue/symbol/UTC-source-date` units,
+never exchangeInfo, and checks grace/open-day status, paired nonempty stable
+depth/trade directories, compression ambiguity, schema-v2 routine/deep-valid
+D-1/D/D+1 replay dependencies, and exact source identities. Passing proof is
+still not deletion authorization.
+
+### Other disk-monitor environment knobs
+
+| Env var | Default | Purpose |
+|---|---|---|
+| `CRYPTO_RECORDER_DISK_SCAN_TIMEOUT_SEC` | `60.0` | Timeout for one recursive `du` scan; a scan that exceeds this reports `status="timeout"`, never zero |
+| `CRYPTO_RECORDER_DISK_MEASUREMENT_STALE_AFTER_SEC` | `1800.0` | How long a last-known-good value may be reused before it triggers a staleness alert |
+| `CRYPTO_RECORDER_DISK_HISTORY_MAX_SAMPLES` | `288` | Bounded growth-history sample count |
+| `CRYPTO_RECORDER_DISK_HISTORY_MAX_AGE_SEC` | `172800.0` | Bounded growth-history max age (48h) |
+| `CRYPTO_RECORDER_REPLAY_MONITOR_MAX_ENTRIES` | `250000` | Bound for the single classified replay-tree scan |
+| `CRYPTO_RECORDER_REPLAY_TRANSIENT_WARN_AGE_SEC` | `86400` | Old staging/backup alert age |
+| `CRYPTO_RECORDER_RAW_RETENTION_ENABLED` | `0` | Destructive cleanup switch; current implementation still refuses mutation |
+| `CRYPTO_RECORDER_RAW_RETENTION_DAYS` | `7` | Minimum proof-plan grace period |
+| `CRYPTO_RECORDER_RAW_RETENTION_STABLE_AGE_SEC` | `3600` | Minimum unchanged-file age used by the proof-only retention inventory |
+
 ## Coverage Terminology
+
 
 Startup and runtime reporting uses these terms:
 
@@ -152,7 +224,7 @@ See [VALIDATION.md](VALIDATION.md) for details.
 
 ## Deployment Script Reference
 
-> Content merged from the former `OPERATIONS.md`.
+> Content merged from the former `DEPLOYMENT.md`.
 
 CryptoRecorder is deployed on a Linux server with one wrapper script:
 
@@ -162,8 +234,8 @@ CryptoRecorder is deployed on a Linux server with one wrapper script:
 
 The script is a **thin operator wrapper** (no business logic). It prepares the
 environment, installs the selected systemd units, and optionally enables/starts them.
-The canonical paths and service groups it uses are defined in
-[LINUX_SERVER.md](OPERATIONS.md).
+The canonical paths and service groups it uses are defined below in the
+[Linux Server Layout](#linux-server-layout) section.
 
 ## Targets
 
@@ -173,9 +245,16 @@ The canonical paths and service groups it uses are defined in
 |--------|---------------|
 | `all` | every group below (default) |
 | `recorder` | `cryptorecorder-recorder.service` |
-| `legacy-converter` | `cryptorecorder-convert.service` + `.timer` |
 | `replay-build` | `cryptorecorder-replay-build.service` + `.timer` |
-| `feature-build` | `cryptorecorder-feature-build.service` + `.timer` |
+
+`legacy-converter` is **not** a deployable target. Production automatically runs
+only `cryptorecorder-recorder.service` and `cryptorecorder-replay-build.timer`;
+the converter (`convert_day.py`) is never installed, enabled, or started as a
+systemd unit by this script. It remains required implementation/reference code
+for replay building, validation, and local test-computer catalog
+reconstruction (see [Linux Server Layout](#linux-server-layout) below), and can
+still be run manually (`python convert_day.py --staging`) when needed — it is
+just not part of the automated deployment path.
 
 ## Flags
 
@@ -183,15 +262,17 @@ The canonical paths and service groups it uses are defined in
 |------|---------|
 | `--target <name>` | Service group to act on. Default `all`. |
 | `--dry-run` | Print every action; change nothing. |
-| `--no-systemd` | Skip all systemd/`/etc` actions (safe in WSL). |
+| `--no-systemd` | Skip systemd install/control and `/etc` writes (safe in WSL). A real environment promotion still checks supported units inactive when `systemctl` exists. |
 | `--install-only` | Prepare env + install units; do not enable/start. |
 | `--enable` | `systemctl enable` the selected units. |
 | `--start` | `systemctl start` the selected units. |
 | `--restart` | `systemctl restart` the selected units. |
-| `--user <name>` | Service user. Default `zsom`. |
-| `--app-dir <path>` | Repo checkout dir. Default `/home/zsom/services/CryptoRecorder`. |
-| `--data-root <path>` | Data base dir. Default `/data/cryptorecorder`. |
-| `--env-file <path>` | Env file path. Default `/etc/cryptorecorder/cryptorecorder.env`. |
+| `--user <name>` | Service user/group. Default `zsom`. Rendered into the `User=`/`Group=` lines of every installed unit file. |
+| `--app-dir <path>` | Repo checkout dir. Default `/home/zsom/services/CryptoRecorder`. Rendered into each unit's `WorkingDirectory=`/`ExecStart=` paths. |
+| `--data-root <path>` | Data base dir. Default `/data/cryptorecorder`. Rendered into a newly created env file's `CRYPTO_RECORDER_*_ROOT` values; has no effect if the env file already exists (never overwritten). |
+| `--env-file <path>` | Env file path. Default `/etc/cryptorecorder/cryptorecorder.env`. Rendered into each unit's `EnvironmentFile=` line. |
+| `--uv-bin <path>` | Operator-installed uv executable or command name. The script never downloads uv. |
+| `--migrate-venv` | Explicitly replace an unrecognized legacy `.venv` through a validated same-parent candidate and preserved backup. |
 
 ## Common steps performed
 
@@ -200,46 +281,82 @@ For the selected target, the script runs these steps (in order):
 1. **Verify Linux** — refuse to run on non-Linux hosts.
 2. **Verify repo root** — must be run from the repository checkout.
 3. **Verify structure** — `docs/REPO_STRUCTURE.md` must exist (the frozen contract).
-4. **Create venv** — create `.venv` if missing.
-5. **Install requirements** — `pip install -r requirements.txt` into `.venv`.
-6. **Create env file** — copy `systemd/cryptorecorder.env.example` to the env-file path
-   **only if it does not already exist** (never silently overwrite an existing env file).
+4. **Verify dependency authority** — locate the operator-supplied uv, record its
+   version, run `uv lock --check`, and record the committed lock SHA-256.
+5. **Prepare the locked environment** — accept an existing `.venv` only when
+   its marker and live validation prove the current production-only lock
+   selection. Otherwise build and validate a same-parent candidate with
+   `uv sync --frozen --no-default-groups`; an unrecognized legacy environment
+   requires the explicit `--migrate-venv` policy.
+6. **Create env file** — render `systemd/cryptorecorder.env.example` (substituting `--data-root`)
+   to the env-file path **only if it does not already exist** (never silently overwrite an
+   existing env file).
 7. **Create data dirs** — create the data roots under `--data-root`.
-8. **Run validation** — `python validate.py --quick`.
-9. **Print target** — show which units/groups were selected and their status.
+8. **Run validation** — validate dependency separation, imports, lock freshness,
+   and production CLIs through `.venv/bin/python`.
+9. **Validate unit template** — verify `Type=oneshot`, `Restart=no`, schema-v2
+   backlog arguments, and 12 GiB/zero-swap limits without starting a service.
+10. **Clean up stale units** — stop/disable/remove every legacy or renamed unit name this repo
+   has ever shipped (see Safety notes below). Runs for every target, before units are installed.
+11. **Install units** — render each unit file for the selected target (substituting `--user`,
+    `--app-dir`, and `--env-file`) and install it to `/etc/systemd/system/`.
+12. **Control units** — `enable`/`start`/`restart` the selected units if those flags were given.
+13. **Print target** — show which units/groups were selected and their status.
 
 When `--no-systemd` is set, steps that touch systemd or `/etc` are skipped; the script
-still prepares the venv, dependencies, and data dirs (or prints them under `--dry-run`).
+still prepares the locked environment and data dirs (or prints them under `--dry-run`).
 
 ## Examples
 
 ```bash
 # See exactly what a full install would do, without touching the system:
-./scripts/deploy_linux_server.sh --target all --dry-run --no-systemd
+./scripts/deploy_linux_server.sh --target all --dry-run --no-systemd \
+  --uv-bin "$(command -v uv)"
 
 # Full server install: prepare, install units, enable + start everything:
-./scripts/deploy_linux_server.sh --target all --enable --start
+./scripts/deploy_linux_server.sh --target all --uv-bin "$(command -v uv)" \
+  --enable --start
 
 # Restart just the recorder after a code update:
 ./scripts/deploy_linux_server.sh --target recorder --restart
 
-# Install the daily build timers but do not start them yet:
+# Install the daily replay-build timer but do not start it yet:
 ./scripts/deploy_linux_server.sh --target replay-build --install-only
-./scripts/deploy_linux_server.sh --target feature-build --install-only
 ```
 
 ## Safety notes
 
 - The script never overwrites an existing env file (step 6).
-- `--dry-run` makes no changes; `--no-systemd` avoids systemd and `/etc` entirely.
+- `--dry-run` makes no changes; `--no-systemd` avoids systemd mutation and
+  `/etc` entirely. A non-dry-run environment promotion still uses a read-only
+  `systemctl is-active` proof when systemd is available, so this flag cannot
+  bypass the inactive-service migration boundary.
+- It never installs uv, uses pip, resolves an unlocked environment, or invokes
+  uv from a runtime service. `pyproject.toml` plus `uv.lock` are authoritative.
+- An existing `.venv` that lacks the current lock marker is preserved and
+  refused by default. Explicit migration requires every supported unit to be
+  inactive, promotes only a validated same-parent candidate, keeps the old
+  environment as `.venv.backup.<UTC>.<PID>`, and rolls back on an unambiguous
+  post-promotion failure. Symlinks, unsafe ownership, collisions, or interrupted
+  candidate evidence fail closed.
 - The script does **not** deploy Syncthing, archive, or import features — none exist.
 - It does **not** modify `recorder.py`, the raw schema, or `convert_day.py`.
+- For every target (not just `all`/`replay-build`), the script stops, disables, and removes
+  any of these legacy/renamed unit files left over from a previous deploy, before installing
+  the current unit set: `cryptorecorder-feature-build.{service,timer}` (pre-issue-#17
+  feature-build group), `crypto-recorder.service` (renamed to
+  `cryptorecorder-recorder.service`), `nautilus-convert.{service,timer}` (renamed to
+  `cryptorecorder-convert.{service,timer}`), `cryptorecorder-daily-build.{service,timer}`
+  (renamed to `cryptorecorder-replay-build.{service,timer}`), and
+  `cryptorecorder-convert.{service,timer}` itself (the legacy converter is no longer part
+  of the automated production deployment path; any copy installed by an older deploy is
+  stopped/disabled/removed). This cleanup step is skipped under `--no-systemd`.
 
 ---
 
 ## Linux Server Layout
 
-> Content merged from the former `OPERATIONS.md`.
+> Content merged from the former `LINUX_SERVER.md`.
 
 CryptoRecorder runs in two environments. Keep them clearly separated; do not hardcode
 one environment's paths into the other.
@@ -258,6 +375,67 @@ The repository is developed in **WSL** and deployed on an **Ubuntu server**. The
 deploy script (`scripts/deploy_linux_server.sh`) is safe to dry-run in WSL and performs
 real systemd actions only on the server.
 
+Dependency environments are explicit and locked. CPython `>=3.12,<3.15` is
+supported; checkpoint 3 was resolved and locally exercised with CPython 3.12.3
+and uv 0.11.29. `VERSION` remains the application-version authority; the
+non-packaged uv project's neutral metadata version is not a release value.
+
+```bash
+# Production: recorder + replay lifecycle/build/validation only.
+uv lock --check
+UV_PROJECT_ENVIRONMENT="$APP_DIR/.venv" \
+  uv sync --frozen --no-default-groups
+
+# Reconstruction: production plus pinned Nautilus, in an external environment.
+uv lock --check
+UV_PROJECT_ENVIRONMENT=/external/cryptorecorder-reconstruction-env \
+  uv sync --frozen --no-default-groups --extra reconstruction
+
+# Development: production + reconstruction + tests, also external.
+uv lock --check
+UV_PROJECT_ENVIRONMENT=/external/cryptorecorder-development-env \
+  uv sync --frozen --no-default-groups \
+    --extra reconstruction \
+    --group dev
+```
+
+Plain production sync contains neither `nautilus_trader` nor pytest. The
+reconstruction extra pins `nautilus_trader==1.225.0` and still excludes test
+tools. The development selection adds only pytest and pytest-asyncio. Frozen
+syncs must leave `uv.lock` byte-identical; `requirements.txt` is intentionally
+absent so there is no second hand-maintained dependency authority.
+
+Production replay scale derivation reads raw Binance exchangeInfo through the
+dependency-free `converter.exchange_info` module. The reconstruction-only
+`converter.instruments` module re-exports those helpers for compatibility but
+is not imported by the production replay writer.
+
+Services continue to execute `<app-dir>/.venv/bin/python`. They never execute
+uv, resolve dependencies, update the lock, or access a package index at
+startup. Repository templates have not yet been deployed or production-
+accepted.
+
+### Legacy `.venv` migration and rollback
+
+Do not stop a unit automatically merely to make an environment migration
+succeed. The operator sequence is:
+
+1. stop the supported recorder and replay-build service/timer manually;
+2. run the deploy command with `--dry-run --install-only --migrate-venv`;
+3. inspect the exact candidate, backup, lock, and unit plan;
+4. run the same command without `--dry-run` but still with `--install-only`;
+5. validate the promoted `.venv` and preserved timestamped backup;
+6. start or restart services only through a separate explicit command.
+
+The deployment wrapper refuses an active supported unit before promotion. It
+renames the existing environment to a timestamped backup, atomically renames
+the validated candidate to `.venv`, verifies the production contract again,
+and restores the backup if that post-promotion check fails unambiguously. It
+does not delete the backup. For manual rollback, keep all units inactive,
+inspect every sibling `.venv.*` artifact, move the failed active environment
+aside, and restore exactly one preserved backup to `.venv`; any collision or
+ambiguous interrupted state requires operator diagnosis rather than cleanup.
+
 ## Canonical production paths
 
 | Name | Value | Notes |
@@ -272,35 +450,196 @@ Generated data roots under `DATA_BASE` (see `config.py` and the env template):
 ```
 /data/cryptorecorder/data_raw          # CRYPTO_RECORDER_DATA_ROOT
 /data/cryptorecorder/replay_store       # CRYPTO_RECORDER_REPLAY_ROOT
-/data/cryptorecorder/feature_store      # CRYPTO_RECORDER_FEATURE_ROOT
-/data/cryptorecorder/catalog_jobs       # CRYPTO_RECORDER_CATALOG_JOBS_ROOT
 /data/cryptorecorder/archive_days       # CRYPTO_RECORDER_ARCHIVE_DAYS_ROOT (placeholder)
-/data/cryptorecorder/label_store        # CRYPTO_RECORDER_LABEL_ROOT (placeholder)
 ```
 
-> `archive_days` and `label_store` are **placeholder** roots. No archive, Syncthing,
-> or label code reads or writes them yet.
+> `archive_days` is a **placeholder** root. No archive, Syncthing, or import/restore
+> code reads or writes it yet. `FEATURE_ROOT`, `CATALOG_JOBS_ROOT`, and `LABEL_ROOT`
+> no longer exist (removed, issue #17) — CryptoRecorder does not own a
+> feature-store, catalog-jobs, or label-store data root.
 
 ## Service groups
 
-Production work is split into four service groups plus a meta target `all`.
+Production work is split into two service groups plus a meta target `all`.
+Production automatically runs **only** `cryptorecorder-recorder.service` and
+`cryptorecorder-replay-build.timer`.
 
 | Group | systemd unit(s) | Kind | Schedule | Command (in `.venv`) |
 |-------|-----------------|------|----------|----------------------|
 | `recorder` | `cryptorecorder-recorder.service` | long-running | always on | `python recorder.py` |
-| `legacy-converter` | `cryptorecorder-convert.service` + `.timer` | oneshot | ~00:10 UTC | `python convert_day.py --staging` (defaults to yesterday UTC) |
-| `replay-build` | `cryptorecorder-replay-build.service` + `.timer` | oneshot | ~01:00 UTC | `python -m pipeline.daily_build --steps replay --date yesterday` |
-| `feature-build` | `cryptorecorder-feature-build.service` + `.timer` | oneshot | ~02:30 UTC | `python -m pipeline.daily_build --steps features --date yesterday` |
+| `replay-build` | `cryptorecorder-replay-build.service` + `.timer` | oneshot | ~01:00 UTC | `python -m pipeline.daily_build --date yesterday --backlog-days 7 --max-build-dates 3 --schema-version 2` |
 
-Meta target **`all`** installs/controls all four groups together.
+Meta target **`all`** installs/controls both groups together.
 
-Ordering: the daily chain runs **convert → replay → features** (each after the
-previous day has closed and the prior step has produced output).
+`replay-build` reads directly from `data_raw` (via `pipeline.raw_manifest`); it
+does not depend on `convert_day.py` or any converter output, so there is no
+ordering dependency between them. The legacy converter systemd units
+(`cryptorecorder-convert.service` + `.timer`) were **deleted from the repository**
+in PR #18 — converter systemd automation is not part of the supported production
+architecture. `convert_day.py`, `converter/`, and `validation/replay_catalog_reconstruct.py`
+remain required implementation/reference code for replay building, validation,
+and local test-computer catalog reconstruction: replay stores are synced
+separately by the operator, and on the test computer the synced replay stores
+may be reconstructed into temporary Nautilus catalogs by symbol (e.g. for
+KovacsTrader) through the supported `pipeline.reconstruct_selected_catalog`
+boundary — run manually, not via systemd. Any
+`cryptorecorder-convert.{service,timer}` already installed on
+an existing server (from before this change) is stopped, disabled, and removed
+automatically the next time the deploy script runs (see "Safety notes" above).
+There is no feature-build step; CryptoRecorder's scope ends at `replay_store`
+(removed, issue #17).
 
-> The replay-build and feature-build services invoke `pipeline.daily_build` because
-> `pipeline.build_replay_store` and `pipeline.build_feature_store` require an explicit
-> `YYYY-MM-DD` date and do not understand the literal `yesterday`. `daily_build`
-> resolves `yesterday` to the previous completed UTC date.
+### Development-computer selected reconstruction
+
+This command is deliberately outside the Linux service/timer groups:
+
+```bash
+/external/cryptorecorder-reconstruction-env/bin/python \
+  -m pipeline.reconstruct_selected_catalog \
+  --replay-root /path/to/synced/replay_store \
+  --venues BINANCE_SPOT \
+  --symbols ADAUSDT BTCUSDT \
+  --start 2026-06-11T12:00:00Z \
+  --end 2026-06-12T00:00:00Z \
+  --output-root /external/temporary/catalog_jobs \
+  --job-id selected-20260611 \
+  --profile full_l2
+```
+
+Create the external output root first and keep it outside production
+`replay_store`. The final job is `<output-root>/<job-id>/`, containing
+`catalog/` and its cryptographic `job_manifest.json`. The interval is
+end-exclusive. Every venue, symbol, endpoint, output root, job ID, and profile
+must be explicit; empty scope never means everything. Use `--overwrite` only
+for intentional replacement of that exact completed job. The command owns
+`<output-root>/.claim_<job-id>/` from preflight through publication. A second
+same-job invocation fails before work; different job IDs remain independent.
+Normal completion or handled failure removes only its exact claim. A process
+crash preserves the claim and its durable publication state; do not delete it
+based only on PID or age—inspect the recorded staging/backup/final paths and
+manifests before an explicit manual recovery.
+
+First publication uses a Linux atomic no-replace rename. An overwrite uses
+Linux `renameat2(RENAME_EXCHANGE)`, so the old completed job remains visible
+while the new job becomes canonical; the prior job is then moved to an exact
+`.replaced_<job-id>_<nonce>` backup. Backup deletion occurs only after the new
+job validates. Cleanup failure preserves that backup and adds a warning to the
+completed job manifest; it does not turn the already-valid publication into a
+false reconstruction failure. No unit, timer, or unattended catalog lifecycle
+is installed for this command.
+
+> The replay-build service invokes `pipeline.daily_build` because
+> `pipeline.build_replay_store` requires an explicit `YYYY-MM-DD` date and does
+> not understand the literal `yesterday`. `daily_build` resolves `yesterday` to
+> the previous completed UTC date.
+
+### Replay-build memory and restart behaviour
+
+**Memory-bounded writes**: `ReplayWriter` spools each symbol/day to a SQLite
+file inside the staging directory (`staging_dir/scratch/`) via
+`converter.spool.RawRecordSpool`, and writes Parquet incrementally in bounded
+batches through `pyarrow.parquet.ParquetWriter`. Peak RSS is O(batch), not
+O(symbol/day). Batch size is controlled by `CRYPTO_RECORDER_REPLAY_PARQUET_BATCH`
+(default 5 000 rows). Because spool files live inside the staging directory,
+build-wide reconciliation moves an abandoned staging tree and its scratch
+files together to a unique quarantine directory after the kernel lock proves
+there is no active owner. It never silently deletes the interrupted evidence.
+
+**Restart policy**: The service uses `Restart=no`. A deterministic failure
+(e.g. bad raw data) will not trigger an automatic retry loop.
+`StartLimitIntervalSec=86400` / `StartLimitBurst=3` in `[Unit]` cap restarts
+if the policy is ever re-enabled. To re-run the build manually after fixing the
+root cause: `sudo systemctl start cryptorecorder-replay-build.service`.
+
+**Resource policy**: the repository template sets `MemoryMax=12G` and
+`MemorySwapMax=0` for the known 16 GiB host. This template has not been
+installed or production-validated. Phase 7's accepted full-day build reached
+its previous exact 10 GiB cgroup ceiling without swap/OOM, so the 12 GiB value
+is an explicit bounded template, not proof of production headroom.
+
+**Start timeout**: `TimeoutStartSec=23h`. A `oneshot` unit is considered
+"hung" by systemd if it does not exit before `TimeoutStartSec` elapses, at
+which point systemd sends `SIGTERM`/`SIGKILL` to the still-running process
+and marks the invocation failed. The daily timer fires once at `01:00 UTC`,
+and systemd will not start a new instance of this service while an existing
+invocation is still active — so a genuinely stuck run must not be allowed to
+stay active indefinitely, or it would silently block every later scheduled
+run. The original `3600` (1 hour) value was too short for a full-universe
+replay build; `infinity` (no cap at all) was considered and rejected because
+it could let a truly stuck job block all future daily activations forever.
+`23h` gives ample room for a long daily build of the previous completed UTC
+day across a large symbol universe, while still guaranteeing systemd
+terminates a stuck/hung run before the next `01:00 UTC` activation.
+`Restart=no` is unchanged, so a timeout failure does not create a restart
+loop; `StartLimitIntervalSec`/`StartLimitBurst` still bound restart attempts
+if `Restart` is ever re-enabled. If the ceiling is ever reached: `systemctl
+status`/`journalctl` will show the invocation as failed; because
+`Restart=no`, no automatic retry occurs — the operator must inspect the
+journal, resolve the root cause, and rerun manually (see Recovery command
+below). The installed service only ever builds the previous completed UTC
+day via `pipeline.daily_build --date yesterday`; it does not perform
+source/schema replacements. Those require the distinct
+`--rebuild-source-changed` or `--replace-incompatible` policy and are run
+manually against exact selected partitions via the documented CLI (preferably
+first against an isolated replay root) or a separately
+controlled transient systemd scope (e.g. `systemd-run`) where an operator
+chooses an explicit timeout appropriate to the manual job — not through this
+installed daily service or its timer. The memory-bounded writer plus
+crash-recovery state machine already make a `SIGKILL`/OOM/timeout mid-build
+safe to recover from on the next run.
+
+**Durable progress and recovery**: one nonblocking kernel advisory lock owns
+all supported replay mutations. Before backlog scanning, a bounded all-date
+reconciliation streams ordinary canonical history without counting it against
+the transient recovery-work bound or revalidating unrelated old partitions.
+It validates a canonical only when a transient for that exact date requires a
+decision, restores one unambiguous valid backup, quarantines stale
+staging/invalid canonical evidence, safely removes an obsolete valid backup
+beside a valid canonical, preserves every quarantine, and refuses symlinked,
+unknown, corrupt, or ambiguous state. Already-valid schema/source partitions
+are `skipped_valid` without consuming a build-date slot. Every action appears
+in the per-date and run reports. Before a replay partition rename, both closed
+Parquet files, optional instrument metadata, the manifest, and the staging
+directory are explicitly fsynced; each backup/canonical rename and successful
+backup removal is followed by a parent-directory fsync.
+
+**Recovery command** (after a confirmed OOM or failure):
+```bash
+sudo systemctl start cryptorecorder-replay-build.service
+# Then inspect:
+journalctl -u cryptorecorder-replay-build.service -n 100
+```
+
+### Later owner-run isolated production acceptance (not executed)
+
+This remains the manual production-acceptance condition in the owner-approved
+2026-08-01 Issue #20 closure amendment. The implementation is release-
+candidate complete, but the checked-in templates have not been deployed and
+no production unit, environment, raw source, or replay root has been changed.
+The replacement PR may close Issue #20 only after exact-head review and this
+isolated acceptance; issue #21 separately retains the original top50/multi-day
+semantic and `v2.0.0` gate.
+
+At the separately approved exact commit, the owner should first preserve the
+installed env/unit files, run `scripts/deploy_linux_server.sh --target
+replay-build --dry-run --install-only`, and diff the rendered source template.
+It must show `Restart=no`, `TimeoutStartSec=23h`, `MemoryMax=12G`,
+`MemorySwapMax=0`, `--schema-version 2`, `--backlog-days 7`, and
+`--max-build-dates 3`.
+
+Before enabling the timer, use operator-approved isolated replay/report roots
+on the production filesystem and run one exact small date/symbol through
+`pipeline.daily_build` twice: first `built`, then `skipped_valid`. Verify the
+lock metadata, atomic run/date reports, manifest/source/file checksums,
+routine/deep integrity, zero residual staging/backup, visible quarantine,
+filesystem capacity grouping, and cgroup swap/OOM/pressure telemetry. Do not
+set either replacement policy during this first acceptance. Resolve every
+legacy/source-changed/corrupt finding separately. Installing/enabling the real
+timer requires a distinct owner decision after that evidence is reviewed.
+
+No command in this checkpoint deployed, started, stopped, restarted, or
+enabled a production unit, and `/etc/cryptorecorder/cryptorecorder.env` was
+not edited.
 
 ## Explicitly out of scope
 
@@ -310,15 +649,17 @@ The following are **not** part of the deployment and have **no** services here:
 - **archive** export,
 - **import / restore** tooling.
 
-`ARCHIVE_DAYS_ROOT` and `LABEL_ROOT` exist only as configuration placeholders.
+`ARCHIVE_DAYS_ROOT` exists only as a configuration placeholder. `LABEL_ROOT` and
+`CATALOG_JOBS_ROOT` no longer exist (removed, issue #17).
 
-See [DEPLOYMENT.md](OPERATIONS.md) for the deploy command and flags.
+See the [Deployment Script Reference](#deployment-script-reference) section
+above for the deploy command and flags.
 
 ---
 
 ## State File Schemas
 
-> Content merged from the former `OPERATIONS.md`.
+> Content merged from the former `SCHEMAS.md`.
 
 These schemas document stable operational fields used by tooling and operators.
 They are interface notes, not a strict JSON Schema contract.

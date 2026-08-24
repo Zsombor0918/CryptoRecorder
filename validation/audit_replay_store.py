@@ -27,7 +27,12 @@ def _sha256(path: Path) -> str | None:
     return digest.hexdigest()
 
 
-def _nested_level_fields_present(parquet: pq.ParquetFile, column_name: str) -> bool:
+def _nested_level_fields_present(
+    parquet: pq.ParquetFile,
+    column_name: str,
+    *,
+    expected_fields: set[str],
+) -> bool:
     try:
         field = parquet.schema_arrow.field(column_name)
     except KeyError:
@@ -36,7 +41,7 @@ def _nested_level_fields_present(parquet: pq.ParquetFile, column_name: str) -> b
     if value_type is None:
         return False
     nested_names = set(getattr(value_type, "names", []))
-    return {"price_str", "size_str"}.issubset(nested_names)
+    return expected_fields.issubset(nested_names)
 
 
 def _init_file_report(path: Path, key_fields: list[str], null_fields: list[str]) -> dict[str, Any]:
@@ -147,6 +152,13 @@ def audit_replay_partition(
             manifest = json.loads(manifest_path.read_text())
         except Exception as exc:
             manifest = {"errors": [str(exc)]}
+    schema_version = int(manifest.get("schema_version", 0))
+    compact_schema = schema_version >= 1
+    trade_null_fields = ["trade_id", "agg_trade_id"]
+    if compact_schema:
+        trade_null_fields.extend(["price_mantissa", "quantity_mantissa"])
+    else:
+        trade_null_fields.extend(["price_str", "quantity_str"])
 
     depth = _audit_parquet_file(
         depth_path,
@@ -156,21 +168,39 @@ def audit_replay_partition(
     trades = _audit_parquet_file(
         trades_path,
         key_fields=["trade_stream_session_id", "trade_session_seq", "raw_index"],
-        null_fields=["trade_id", "agg_trade_id", "price_str", "quantity_str"],
+        null_fields=trade_null_fields,
     )
 
     if depth_path.exists():
         try:
             depth_parquet = pq.ParquetFile(depth_path)
+            expected_level_fields = (
+                {"price_mantissa", "size_mantissa"}
+                if compact_schema
+                else {"price_str", "size_str"}
+            )
             depth["level_exact_fields_present"] = (
-                _nested_level_fields_present(depth_parquet, "bids")
-                and _nested_level_fields_present(depth_parquet, "asks")
+                _nested_level_fields_present(
+                    depth_parquet,
+                    "bids",
+                    expected_fields=expected_level_fields,
+                )
+                and _nested_level_fields_present(
+                    depth_parquet,
+                    "asks",
+                    expected_fields=expected_level_fields,
+                )
+            )
+            depth["level_exact_encoding"] = (
+                "fixed_point_mantissa" if compact_schema else "decimal_string"
             )
         except Exception as exc:
             depth["level_exact_fields_present"] = False
+            depth["level_exact_encoding"] = None
             depth["errors"].append(str(exc))
     else:
         depth["level_exact_fields_present"] = False
+        depth["level_exact_encoding"] = None
 
     depth_checksum = _sha256(depth_path)
     trades_checksum = _sha256(trades_path)
@@ -186,6 +216,7 @@ def audit_replay_partition(
         "instrument_exists": instrument_path.exists(),
         "manifest_exists": manifest_path.exists(),
         "manifest_status": manifest.get("status"),
+        "schema_version": schema_version,
         "manifest_counts": {
             "depth_record_count": manifest_depth_count,
             "trade_record_count": manifest_trade_count,

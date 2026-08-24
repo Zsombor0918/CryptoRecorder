@@ -93,6 +93,4713 @@ An entry may be skipped **only** for:
 - <or "none — task fully completed">
 ```
 
+## 2026-08-04 — Decouple production replay scale derivation from Nautilus
+
+### Change summary
+- Extracted Binance exchangeInfo loading, filter lookup, and decimal-precision
+  helpers into dependency-free `converter.exchange_info`.
+- Rewired the compact replay writer to the dependency-free module while
+  preserving the existing `converter.instruments` helper API by re-export.
+- Removed the unsupported redundant `Timezone=UTC` timer key while preserving
+  the UTC-qualified 01:00 `OnCalendar` schedule.
+- Added focused production-import, schema-v2 scale-derivation,
+  reconstruction-compatibility, and systemd timer regression coverage.
+
+### Files/packages touched
+- `converter/exchange_info.py`
+- `converter/instruments.py`
+- `converter/__init__.py`
+- `stores/replay_writer.py`
+- `systemd/cryptorecorder-replay-build.timer`
+- `tests/test_uv_dependency_contract.py`
+- `tests/test_replay_schema_v1.py`
+- `tests/test_agent_infrastructure.py`
+- `docs/REPO_STRUCTURE.md`
+- `docs/PROJECT_STATUS.md`
+- `docs/IMPLEMENTATION_AUDIT.md`
+- `docs/REPLAY_STORE.md`
+- `docs/DAILY_BUILD_PIPELINE.md`
+- `docs/OPERATIONS.md`
+- `CHANGELOG.md`
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] docs/REPO_STRUCTURE.md
+- [x] docs/PROJECT_STATUS.md
+- [x] docs/IMPLEMENTATION_AUDIT.md
+- [x] relevant feature docs:
+  - `docs/FULL_L2_REPLAY_CATALOG_PLAN.md`
+  - `docs/REPLAY_STORE.md`
+  - `docs/DAILY_BUILD_PIPELINE.md`
+  - `docs/OPERATIONS.md`
+  - `docs/AI_WORKFLOW.md`
+  - `CHANGELOG.md`
+
+### Docs updated
+- [x] CHANGELOG.md
+- [ ] README.md — no CLI, layout, or operator invocation changed
+- [x] docs/PROJECT_STATUS.md
+- [x] docs/REPO_STRUCTURE.md
+- [x] relevant feature docs:
+  - `docs/IMPLEMENTATION_AUDIT.md`
+  - `docs/REPLAY_STORE.md`
+  - `docs/DAILY_BUILD_PIPELINE.md`
+  - `docs/OPERATIONS.md`
+
+### Status / validation impact
+- Validated status changed: no.
+- Deferred status changed: no.
+- New claims added: yes — production compact replay scale derivation works
+  without importing or installing Nautilus.
+- Evidence for any new validation claim:
+  - A fresh frozen production environment contained neither
+    `nautilus_trader` nor pytest; imported `stores.replay_writer` and
+    `pipeline.daily_build`; and passed
+    `validation.validate_dependency_environment --kind production`.
+  - Focused regression coverage passed, including scale derivation from raw
+    exchangeInfo with Nautilus imports deliberately blocked and reconstruction
+    compatibility with pinned Nautilus 1.225.0.
+  - `uv.lock` remained byte-identical at
+    `976451a3c49b0098bc6e620acb889aa9fb6aa8aaf8098d20db0416721ed1b5af`.
+
+### Tests run
+```bash
+env UV_PROJECT_ENVIRONMENT="$PWD/.venv-production-check" \
+  /home/zsombor0918/.local/bin/uv sync --frozen --no-default-groups
+
+env PYTHONPATH="$PWD" .venv-production-check/bin/python -c \
+  'import importlib.util; assert importlib.util.find_spec("nautilus_trader") is None; assert importlib.util.find_spec("pytest") is None; import stores.replay_writer; import pipeline.daily_build'
+
+env UV_PROJECT_ENVIRONMENT="$PWD/.venv-test" \
+  /home/zsombor0918/.local/bin/uv sync --frozen --extra reconstruction --group dev
+
+.venv-test/bin/python -m pytest -q \
+  tests/test_uv_dependency_contract.py \
+  tests/test_replay_store.py \
+  tests/test_replay_schema_v1.py \
+  tests/test_replay_schema_v1_corrections.py \
+  tests/test_replay_hierarchical_integrity_v2.py \
+  tests/test_daily_build.py \
+  tests/test_agent_infrastructure.py \
+  tests/test_repo_structure.py
+# 198 passed; two environment-only failures were rerun below.
+
+.venv-test/bin/python -m pytest -q \
+  tests/test_agent_infrastructure.py::test_replay_build_timer_uses_supported_utc_calendar
+# 1 passed outside the restricted sandbox.
+
+.venv/bin/python -m pytest -q tests/test_repo_structure.py
+# 23 passed while the temporary test environment used the contract-ignored
+# .venv name; it was restored to .venv-test immediately afterward.
+
+.venv-test/bin/python -m compileall -q converter stores pipeline validation
+# PASS
+```
+
+### Validation CLIs run
+```bash
+env PYTHONPATH="$PWD" .venv-production-check/bin/python \
+  -m validation.validate_dependency_environment \
+  --kind production \
+  --uv-bin /home/zsombor0918/.local/bin/uv
+# status: passed; exact locked environment; forbidden dependencies absent
+
+/home/zsombor0918/.local/bin/uv lock --check
+# PASS; lock unchanged
+
+systemd-analyze verify \
+  systemd/cryptorecorder-recorder.service \
+  systemd/cryptorecorder-replay-build.service \
+  systemd/cryptorecorder-replay-build.timer
+# Exit 0; repository templates parsed. Final installed paths are verified
+# separately after production promotion.
+
+git diff --check
+# PASS
+```
+
+### Known limitations / out of scope
+- No recorder/raw code, raw schema/layout/data, replay schema, manifest,
+  ordering, builder identity, dependency pin, or `convert_day.py` behavior
+  changed.
+- No full pytest suite was run, per the operator's focused-test instruction.
+- No Nautilus dependency was added to production and no catalog reconstruction
+  workload was run.
+
+## 2026-08-03 — Preserve selected-job success on claim cleanup failure
+
+### Change summary
+- Added an explicit completed-and-validated publication boundary to selected
+  reconstruction claim cleanup.
+- Kept cleanup failure fail-closed before that boundary, while reporting a
+  post-publication manifest/runtime warning and returning the completed job
+  after that boundary.
+- Preserved real claim residue for manual inspection and kept later same-job
+  invocations fail-closed; a partially removed claim is never recreated.
+
+### Files/packages touched
+- `pipeline/reconstruct_selected_catalog.py`
+- `tests/test_reconstruct_selected_catalog.py`
+- `CHANGELOG.md`
+- `docs/CHANGE_AUDIT.md`
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] docs/REPO_STRUCTURE.md
+- [x] docs/PROJECT_STATUS.md
+- [x] docs/IMPLEMENTATION_AUDIT.md
+- [x] relevant feature docs:
+  - `docs/OPERATIONS.md`
+  - `docs/VALIDATION.md`
+  - `CHANGELOG.md`
+
+### Docs updated
+- [x] CHANGELOG.md
+- [ ] README.md — no invocation or user-facing scope changed
+- [ ] docs/PROJECT_STATUS.md — no validated/deferred status changed
+- [ ] docs/REPO_STRUCTURE.md — no file/package contract changed
+- [ ] relevant feature docs — existing exact-job lifecycle remains unchanged;
+  this correction narrows only success/error reporting after publication
+- No docs update required because: existing selected-reconstruction operations
+  and lifecycle documentation already describe the exact-job claim; this fix
+  changes only post-publication cleanup result reporting.
+
+### Status / validation impact
+- Validated status changed: no.
+- Deferred status changed: no.
+- New claims added: yes — claim-cleanup faults after completed publication are
+  warnings rather than false reconstruction failures; pre-publication cleanup
+  faults remain errors.
+- Evidence for any new validation claim:
+  - Focused selected reconstruction tests passed 41 tests.
+  - The four-file replay/reconstruction safety set passed 120 tests.
+  - The full practical suite passed 855 tests with 3 skips.
+
+### Tests run
+```bash
+.venv/bin/python -m py_compile pipeline/reconstruct_selected_catalog.py
+
+.venv/bin/python -m pytest -q tests/test_reconstruct_selected_catalog.py
+# 41 passed
+
+.venv/bin/python -m pytest -q \
+  tests/test_replay_lifecycle.py \
+  tests/test_replay_memory_bounded.py \
+  tests/test_reconstruct_selected_catalog.py \
+  tests/test_serial_gate.py
+# 120 passed
+
+.venv/bin/python -m pytest -q
+# 855 passed, 3 skipped
+```
+
+### Validation CLIs run
+```bash
+uv lock --check
+git diff --check
+# PASS
+```
+
+### Known limitations / out of scope
+- No replay/catalog semantics, manifest schema, locking scope, overwrite
+  exchange protocol, replay publication, serial gate, VERSION, raw retention,
+  production configuration, deployment, or real-data workload changed.
+- The six previously resolved PR #22 findings were not reopened.
+
+## 2026-08-01 — Resolve PR #22 exact-head replay safety findings
+
+### Change summary
+- Kept retained canonical history outside the bounded transient-recovery
+  candidate inventory while preserving bounded actions, strict structural
+  checks, quarantine visibility, and exact-date canonical validation when a
+  transient requires it.
+- Made replay publication durable by fsyncing the closed Parquet and metadata
+  files, staging directory, and parent-directory rename transitions before a
+  partition is reported as published.
+- Added one atomic exact-job selected-reconstruction claim, Linux atomic
+  no-replace/exchange publication, recoverable overwrite transition state, and
+  honest post-publication backup-cleanup warnings.
+- Converted a serial semantic-gate subprocess timeout into one persisted failed
+  stage result which stops the gate without retry.
+
+### Files/packages touched
+- `pipeline/replay_lifecycle.py`
+- `stores/replay_writer.py`
+- `pipeline/reconstruct_selected_catalog.py`
+- `validation/serial_gate.py`
+- `tests/test_replay_lifecycle.py`
+- `tests/test_replay_memory_bounded.py`
+- `tests/test_reconstruct_selected_catalog.py`
+- `tests/test_serial_gate.py`
+- `docs/PROJECT_STATUS.md`
+- `docs/OPERATIONS.md`
+- `CHANGELOG.md`
+- `docs/CHANGE_AUDIT.md`
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] docs/REPO_STRUCTURE.md
+- [x] docs/PROJECT_STATUS.md
+- [x] docs/IMPLEMENTATION_AUDIT.md
+- [x] relevant feature docs:
+  - `docs/FULL_L2_REPLAY_CATALOG_PLAN.md`
+  - `docs/OPERATIONS.md`
+  - `docs/AI_WORKFLOW.md`
+  - `docs/REPLAY_STORE.md`
+  - `docs/DAILY_BUILD_PIPELINE.md`
+  - `docs/VALIDATION.md`
+  - `CHANGELOG.md`
+
+### Docs updated
+- [x] CHANGELOG.md
+- [ ] README.md — no user invocation or ownership boundary changed
+- [x] docs/PROJECT_STATUS.md
+- [ ] docs/REPO_STRUCTURE.md — no file or package contract changed
+- [x] relevant feature docs:
+  - `docs/OPERATIONS.md`
+
+### Status / validation impact
+- Validated status changed: no.
+- Deferred status changed: no.
+- New claims added: yes — focused synthetic and fault-injection coverage proves
+  the six exact-head safety corrections described above.
+- Evidence for any new validation claim:
+  - The locked focused suite passed 250 tests; the locked full suite passed
+    850 tests with 3 skips and only 2 third-party Nautilus deprecation warnings.
+  - A fresh synthetic replay build passed
+    `validation.audit_replay_store` with matching rows/checksums and sorted
+    depth/trade data.
+  - No market-data, production, deployment, or service mutation was performed.
+
+### Tests run
+```bash
+UV_PROJECT_ENVIRONMENT=/tmp/cr-pr22-review-fix-dev-env-offline \
+  UV_CACHE_DIR=/tmp/cr-review-uv-cache-full \
+  uv sync --offline --frozen --no-default-groups \
+    --extra reconstruction --group dev
+
+UV_CACHE_DIR=/tmp/cr-review-uv-cache-full \
+  /tmp/cr-pr22-review-fix-dev-env-offline/bin/python -m pytest -q \
+    tests/test_replay_lifecycle.py \
+    tests/test_daily_build.py \
+    tests/test_replay_build_policy.py \
+    tests/test_replay_memory_bounded.py \
+    tests/test_replay_store.py \
+    tests/test_replay_fail_closed_hardening.py \
+    tests/test_reconstruct_selected_catalog.py \
+    tests/test_replay_catalog_reconstruct.py \
+    tests/test_serial_gate.py \
+    tests/test_stage_runner_cli.py \
+    tests/test_repo_structure.py \
+    tests/test_agent_infrastructure.py
+# 250 passed
+
+# The managed command sandbox denies asyncio's worker-thread self-pipe wakeup.
+# The full run therefore used a process-local 50 ms EpollSelector heartbeat;
+# repository code, dependencies, collection, and assertions were unchanged.
+UV_CACHE_DIR=/tmp/cr-review-uv-cache-full \
+  /tmp/cr-pr22-review-fix-dev-env-offline/bin/python <pytest-heartbeat-harness>
+# 850 passed, 3 skipped, 2 third-party Nautilus deprecation warnings
+
+UV_CACHE_DIR=/tmp/cr-review-uv-cache-full \
+  /tmp/cr-pr22-review-fix-dev-env-offline/bin/python \
+    -m validation.validate_dependency_environment \
+    --kind development --uv-bin /home/z0055upd/.local/bin/uv \
+    --json-output /tmp/cr-pr22-review-dependency-validation.json
+# PASS; exact_locked_environment=true; Python 3.12.3; uv 0.11.29
+```
+
+### Validation CLIs run
+```bash
+UV_CACHE_DIR=/tmp/cr-review-uv-cache-full uv lock --check
+# PASS; uv.lock SHA-256 remained
+# 976451a3c49b0098bc6e620acb889aa9fb6aa8aaf8098d20db0416721ed1b5af
+
+/tmp/cr-pr22-review-fix-dev-env-offline/bin/python \
+  -m validation.audit_replay_store \
+  --replay-root /tmp/cr-pr22-replay-audit-y5jjg9m_/replay \
+  --date 2026-06-12 --symbols ADAUSDT --venues BINANCE_SPOT \
+  --report-path /tmp/cr-pr22-replay-audit-y5jjg9m_/audit.json
+# PASS; one synthetic partition, exact counts/checksums, sorted streams
+
+UV_CACHE_DIR=/tmp/cr-review-uv-cache-full \
+  bash scripts/deploy_linux_server.sh --target all --dry-run --no-systemd \
+  --uv-bin /home/z0055upd/.local/bin/uv
+# PASS; no mutation
+
+bash -n scripts/*.sh .githooks/pre-commit .githooks/commit-msg
+git diff --check
+# PASS
+```
+
+### Known limitations / out of scope
+- Automatic raw retirement remains unchanged and disabled.
+- No replay semantics, raw ingestion, `convert_day.py`, schema, ordering,
+  precision, production data/service, deployment, real-data gate, top50,
+  multi-day, or version declaration was changed or run.
+- The asyncio heartbeat is solely a managed-sandbox execution workaround and
+  is not part of the repository.
+
+## 2026-08-01 — Issue #20 owner-approved closure amendment and PR preparation
+
+### Change summary
+- Verified and preserved the checkpoint-4 preflight evidence as
+  `BLOCKED_SOURCE_UNAVAILABLE`: no semantic supervisor or workload launched,
+  and the exact inventory/blocker hashes remained unchanged.
+- Preserved the original Issue #20 contract and appended the dated owner-
+  approved closure amendment. Created follow-up issue #21 to retain the exact
+  top50/multi-day semantic gate and `v2.0.0` promotion without weakening the
+  deferred acceptance criteria.
+- Updated current status, plan, implementation audit, operations, README, and
+  changelog text to record release-candidate implementation status, the source
+  blocker, the still-deferred gate, and the remaining exact-head/manual
+  production-acceptance boundary.
+
+### Files/packages touched
+- `README.md`
+- `CHANGELOG.md`
+- `docs/PROJECT_STATUS.md`
+- `docs/FULL_L2_REPLAY_CATALOG_PLAN.md`
+- `docs/IMPLEMENTATION_AUDIT.md`
+- `docs/OPERATIONS.md`
+- `docs/CHANGE_AUDIT.md`
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] `.github/copilot-instructions.md`
+- [x] docs/REPO_STRUCTURE.md
+- [x] docs/PROJECT_STATUS.md
+- [x] docs/IMPLEMENTATION_AUDIT.md
+- [x] relevant feature docs:
+  - `docs/FULL_L2_REPLAY_CATALOG_PLAN.md`
+  - `docs/OPERATIONS.md`
+  - `docs/VALIDATION.md`
+  - `docs/AI_WORKFLOW.md`
+  - `README.md`, `CHANGELOG.md`
+
+### Docs updated
+- [x] CHANGELOG.md
+- [x] README.md
+- [x] docs/PROJECT_STATUS.md
+- [ ] docs/REPO_STRUCTURE.md — no structure or file-contract change
+- [x] relevant feature docs:
+  - `docs/FULL_L2_REPLAY_CATALOG_PLAN.md`
+  - `docs/IMPLEMENTATION_AUDIT.md`
+  - `docs/OPERATIONS.md`
+
+### Status / validation impact
+- Validated status changed: yes — Issue #20 implementation is recorded as
+  release-candidate complete under the explicit owner amendment, subject to
+  exact-head PR review and manual isolated production acceptance.
+- Deferred status changed: yes — the unchanged top50/multi-day semantic gate
+  and `v2.0.0` promotion are explicitly transferred to follow-up issue #21.
+- New claims added: no new replay, semantic, production, or deployment claim;
+  this records accepted existing evidence and an objective source blocker.
+- Evidence for any new validation claim:
+  - External checkpoint-4 inventory SHA-256:
+    `f7f4eb92d0aa5bc5e58a9ac3c5d7cf80166baa498f9a6dc9182cfcbf74d5abe2`.
+  - External checkpoint-4 blocker Markdown SHA-256:
+    `28da7cf44bf58240bb345a8cb85dc43070b10e051ca51b4670506401927c2d2b`.
+  - `FAILED` remains present, `COMPLETE` absent, and persisted state records
+    `supervisor_launched=false`.
+
+### Tests run
+```bash
+UV_PROJECT_ENVIRONMENT=<fresh-external-development-env> \
+  uv sync --frozen --no-default-groups --extra reconstruction --group dev
+
+<fresh-external-development-env>/bin/python -m pytest -q
+# 834 passed, 3 skipped, 2 third-party deprecation warnings
+
+<fresh-external-development-env>/bin/python -m pytest -q \
+  tests/test_repo_structure.py \
+  tests/test_agent_infrastructure.py \
+  tests/test_reconstruct_selected_catalog.py \
+  tests/test_replay_catalog_reconstruct.py \
+  tests/test_replay_lifecycle.py \
+  tests/test_daily_backlog_lifecycle.py \
+  tests/test_daily_build.py \
+  tests/test_replay_build_policy.py \
+  tests/test_replay_monitoring_retention.py \
+  tests/test_disk_monitor_fail_safe.py \
+  tests/test_disk_monitor_cleanup.py
+# 182 passed, 2 third-party deprecation warnings
+
+bash -n scripts/*.sh .githooks/pre-commit .githooks/commit-msg
+bash scripts/deploy_linux_server.sh --target all --dry-run --no-systemd \
+  --install-only --uv-bin "$(command -v uv)" \
+  --app-dir <new-external-app-path> \
+  --data-root <new-external-data-path> \
+  --env-file <new-external-env-path>
+# PASS; no requested path was created
+```
+
+### Validation CLIs run
+```bash
+uv lock --check
+<fresh-external-development-env>/bin/python \
+  -m validation.validate_dependency_environment --kind development \
+  --uv-bin "$(command -v uv)" --json-output <new-external-report>
+# PASS; CPython 3.12.3, uv 0.11.29, Nautilus 1.225.0
+# uv.lock SHA-256 before/after:
+# 976451a3c49b0098bc6e620acb889aa9fb6aa8aaf8098d20db0416721ed1b5af
+
+<fresh-external-development-env>/bin/python \
+  -m validation.audit_change_compliance --base main
+# PASS
+
+git diff --check
+# PASS
+```
+
+### Known limitations / out of scope
+- No semantic matrix, replay build, raw-data scan, production mutation,
+  deployment, service control, replay-semantic change, `convert_day.py`
+  change, or `v2.0.0` declaration was performed.
+- The exact top50/multi-day gate remains deferred to issue #21 because the
+  retained fixture lacks the required universe/date enclosure.
+- Production templates and uv migration remain locally validated but not
+  manually accepted on the production host; the exact operator checklist
+  remains in `docs/OPERATIONS.md`.
+
+## 2026-08-01 — Issue #20 closure checkpoint 3 authoritative uv environments
+
+### Change summary
+- Replaced the hand-maintained requirements file with one authoritative,
+  committed `pyproject.toml`/`uv.lock` contract. The flat application remains
+  a non-packaged uv virtual project, all groups are explicit, and `VERSION`
+  remains the sole application release value.
+- Classified direct runtime dependencies from first-party imports and actual
+  clean-environment execution: production is aiohttp, NumPy, PyArrow, and
+  zstandard; reconstruction adds exact Nautilus 1.225.0; development adds only
+  pytest and pytest-asyncio. Pandas is transitive-only.
+- Moved the existing pure depth event-time/repartition helpers into
+  `converter.depth_repartition` so the production replay builder no longer
+  imports Nautilus at module import time. No timestamp, deduplication, replay,
+  converter, or reconstruction semantics changed.
+- Added a read-only dependency-environment validator for lock freshness/hash,
+  exact selected closure, required/forbidden packages, imports, CLI help,
+  exact Nautilus compatibility, and an optional safely scoped tiny production
+  replay smoke.
+- Migrated the deployment wrapper from pip to operator-supplied frozen uv.
+  Existing `.venv` paths and systemd runtime commands remain unchanged;
+  unrecognized legacy environments require explicit inactive-service
+  migration through a validated candidate, preserved backup, post-promotion
+  verification, and fail-closed rollback/evidence handling.
+- Preserved the first failed production smoke, which exposed the missing direct
+  NumPy contract in the initial classification. Regenerated the lock after
+  declaring NumPy, then used fresh non-overwriting successful smoke paths.
+
+### Files/packages touched
+- `pyproject.toml`, `uv.lock`, removed `requirements.txt`
+- `converter/depth_repartition.py`, `converter/depth_phase2.py`
+- `pipeline/build_replay_store.py`
+- `pipeline/reconstruct_selected_catalog.py`
+- `validation/validate_dependency_environment.py`
+- `validation/audit_change_compliance.py`
+- `validate.py`
+- `scripts/deploy_linux_server.sh`
+- `tests/test_uv_dependency_contract.py`
+- `tests/test_reconstruct_selected_catalog.py`
+- `tests/test_repo_structure.py`
+- `tests/test_agent_infrastructure.py`
+- `AGENTS.md`, `.github/copilot-instructions.md`
+- `README.md`, `INSTALL.md`, `CHANGELOG.md`
+- `docs/AI_WORKFLOW.md`, `docs/ARCHITECTURE.md`
+- `docs/IMPLEMENTATION_AUDIT.md`, `docs/OPERATIONS.md`
+- `docs/PROJECT_STATUS.md`, `docs/REPO_STRUCTURE.md`
+- `docs/VALIDATION.md`, `docs/CHANGE_AUDIT.md`
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] `.github/copilot-instructions.md`
+- [x] docs/REPO_STRUCTURE.md
+- [x] docs/PROJECT_STATUS.md
+- [x] docs/IMPLEMENTATION_AUDIT.md
+- [x] relevant feature docs:
+  - `docs/ARCHITECTURE.md`
+  - `docs/OPERATIONS.md`
+  - `docs/VALIDATION.md`
+  - `docs/FULL_L2_REPLAY_CATALOG_PLAN.md`
+  - `docs/AI_WORKFLOW.md`
+  - `README.md`, `INSTALL.md`, `CHANGELOG.md`
+
+### Docs updated
+- [x] CHANGELOG.md
+- [x] README.md
+- [x] INSTALL.md
+- [x] docs/PROJECT_STATUS.md
+- [x] docs/REPO_STRUCTURE.md
+- [x] relevant feature docs:
+  - `docs/ARCHITECTURE.md`
+  - `docs/OPERATIONS.md`
+  - `docs/VALIDATION.md`
+  - `docs/IMPLEMENTATION_AUDIT.md`
+  - `docs/AI_WORKFLOW.md`
+  - `AGENTS.md`, `.github/copilot-instructions.md`
+
+### Status / validation impact
+- Validated status changed: yes — authoritative dependency grouping and three
+  clean local Linux/WSL environments are now validated.
+- Deferred status changed: yes — uv migration is no longer deferred at the
+  repository/template level; production installation/migration remains
+  explicitly deferred.
+- New claims added: yes — only local CPython 3.12.3/uv 0.11.29 environment
+  separation, tiny production replay integrity, selected reconstruction, and
+  clean-suite evidence.
+- Evidence for any new validation claim:
+  - Production-only frozen environment excluded Nautilus/pytest, passed all
+    production imports/CLI help, and built/routine+deep-validated 2 depth + 1
+    identified trade row.
+  - Reconstruction frozen environment included Nautilus 1.225.0, excluded
+    pytest, and wrote a readable selected full-L2 catalog with 1 TradeTick, 4
+    flattened deltas, and 1 Depth10; job-manifest SHA-256
+    `f445e93895114f85c072cfd5fed6e7446a77609b02562574f33f4bd3e63972f4`.
+  - Development frozen environment passed 160 focused tests and the full 834
+    passed, 3 skipped suite. Lock SHA-256 remained
+    `976451a3c49b0098bc6e620acb889aa9fb6aa8aaf8098d20db0416721ed1b5af`.
+  - External acceptance JSON SHA-256:
+    `fde42fe0b6f2ba88294e093ab645e80a7490a8bcb9cc34e44e53344d9c118b01`.
+
+### Tests run
+```bash
+bash -n scripts/deploy_linux_server.sh
+uv lock --check
+
+<external-development-env>/bin/python -m pytest -q \
+  tests/test_uv_dependency_contract.py \
+  tests/test_reconstruct_selected_catalog.py \
+  tests/test_replay_catalog_reconstruct.py \
+  tests/test_replay_lifecycle.py \
+  tests/test_daily_backlog_lifecycle.py \
+  tests/test_daily_build.py \
+  tests/test_replay_build_policy.py \
+  tests/test_replay_store.py \
+  tests/test_writer_backpressure.py \
+  tests/test_repo_structure.py \
+  tests/test_agent_infrastructure.py
+# 160 passed, 2 third-party deprecation warnings
+
+<external-development-env>/bin/python -m pytest -q
+# 834 passed, 3 skipped, 2 third-party deprecation warnings
+```
+
+### Validation CLIs run
+```bash
+uv lock --check
+UV_PROJECT_ENVIRONMENT=<external-production-env> \
+  uv sync --frozen --no-default-groups
+UV_PROJECT_ENVIRONMENT=<external-reconstruction-env> \
+  uv sync --frozen --no-default-groups --extra reconstruction
+UV_PROJECT_ENVIRONMENT=<external-development-env> \
+  uv sync --frozen --no-default-groups --extra reconstruction --group dev
+
+<external-production-env>/bin/python \
+  -m validation.validate_dependency_environment --kind production \
+  --production-smoke-root <new-external-smoke-root>
+<external-reconstruction-env>/bin/python \
+  -m validation.validate_dependency_environment --kind reconstruction
+<external-development-env>/bin/python \
+  -m validation.validate_dependency_environment --kind development
+
+<external-reconstruction-env>/bin/python \
+  -m pipeline.reconstruct_selected_catalog \
+  --replay-root <tiny-external-schema-v2-replay> \
+  --venues BINANCE_SPOT --symbols ADAUSDT \
+  --start 2026-06-12T00:00:00Z --end 2026-06-12T00:01:00Z \
+  --output-root <external-reconstruction-jobs> --job-id uv-clean-smoke \
+  --profile full_l2
+
+bash scripts/deploy_linux_server.sh --target all --dry-run --no-systemd \
+  --uv-bin "$(command -v uv)" \
+  --app-dir <new-external-app-path> --data-root <new-external-data-path>
+
+python -m validation.audit_change_compliance --staged
+```
+
+### Known limitations / out of scope
+- This proves clean local Linux/WSL environments only; Windows and macOS were
+  not tested.
+- No production service, `/etc` environment, production replay root, or
+  production `.venv` was changed. The deployment/migration procedure is
+  implemented and dry-run tested, not production-accepted.
+- No representative matrix, 150-partition build, top50/multi-day semantic
+  gate, production replay migration, `v2.0.0` declaration, checkpoint 4, PR,
+  or Issue #20 mutation was performed.
+- `convert_day.py`, recorder ingestion, raw schema/layout, replay rows/order/
+  precision/schema, systemd runtime paths, and production service state are
+  unchanged.
+
+## 2026-07-30 — fix(replay): recover native Binance trade identifiers
+
+### Change summary
+- Matched the unchanged reference converter's Binance trade-identifier
+  precedence without changing `convert_day.py`: preserve normalized top-level
+  identifiers, otherwise recover native `trade.t` or aggregate `aggTrade.a`
+  exactly. No identifier is rounded, hashed, renumbered, or synthesized.
+- Made anonymous supported trades fail before any replay schema is spooled or
+  atomically published. Replay catalog reconstruction independently raises on
+  the same invalid row instead of silently producing a shorter catalog.
+- Advanced the normalization-only builder identities to v1.2.1/v2.0.1 while
+  leaving format and physical schema versions unchanged. Known v2.0.0
+  partitions remain readable/auditable, but are not silently reused as
+  current-builder artifacts.
+- Added focused normalization, writer-publication, reconstruction-oracle,
+  scale-stability, and builder-compatibility tests.
+- Reused the preserved BTWUSDT raw source and unchanged reference catalog,
+  rebuilt only the schema-v2 replay/candidate in a fresh external directory,
+  and passed the complete artifact-bound nine-component corrected gate.
+
+### Files/packages touched
+- `pipeline/build_replay_store.py`
+- `stores/replay_schema.py`
+- `stores/replay_reader.py`
+- `stores/replay_writer.py`
+- `validation/replay_catalog_reconstruct.py`
+- `tests/test_replay_trade_identifier_normalization.py`
+- `tests/test_stage_runner_cli.py`
+- `CHANGELOG.md`
+- `docs/PROJECT_STATUS.md`
+- `docs/IMPLEMENTATION_AUDIT.md`
+- `docs/REPLAY_STORE.md`
+- `docs/VALIDATION.md`
+- `docs/CHANGE_AUDIT.md`
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] docs/REPO_STRUCTURE.md
+- [x] docs/PROJECT_STATUS.md
+- [x] docs/IMPLEMENTATION_AUDIT.md
+- [x] relevant feature docs:
+  - `docs/FULL_L2_REPLAY_CATALOG_PLAN.md`
+  - `docs/OPERATIONS.md`
+  - `docs/AI_WORKFLOW.md`
+  - `docs/REPLAY_STORE.md`
+  - `docs/VALIDATION.md`
+  - `CHANGELOG.md`
+
+### Docs updated
+- [x] CHANGELOG.md
+- [ ] README.md — no new operator interface, repository layout, or production
+  status; its existing deferred-scope statement remains accurate
+- [x] docs/PROJECT_STATUS.md
+- [ ] docs/REPO_STRUCTURE.md — no path or supported-module inventory change
+- [x] relevant feature docs:
+  - `docs/IMPLEMENTATION_AUDIT.md`
+  - `docs/REPLAY_STORE.md`
+  - `docs/VALIDATION.md`
+
+### Status / validation impact
+- Validated status changed: yes — one corrected BTWUSDT futures representative
+  now has current-builder local development evidence
+- Deferred status changed: no
+- New claims added: yes
+- Evidence for any new validation claim:
+  - Fresh `BINANCE_USDTF/BTWUSDT/2026-06-11` external corrected attempt:
+    reference/candidate TradeTicks 1,371,172/1,371,172 exact; flattened
+    OrderBookDelta rows 11,507,066/11,507,066 exact; Depth10
+    40,398/40,398 exact; checkpoints 7/7; continuity exact; fences 249/249
+    with identical digest; metadata/source identity exact; routine/deep
+    integrity passed.
+  - Replay trades contain 1,371,217 non-null `trade_id` values recovered from
+    native `trade.t`, zero anonymous rows, and 45 preserved zero-quantity rows
+    identically excluded by both catalog paths.
+  - Artifact identity SHA-256:
+    `efeadc689dbf799afe5d1ce77295c1377329c6c87ebf3dae3cc96b3b7c3e8a44`.
+    Final report SHA-256:
+    `2ae29713f09dd10988566c10c3bb040ec55a0252d936a5e60e08032295af4d85`.
+  - All substantial stages ran serially in separate effective 10 GiB,
+    zero-swap cgroups with valid nonzero telemetry and zero OOM/OOM-kill.
+    Peak cgroup memory was 2,371,661,824 bytes; peak scratch was
+    2,256,375,339 bytes; build/candidate wall time was 409.933 seconds.
+
+### Tests run
+```bash
+git diff --check
+.venv/bin/python -m py_compile pipeline/build_replay_store.py \
+  stores/replay_reader.py stores/replay_schema.py stores/replay_writer.py \
+  validation/replay_catalog_reconstruct.py tests/test_stage_runner_cli.py \
+  tests/test_replay_trade_identifier_normalization.py
+# No configured Ruff executable was installed; no dependency was installed.
+
+.venv/bin/python -m pytest -q tests/test_replay_trade_identifier_normalization.py
+# 17 passed
+.venv/bin/python -m pytest -q tests/test_replay_store.py \
+  tests/test_replay_schema_v1.py tests/test_replay_schema_v1_corrections.py \
+  tests/test_replay_hierarchical_integrity_v2.py \
+  tests/test_replay_fail_closed_hardening.py \
+  tests/test_replay_catalog_reconstruct.py \
+  tests/test_bounded_catalog_reader.py tests/test_catalog_reader_boundaries.py
+# 180 passed
+.venv/bin/python -m pytest -q tests/test_native_trades_ingest.py \
+  tests/test_trade_deterministic.py tests/test_converter_integration.py \
+  tests/test_convert_day_phase2.py tests/test_futures_continuity.py \
+  tests/test_replay_sync_continuity.py \
+  tests/test_replay_depth_repartitioning.py tests/test_daily_build.py
+# 109 passed
+.venv/bin/python -m pytest -q tests/test_semantic_equivalence.py \
+  tests/test_semantic_oracle_detects_injected_faults.py \
+  tests/test_semantic_oracle_exhaustive_streaming.py \
+  tests/test_validate_catalog_equivalence_exhaustive_wiring.py \
+  tests/test_catalog_equivalence.py tests/test_catalog_equivalence_full_l2.py
+# 63 passed, 1 skipped
+.venv/bin/python -m pytest -q tests/test_artifact_identity.py \
+  tests/test_stage_runner_cli.py tests/test_serial_gate.py \
+  tests/test_cgroup_wrapper.py
+# 51 passed
+.venv/bin/python -m pytest -q tests/test_repo_structure.py \
+  tests/test_agent_infrastructure.py
+# 56 passed
+set -o pipefail
+.venv/bin/python -m pytest -q | tail -n 15
+# 745 passed, 3 skipped
+```
+
+### Validation CLIs run
+```bash
+env PYTHONPATH="$REPO" "$REPO/.venv/bin/python" \
+  "$CORRECTED_ROOT/tools/run_corrected_attempt.py"
+# Reused reference; rebuilt replay/candidate; all nine components passed.
+# Every substantial child used scripts/run_under_cgroup.sh 10G with no retry.
+
+bash scripts/run_under_cgroup.sh 10G env PYTHONPATH="$REPO" \
+  "$REPO/.venv/bin/python" -m validation.audit_replay_store \
+  --replay-root "$CORRECTED_ROOT/replay/replay_store" \
+  --venue BINANCE_USDTF --symbol BTWUSDT --date 2026-06-11
+# One complete valid schema-v2 partition; counts/checksums/order passed.
+
+.venv/bin/python -m validation.audit_change_compliance --staged
+# PASS
+```
+
+### Known limitations / out of scope
+- Evidence is representative local development validation for one futures
+  symbol/day. It is not a completed representative matrix, top50/full-universe,
+  multi-day, Tier-3, production, or v2.0.0 declaration.
+- The previous ADA/BTC/ETH/ZEC spot reports remain valid for their exact
+  v2.0.0-builder artifacts, but final-checkpoint evidence under v2.0.1 still
+  requires intentional replay/candidate revalidation. No spot case was rebuilt.
+- The stopped futures supervisor was not restarted; VELVETUSDT and later cases
+  were not started. The 150-partition build, Phase 8, deployment, retention,
+  uv, and KovacsTrader remain pending.
+- No raw-side, ordering, timestamps, fixed-point scale, continuity, carry,
+  fence, compact-layout, or production-service semantics changed.
+
+## 2026-07-30 — fix(validation): checkpoint hardened Phase 7 semantic validation
+
+### Change summary
+- Audited both validation catalog writers and proved that every successfully
+  produced reference/replay validation catalog under Nautilus 1.225.0 has
+  internally non-decreasing files and strictly disjoint closed `ts_init`
+  intervals. The proof is scoped to these CryptoRecorder writers, not arbitrary
+  Nautilus catalogs. Recorded the separate equal-singleton writer-skip caveat.
+- Hardened the direct Parquet validation reader with an exact
+  `nautilus_trader==1.225.0` pin and runtime check around the private
+  `ParquetDataCatalog._query_files()` method. There is no DataFusion fallback.
+  Full-selection preflight now verifies the exact pinned physical class schema,
+  instrument, filename/content bounds, row-group/internal order, and strict
+  non-overlap before the first yield. Each bounded decoded batch is validated
+  in full against Arrow row order/timestamps and instrument identity before its
+  first object is yielded.
+- Added focused real-Parquet coverage for non-overlapping/overlapping/equal
+  boundary files, internal disorder, equal ties within one file, wrong
+  class/instrument, multiple instruments, exact endpoints, many-file resource
+  bounds, decoded reorder, and changed/missing/extra/reordered events near the
+  end. Tests prove one open file, bounded decode batches, prior-batch release at
+  the next decode and after exhaustion, and no `from_pyo3_list()` input
+  retention.
+- Retained reusable process-isolated `trades`, `deltas`, `depth10`,
+  `checkpoints`, `continuity`, `fences`, `metadata`, `integrity`, and `report`
+  stages. Removed build/transform commands from `validation/`, the obsolete
+  combined `depth` alias, no-op time-window options, and misleading reader
+  names. Stage/report fragments now share an explicit
+  date/venue/symbol/source/candidate scope and fail closed if mixed.
+- Removed the one-off DataFusion memory probes, stress benchmark, and real-gate
+  driver. Kept the reusable serial runner and cgroup wrapper with tests,
+  overwrite guards, fragment-size/pass checks, sanitized paths, and no retry.
+- Tightened replay schema dispatch so versionless historical manifests are v0
+  only when both exact legacy physical schemas confirm that contract; compact
+  layouts without an explicit supported version and all manifest/physical
+  contradictions fail before decoding.
+- Added canonical artifact-document SHA-256 binding to every isolated stage.
+  Each stage now revalidates exact input content before and after execution,
+  and aggregation independently recomputes the identity and rejects copied,
+  mixed-build, mutated, label-only, missing, duplicate, or unexpected
+  fragments.
+- Added the length-framed `arrow_canonical_v2` method for new schema-v2 block
+  digests, including primitive/list/struct validity. Existing manifests
+  recording `arrow_canonical_v1` retain the unchanged legacy verifier, so
+  accepted artifacts remain auditable without reinterpretation or rebuild.
+  Complete-file SHA-256 remains the separate routine integrity layer.
+- Tightened existing schema-v2 validation with exact physical schema/version
+  contracts, structural block metadata, boundary-key verification,
+  file-handle closure, and honest source-contribution boundaries. Offline
+  equivalence builds now require a closed full D+1 scope and abort on a failed
+  non-empty carry build.
+- Corrected the replay-store audit so schema-v1/v2 fixed-point mantissa fields
+  are recognized as their exact compact representation; the audit no longer
+  reports missing legacy decimal-string fields for a valid schema-v2
+  partition.
+- Reused the preserved BTCUSDT reference/replay/trade results. Because the
+  actual reader algorithm changed, reran only deltas; then ran only the five
+  remaining stages, each serially under its own 10 GiB cgroup. All passed with
+  zero OOM events. Aggregated the required nine fragments into the new external
+  `gate_report_hardened.json` without overwriting the stale failure report.
+
+### Files/packages touched
+- `validation/catalog_compare.py`
+- `validation/artifact_identity.py`
+- `validation/audit_replay_store.py`
+- `validation/replay_catalog_reconstruct.py`
+- `validation/stage_runner_cli.py`
+- `validation/validate_catalog_equivalence.py`
+- `validation/serial_gate.py`
+- `pipeline/build_replay_store.py`
+- `pipeline/daily_build.py`
+- `pipeline/raw_manifest.py`
+- `stores/replay_reader.py`
+- `stores/replay_schema.py`
+- `stores/replay_writer.py`
+- `scripts/run_under_cgroup.sh`
+- `scripts/README.md`
+- `tests/test_bounded_catalog_reader.py`
+- `tests/test_artifact_identity.py`
+- `tests/test_catalog_reader_boundaries.py`
+- `tests/test_cgroup_wrapper.py`
+- `tests/test_replay_depth_repartitioning.py`
+- `tests/test_replay_hierarchical_integrity_v2.py`
+- `tests/test_replay_fail_closed_hardening.py`
+- `tests/test_catalog_equivalence.py`
+- `tests/test_daily_build.py`
+- `tests/test_replay_schema_v1.py`
+- `tests/test_serial_gate.py`
+- `tests/test_stage_runner_cli.py`
+- `tests/test_validate_catalog_equivalence_exhaustive_wiring.py`
+- `requirements.txt`
+- `docs/FULL_L2_REPLAY_CATALOG_PLAN.md`
+- `docs/VALIDATION.md`
+- `docs/IMPLEMENTATION_AUDIT.md`
+- `docs/PROJECT_STATUS.md`
+- `CHANGELOG.md`
+- `docs/CHANGE_AUDIT.md`
+
+Catalogs, replay partitions, raw data, large logs, and cgroup sample streams
+remain external. A path-sanitized machine-readable summary was generated at
+`validation_reports/issue20_phase7_btcusdt_spot_2026-06-11.json`; repository
+policy keeps that runtime-report directory gitignored.
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] docs/REPO_STRUCTURE.md
+- [x] docs/PROJECT_STATUS.md
+- [x] docs/IMPLEMENTATION_AUDIT.md
+- [x] relevant feature docs:
+  - `docs/FULL_L2_REPLAY_CATALOG_PLAN.md`
+  - `docs/OPERATIONS.md`
+  - `docs/AI_WORKFLOW.md`
+  - `docs/VALIDATION.md`
+
+### Docs updated
+- [x] CHANGELOG.md
+- [ ] README.md
+- [x] docs/PROJECT_STATUS.md
+- [x] docs/REPO_STRUCTURE.md
+- [x] relevant feature docs:
+  - `docs/VALIDATION.md`
+  - `docs/IMPLEMENTATION_AUDIT.md`
+  - `docs/FULL_L2_REPLAY_CATALOG_PLAN.md`
+- README update was not required because this is internal validation-only
+  hardening with its operator contract documented in `docs/VALIDATION.md`.
+- REPO_STRUCTURE was updated to inventory the supported validation identity
+  and serial-stage modules and the thin cgroup wrapper.
+
+### Status / validation impact
+- Validated status changed: no — `convert_day.py` remains the production
+  reference and the top50/multi-day `v2.0.0` gate remains deferred.
+- Deferred status changed: no.
+- New claims added: yes — one representative high-volume
+  BINANCE_SPOT/BTCUSDT schema-v2 day completed the full semantic report.
+- Evidence for the new validation claim:
+  - Preserved reference and replay construction fragments passed; preserved
+    exhaustive trades matched 3,418,712/3,418,712 exactly.
+  - Hardened deltas matched 30,009,655/30,009,655 exactly with zero
+    mismatches. Its SHA-256
+    `4f437172ee3bafaf4d2f3059a5c04cf4af21d85d83dc7c3415f576376e98033e`
+    is identical to the accepted Round 5 fragment. Cgroup exit 0, zero OOM
+    events, sampled peak 137,437,184 bytes; `/usr/bin/time` max RSS
+    275,856 KiB. The preserved pre-hardening cgroup peak evidence
+    (1,351,847,936 bytes, approximately 1.29 GiB) was retained.
+  - Depth10 matched 84,066/84,066 exactly. All 7 checkpoint canonical hashes
+    matched. Continuity matched (7 seeds, 0 resyncs, 0 desyncs, 25 fences).
+    All 25 fence ranges had identical canonical digest
+    `71a88f880d393f9c078f20aff2f653546a08005c54aa072d88c3a888fdf60cf3`.
+  - Raw/replay metadata matched exhaustively for 846,430 depth records and
+    3,419,004 trade records. Fresh source identity matched both manifest
+    copies exactly for 25 depth and 24 trade files. Metadata cgroup exit 0,
+    zero OOM events, transient sampled peak 5,308,530,688 bytes, max process
+    RSS 587,064 KiB.
+  - Final report passed with the exact nine required stages and no
+    missing/duplicate/unexpected fragments (SHA-256
+    `69c4466d1a6cb4206110f07def6f9d9c2b751a65f6923bd270ac16956668c281`).
+
+### Tests run
+```bash
+git diff --check
+# passed
+
+source .venv/bin/activate
+git ls-files -m -o --exclude-standard -- '*.py' |
+  while read -r path; do test ! -f "$path" || python -m py_compile "$path"; done
+# passed for every existing changed Python module
+# No configured linter executable was installed; none was installed ad hoc.
+
+pytest -q tests/test_replay_fail_closed_hardening.py \
+  tests/test_replay_schema_v1.py tests/test_replay_schema_v1_corrections.py
+# 104 passed
+
+pytest -q tests/test_replay_hierarchical_integrity_v2.py
+# 45 passed
+
+pytest -q tests/test_artifact_identity.py tests/test_stage_runner_cli.py
+# 30 passed
+
+pytest -q tests/test_bounded_catalog_reader.py \
+  tests/test_catalog_reader_boundaries.py
+# 24 passed
+
+pytest -q tests/test_stage_runner_cli.py tests/test_serial_gate.py \
+  tests/test_cgroup_wrapper.py
+# 41 passed
+
+pytest -q tests/test_replay_depth_repartitioning.py tests/test_daily_build.py
+# 25 passed
+
+pytest -q tests/test_semantic_oracle_exhaustive_streaming.py \
+  tests/test_semantic_oracle_detects_injected_faults.py \
+  tests/test_validate_catalog_equivalence_exhaustive_wiring.py
+# 56 passed
+
+pytest -q tests/test_repo_structure.py tests/test_agent_infrastructure.py
+# 56 passed
+
+source .venv/bin/activate && \
+  python -m pytest -q tests/test_bounded_catalog_reader.py \
+  tests/test_catalog_reader_boundaries.py
+# 24 passed
+
+source .venv/bin/activate && \
+  python -m pytest -q tests/test_replay_schema_v1.py \
+  tests/test_replay_schema_v1_corrections.py \
+  tests/test_replay_hierarchical_integrity_v2.py \
+  tests/test_replay_depth_repartitioning.py \
+  tests/test_replay_sync_continuity.py tests/test_replay_store.py \
+  tests/test_replay_catalog_reconstruct.py tests/test_daily_build.py
+# 154 passed
+
+source .venv/bin/activate && \
+  python -m pytest -q tests/test_semantic_oracle_exhaustive_streaming.py \
+  tests/test_semantic_oracle_detects_injected_faults.py \
+  tests/test_validate_catalog_equivalence_exhaustive_wiring.py \
+  tests/test_catalog_equivalence.py tests/test_catalog_equivalence_full_l2.py
+# 61 passed, 1 skipped
+
+source .venv/bin/activate && \
+  python -m pytest -q tests/test_repo_structure.py \
+  tests/test_agent_infrastructure.py tests/test_stage_runner_cli.py \
+  tests/test_serial_gate.py tests/test_cgroup_wrapper.py
+# 82 passed
+
+source .venv/bin/activate && \
+  python -m pytest -q tests/test_replay_store.py \
+  tests/test_replay_hierarchical_integrity_v2.py
+# 44 passed
+
+source .venv/bin/activate && pytest
+# 728 passed, 3 skipped
+```
+
+### Validation CLIs run
+```bash
+# Each substantial command below was run once, serially, through:
+# bash scripts/run_under_cgroup.sh 10G <logs> <unique-unit> -- /usr/bin/time -v ...
+
+python -m validation.stage_runner_cli deltas \
+  --config <gate-root>/configs/deltas.json \
+  --out <gate-root>/fragments/deltas_hardened.json
+# passed: 30,009,655/30,009,655 exact; zero OOM events
+
+python -m validation.stage_runner_cli depth10 \
+  --config <gate-root>/configs/depth10.json \
+  --out <gate-root>/fragments/depth10.json
+python -m validation.stage_runner_cli checkpoints \
+  --config <gate-root>/configs/checkpoints.json \
+  --out <gate-root>/fragments/checkpoints.json
+python -m validation.stage_runner_cli continuity \
+  --config <gate-root>/configs/continuity.json \
+  --out <gate-root>/fragments/continuity.json
+python -m validation.stage_runner_cli fences \
+  --config <gate-root>/configs/fences.json \
+  --out <gate-root>/fragments/fences.json
+python -m validation.stage_runner_cli metadata \
+  --config <gate-root>/configs/metadata.json \
+  --out <gate-root>/fragments/metadata.json
+# all passed; each cgroup recorded exit_code=0 and oom_kill=0
+
+python -m validation.stage_runner_cli report \
+  --config <gate-root>/configs/report_hardened.json \
+  --out <gate-root>/gate_report_hardened.json
+# passed; exact required stage set present
+
+python -m validation.audit_replay_store \
+  --replay-root <external-ADA-canary>/replay_store \
+  --date 2026-06-12 --symbols ADAUSDT --venues BINANCE_SPOT \
+  --report-path <external-ADA-canary>/checkpoint_replay_audit_v2_20260729.json
+# completed: schema_version=2; counts/checksums/order exact; zero duplicate
+# sequence keys; fixed-point level fields recognized; no partition missing
+
+python -m validation.audit_change_compliance --staged
+# PASS
+```
+
+The monolithic `validation.validate_catalog_equivalence` CLI was deliberately
+not run because it would rebuild and rerun the preserved reference, replay, and
+trade stages, which this task explicitly prohibited. Its semantic components
+were instead executed through the isolated CLIs above against the preserved
+artifacts.
+
+### Known limitations / out of scope
+- Did not modify `convert_day.py`, recorder/raw ingestion, replay-v2 semantics,
+  schema, or integrity rules.
+- Did not rebuild any preserved catalog or replay partition and did not rerun
+  reference, replay, or trades.
+- Did not weaken exhaustive comparison or treat crossed-book diagnostics as a
+  side-to-side mismatch when both sides and all checkpoint hashes matched.
+- Did not start the 150-partition build, deployment, retention, KovacsTrader,
+  Phase 8, or later work.
+- Did not promote the single BTCUSDT day to broader top50/multi-day validation.
+- Did not rewrite remote history or force-push.
+
+## 2026-07-29 — perf(stores): measured v1 Parquet encoding optimization (Phase 7 Stage A)
+
+### Change summary
+- Phase 6 (`4f84b05`) and the Phase 7 blocking correction (`b5a3555`) are
+  both approved and unmodified. This entry is Phase 7 Stage A: format
+  selection using the complete real local 2026-06-11 universe (150/150
+  valid partitions for both v0 and v1) as development/Tier-2 evidence —
+  explicitly NOT a Tier-3 production-day storage-gate claim.
+- **Baseline** (exact, from the existing `/tmp/phase7/replay_v0` and
+  `/tmp/phase7/replay_v1` roots, Parquet-footer-metadata-only analysis,
+  no data re-scan): v0 = 17,004,186,427 bytes (15.836 GiB; depth
+  11.271 GiB `equiv.` — actually 11,271,259,512 bytes = 10.497 GiB depth,
+  5,732,655,997 bytes = 5.339 GiB trades). v1 (corrected scale, `b5a3555`
+  default encoding) = 11,942,275,817 bytes (11.122 GiB; depth
+  6,817,371,311 bytes = 6.349 GiB, trades 5,123,435,355 bytes = 4.772
+  GiB). v1/v0 ratio 70.2%. Both: 45,036,499 depth rows, 103,254,133
+  trade rows, 1,090,289,773 total depth levels (v1). v0 bytes/depth-event
+  250.27, v1 bytes/depth-event (pre-optimization) 151.37, bytes/trade
+  55.52 (v0) vs 49.62 (v1 pre-optimization).
+- **Per-column attribution (v1 pre-optimization) identified the dominant
+  physical columns** before changing anything: depth —
+  `native_payload_hash` 14.1%, `bids`/`asks` `size_mantissa` 18.98%/17.23%,
+  `price_mantissa` 10.81%/9.93%, `U`/`u`/`pu` continuity ids ~9-10%
+  combined, `ts_exchange_ns`/`ts_receive_ns` ~7% combined,
+  `session_seq`/`raw_index` ~4% combined; trades — `native_payload_hash`
+  dominant at 67.75%, `ts_receive_ns` 9.65%, `raw_index` 8.22%,
+  `trade_session_seq` 5.32%.
+- **Representative-symbol sweep** (ADAUSDT/BTCUSDT/ETHUSDT spot,
+  BTCUSDT/ETHUSDT/VELVETUSDT/LABUSDT futures — the two
+  highest-local-volume symbols by trade count and one of the five
+  scale-corrected anomalous futures symbols), one-off analysis script
+  (not committed), varying one dimension at a time then testing the
+  best combination:
+  - Row-group target (~64/128/256 MiB) x ZSTD level (3/6/9): larger row
+    groups and higher ZSTD levels both monotonically reduced size on
+    every symbol (diminishing returns above ~128 MiB / level 6-9); e.g.
+    `BINANCE_SPOT/BTCUSDT` depth: 171,127,843 (source) →
+    146,327,089 bytes at 256 MiB/zstd9.
+  - Dictionary encoding disabled entirely measured smaller on every
+    representative symbol than dictionary enabled at the same row-group/
+    level, including for already-low-cardinality repeated string columns
+    — verified directly at scale on `VELVETUSDT` (11,387,310 trade rows):
+    `market_type` compressed to 49,578 bytes with dictionary disabled vs.
+    32,522 bytes enabled (a ~17 KB difference) against an ~8,174,885 byte
+    (8 MB) smaller overall trades.parquet file with dictionary disabled;
+    `trade_id`/`agg_trade_id`/`quality_flags` similarly showed negligible
+    (<1 KB) differences. No column required a manually-preserved
+    dictionary exception.
+  - `DELTA_BINARY_PACKED` for `session_seq`/`trade_session_seq`/
+    `raw_index`/`ts_exchange_ns`/`ts_receive_ns` (all monotonic or
+    near-monotonic within a session) measured substantial additional
+    reduction on top of ZSTD alone — e.g. `BINANCE_USDTF/BTCUSDT` trades:
+    169,921,400 (256 MiB/zstd9, no delta) → 148,426,438 bytes
+    (delta + no-dictionary combined).
+  - `BYTE_STREAM_SPLIT` for the int64 fixed-point mantissa columns
+    (`price_mantissa`/`quantity_mantissa` for trades; the nested
+    `bids`/`asks` `price_mantissa`/`size_mantissa` for depth — confirmed
+    directly that `column_encoding` accepts dotted nested-field paths,
+    e.g. `bids.list.element.price_mantissa`) measured a further
+    reduction beyond delta-encoded integers alone on large symbols:
+    `BINANCE_USDTF/BTCUSDT` depth, delta-ints-only 325,308,871 bytes →
+    delta-ints + BSS-mantissas 255,321,595 bytes (21.5% additional
+    reduction); `BINANCE_SPOT/BTCUSDT` depth 136,068,640 → 126,986,602
+    (6.7%); `BINANCE_USDTF/LABUSDT` depth 113,251,076 → 106,245,880 (6.2%).
+  - Nested fixed-point depth layout vs. an alternative split/flat depth
+    candidate: NOT tested as a separate candidate, because nested depth
+    was not the dominant remaining size driver after the above
+    combination was applied (see per-column evidence below) — per the
+    Stage A instructions ("if depth remains the dominant cost"), this
+    comparison was correctly skipped as unnecessary given the actual
+    measured column breakdown.
+  - Remaining exact ID/sequence compaction: not pursued further beyond
+    delta encoding of the already-planned integer columns — `U`/`u`/`pu`
+    (string continuity ids) and `trade_id`/`agg_trade_id` remain
+    deliberately uncompacted lexical strings, matching the existing v1
+    prototype's Phase 5 scope decision (their partition-constancy/safe-
+    numeric-packing was marked "pending proof"/"benchmark-needed" in the
+    Phase 3 field/consumer/integrity matrix and this entry did not
+    attempt to resolve that).
+- **Selected candidate**: ZSTD level 6, dictionary disabled, larger
+  row-group batch sizes (depth 20,000 rows, trades 50,000 rows,
+  independently configurable via `CRYPTO_RECORDER_REPLAY_V1_DEPTH_BATCH`/
+  `CRYPTO_RECORDER_REPLAY_V1_TRADE_BATCH` env vars; ZSTD level itself via
+  `CRYPTO_RECORDER_REPLAY_V1_ZSTD_LEVEL`), `DELTA_BINARY_PACKED` for the
+  monotonic integer columns, `BYTE_STREAM_SPLIT` for all fixed-point
+  mantissa columns including the nested depth-level ones. Implemented in
+  `stores/replay_writer.py` (`V1_COMPRESSION_LEVEL`/
+  `V1_DEPTH_PARQUET_BATCH`/`V1_TRADE_PARQUET_BATCH`/`V1_USE_DICTIONARY`/
+  `V1_DEPTH_COLUMN_ENCODING`/`V1_TRADE_COLUMN_ENCODING` module constants;
+  `_write_channel_incremental()` gained optional `compression_level`/
+  `use_dictionary`/`column_encoding` parameters, defaulting to the
+  original unchanged v0 behavior — only `finalize_staging()`'s
+  `schema_version == 1` branch passes the new v1-specific values, so v0's
+  physical writer call path and output are completely unaffected).
+  `stores/replay_schema.py`'s `BUILDER_VERSION_V1` bumped to `v1.2.0`
+  (encoding profile changed); `FORMAT_VERSION_V1`/`SCHEMA_VERSION_V1`
+  (the reader contract) unchanged, since `stores/replay_reader.py` reads
+  via standard `pq.ParquetFile`/`pq.read_table` and required zero code
+  changes — any Parquet-aware reader decodes the new encoding
+  transparently to the identical logical values. The v1 manifest's
+  `encoding_profile` now also records `use_dictionary`,
+  `depth_column_encoding`, `trade_column_encoding`, and per-channel
+  `depth_row_group_batch_size`/`trade_row_group_batch_size` so a built
+  partition's exact physical format is self-describing from its
+  manifest alone.
+- **Full-universe rebuild** (2026-06-11, all 150 real partitions, into a
+  fresh isolated candidate root `/tmp/phase7/replay_v1_optimized` — the
+  production `replay_store` was never touched): **150/150 succeeded**
+  (0 failed — no partition, large or small, was omitted from the
+  reported total). Every one of the 150 manifests validates via
+  `stores.replay_writer.validate_partition()`.
+  - **Size**: 8,783,383,810 bytes = **8.180 GiB** total (depth
+    4,948,962,336 bytes = 4.609 GiB; trades 3,832,818,373 bytes = 3.570
+    GiB; manifests 1,407,110 bytes = 1.342 MiB; instrument metadata
+    195,991 bytes = 0.187 MiB).
+  - **Ratio vs. baselines**: 48.3% reduction vs. v0 (8.180/15.836 GiB =
+    51.65%); 26.5% further reduction vs. the corrected-scale v1 baseline
+    before this optimization (8.180/11.122 GiB = 73.55%).
+  - **bytes/trade**: 37.12 (down from 49.62 pre-optimization, 55.52 for
+    v0). **bytes/depth-event**: 109.89 (down from 151.37 pre-optimization,
+    250.27 for v0).
+  - **Wall time**: 2:53:55 (up from 2:40:58 for the corrected-but-
+    unoptimized v1 build — ZSTD level 6 + delta/BSS encoding costs more
+    CPU than level 3 with plain encoding, a measured, accepted tradeoff
+    for the size reduction, still well within acceptable daily-build
+    time budgets). **Max RSS**: 2,410,720 KiB = 2.30 GiB (up from
+    1,110,976 KiB for the unoptimized build — larger row-group batches
+    held fully in memory before each Parquet row-group write account for
+    the increase; still far below the 16 GB machine-safety ceiling).
+  - **Per-column evidence AFTER optimization**: `native_payload_hash` is
+    now the dominant remaining cost driver — 28.09% of depth
+    (1,390,370,085 bytes = 1.295 GiB) and 86.23% of trades
+    (3,304,924,644 bytes = 3.078 GiB), **54.0% of the entire candidate's
+    total size** (4,695,294,729 of 8,783,383,810 bytes). This is a
+    32-byte SHA-256 hash recorded per event; being cryptographically
+    high-entropy, it is not meaningfully compressible or delta/
+    dictionary-encodable by any Parquet physical encoding — its
+    reduction is explicitly flagged "Unresolved" in
+    `docs/IMPLEMENTATION_AUDIT.md`, pending the (not-yet-implemented)
+    Phase 2 Section 3 traceability design, and is out of scope for this
+    Stage A Parquet-encoding-only sweep (changing what is stored per
+    event, rather than how it is physically encoded, would be a
+    different kind of change requiring separate explicit scoping).
+    Remaining depth drivers after `native_payload_hash`: `bids`/`asks`
+    `size_mantissa` 19.03%/17.23%, `price_mantissa` 11.52%/10.47%; the
+    `U`/`u`/`pu` continuity-id strings collectively remain ~9% (deferred,
+    per the matrix's own "pending proof" caveat — not overlooked).
+- **Tier-2 re-run** (canonical `validation.validate_catalog_equivalence`
+  CLI, ADAUSDT, 2026-06-12, real local `data_raw`), both schema
+  versions, with the new v1 encoding in effect: all 7 gating components
+  pass; `fenced_ranges` still byte-identical (34/34, same canonical
+  digest as every prior Phase 6/7 result) — confirming the encoding
+  change is purely physical, with zero effect on any semantic
+  comparison (every trade, every depth update/level, exact
+  prices/quantities, ordering, IDs/sequences, timestamps, snapshots,
+  sync_state/stream_lifecycle, desync/resync, fenced ranges, source
+  identity, and deterministic integrity are all unchanged).
+
+### Files/packages touched
+- `stores/replay_writer.py`
+- `stores/replay_schema.py`
+- `CHANGELOG.md`
+- `docs/CHANGE_AUDIT.md`
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] docs/REPO_STRUCTURE.md
+- [x] docs/PROJECT_STATUS.md
+- [x] docs/IMPLEMENTATION_AUDIT.md (reviewed specifically for
+  `native_payload_hash`'s documented "Unresolved" status — confirmed
+  this entry does not attempt to resolve it, and does not claim it as
+  resolved)
+- [x] relevant feature docs:
+  - docs/FULL_L2_REPLAY_CATALOG_PLAN.md (reviewed; no status-claim
+    changes needed — v1 remains an unreleased development prototype;
+    this entry does not change the full-L2/v0 equivalence claim)
+
+### Docs updated
+- [x] CHANGELOG.md
+- [ ] README.md
+- [ ] docs/PROJECT_STATUS.md
+- [ ] docs/REPO_STRUCTURE.md
+- [ ] relevant feature docs:
+  - none
+- No docs update required because: this is a v1-internal Parquet
+  physical-encoding optimization with a byte-for-byte-preserved reader
+  contract and zero observable semantic change (proven by an unchanged
+  Tier-2 canonical-gate result); v1 remains an unreleased development
+  prototype (not a validated production claim), so no
+  validated/deferred status claim changes.
+
+### Status / validation impact
+- Validated status changed: no
+- Deferred status changed: no
+- New claims added: no
+- Evidence for any new validation claim: n/a — this entry is explicitly
+  local development/Tier-2 evidence, not a Tier-3 production storage-gate
+  claim. The best measured candidate (8.18 GiB) remains above the 5 GiB
+  hard target.
+
+### Tests run
+```bash
+source .venv/bin/activate
+python -m pytest tests/test_replay_schema_v1.py tests/test_replay_schema_v1_corrections.py \
+  tests/test_replay_scale_selection_and_eligibility.py tests/test_replay_store.py \
+  tests/test_replay_depth_adapter.py tests/test_replay_memory_bounded.py \
+  tests/test_replay_sync_continuity.py tests/test_replay_catalog_reconstruct.py -q
+# 163 passed
+python -m pytest -q
+# 561 passed, 3 skipped (unchanged from before this entry -- no new tests
+# were required since stores/replay_reader.py needed zero changes and
+# existing v1 round-trip tests already exercise real Parquet decode)
+python -m pytest tests/test_repo_structure.py tests/test_agent_infrastructure.py -q
+# 56 passed
+```
+
+### Validation CLIs run
+```bash
+# Canonical Tier-2 gate, both schema versions, ADAUSDT (regression check
+# against the new v1 encoding):
+CRYPTO_RECORDER_DATA_ROOT="$(pwd)/data_raw" python -m validation.validate_catalog_equivalence \
+  --date 2026-06-12 --symbols ADAUSDT --venues BINANCE_SPOT --data-root "$(pwd)/data_raw" \
+  --work-root /tmp/phase7opt_v0/work --old-catalog-root /tmp/phase7opt_v0/old_catalog \
+  --replay-root /tmp/phase7opt_v0/replay --new-catalog-root /tmp/phase7opt_v0/new_catalog \
+  --profile full_l2 --emit-depth10 --schema-version 0 --overwrite \
+  --report-path /tmp/phase7opt_v0/report.json
+# result: passed, 7/7, fenced_ranges 34/34 byte-identical.
+
+CRYPTO_RECORDER_DATA_ROOT="$(pwd)/data_raw" python -m validation.validate_catalog_equivalence \
+  --date 2026-06-12 --symbols ADAUSDT --venues BINANCE_SPOT --data-root "$(pwd)/data_raw" \
+  --work-root /tmp/phase7opt_v1/work --old-catalog-root /tmp/phase7opt_v1/old_catalog \
+  --replay-root /tmp/phase7opt_v1/replay --new-catalog-root /tmp/phase7opt_v1/new_catalog \
+  --profile full_l2 --emit-depth10 --schema-version 1 --overwrite \
+  --report-path /tmp/phase7opt_v1/report.json
+# result: passed, 7/7, same fenced_ranges digest, with the new v1 encoding in effect.
+
+# Full-universe optimized-candidate rebuild (isolated candidate root, never
+# touching production replay_store):
+CRYPTO_RECORDER_CONVERTER_TEMP_DIR=/tmp/phase7/scratch3 python -m pipeline.build_replay_store \
+  --date 2026-06-11 --symbols all --data-root "$(pwd)/data_raw" \
+  --replay-root /tmp/phase7/replay_v1_optimized --schema-version 1
+# result: 150 successful, 0 failed. Total 8,783,383,810 bytes (8.180 GiB).
+```
+
+### Known limitations / out of scope
+- The best measured local Parquet candidate (8.18 GiB) remains above
+  the 5 GiB hard target. `native_payload_hash` (54% of total size) is
+  the dominant remaining driver and its reduction is explicitly
+  out-of-scope/unresolved (Phase 2 Section 3 traceability design, not
+  yet implemented) — this was NOT attempted here.
+- Stage B (running this finalized candidate against a real production
+  day, e.g. 2026-07-22/23, on an isolated production-server candidate
+  root) has NOT been performed. The June 2026-06-11 results are local
+  development/Tier-2 evidence only, explicitly not a Tier-3 production
+  storage-gate claim.
+- Custom binary format (Phase 8) was NOT started and requires explicit
+  user approval before any work begins on it.
+- Phase 8, self-contained/raw-retention work, lifecycle hardening,
+  reconstruction CLI, monitoring, deterministic-rebuild phase, `uv`,
+  deployment, KovacsTrader changes, and final documentation were NOT
+  started.
+- `convert_day.py` was not modified.
+
+## 2026-07-28 — fix(stores): select v1 fixed-point scale from declared and observed precision
+
+### Change summary
+- Phase 6 was approved and verified (`4f84b051858f866e54cc493a1eb5edf205bdfc2e`
+  confirmed matching `origin/refactor/recorder-replay-only`). This entry
+  is a blocking Phase 7 prerequisite correction, discovered while
+  attempting the first real full-production-day (2026-06-11, the only
+  local raw day with 100% symbol coverage: 72/72 BINANCE_SPOT + 78/78
+  BINANCE_USDTF) Phase 7 measurement build.
+- **Root cause**: the v1 compact schema's automatic `price_scale`/
+  `qty_scale` derivation (`_derive_fixed_point_scales()`) used only the
+  exchange's *declared* `PRICE_FILTER.tickSize`/`LOT_SIZE.stepSize`/
+  `MARKET_LOT_SIZE.stepSize`. 5 of 78 real BINANCE_USDTF futures symbols
+  (`BTWUSDT`, `GUAUSDT`, `HOMEUSDT`, `IRYSUSDT`, `LABUSDT`) failed the
+  full-universe v1 build with `"value '0.0795760' cannot be represented
+  exactly at scale 5 (would lose precision)"` — confirmed by direct
+  evidence gathering (exact `Decimal` parsing of every raw depth/trade
+  price and quantity for these 5 symbols on 2026-06-11): the exchange's
+  actual recorded tick granularity that day was finer than its own
+  declared filter for all 5 symbols (e.g. `BTWUSDT` declared price scale
+  5 vs. real observed max scale 6, appearing in both `snapshot_seed` and
+  `depth_update` depth record types as well as `trade` records). This is
+  a genuine data anomaly present in real production data, not a
+  benchmark artifact — a complete-day v1 candidate could not be built at
+  all until this was fixed.
+- **Fix**:
+  - `stores/replay_schema.py`: added `normalized_decimal_scale(value_str)`
+    — the exact minimum number of fractional decimal digits required to
+    represent a value exactly, computed via `Decimal(...).normalize()`
+    (strips insignificant trailing zeros) — never lexical string length,
+    never `float`. `encode_fixed_point()` now also validates the
+    resulting mantissa fits within signed int64 range (the physical
+    Parquet/Arrow type of every `*_mantissa` field), raising a clear
+    `ValueError` instead of silently overflowing/wrapping.
+  - `stores/replay_writer.py`: `ReplayWriter.write_depth_batch()`/
+    `write_trades_batch()` now update two small running-maximum counters
+    (`self._observed_price_scale`/`self._observed_qty_scale`) as each
+    batch is spooled — bounded, incremental, never a rescan of a
+    partition or a full-day Python list. `finalize_staging()`'s
+    automatic scale selection (when `price_scale`/`qty_scale` were not
+    explicitly supplied) is now `max(declared exchangeInfo scale,
+    observed scale)` for each of price and quantity independently. An
+    *explicitly* supplied scale is never silently enlarged: if observed
+    data would require more precision than an explicit override,
+    `finalize_staging()` raises a clear `ValueError` naming the exact
+    insufficient value instead. The v1 manifest's `encoding_profile` now
+    separately records `price_scale_declared`/`price_scale_observed`/
+    `qty_scale_declared`/`qty_scale_observed` (in addition to the
+    selected `price_scale`/`qty_scale` at the top level) so any
+    anomalous partition remains fully explainable from the manifest
+    alone. `stores/replay_schema.py`'s `BUILDER_VERSION_V1` bumped from
+    `v1.0.0` to `v1.1.0` (the deterministic scale-selection algorithm
+    changed); `FORMAT_VERSION_V1`/`SCHEMA_VERSION_V1` (the physical
+    schema/reader contract) are unchanged, since the reader's decode
+    logic did not change — only which scale value ends up recorded in
+    the manifest changed.
+  - `pipeline/raw_manifest.py`: added `ELIGIBLE_MARKET_CHANNELS =
+    frozenset({"depth_v2", "trade_v2"})` and used it in
+    `scan_raw_coverage()`'s channel-scanning loop so only genuine
+    market-data channel directories can ever contribute a venue/symbol
+    entry to the returned coverage — the venue-level `exchangeinfo`
+    metadata channel's single `EXCHANGEINFO` pseudo-"symbol" directory
+    can no longer leak into the eligible-symbol universe for either
+    schema version (previously it did: v0 silently "succeeded" building
+    a meaningless replay partition for the literal string
+    `"EXCHANGEINFO"`, while v1 correctly refused with "no exchangeInfo
+    entry found" — an inconsistency that also inflated the naive
+    eligible-partition count from 150 real symbols to 152). This is a
+    small, explicit allow-list, not a broad "ignore anything unfamiliar"
+    rule: a genuinely malformed market-data directory still surfaces via
+    the pre-existing per-venue error collection, and a real symbol
+    missing one of the two channels is still reported honestly (with
+    only the present channel key set) rather than hidden.
+- Added `tests/test_replay_scale_selection_and_eligibility.py` (22
+  tests, listed in full in the CHANGELOG entry) covering: the exact real
+  failing value selecting the correct (not naively inflated) scale and
+  round-tripping exactly; insignificant-trailing-zero handling;
+  declared-scale-as-floor retention; mixed depth+trade maximum
+  selection; qty_scale considering all four sources
+  (`LOT_SIZE`/`MARKET_LOT_SIZE`/observed depth/observed trade);
+  scientific-notation/zero/negative-exponent exactness;
+  explicit-override-never-silently-enlarged failure behavior; int64
+  overflow failure; end-to-end `EXCHANGEINFO` exclusion for both venues
+  and both schema versions; and honest missing-single-channel reporting.
+  Updated 3 pre-existing tests whose fixed expectations were tied to the
+  behavior being corrected (`tests/test_replay_schema_v1.py`'s
+  float-intermediate test needed a value that also fits the newly
+  int64-checked mantissa range; `tests/test_daily_build.py`'s two
+  `EXCHANGEINFO`-exclusion tests now assert exclusion happens at
+  `scan_raw_coverage()`'s source, matching the corrected behavior,
+  rather than only via `pipeline.daily_build`'s pre-existing downstream
+  `ELIGIBLE_REPLAY_CHANNELS` filter).
+- **Rebuilt the complete real 2026-06-11 universe** into fresh isolated
+  candidate roots (`/tmp/phase7/replay_v0`, `/tmp/phase7/replay_v1` —
+  never touching the production `replay_store`) with the fix applied:
+  v0 150/150 succeeded (unchanged — v0 was never affected by this bug);
+  **v1 150/150 succeeded (up from 145/150 before this fix)**, including
+  all 5 previously-failing futures symbols. Every one of the 300
+  resulting manifests (150 v0 + 150 v1) validates via
+  `stores.replay_writer.validate_partition()`. Direct focused semantic
+  proof for the 5 corrected symbols: every sampled raw price/size string
+  encodes and decodes exactly at its manifest-recorded selected scale
+  (50,000+ depth levels sampled for `LABUSDT` alone; zero precision-loss
+  failures for any of the 5).
+
+### Files/packages touched
+- `stores/replay_schema.py`
+- `stores/replay_writer.py`
+- `pipeline/raw_manifest.py`
+- `tests/test_replay_scale_selection_and_eligibility.py` (new)
+- `tests/test_replay_schema_v1.py`
+- `tests/test_daily_build.py`
+- `CHANGELOG.md`
+- `docs/CHANGE_AUDIT.md`
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] docs/REPO_STRUCTURE.md
+- [x] docs/PROJECT_STATUS.md
+- [ ] docs/IMPLEMENTATION_AUDIT.md
+- [x] relevant feature docs:
+  - docs/FULL_L2_REPLAY_CATALOG_PLAN.md (reviewed; no status-claim
+    changes needed — this is a v1-internal correctness correction, not
+    a change to the full-L2/v0 equivalence claim)
+
+### Docs updated
+- [x] CHANGELOG.md
+- [ ] README.md
+- [ ] docs/PROJECT_STATUS.md
+- [ ] docs/REPO_STRUCTURE.md
+- [ ] relevant feature docs:
+  - none
+- No docs update required because: this is an internal v1 encoding
+  correctness fix and an eligibility-scan bug fix; it does not change
+  any validated/deferred status claim (v1 remains an unreleased,
+  development-only prototype), does not affect `convert_day.py` or the
+  v0 production path, and does not change the repo structure contract.
+
+### Status / validation impact
+- Validated status changed: no
+- Deferred status changed: no
+- New claims added: no
+- Evidence for any new validation claim: n/a — this fixes a real defect
+  that blocked v1 from being a valid complete-day candidate at all; it
+  does not newly validate v1 for production use.
+
+### Tests run
+```bash
+source .venv/bin/activate
+python -m pytest tests/test_replay_scale_selection_and_eligibility.py -q
+# 22 passed
+python -m pytest tests/test_replay_schema_v1.py tests/test_replay_schema_v1_corrections.py \
+  tests/test_replay_store.py tests/test_replay_depth_adapter.py tests/test_replay_memory_bounded.py \
+  tests/test_replay_sync_continuity.py tests/test_replay_catalog_reconstruct.py \
+  tests/test_daily_build.py tests/test_pipeline_validation.py \
+  tests/test_replay_scale_selection_and_eligibility.py -q
+# 182 passed, 1 skipped
+python -m pytest -q
+# 561 passed, 3 skipped (up from 539)
+python -m pytest tests/test_repo_structure.py tests/test_agent_infrastructure.py -q
+# 56 passed
+```
+
+### Validation CLIs run
+```bash
+# Canonical Tier-2 gate, both schema versions, ADAUSDT (unaffected regression check):
+CRYPTO_RECORDER_DATA_ROOT="$(pwd)/data_raw" python -m validation.validate_catalog_equivalence \
+  --date 2026-06-12 --symbols ADAUSDT --venues BINANCE_SPOT --data-root "$(pwd)/data_raw" \
+  --work-root /tmp/phase7fix_v0/work --old-catalog-root /tmp/phase7fix_v0/old_catalog \
+  --replay-root /tmp/phase7fix_v0/replay --new-catalog-root /tmp/phase7fix_v0/new_catalog \
+  --profile full_l2 --emit-depth10 --schema-version 0 --overwrite \
+  --report-path /tmp/phase7fix_v0/report.json
+# result: passed, 7/7, fenced_ranges 34/34 byte-identical to every prior Phase 6 result.
+
+CRYPTO_RECORDER_DATA_ROOT="$(pwd)/data_raw" python -m validation.validate_catalog_equivalence \
+  --date 2026-06-12 --symbols ADAUSDT --venues BINANCE_SPOT --data-root "$(pwd)/data_raw" \
+  --work-root /tmp/phase7fix_v1/work --old-catalog-root /tmp/phase7fix_v1/old_catalog \
+  --replay-root /tmp/phase7fix_v1/replay --new-catalog-root /tmp/phase7fix_v1/new_catalog \
+  --profile full_l2 --emit-depth10 --schema-version 1 --overwrite \
+  --report-path /tmp/phase7fix_v1/report.json
+# result: passed, 7/7, same fenced_ranges digest.
+
+# Complete real 2026-06-11 full-universe rebuild (isolated candidate roots, never
+# touching production replay_store), both schema versions:
+CRYPTO_RECORDER_CONVERTER_TEMP_DIR=/tmp/phase7/scratch python -m pipeline.build_replay_store \
+  --date 2026-06-11 --symbols all --data-root "$(pwd)/data_raw" \
+  --replay-root /tmp/phase7/replay_v0 --schema-version 0
+# result: 150 successful, 0 failed.
+
+CRYPTO_RECORDER_CONVERTER_TEMP_DIR=/tmp/phase7/scratch2 python -m pipeline.build_replay_store \
+  --date 2026-06-11 --symbols all --data-root "$(pwd)/data_raw" \
+  --replay-root /tmp/phase7/replay_v1 --schema-version 1
+# result: 150 successful, 0 failed (up from 145 successful, 7 failed before this fix).
+```
+
+### Known limitations / out of scope
+- The Parquet format-selection/optimization sweep itself (row-group
+  sizing, ZSTD level tuning, alternative encodings, nested-vs-split
+  depth layout comparison, per-column size attribution) has NOT started
+  — this correction is a blocking prerequisite for it, not the sweep
+  itself.
+- Phase 8, self-contained/raw-retention work, lifecycle hardening,
+  reconstruction CLI, monitoring, deterministic-rebuild phase, `uv`,
+  deployment, KovacsTrader changes, and final documentation were NOT
+  started.
+- `convert_day.py` was not modified.
+
+## 2026-07-27 — fix(converter): make spool merge state transactionally retryable
+
+### Change summary
+- `bc00b1e` was reviewed and its byte-budget/bounded-fan-in/atomic-write/
+  descriptor-bound fixes were accepted. One remaining transactional-state
+  gap was identified and is fixed here, on top of `bc00b1e` (kept, not
+  reverted): `_ensure_single_run()` only reassigned `self._run_paths`
+  once the *entire* multi-level reduction finished successfully. If one
+  or more batches had already merged successfully and unlinked their
+  inputs, and a *later* batch (or a later merge pass) then raised,
+  `self._run_paths` still referenced the already-deleted inputs from the
+  successful batches — retry was impossible (the stale paths no longer
+  existed on disk) and `close()` would leak the completed intermediate
+  merge outputs (they were reachable from neither `self._run_paths` nor
+  any other tracked collection).
+- **Fix — ownership/state model corrected**:
+  - `_ensure_single_run()` rewritten as a single rolling reduction
+    (rather than processing whole "levels" of the reduction tree at
+    once): it repeatedly takes the next `fan_in`-sized batch directly
+    from the front of `self._run_paths`, calls `_merge_batch()` (which
+    may raise, leaving `self._run_paths` completely untouched), and only
+    once that call returns successfully reassigns `self._run_paths` in
+    a single atomic Python statement (`self._run_paths = [merged_path] +
+    self._run_paths[len(batch):]`) *before* unlinking the batch's
+    now-superseded input files from disk. This guarantees
+    `self._run_paths` is a complete, valid, retryable set of sorted runs
+    at every single point during the reduction — including immediately
+    after a caught failure — with every already-completed batch from the
+    same call correctly reflected (its output tracked, its inputs no
+    longer listed).
+  - Added `self._owned_paths: set[Path]`, an append-only ownership
+    record populated in `_flush_run()` (every initial flushed run) and
+    `_merge_batch()` (both the `*.run.part` temporary name, immediately
+    on creation, and the final `*.run` name, after a successful atomic
+    rename). `close()` now unlinks the union of `self._run_paths` and
+    `self._owned_paths` — guaranteeing every file this spool has ever
+    created is removed, including any intermediate output that was
+    logically superseded (e.g. by a subsequent successful merge) but
+    happened to fail its unlink, and any partial output left behind by a
+    caught failure — independent of the spool's current logical state.
+  - `_merge_batch()` now also wraps the `os.replace()` call itself in a
+    try/except: if the atomic rename fails (disk full, cross-device
+    rename, permission error), the fully written, fsync'd, and closed
+    `*.run.part` file is treated as a partial output and removed exactly
+    like a mid-write failure, and the exception then propagates.
+  - `_ensure_single_run()` now unconditionally calls `self._flush_run()`
+    at its very start (before checking the `self._merged` cache), so any
+    records buffered but not yet flushed since the last merge always
+    participate in the next merge. `insert()` now unconditionally sets
+    `self._merged = False` on every call (previously this was implicit/
+    accidental via the byte-budget flush path only) — so additional
+    insertion after a query (which triggers the lazy merge-and-cache) is
+    still fully supported, exactly matching the original SQLite-backed
+    implementation's behavior (every query there was a live view of the
+    current table contents): a later query always folds in newly
+    inserted records; no record is ever silently ignored. No manual
+    cache reset is needed anywhere by any caller: retry after a caught
+    failure is now fully automatic, since `self._merged` is only ever
+    set `True` once the entire reduction completes without error.
+- Added 4 new tests to `tests/test_spool_external_merge.py` (now 21
+  total, up from 17), each proving retry recovers every original record
+  exactly once, no owned file leaks after `close()`, and no required
+  input is deleted prematurely:
+  1. a failure injected into the *second* merge batch, after the first
+     batch already succeeded (monkeypatches `RawRecordSpool._merge_batch`
+     with a counting wrapper) — asserts the run count after the caught
+     failure reflects exactly one completed reduction, every remaining
+     path still exists on disk, and a retry (restoring the real method)
+     recovers all records;
+  2. the same pattern with the injected failure occurring several
+     successful batches into a larger (40-record) reduction —
+     representative of a failure during a later merge pass, not just the
+     very first one;
+  3. a failure injected into `os.replace()` itself — proves the
+     fully-written `.run.part` output is cleaned up exactly like a
+     mid-write failure, inputs are untouched, and retry recovers fully;
+  4. insert → commit → query (merges and caches, `self._merged is True`)
+     → additional insert (`self._merged` immediately becomes `False`) →
+     commit → query again — proves the second query sees every original
+     plus every newly inserted record exactly once (no loss, no
+     duplication).
+  Also removed the now-unnecessary manual `spool._merged = False` reset
+  from the pre-existing merge-failure test (retry is automatic now).
+
+### Files/packages touched
+- `converter/spool.py`
+- `tests/test_spool_external_merge.py`
+- `CHANGELOG.md`
+- `docs/CHANGE_AUDIT.md`
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] docs/REPO_STRUCTURE.md
+- [x] docs/PROJECT_STATUS.md
+- [ ] docs/IMPLEMENTATION_AUDIT.md
+- [x] relevant feature docs:
+  - docs/FULL_L2_REPLAY_CATALOG_PLAN.md (reviewed; no status-claim
+    changes needed — this is a correction to an already-internal-only
+    scratch mechanism's failure/retry semantics)
+
+### Docs updated
+- [x] CHANGELOG.md
+- [ ] README.md
+- [ ] docs/PROJECT_STATUS.md
+- [ ] docs/REPO_STRUCTURE.md
+- [ ] relevant feature docs:
+  - none
+- No docs update required because: this is a correction to an internal
+  scratch-storage mechanism's failure/retry state model, with a
+  byte-for-byte-preserved public interface and zero observable semantic
+  change on the success path (proven by an unchanged Tier-2
+  canonical-gate result); no status claim, consumer contract, or repo
+  structure is affected.
+
+### Status / validation impact
+- Validated status changed: no
+- Deferred status changed: no
+- New claims added: no
+- Evidence for any new validation claim: n/a — this entry proves
+  behavior is still UNCHANGED on the success path, and corrects the
+  previously-broken failure/retry path to actually be retryable and
+  leak-free.
+
+### Tests run
+```bash
+source .venv/bin/activate
+python -m pytest tests/test_spool_external_merge.py -q
+# 21 passed
+python -m pytest tests/test_streaming_conversion_memory.py tests/test_convert_day_phase2.py \
+  tests/test_convert_integrity_and_readiness.py tests/test_converter_integration.py \
+  tests/test_depth_deterministic.py tests/test_futures_continuity.py \
+  tests/test_gap_and_fence_diagnostics.py tests/test_replay_store.py \
+  tests/test_replay_depth_adapter.py tests/test_replay_memory_bounded.py \
+  tests/test_replay_sync_continuity.py tests/test_replay_catalog_reconstruct.py \
+  tests/test_semantic_equivalence.py tests/test_catalog_equivalence.py \
+  tests/test_catalog_equivalence_full_l2.py -q
+# 165 passed, 1 skipped
+python -m pytest -q
+# 539 passed, 3 skipped (up from 535 in bc00b1e)
+python -m pytest tests/test_repo_structure.py tests/test_agent_infrastructure.py -q
+# 56 passed
+```
+
+### Validation CLIs run
+```bash
+CRYPTO_RECORDER_DATA_ROOT="$(pwd)/data_raw" python -m validation.validate_catalog_equivalence \
+  --date 2026-06-12 --symbols ADAUSDT --venues BINANCE_SPOT --data-root "$(pwd)/data_raw" \
+  --work-root /tmp/phase6c_v0/work --old-catalog-root /tmp/phase6c_v0/old_catalog \
+  --replay-root /tmp/phase6c_v0/replay --new-catalog-root /tmp/phase6c_v0/new_catalog \
+  --profile full_l2 --emit-depth10 --schema-version 0 --overwrite \
+  --report-path /tmp/phase6c_v0/report.json
+# result: passed. All 7 components pass. fenced_ranges: count_old=34,
+# count_new=34, digest_old==digest_new, same digest as before this
+# correction, bc00b1e, c131217, and the original Phase 6 commit.
+
+CRYPTO_RECORDER_DATA_ROOT="$(pwd)/data_raw" python -m validation.validate_catalog_equivalence \
+  --date 2026-06-12 --symbols ADAUSDT --venues BINANCE_SPOT --data-root "$(pwd)/data_raw" \
+  --work-root /tmp/phase6c_v1/work --old-catalog-root /tmp/phase6c_v1/old_catalog \
+  --replay-root /tmp/phase6c_v1/replay --new-catalog-root /tmp/phase6c_v1/new_catalog \
+  --profile full_l2 --emit-depth10 --schema-version 1 --overwrite \
+  --report-path /tmp/phase6c_v1/report.json
+# result: passed. Same 7/7 pass, same fenced_ranges digest.
+```
+
+### Known limitations / out of scope
+- Phase 7, Tier 3 broader validation, production deployment, retention
+  gate, `uv` migration, and KovacsTrader work were NOT started.
+- Phase 11 (broader unknown/SIGKILL crash-lifecycle discovery of stray
+  temp/scratch files across process restarts) remains explicitly
+  deferred — only the atomic-write + caught-exception cleanup path
+  within a single process's lifetime was corrected here.
+- `convert_day.py`, schema semantics, `DedupeSet`, and `ObjectSpool` were
+  not modified.
+
+## 2026-07-27 — fix(converter): bound spool memory by bytes and fan-in, not record count
+
+### Change summary
+- The prior Phase 6 commit (`c131217`) was reviewed and NOT approved: it
+  violated the approved Phase 6 RAM/scratch model in 4 specific ways.
+  This entry is the correction, applied on top of `c131217` (kept, not
+  reverted, not force-pushed).
+- **Violation 1 (fixed)**: `CRYPTO_RECORDER_SPOOL_RUN_SIZE` bounded the
+  in-memory run buffer by *record count*, which does not bound memory
+  bytes — raw depth records vary hugely in size (large nested
+  `bids`/`asks` arrays on `depth_update` vs. tiny `sync_state`/
+  `stream_lifecycle` records). Replaced with a byte budget,
+  `CRYPTO_RECORDER_SPOOL_RUN_BYTES` (default 64 MiB): `insert()` now
+  serializes the record to bytes immediately (`pickle.dumps`) and only
+  those bytes are buffered (`self._buffer_bytes` tracks cumulative
+  size); the buffer flushes to a new sorted run file once the budget is
+  reached. A single record whose own serialized size already exceeds
+  the budget is still accepted as its own one-record run, flushed
+  immediately — never blocking or growing the buffer without bound.
+- **Violation 2 (fixed)**: `heapq.merge(*all_run_iterators)` opened and
+  held one buffered item per run file simultaneously — unbounded fan-in,
+  so memory/file-descriptor usage was proportional to the number of
+  runs (unbounded for large inputs), not to a configured constant.
+  Replaced with a bounded fan-in hierarchical (multi-pass) merge:
+  `CRYPTO_RECORDER_SPOOL_FAN_IN` (default 16); `_merge_batch()` merges
+  at most `fan_in` run files into one new output run; `_ensure_single_run()`
+  repeats merge passes (opening at most `fan_in + 1` file handles per
+  pass) until exactly one fully sorted run remains, then caches the
+  result (`self._merged`) so every subsequent query
+  (`iter_records`/`first_record`/`has_record_before`/`max_record`)
+  reuses the cached single run and never re-triggers a fresh merge or
+  exceeds the same descriptor bound.
+- **Violation 3 (fixed)**: intermediate merge outputs are now written
+  atomically. `_merge_batch()` writes to a temporary `*.run.part` name,
+  flushes and `fsync`'s it, closes it, then atomically renames
+  (`os.replace`) it to its final `*.run` name — a reader can never
+  observe a partially written merge output under its final name. Input
+  run files for a pass are unlinked only in `_ensure_single_run()`
+  *after* `_merge_batch()` has returned successfully (i.e., after the
+  replacement output is durably renamed into place). On any exception
+  raised while writing a merge output, the partial `.part` file is
+  removed and the exception propagates with the pass's input run files
+  left completely untouched. Broader unknown/SIGKILL crash-lifecycle
+  cleanup of stray temp files across process restarts is explicitly out
+  of scope here and remains deferred to the already-planned Phase 11.
+- **Violation 4 (fixed — measured, not merely claimed)**: wrote a
+  one-off benchmark script (`/tmp/bench_spool.py`, NOT added to the
+  repo) that reconstructs the original pre-Phase-6 SQLite-backed
+  `RawRecordSpool` verbatim from commit `59e28d8` for comparison
+  purposes only, and feeds both it and the corrected spool the
+  identical real ADAUSDT 2026-06-12 `depth_v2` raw fixture (412,464
+  records), each in an isolated subprocess, measuring wall time, peak
+  apparent scratch bytes on disk, and `resource.getrusage(...).ru_maxrss`.
+  Results: SQLite (old) — wall 5.68s, peak scratch bytes 259,747,840
+  (247.7 MiB), max RSS 1,187,312 KiB; external-merge (corrected) — wall
+  4.41s, peak scratch bytes 204,063,710 (194.6 MiB), max RSS 1,293,964
+  KiB. Honest caveat recorded: max RSS in this benchmark is dominated by
+  holding all 412K raw records in an in-process Python list before
+  feeding either spool (identical overhead for both variants), so this
+  benchmark does not cleanly isolate the spool's own incremental RSS
+  contribution — only the peak-scratch-bytes-on-disk and wall-time
+  results are cleanly isolated. A full isolated per-spool RSS
+  measurement is deferred to Tier-3 measurement (Phase 7), per the
+  explicit instruction that "Full Tier-3 measurement remains Phase 7."
+- Rewrote `tests/test_spool_external_merge.py` (17 tests, up from 11):
+  removed the 3 tests tied to the now-removed record-count run-size
+  model; added byte-budget flush-boundary prediction (predicts exact
+  run boundaries from directly measured pickle sizes, not tied to a
+  specific pickle-protocol byte count), highly-variable/large-nested-payload
+  handling, oversized-single-record handling, a multi-pass correctness
+  test (small `fan_in` forces >20 runs and multiple merge levels, then
+  re-verifies every existing query method — `iter_records`,
+  `first_record`, `has_record_before`, `max_record` — against the prior
+  SQL-based semantics), a bounded-open-file-descriptor proof (`_OpenTracker`
+  wraps `builtins.open` to empirically prove peak concurrent open files
+  never exceeds `fan_in + 2` across 130+ forced runs, both on the first
+  query pass and on a repeated query pass that must reuse the cached
+  merged run rather than increase peak descriptor usage), a repeated
+  first_record/has_record_before/max_record descriptor-bound test, and a
+  merge-failure-cleanup test (injects a one-shot failure into `os.fsync`,
+  asserts no partial `.run.part` file remains and no input run file was
+  deleted prematurely, then proves the spool recovers and completes
+  correctly on a subsequent attempt). Also updated the live-object-counter
+  bounded-memory test and the env-var-defaults test for the new
+  attribute names.
+
+### Files/packages touched
+- `converter/spool.py`
+- `tests/test_spool_external_merge.py`
+- `CHANGELOG.md`
+- `docs/CHANGE_AUDIT.md`
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] docs/REPO_STRUCTURE.md
+- [x] docs/PROJECT_STATUS.md
+- [ ] docs/IMPLEMENTATION_AUDIT.md
+- [x] relevant feature docs:
+  - docs/FULL_L2_REPLAY_CATALOG_PLAN.md (reviewed; no status-claim
+    changes needed — this is an internal correction to an
+    already-internal-only scratch mechanism)
+
+### Docs updated
+- [x] CHANGELOG.md
+- [ ] README.md
+- [ ] docs/PROJECT_STATUS.md
+- [ ] docs/REPO_STRUCTURE.md
+- [ ] relevant feature docs:
+  - none
+- No docs update required because: this is a correction to an internal
+  scratch-storage mechanism with a byte-for-byte-preserved public
+  interface and zero observable semantic change (proven by an unchanged
+  Tier-2 canonical-gate result); no status claim, consumer contract, or
+  repo structure is affected.
+
+### Status / validation impact
+- Validated status changed: no
+- Deferred status changed: no
+- New claims added: no
+- Evidence for any new validation claim: n/a — this entry proves
+  behavior is still UNCHANGED after correcting the RAM/scratch model.
+
+### Tests run
+```bash
+source .venv/bin/activate
+python -m pytest tests/test_spool_external_merge.py -q
+# 17 passed
+python -m pytest tests/test_streaming_conversion_memory.py tests/test_convert_day_phase2.py \
+  tests/test_convert_integrity_and_readiness.py tests/test_converter_integration.py \
+  tests/test_depth_deterministic.py tests/test_futures_continuity.py \
+  tests/test_gap_and_fence_diagnostics.py tests/test_replay_store.py \
+  tests/test_replay_depth_adapter.py tests/test_replay_memory_bounded.py \
+  tests/test_replay_sync_continuity.py tests/test_replay_catalog_reconstruct.py \
+  tests/test_semantic_equivalence.py tests/test_catalog_equivalence.py \
+  tests/test_catalog_equivalence_full_l2.py -q
+# 165 passed, 1 skipped
+python -m pytest -q
+# 535 passed, 3 skipped (up from 529 in c131217)
+python -m pytest tests/test_repo_structure.py tests/test_agent_infrastructure.py -q
+# 56 passed
+```
+
+### Validation CLIs run
+```bash
+CRYPTO_RECORDER_DATA_ROOT="$(pwd)/data_raw" python -m validation.validate_catalog_equivalence \
+  --date 2026-06-12 --symbols ADAUSDT --venues BINANCE_SPOT --data-root "$(pwd)/data_raw" \
+  --work-root /tmp/phase6b_v0/work --old-catalog-root /tmp/phase6b_v0/old_catalog \
+  --replay-root /tmp/phase6b_v0/replay --new-catalog-root /tmp/phase6b_v0/new_catalog \
+  --profile full_l2 --emit-depth10 --schema-version 0 --overwrite \
+  --report-path /tmp/phase6b_v0/report.json
+# result: passed. All 7 components pass. fenced_ranges: count_old=34,
+# count_new=34, digest_old==digest_new, same digest as before this
+# correction and before Phase 6.
+
+CRYPTO_RECORDER_DATA_ROOT="$(pwd)/data_raw" python -m validation.validate_catalog_equivalence \
+  --date 2026-06-12 --symbols ADAUSDT --venues BINANCE_SPOT --data-root "$(pwd)/data_raw" \
+  --work-root /tmp/phase6b_v1/work --old-catalog-root /tmp/phase6b_v1/old_catalog \
+  --replay-root /tmp/phase6b_v1/replay --new-catalog-root /tmp/phase6b_v1/new_catalog \
+  --profile full_l2 --emit-depth10 --schema-version 1 --overwrite \
+  --report-path /tmp/phase6b_v1/report.json
+# result: passed. Same 7/7 pass, same fenced_ranges digest.
+
+python /tmp/bench_spool.py old   # one-off benchmark, not part of the repo
+python /tmp/bench_spool.py new   # one-off benchmark, not part of the repo
+# see Change summary above for measured wall time / peak scratch bytes / max RSS
+```
+
+### Known limitations / out of scope
+- Phase 7 (full Tier-3 measurement, format-selection sweep for the
+  <5 GiB/day target), broader top50/multi-day validation, production
+  deployment, retention gate, `uv` migration, and KovacsTrader work were
+  NOT started.
+- Phase 11 (broader unknown/SIGKILL crash-lifecycle cleanup of stray
+  temp/scratch files across process restarts) was explicitly deferred,
+  per the user's own scoping instruction — only the atomic-write +
+  caught-exception cleanup path was implemented here.
+- `convert_day.py`, `DedupeSet`, and `ObjectSpool` were not modified.
+- The isolated per-spool RSS delta (as distinct from the shared
+  input-holding overhead measured in this entry's benchmark) is not
+  yet isolated; that level of measurement rigor is deferred to Phase 7.
+
+## 2026-07-27 — feat(converter): bounded external-merge replay conversion spool
+
+### Change summary
+- Issue #20 Phase 5 is approved and fixed at commit `59e28d8` (the prior
+  entry below). Per the approved plan's correction #13
+  ("scratch-inefficient"), this is Phase 6: replace
+  `converter/spool.py`'s `RawRecordSpool` — the disk-backed scratch
+  structure used by `convert_day.py`'s raw repartition/carry spools,
+  `stores/replay_writer.py`'s write batching, `stores/replay_depth_adapter.py`'s
+  replay-side resort, and `validation/validate_catalog_equivalence.py`'s
+  raw metadata sort — from a single on-disk SQLite table (3 secondary
+  indexes, full JSON-text payload per row) with a genuine bounded
+  external merge sort.
+- New implementation: records are buffered in memory up to a
+  configurable run size (`CRYPTO_RECORDER_SPOOL_RUN_SIZE`, default
+  20000), each run is sorted in memory and flushed to a disk-backed
+  pickle file (`_flush_run()`), and the fully sorted stream is produced
+  by a bounded k-way merge (`heapq.merge`) across all run files
+  (`_iter_sorted()`) — peak memory is O(run size), never O(total record
+  count).
+- Public interface, constructor signature, and every method's external
+  behavior are unchanged: `insert(record, sort_key, raw_index)`,
+  `commit()`, `iter_records(record_type=, session_id=, min_sort_key=)`,
+  `first_record(record_type=)`, `has_record_before(record_type,
+  sort_key)`, `max_record(record_type=, session_id=, first_tie=)` (both
+  `first_tie=True` and `first_tie=False` reproduce the prior SQL `ORDER
+  BY ... LIMIT 1` tie-break semantics exactly), and `close()` (removes
+  every run file plus the pre-existing placeholder marker `self.path`,
+  which is retained purely to preserve the exact temp-dir/lifecycle
+  contract asserted by `tests/test_streaming_conversion_memory.py::test_converter_spool_uses_configured_temp_dir`).
+- `DedupeSet` and `ObjectSpool` in the same file are unchanged (still
+  SQLite-backed) — explicitly out of scope for this narrowly targeted
+  correction.
+- Added `tests/test_spool_external_merge.py` (11 new tests): sort-order
+  correctness against out-of-order insertion; `record_type`/
+  `session_id`/`min_sort_key` filter correctness; `first_record`
+  filtering; `has_record_before` boundary correctness; `max_record` with
+  `first_tie=True` and `first_tie=False`, each proven against the exact
+  prior SQL `ORDER BY` tie-break semantics with constructed tie cases;
+  session/record_type filtering in `max_record`; `close()` removing all
+  run files and the marker path; an explicit proof that exceeding the
+  configured run size produces multiple on-disk run files
+  (`len(spool._run_paths) == ceil(n / run_size)`) while still yielding a
+  fully correct merged sort; the default run-size value; and a
+  live-object-counter bounded-memory proof (5,000 records, run size
+  200) showing peak simultaneously-alive spooled Python record objects
+  stays under 1,000 during insertion (bounded by run size, not
+  proportional to the total record count), with all objects released
+  after `close()`.
+
+### Files/packages touched
+- `converter/spool.py`
+- `tests/test_spool_external_merge.py` (new)
+- `CHANGELOG.md`
+- `docs/CHANGE_AUDIT.md`
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] docs/REPO_STRUCTURE.md
+- [x] docs/PROJECT_STATUS.md
+- [ ] docs/IMPLEMENTATION_AUDIT.md
+- [x] relevant feature docs:
+  - docs/FULL_L2_REPLAY_CATALOG_PLAN.md (reviewed; no status-claim
+    changes needed by this internal-implementation-only correction)
+
+### Docs updated
+- [x] CHANGELOG.md
+- [ ] README.md
+- [ ] docs/PROJECT_STATUS.md
+- [ ] docs/REPO_STRUCTURE.md
+- [ ] relevant feature docs:
+  - none
+- No docs update required because: this is an internal scratch-storage
+  implementation swap with a byte-for-byte-preserved public interface
+  and zero observable semantic change (proven by an unchanged Tier-2
+  canonical-gate result); no status claim, consumer contract, or repo
+  structure is affected.
+
+### Status / validation impact
+- Validated status changed: no
+- Deferred status changed: no
+- New claims added: no
+- Evidence for any new validation claim: n/a — this entry proves
+  behavior is UNCHANGED, not a new capability.
+
+### Tests run
+```bash
+source .venv/bin/activate
+python -m pytest tests/test_streaming_conversion_memory.py -q
+# 3 passed
+python -m pytest tests/test_convert_day_phase2.py tests/test_convert_integrity_and_readiness.py \
+  tests/test_converter_integration.py tests/test_depth_deterministic.py \
+  tests/test_futures_continuity.py tests/test_gap_and_fence_diagnostics.py \
+  tests/test_replay_store.py tests/test_replay_depth_adapter.py \
+  tests/test_replay_memory_bounded.py tests/test_replay_sync_continuity.py \
+  tests/test_replay_catalog_reconstruct.py tests/test_semantic_equivalence.py \
+  tests/test_catalog_equivalence.py tests/test_catalog_equivalence_full_l2.py -q
+# 162 passed, 1 skipped
+python -m pytest tests/test_spool_external_merge.py -q
+# 11 passed (new)
+python -m pytest -q
+# 529 passed, 3 skipped (up from 518 baseline, +11 new)
+python -m pytest tests/test_repo_structure.py tests/test_agent_infrastructure.py -q
+# 56 passed
+```
+
+### Validation CLIs run
+```bash
+CRYPTO_RECORDER_DATA_ROOT="$(pwd)/data_raw" python -m validation.validate_catalog_equivalence \
+  --date 2026-06-12 --symbols ADAUSDT --venues BINANCE_SPOT --data-root "$(pwd)/data_raw" \
+  --work-root /tmp/phase6_v0/work --old-catalog-root /tmp/phase6_v0/old_catalog \
+  --replay-root /tmp/phase6_v0/replay --new-catalog-root /tmp/phase6_v0/new_catalog \
+  --profile full_l2 --emit-depth10 --schema-version 0 --overwrite \
+  --report-path /tmp/phase6_v0/report.json
+# result: passed. All 7 components pass: instrument IDs, instrument
+# precision, trade_ticks, order_book_deltas, order_book_depth10,
+# book_checkpoints, continuity_diagnostics, fenced_ranges,
+# raw_to_replay_metadata. fenced_ranges: count_old=34, count_new=34,
+# digest_old==digest_new (byte-identical), same digest value as before
+# the spool rewrite.
+
+CRYPTO_RECORDER_DATA_ROOT="$(pwd)/data_raw" python -m validation.validate_catalog_equivalence \
+  --date 2026-06-12 --symbols ADAUSDT --venues BINANCE_SPOT --data-root "$(pwd)/data_raw" \
+  --work-root /tmp/phase6_v1/work --old-catalog-root /tmp/phase6_v1/old_catalog \
+  --replay-root /tmp/phase6_v1/replay --new-catalog-root /tmp/phase6_v1/new_catalog \
+  --profile full_l2 --emit-depth10 --schema-version 1 --overwrite \
+  --report-path /tmp/phase6_v1/report.json
+# result: passed. Same 7/7 pass, same fenced_ranges digest (identical
+# to schema_version=0 and to the pre-Phase-6 result).
+```
+
+### Known limitations / out of scope
+- Phase 7 (format-selection sweep for the <5 GiB/day target, <2 GiB/day
+  stretch target), Tier 3 broader top50/multi-day validation, production
+  deployment, retention gate, `uv` migration, and KovacsTrader work were
+  NOT started, per the approved checkpoint.
+- The two previously deferred follow-ups (stale
+  `FULL_L2_REPLAY_CATALOG_PLAN.md` caveats section; selected-reconstruction
+  CLI auto-resolution of preceding replay partitions for cross-day carry)
+  remain deferred and were NOT implemented in this Phase 6 change.
+- `convert_day.py` was not modified or reverted; it remains the
+  permanent behavioral oracle.
+
+## 2026-07-27 — fix(replay): preserve synchronization continuity events
+
+### Change summary
+- A review of the pushed head (`1fb588d`) correctly rejected the previous
+  round's fenced-range gap as "out of scope because v0 has the same
+  failure" — it proved a pre-existing replay-builder semantic defect,
+  not an acceptable limitation, and the approved plan mandates exact
+  sync/desync/resync and fenced-range reproduction. This entry is the
+  narrowly scoped semantic correction requested, on top of `1fb588d`
+  (not reverted).
+- **Step 1 — inventory (evidence, not guessing)**: directly enumerated
+  every raw `depth_v2` `record_type` value present in the ADAUSDT
+  2026-06-12 fixture via `converter.readers.stream_raw_records()`:
+  `depth_update` (412,332), `sync_state` (68), `stream_lifecycle` (60),
+  `snapshot_seed` (4) — no other record types exist in this fixture.
+  Cross-referenced against `converter.depth_phase2._run_depth_replay_loop()`
+  (the shared engine both `convert_day.py` and the replay-reconstruction
+  path use) to confirm which types it actually reads:
+  `record_type == "sync_state"` is read directly (`rec["state"]`/
+  `rec["reason"]` drive desync/resync state transitions and
+  fenced-range open/close via `_open_fence()`/`_close_fence()`);
+  `record_type == "stream_lifecycle"` triggers only a diagnostic counter
+  and a `continue`, but the engine's session-change detection (which
+  closes/opens fences on a `stream_session_id` change) runs
+  UNCONDITIONALLY before that, using the CURRENT record's timestamp —
+  so `stream_lifecycle` records' PRESENCE and TIMESTAMP matter even
+  though their content does not.
+- **Step 2 — root cause confirmed exactly as described**:
+  `pipeline/build_replay_store.py::_convert_depth_record()`'s
+  `if record_type not in {"snapshot_seed", "depth_update"}: return None`
+  silently dropped `sync_state` (and `stream_lifecycle`) records before
+  any later branch could act on them — verified this is the sole cause
+  by re-running the canonical Tier-2 gate after each incremental fix and
+  observing the fenced-range count/digest converge exactly.
+- **Fix, part A (sync_state)**: `_convert_depth_record()` now accepts
+  `record_type in {"snapshot_seed", "depth_update", "sync_state"}`.
+  `sync_state` records have no book payload and no `U`/`u`/`pu` (they use
+  `last_update_id`/`prev_update_id` instead — distinct fields, never
+  conflated with `U`/`u`/`pu`); their complete state transition
+  (`state`/`previous_state`/`reason`/`last_update_id`/`prev_update_id`)
+  is preserved via the existing, already-nullable `quality_flags` JSON
+  column (`{"sync_state_transition": {...}}`) — no new physical schema
+  field added or changed for either v0 or v1. A pre-existing latent bug
+  was also fixed here: the prior code read `raw_record.get("sync_state")`
+  (a `depth_update` record's own, differently-named, legacy informational
+  field) to determine `is_desync`/`is_resync`, which would never be
+  populated on an actual `sync_state` RECORD (whose transition value is
+  in its `state` field) — now dispatches on record type to read the
+  correct field.
+- **Fix, part B (stream_lifecycle)**: `_convert_depth_record()` also
+  accepts `record_type == "stream_lifecycle"`, preserving `event`/
+  `reason` via `quality_flags` (`{"stream_lifecycle_event": {...}}`) for
+  completeness, even though the shared engine only needs their
+  presence-and-timestamp. This closed 31 of the 34 fenced ranges'
+  `end_ts_ns` mismatches (each off by exactly the raw gap between the
+  dropped `stream_lifecycle` record and the next preserved record — the
+  fence count already matched at 34/34 after part A alone; only the
+  digest, sensitive to exact timestamps, differed).
+- **Fix, part C (cross-day carry recovery)**: after parts A/B, exactly 1
+  of 34 fences still differed — root-caused to a session (session 19)
+  that began on 2026-06-11 (its first record in the 2026-06-12 raw file
+  is `session_seq=54040`, mid-session). `convert_day.py`'s raw path
+  recovers such sessions via its existing, already-implemented
+  cross-day carry-spool mechanism
+  (`converter.depth_phase2._recover_carry_state_from_spool()`/
+  `_emit_synthetic_opening_snapshot()`, invoked from
+  `convert_depth_v2_streaming()`'s `_prime()` callback) — reading the
+  adjacent day's raw partition to find the session's last snapshot and
+  replay forward from it. The replay-reconstruction path
+  (`replay_records_to_depth_streaming()`) had no equivalent mechanism at
+  all, so it fenced immediately at the session's first record in the
+  target day. Added a new, optional `carry_records` parameter to
+  `replay_records_to_depth_streaming()` that, when supplied, reuses the
+  EXACT SAME `_recover_carry_state_from_spool()`/
+  `_emit_synthetic_opening_snapshot()` helpers via two bounded, disk-backed
+  `converter.spool.RawRecordSpool` instances (never a full-day Python
+  list) — identical mechanism to the raw path, applied to
+  already-adapter-normalized replay rows instead of raw records.
+  Omitting `carry_records` (the previous default, and every other
+  existing caller) leaves behavior completely unchanged — verified by a
+  dedicated backward-compatibility test.
+  `validation/replay_catalog_reconstruct.py`'s `_write_depth_for_partition()`
+  now checks whether the previous day's replay partition exists (via
+  `ReplayReader.iter_dates()`) and, if so, supplies its depth rows
+  (via the same `iter_replay_depth_records()` adapter) as
+  `carry_records` — consumed transiently to derive carry state; never
+  copied, persisted, or exposed as part of the requested date's own
+  reconstructed catalog output (the reconstructed date range is derived
+  from the caller's `start`/`end` window, not from what partitions exist
+  in `replay_root`). `validation/validate_catalog_equivalence.py`'s
+  `_run_new_pipeline()` now also builds the previous day's replay
+  partition (same `schema_version`) purely so this carry lookup can find
+  it — this build is not itself part of the requested date's output.
+  This applies identically to v0 and v1 logical replay (same shared
+  engine, same helpers, dispatched only by which schema version's reader
+  produced the adapter-normalized rows).
+- Also updated `validation/validate_catalog_equivalence.py`'s raw-to-
+  replay metadata comparator
+  (`_DEPTH_ACCEPTED_RECORD_TYPES`/`_normalize_raw_depth_record()`) to
+  accept and correctly normalize `sync_state`/`stream_lifecycle` records
+  identically to the writer's new logic, so it compares like-for-like
+  instead of flagging a spurious "extra on the raw side" mismatch now
+  that these types are written to replay.
+- Added `tests/test_replay_sync_continuity.py` (14 tests): proves
+  `_convert_depth_record()` no longer drops `sync_state`/
+  `stream_lifecycle`, an unsupported/non-continuity record type is still
+  deliberately dropped, `sync_state` survives v0 AND v1 writer/reader
+  round-trip with its ordering relative to snapshots/depth_updates
+  preserved exactly, desync/resync flags survive, dropping a
+  `resync_required` `sync_state` record changes reconstructed continuity
+  evidence (`Phase2ReplayMetrics.resync_count`), the candidate
+  reconstructs the expected fenced range from a synthetic
+  desync→resync→re-snapshot sequence, cross-day carry recovery both
+  recovers a session started on a prior day (matching `convert_day.py`'s
+  synthetic-opening-snapshot/`carried_seed_last_update_id` behavior) and
+  remains fully backward-compatible (identical fenced-range output) when
+  `carry_records` is omitted.
+
+### Files/packages touched
+- `pipeline/build_replay_store.py` (`_convert_depth_record()`: accept
+  `sync_state`/`stream_lifecycle`, correct desync/resync field dispatch,
+  preserve state transition via `quality_flags`)
+- `stores/replay_schema.py` (`DEPTH_RECORD_TYPE_CODES`: added
+  `sync_state=2`/`stream_lifecycle=3`, v0 codes unchanged)
+- `stores/replay_depth_adapter.py` (`replay_row_to_depth_record()`:
+  recover `sync_state` transition fields via new
+  `_sync_state_transition()`; docstrings updated)
+- `converter/depth_phase2.py` (`replay_records_to_depth_streaming()`:
+  new optional `carry_records` parameter reusing the raw path's existing
+  carry-recovery helpers)
+- `validation/replay_catalog_reconstruct.py` (`_write_depth_for_partition()`:
+  supply previous-day replay rows as `carry_records` when available;
+  new `_date_shift()` helper)
+- `validation/validate_catalog_equivalence.py`
+  (`_DEPTH_ACCEPTED_RECORD_TYPES`/`_normalize_raw_depth_record()`: accept
+  and normalize `sync_state`/`stream_lifecycle`; `_run_new_pipeline()`:
+  also build the previous day's replay partition for carry lookup)
+- `tests/test_replay_sync_continuity.py` (new — 14 tests)
+- `CHANGELOG.md` (`[Unreleased]` → `Added`)
+- `docs/CHANGE_AUDIT.md` (this entry)
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] docs/REPO_STRUCTURE.md (no folder/file contract change)
+- [x] docs/PROJECT_STATUS.md (reviewed; no validated/deferred status
+  changed — Phase 5 remains not-yet-approved per the user's explicit
+  instruction; this entry does not advance any v2.0.0/full_l2 claim)
+- [x] docs/IMPLEMENTATION_AUDIT.md (reviewed; no contradiction — this
+  entry restores information the Phase 3 matrix never authorized
+  dropping in the first place; it is a correctness fix, not a new
+  compaction decision)
+- [x] relevant feature docs:
+  - docs/FULL_L2_REPLAY_CATALOG_PLAN.md (reviewed; its "Equivalence
+    Boundary (caveats)" section previously listed `sync_state`
+    fenced-range bookkeeping and cross-day carry as NOT reproduced by
+    the replay path — both are now reproduced; no doc text update made
+    in this entry since the checkpoint explicitly limits scope to the
+    code correction, test evidence, and this audit trail, and the ADAUSDT
+    smoke's own documented result already matches this entry's evidence)
+
+### Docs updated
+- [x] CHANGELOG.md
+- No docs update required because: no validated/deferred status claim
+  changed; `docs/FULL_L2_REPLAY_CATALOG_PLAN.md`'s existing ADAUSDT-smoke
+  evidence and caveat list are superseded by, but not contradicted by,
+  this entry's more complete Tier-2 result — a broader documentation
+  pass is out of scope for this narrowly scoped semantic correction per
+  the explicit instruction.
+
+### Status / validation impact
+- Validated status changed: no
+- Deferred status changed: no
+- New claims added: no new *validated* status claim; Phase 5 remains
+  explicitly not-yet-approved (per the user's own instruction) and Phase
+  6 has not begun.
+- Evidence for any new validation claim:
+  - **Tier 2 re-run (canonical `validation.validate_catalog_equivalence`
+    CLI, ADAUSDT, 2026-06-12, real local `data_raw`, `--schema-version 1`
+    then again with `--schema-version 0`)**: for BOTH schema versions,
+    `report["status"] == "passed"` and ALL SEVEN gating components pass:
+    `instrument_ids_match=True`, `instrument_precision.passed=True`,
+    `trade_ticks.passed=True` (124,457/124,457), `order_book_deltas.passed=True`
+    (412,317/412,317), `order_book_depth10.passed=True` (71,341/71,341),
+    `book_checkpoints.passed=True` (7/7), `continuity_diagnostics.passed=True`,
+    `fenced_ranges.passed=True` (`count_old=34`, `count_new=34`,
+    `digest_old == digest_new` byte-for-byte).
+  - Confirmed via `converter.depth_phase2.fence_canonical_key()`-based
+    direct key-by-key diffing (not just the count) that the full 34-fence
+    lists are identical, not merely equal in count — the earlier "1
+    fence differs" case was diagnosed field-by-field (`start_ts_ns`/
+    `reason` differed due to missing cross-day carry) before being fixed.
+
+### Tests run
+```bash
+source .venv/bin/activate
+python -m pytest tests/test_replay_sync_continuity.py -q   # 14 passed
+python -m pytest tests/test_replay_schema_v1.py tests/test_replay_schema_v1_corrections.py \
+  tests/test_replay_store.py tests/test_replay_depth_adapter.py tests/test_replay_memory_bounded.py \
+  tests/test_convert_day_phase2.py tests/test_book_checkpoint_hash_canonicalization.py \
+  tests/test_replay_catalog_reconstruct.py tests/test_replay_sync_continuity.py -q
+  # 170 passed
+python -m pytest tests/test_repo_structure.py tests/test_agent_infrastructure.py -q   # 56 passed
+python -m pytest -q   # 518 passed, 3 skipped
+```
+
+### Validation CLIs run
+```bash
+CRYPTO_RECORDER_DATA_ROOT="$(pwd)/data_raw" python -m validation.validate_catalog_equivalence \
+  --date 2026-06-12 --symbols ADAUSDT --venues BINANCE_SPOT \
+  --data-root "$(pwd)/data_raw" --work-root /tmp/.../work \
+  --old-catalog-root /tmp/.../old_catalog --replay-root /tmp/.../replay \
+  --new-catalog-root /tmp/.../new_catalog --profile full_l2 --emit-depth10 \
+  --schema-version 1 --overwrite --report-path /tmp/.../report.json
+# repeated identically with --schema-version 0
+python -m validation.audit_change_compliance --staged
+```
+
+### Known limitations / out of scope
+- Docs (`docs/FULL_L2_REPLAY_CATALOG_PLAN.md`'s caveat list) were not
+  rewritten in this entry — deliberately out of scope for this narrowly
+  scoped semantic correction; a future documentation pass should update
+  its "Equivalence Boundary" section to remove the now-resolved
+  `sync_state`/cross-day-carry caveats.
+- This Tier-2 re-run covers exactly one symbol (ADAUSDT) and one day
+  (2026-06-12) on BINANCE_SPOT; it does not cover BINANCE_USDTF or any
+  other symbol/day, and remains development evidence, not a Tier-3
+  representative-day claim.
+- Phase 5 remains **not yet approved** (explicit user instruction); Phase
+  6, Tier 3, production deployment, custom format, retention gate, uv
+  migration, and any KovacsTrader change remain out of scope and were not
+  started.
+
+---
+
+## 2026-07-27 — Issue #20 Phase 5 corrective commit: complete v1 logical and validation contract
+
+### Change summary
+- A review of the pushed head (`76a61e5`, the Phase 5 compact replay
+  schema v1 prototype) correctly identified 4 review blockers. The
+  `76a61e5` commit is **not reverted**; this entry is a narrowly scoped
+  corrective commit on top of it, per explicit instruction, and Phase 5
+  remains directionally accepted (the 1.30x local size reduction reported
+  previously is honest prototype evidence, not a failure).
+- **Blocker 1 — complete logical-row contract**: `stores/replay_reader.py`'s
+  `_decode_depth_row_v1()`/`_decode_trade_row_v1()` previously omitted
+  `venue`/`symbol`/`date` from every decoded v1 row despite the module
+  docstring claiming v0/v1 logical parity, and despite v0 rows (as
+  produced by `pipeline/build_replay_store.py`'s
+  `_convert_depth_record()`/`_convert_trade_record()`) always carrying
+  these three fields. Both decode functions now accept the partition
+  identity (threaded through from `ReplayReader.iter_depths()`/
+  `iter_trades()`, which already have `venue`/`symbol`/`date` as method
+  arguments) and include them in every returned row.
+- **Blocker 2 — version-aware partition validation**: `stores/replay_writer.py`'s
+  `validate_partition()` previously validated only `status`/checksums,
+  identically regardless of `schema_version` — an unsupported version, a
+  v1 partition missing required metadata, or a manifest/physical-schema
+  mismatch would all have been silently accepted as valid (and
+  skippable, via `pipeline.build_replay_store`'s skip-if-valid check).
+  Split the version-specific logic into a new
+  `_validate_schema_version_contract()` helper: a manifest with no
+  `schema_version` (legacy v0) or an explicit `schema_version=0` requires
+  the on-disk depth/trades Parquet physical schema to exactly match
+  `DEPTH_REPLAY_SCHEMA`/`TRADE_REPLAY_SCHEMA` (field names + types, via
+  new `_schema_matches()`); an explicit `schema_version=1` additionally
+  requires `format_version == FORMAT_VERSION_V1`, a non-empty
+  `builder_version`, integer `price_scale`/`qty_scale` (rejecting `bool`,
+  which is a `int` subclass in Python, and negative values), a complete
+  `encoding_profile` (`compression`/`compression_level`/
+  `row_group_batch_size` present), and that the physical Parquet schemas
+  match `DEPTH_REPLAY_SCHEMA_V1`/`TRADE_REPLAY_SCHEMA_V1`. An explicit
+  `schema_version` outside `{0, 1}` (`SUPPORTED_SCHEMA_VERSIONS`) fails
+  immediately with a logged warning.
+- **Blocker 3 — explicit non-default v1 path through the canonical
+  builder**: `pipeline/build_replay_store.py`'s `build_replay_for_symbol()`
+  gained `schema_version: int = 0` (plus `price_scale`/`qty_scale`
+  passthrough) — the default preserves exactly today's production
+  behavior for every existing caller (including
+  `pipeline/daily_build.py`, which does not pass this argument). Added a
+  `--schema-version {0,1}` CLI flag to `python -m pipeline.build_replay_store`.
+  No systemd unit or production configuration references this flag; no
+  automatic rebuild/migration of existing partitions was added; an
+  unsupported value fails immediately via `ReplayWriter`'s own
+  constructor check (unchanged from the original Phase 5 commit).
+- **Blocker 4 — source identity bound to the raw root actually
+  consumed**: `stores/replay_writer.py`'s `finalize_staging()` no longer
+  calls `pipeline.raw_manifest.compute_raw_source_identity()` itself (the
+  original Phase 5 commit did, using the global `config.DATA_ROOT`
+  default when no explicit `data_root` was supplied to
+  `compute_raw_source_identity`, which could silently record checksums
+  against a different raw root than a custom `--data-root` build
+  actually consumed). `ReplayWriter` now only ever records
+  `source_identity` if the caller explicitly supplies it (constructor
+  arg or the new `set_source_identity()` method); if not supplied, the
+  manifest honestly records `source_identity` as incomplete
+  (`"error": "source_identity not supplied by caller"`), never a guess.
+  `pipeline/build_replay_store.py`'s `build_replay_for_symbol()` now
+  computes `compute_raw_source_identity(..., data_root=data_root)` — the
+  EXACT `data_root` argument it was called with — immediately after
+  streaming depth/trade records, and calls
+  `writer.set_source_identity(...)` before finalization. Also fixed
+  `converter/instruments.py`'s `load_exchange_info()` and
+  `stores/replay_writer.py`'s `_derive_fixed_point_scales()`/
+  `ReplayWriter.__init__()` to accept an explicit `data_root` parameter
+  (previously both hardcoded to `config.DATA_ROOT`), threaded through
+  from `build_replay_for_symbol()`'s own `data_root`, so a custom
+  `--data-root` build's fixed-point scale derivation reads exchangeInfo
+  from the same root it consumed for depth/trade streaming and source
+  identity — never a different, global default root.
+- **Pre-existing gap fixed while re-running Tier-2 through the canonical
+  builder** (discovered during this correction, NOT specific to
+  `schema_version`): `build_replay_for_symbol()`'s `instrument_metadata`
+  dict never included the raw exchangeInfo `filters` list (only
+  `venue`/`symbol`/`market_type`/`instrument_id`/`raw_symbol`/
+  `quote_asset`/`base_asset`). `validation/replay_catalog_reconstruct.py`'s
+  `_exchange_info_from_replay_metadata()` requires a `filters` key to
+  treat the replay's `instrument.json` as exchangeInfo-shaped; without
+  it, `build_instruments()` silently fell back to
+  `converter.instruments._default_info()`'s generic
+  `PRICE_FILTER.tickSize="0.01000000"`/`LOT_SIZE.stepSize="0.00001000"`
+  defaults — producing a DIFFERENT price/size precision than the
+  reference `convert_day.py` path's real exchangeInfo-derived precision,
+  and failing the canonical instrument-precision comparison
+  (`compare_instruments_semantic()`) for ANY replay-based candidate (v0
+  or v1 alike — confirmed by reproducing the exact same
+  `price_precision`/`size_precision` mismatch for ADAUSDT with
+  `schema_version=0`). Fixed by including `symbol_info.get("filters", [])`
+  in `instrument_metadata`.
+- Also fixed a pre-existing, unrelated bug in
+  `validation/validate_catalog_equivalence.py`'s CLI `main()`: the
+  summary `print()` block referenced stale comparison-dict keys
+  (`comparison["trade_count_old"]`, `comparison["timestamp_range_match"]`)
+  that no longer exist in the current per-instrument (`by_instrument`)
+  report shape, causing a `KeyError` crash immediately after a
+  successful comparison run (the JSON report itself was written
+  correctly before the crash — this was a cosmetic CLI-output bug, not a
+  comparison-logic bug). Rewrote the summary print to walk the actual
+  `by_instrument` structure.
+- Added `tests/test_replay_schema_v1_corrections.py` (20 tests) proving
+  all 4 blockers plus the instrument-metadata regression: complete
+  key-set/value comparison of equivalent v0/v1 rows (not just the
+  manifest), `validate_partition()` acceptance/rejection for valid v0,
+  valid v1, unsupported version, missing `price_scale`, invalid
+  `qty_scale` type, malformed `encoding_profile`, and v0/v1 physical-
+  schema mismatch in both directions, `build_replay_for_symbol()`
+  defaulting to v0 / explicitly producing v1 / failing immediately on an
+  unsupported version / publishing instrument metadata, and
+  `source_identity` reflecting only the actually-consumed root across
+  two different raw roots with different file content (proving no
+  cross-root leakage) plus `ReplayWriter` never recomputing
+  `source_identity` itself.
+
+### Files/packages touched
+- `stores/replay_reader.py` (venue/symbol/date restored in v1 decode)
+- `stores/replay_writer.py` (version-aware `validate_partition()`,
+  `_validate_schema_version_contract()`, `_schema_matches()`,
+  `set_source_identity()`, `data_root` constructor arg, removed internal
+  `compute_raw_source_identity()` call)
+- `converter/instruments.py` (`load_exchange_info()` gained explicit
+  `data_root` parameter)
+- `pipeline/build_replay_store.py` (`schema_version`/`price_scale`/
+  `qty_scale` args + `--schema-version` CLI flag on
+  `build_replay_for_symbol()`/`main()`; explicit `compute_raw_source_identity()`
+  call bound to the actual `data_root`; `instrument_metadata` now
+  includes `filters`)
+- `validation/validate_catalog_equivalence.py` (`schema_version` param
+  threaded through `_run_new_pipeline()`/`validate_catalog_equivalence()`/
+  CLI `--schema-version`; fixed the stale CLI summary print)
+- `tests/test_replay_schema_v1_corrections.py` (new — 20 tests)
+- `tests/test_replay_schema_v1.py` (2 stubs updated for the
+  `load_exchange_info(..., data_root=...)` signature change; 1 test
+  rewritten for the `ReplayWriter` no-longer-self-computing-source-identity
+  contract)
+- `CHANGELOG.md` (`[Unreleased]` → `Added`)
+- `docs/CHANGE_AUDIT.md` (this entry)
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] docs/REPO_STRUCTURE.md (no folder/file contract change)
+- [x] docs/PROJECT_STATUS.md (reviewed; no validated/deferred status
+  changed — the `full_l2`/v2.0.0 gate remains unmet; this correction
+  strengthens the Phase 5 prototype without claiming Tier-3 completion)
+- [x] docs/IMPLEMENTATION_AUDIT.md (reviewed; no contradiction — the
+  Phase 3 matrix's compaction levers are unchanged by this correction,
+  only the completeness/validation/identity-binding bugs around them)
+- [x] relevant feature docs:
+  - docs/FULL_L2_REPLAY_CATALOG_PLAN.md (reviewed; the
+    `sync_state`-fenced-range-bookkeeping caveat this entry's Tier-2
+    re-run confirms is pre-existing and identical for v0 is already
+    documented there — no update needed)
+  - docs/REPLAY_STORE.md (reviewed; the "Versioning (v0 / v1)" section
+    added in the prior Phase 5 entry remains accurate — no update
+    required for this correction)
+
+### Docs updated
+- [x] CHANGELOG.md
+- No docs update required because: the v0/v1 physical-difference
+  description in `docs/REPLAY_STORE.md` remains accurate; no new
+  validated/deferred status claim changed.
+
+### Status / validation impact
+- Validated status changed: no
+- Deferred status changed: no
+- New claims added: no new *validated* status claim. This entry reports
+  an HONEST PARTIAL Tier-2 result (see below), explicitly not claimed as
+  a full Tier-2 pass, and does not alter the `full_l2`/v2.0.0 gate.
+- Evidence for any new validation claim:
+  - **Tier 2 re-run through the canonical builder + canonical validator**
+    (`validation.validate_catalog_equivalence` CLI, `--schema-version 1`,
+    `--profile full_l2 --emit-depth10`, ADAUSDT, BINANCE_SPOT,
+    2026-06-12, real local `data_raw`, normal instrument-metadata
+    publication via the canonical `build_replay_for_symbol()` path — not
+    a manual four-function comparison script):
+    - `instrument_ids_match`: **True**
+    - `instrument_precision` (after the filters fix): **True**
+      (`price_precision`/`size_precision`/`price_increment`/
+      `size_increment` all match; before the fix this was **False**
+      — `price_precision` 4 vs 2, `size_precision` 1 vs 5 — confirming
+      the gap was real and the fix necessary)
+    - `trade_ticks` (exhaustive): **True** (124,457 / 124,457)
+    - `order_book_deltas` (exhaustive): **True** (412,317 / 412,317)
+    - `order_book_depth10` (exhaustive): **True** (71,341 / 71,341)
+    - `book_checkpoints` (streaming, hash-canonicalized): **True**
+      (7/7 checkpoints match)
+    - `raw_to_replay_metadata` (quality/continuity evidence, bounded
+      raw-vs-replay comparison): **True**
+    - `continuity_diagnostics`: **False** (`fenced_range_count`: old 34,
+      new 1)
+    - `fenced_ranges` (digest comparison): **False** (`count_old=34`,
+      `count_new=1`, digest mismatch)
+    - **Re-run the identical canonical validator with `--schema-version 0`
+      against the same raw data**: the exact same
+      `continuity_diagnostics`/`fenced_ranges` result
+      (`fenced_range_count` old 34, new 1) occurs for legacy v0 too —
+      proving this gap is NOT a v1-specific regression but the
+      already-documented `sync_state`-fenced-range-bookkeeping caveat in
+      `docs/FULL_L2_REPLAY_CATALOG_PLAN.md` (the replay builder drops
+      `sync_state` records identically for both schema versions).
+    - **Honest conclusion, per this correction's own instruction**: Tier 2
+      is **6 of 7 canonical gating components pass** for the v1
+      prototype on this single symbol/day. It is explicitly **NOT**
+      reported as "Tier 2 fully passed" — the fenced-range/continuity gap
+      remains open (shared with legacy v0, not newly introduced by v1),
+      and closing it is out of scope for this corrective commit (it is
+      not a v1-specific defect to fix, and reproducing it identically on
+      v0 proves the canonical validator's fenced-range/continuity
+      comparators are functioning correctly, not broken by this
+      correction).
+
+### Tests run
+```bash
+source .venv/bin/activate
+python -m pytest tests/test_replay_schema_v1_corrections.py tests/test_replay_schema_v1.py tests/test_book_checkpoint_hash_canonicalization.py -q
+  # 90 passed
+python -m pytest tests/test_replay_store.py tests/test_replay_depth_adapter.py tests/test_replay_memory_bounded.py tests/test_converter_integration.py tests/test_convert_day_phase2.py tests/test_streaming_gating_bounded_memory.py tests/test_validate_catalog_equivalence_exhaustive_wiring.py tests/test_semantic_oracle_exhaustive_streaming.py tests/test_semantic_oracle_detects_injected_faults.py tests/test_catalog_equivalence.py tests/test_catalog_equivalence_full_l2.py tests/test_windowed_loader_boundaries.py -q
+  # 141 passed, 1 skipped
+python -m pytest tests/test_repo_structure.py tests/test_agent_infrastructure.py -q   # 56 passed
+python -m pytest -q   # 504 passed, 3 skipped
+```
+
+### Validation CLIs run
+```bash
+CRYPTO_RECORDER_DATA_ROOT="$(pwd)/data_raw" python -m validation.validate_catalog_equivalence \
+  --date 2026-06-12 --symbols ADAUSDT --venues BINANCE_SPOT \
+  --data-root "$(pwd)/data_raw" \
+  --work-root /tmp/tier2_v3_work/work \
+  --old-catalog-root /tmp/tier2_v3_work/old_catalog \
+  --replay-root /tmp/tier2_v3_work/replay \
+  --new-catalog-root /tmp/tier2_v3_work/new_catalog \
+  --profile full_l2 --emit-depth10 --schema-version 1 --overwrite \
+  --report-path /tmp/tier2_v3_work/report.json
+# Re-run identically with --schema-version 0 against /tmp/tier2_v0_check/*
+# to confirm the fenced-range gap is pre-existing, not v1-specific.
+python -m validation.audit_change_compliance --staged
+```
+
+### Known limitations / out of scope
+- The `continuity_diagnostics`/`fenced_ranges` gap (34 vs 1 fenced
+  ranges) remains open for BOTH v0 and v1 — this corrective commit does
+  not attempt to close it, since it is a pre-existing, already-documented
+  `sync_state` limitation of the replay builder shared by both schema
+  versions, not a defect introduced by Phase 5 or this correction.
+  Closing it (if ever required) is a separate, future scoped task.
+- The Tier-2 re-run covers exactly one symbol (ADAUSDT) and one day
+  (2026-06-12) on BINANCE_SPOT; it does not cover BINANCE_USDTF or any
+  other symbol, and must not be read as a Tier-3 representative-day
+  result.
+- No real-build peak-RSS/MemoryMax measurement was taken for this
+  corrective commit's Tier-2 re-run (unchanged limitation from the prior
+  Phase 5 entry).
+- Phase 6 (external-merge/SQLite replacement), Tier 3, format-selection
+  Phase 7, a custom binary format, Phase 9 self-contained-replay
+  acceptance, the raw-retention deletion gate, staging lifecycle work,
+  disk-monitor/systemd changes, a selected-reconstruction CLI, production
+  deployment/data cleanup, uv migration, and any KovacsTrader change
+  remain explicitly **not started**, per the approved checkpoint's scope
+  boundary.
+
+---
+
+## 2026-07-27 — Issue #20 Phase 5 (revised-plan phase numbering): compact versioned replay schema v1 prototype
+
+### Change summary
+- Implemented the smallest viable versioned compact replay-schema v1
+  prototype, per the approved Phase 0–4 review checkpoint (baseline,
+  semantic oracle + failure-injection proof, raw-retention/legacy/
+  traceability/versioning design, field/consumer/integrity matrix,
+  repo-boundary alignment — all previously completed and approved; not
+  repeated or re-hardened here). Legacy v0 is completely unchanged and
+  remains the default; v1 is strictly additive and opt-in.
+- **Versioning**: added `format_version`/`schema_version`/
+  `builder_version`/`SUPPORTED_SCHEMA_VERSIONS = (0, 1)` to
+  `stores/replay_schema.py`. A manifest with no `schema_version` field is
+  legacy v0 (unchanged behavior). `ReplayReader.get_schema_version()`
+  dispatches on the manifest's `schema_version`; an explicit version
+  outside `{0, 1}` raises `ValueError` naming the found and supported
+  versions — never silently misread. `ReplayWriter(..., schema_version=1)`
+  is required to opt in; `schema_version` outside `{0, 1}` raises
+  immediately at construction. v0 and v1 partitions may coexist under the
+  same `replay_store/` root; no existing partition is migrated or
+  rewritten in place.
+- **Partition constants**: `venue`/`symbol`/`date` are removed from every
+  v1 physical row (matrix: proven partition-constant, path-derivable) and
+  restored by the reader from the manifest/partition path — proven via
+  `tests/test_replay_schema_v1.py::test_partition_constants_*`.
+- **Exact fixed-point representation**: `stores/replay_schema.py` adds
+  `encode_fixed_point()`/`decode_fixed_point()` (`Decimal` only, never a
+  float intermediate; raises if a value cannot be represented exactly at
+  the given scale). `stores/replay_writer.py::_derive_fixed_point_scales()`
+  derives `(price_scale, qty_scale)` from date-specific Binance
+  `PRICE_FILTER.tickSize`/`LOT_SIZE.stepSize`/`MARKET_LOT_SIZE` via the
+  existing `converter.instruments.load_exchange_info()`/`_get_filter()`
+  (spot and futures looked up independently, since `load_exchange_info` is
+  keyed by `venue`); raises a clear `ValueError` (never guesses) if the
+  required filters are unavailable. Scales are recorded once per partition
+  in the manifest (`price_scale`/`qty_scale`) — the replay partition
+  itself, not `data_raw`, carries everything needed to reconstruct exact
+  values. `price_str`/`quantity_str`/float64 duplication is dropped in v1
+  in favor of a single int64 mantissa per field.
+- **Compact flags/quality/continuity**: the 5 depth boolean columns
+  (`is_snapshot_seed`, `is_depth_update`, `is_sync_state`, `is_desync`,
+  `is_resync`) are packed into one int8 bitmask
+  (`pack_depth_flags()`/`unpack_depth_flags()`); `record_type` becomes an
+  int8 enum code (`DEPTH_RECORD_TYPE_CODES`/`TRADE_RECORD_TYPE_CODES`).
+  Per the matrix's explicit "pending proof"/"benchmark-needed" status,
+  `U`/`u`/`pu`, `trade_id`/`agg_trade_id`, `market_type`, and
+  `quality_flags` are deliberately left in their v0 lexical/JSON form in
+  this prototype — not compacted, not removed.
+- **Integrity/traceability**: `native_payload_hash` is stored as 32 raw
+  bytes (`pa.binary(32)`) instead of a 64-character hex string — the hash
+  value itself is retained (the Phase 2 Section 3 traceability
+  replacement design remains unimplemented, so hash removal is not
+  authorized; only its physical encoding is compacted). Added
+  `pipeline/raw_manifest.py::compute_raw_source_identity()` (bounded-
+  memory streaming SHA-256 per raw file) and wired it into v1 manifests as
+  a best-effort `source_identity` field — provenance evidence only, not
+  required for reconstruction (failure to compute it is logged and
+  recorded honestly in the manifest, never a build failure).
+- **Reader/writer boundary**: `stores/replay_reader.py`'s
+  `_decode_depth_row_v1()`/`_decode_trade_row_v1()` decode v1 physical rows
+  back to the exact v0 logical row shape (independent of, and importing
+  nothing from, `convert_day.py`/`converter/depth_phase2.py`), so every
+  existing downstream consumer (`stores/replay_depth_adapter.py`,
+  `validation/validate_catalog_equivalence.py`,
+  `validation/replay_catalog_reconstruct.py`) requires zero changes to
+  read either schema version. KovacsTrader was not touched; compact
+  physical columns remain internal to CryptoRecorder.
+- **RAM/scope boundary**: v1 writing reuses the existing bounded
+  `RawRecordSpool`-backed batch write path unchanged (row-by-row
+  projection via `_project_depth_row_v1()`/`_project_trade_row_v1()`
+  applied inside the existing bounded batch loop — no new full-day
+  in-memory collection). No Phase 6 external-merge/SQLite-replacement work
+  was started.
+- **Oracle correction discovered during the Tier-2 gate** (not a schema or
+  reference-route change): the real ADAUSDT run below found
+  `compare_book_checkpoints_streaming()`'s book-state comparison/hash was
+  literal-string-sensitive to fractional-digit padding — v1 formats
+  prices/quantities at the instrument's exact required scale (e.g. 4
+  decimals, from `PRICE_FILTER.tickSize`) while legacy v0 preserves
+  Binance's literal 8-decimal wire-format string; both represent the exact
+  same numeric value (`Decimal("0.1713") == Decimal("0.17130000")`).
+  Added `_canonical_decimal_str()`/`_canonical_book_state()` to
+  `validation/catalog_compare.py` — `Decimal`-only, never a float
+  intermediate, strips only numerically insignificant zero-padding and
+  never rounds/quantizes genuinely different values into equality — and
+  applied them to `compare_book_checkpoints_streaming()`'s `match`/hash
+  computation. This is confined entirely to the validation oracle; no
+  change was made to `convert_day.py`, the reference converter, replay
+  physical encoding, or Nautilus catalog behavior.
+
+### Files/packages touched
+- `stores/replay_schema.py` (v1 pyarrow schemas, version constants, enum
+  maps, flag bitmask helpers, fixed-point encode/decode helpers)
+- `stores/replay_writer.py` (`schema_version`/`price_scale`/`qty_scale`
+  constructor args, `_derive_fixed_point_scales()`,
+  `_project_depth_row_v1()`/`_project_trade_row_v1()`, `row_transform`
+  param on `_write_channel_incremental()`, v1 manifest fields)
+- `stores/replay_reader.py` (`get_schema_version()`, v0/v1 dispatch in
+  `iter_depths()`/`iter_trades()`, `_decode_depth_row_v1()`/
+  `_decode_trade_row_v1()`)
+- `pipeline/raw_manifest.py` (`compute_raw_source_identity()`)
+- `validation/catalog_compare.py` (`_canonical_decimal_str()`,
+  `_canonical_book_state()`, wired into
+  `compare_book_checkpoints_streaming()`)
+- `tests/test_replay_schema_v1.py` (new — 46 tests)
+- `tests/test_book_checkpoint_hash_canonicalization.py` (new — 22 tests)
+- `docs/REPLAY_STORE.md` (new "Versioning (v0 / v1)" section)
+- `CHANGELOG.md` (`[Unreleased]` → `Added`)
+- `docs/CHANGE_AUDIT.md` (this entry)
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] docs/REPO_STRUCTURE.md (no folder/file contract change — all new
+  code lives in the already-approved `stores/`/`pipeline/`/`validation/`
+  packages)
+- [x] docs/PROJECT_STATUS.md (reviewed; no validated/deferred status
+  changed by this entry — the `full_l2`/v2.0.0 gate remains unmet;
+  v1 remains an unvalidated-at-Tier-3-scale prototype)
+- [x] docs/IMPLEMENTATION_AUDIT.md (reviewed; this entry implements
+  exactly the compaction levers that document's Phase 3 matrix approved,
+  and does not contradict any "pending proof"/"unresolved" item — items
+  still pending proof were deliberately left uncompacted)
+- [x] relevant feature docs:
+  - docs/REPLAY_STORE.md (updated — see Docs updated)
+  - docs/FULL_L2_REPLAY_CATALOG_PLAN.md (reviewed; describes the
+    replay-reconstruction path, which is schema-version-agnostic per this
+    entry's reader change — no update required)
+
+### Docs updated
+- [x] CHANGELOG.md
+- [x] docs/REPLAY_STORE.md
+- No further docs update required because: no other documented CLI, flag,
+  or status claim changed; `docs/PROJECT_STATUS.md` correctly still shows
+  no validated Tier-3 full_l2 claim, which this entry does not alter.
+
+### Status / validation impact
+- Validated status changed: no
+- Deferred status changed: no
+- New claims added: no new *validated* status claim. This entry records
+  a real Tier-2 (single-symbol/single-day, local, development-evidence)
+  semantic-equivalence PASS for the v1 prototype against the
+  `convert_day.py` reference on ADAUSDT/2026-06-12, and real local size
+  measurements — both are reported honestly as development evidence, not
+  as a Tier-3 representative-day or production claim.
+- Evidence for any new validation claim:
+  - **Tier 1 (synthetic round-trip)**: `pytest tests/test_replay_schema_v1.py
+    tests/test_book_checkpoint_hash_canonicalization.py -q` → 46 + 22 = 68
+    passed.
+  - **Tier 2 (local real data, ADAUSDT, 2026-06-12)**: built the reference
+    catalog via `convert_day.py --date 2026-06-12 --symbols ADAUSDT
+    --venues BINANCE_SPOT --staging --catalog-root /tmp/tier2_ref_catalog`
+    (166.4s; 124,457 trades, 412,317 delta_events, 71,341 depth10, 34
+    fenced ranges). Built a real v1 replay partition directly from
+    `data_raw` via `ReplayWriter(..., schema_version=1)` with scales
+    derived from the real 2026-06-12 exchangeInfo (`price_scale=4,
+    qty_scale=1` for ADAUSDT) — 412,336 depth records, 124,457 trade
+    records, 59.5s. Built the candidate catalog via
+    `validation.replay_catalog_reconstruct.generate_catalog_from_replay(
+    profile="full_l2", emit_depth10=True)` from that v1 partition — 590.4s;
+    124,457 trade_ticks, 412,317 order_book_deltas, 71,341 depth10 (exact
+    count match with the reference). Ran the exhaustive, order-preserving,
+    gating semantic oracle directly
+    (`compare_trade_ticks_exhaustive`, `compare_order_book_deltas_exhaustive`,
+    `compare_book_checkpoints_streaming`,
+    `compare_order_book_depth10_exhaustive`) over the full UTC day
+    (closed 1-hour windows): all four passed
+    (`trades_cmp["passed"]=True`, `deltas_cmp["passed"]=True`,
+    `checkpoints_cmp["passed"]=True` — 7/7 checkpoints hash-matching after
+    the canonicalization fix, `depth10_cmp["passed"]=True`). Runtimes:
+    trades 4.0s, deltas 28.3s, checkpoints 18.6s, depth10 19.0s.
+  - **Local old-v0 vs new-v1 size measurement** (ADAUSDT, 2026-06-12,
+    single symbol/day — development evidence only, not a Tier-3 claim):
+    - v0 `depth.parquet`: 38,997,712 bytes (94.58 bytes/depth event over
+      412,336 events)
+    - v1 `depth.parquet`: 29,071,749 bytes (70.50 bytes/depth event) —
+      1.341x reduction
+    - v0 `trades.parquet`: 7,347,664 bytes (59.04 bytes/trade over
+      124,457 trades)
+    - v1 `trades.parquet`: 6,538,715 bytes (52.54 bytes/trade) —
+      1.124x reduction
+    - Combined: 46,345,376 bytes (v0) vs 35,610,464 bytes (v1) —
+      1.301x reduction
+    - Peak-memory evidence: not separately profiled in this session (no
+      `MemoryMax`/RSS sampling tool was run against the real ADAUSDT
+      build); the bounded-memory *behavior* is proven structurally (v1
+      reuses the unchanged, already-bounded `RawRecordSpool`/batch-write
+      path) and empirically at synthetic scale (20,000-row live-object-
+      counter proof in `tests/test_replay_schema_v1.py`), but no
+      real-build peak-RSS number is reported here — this is an explicit
+      limitation of this entry, not a claim of "well under X".
+
+### Tests run
+```bash
+source .venv/bin/activate
+python -m pytest tests/test_replay_schema_v1.py -q                        # 46 passed
+python -m pytest tests/test_book_checkpoint_hash_canonicalization.py -q   # 22 passed
+python -m pytest tests/test_streaming_gating_bounded_memory.py tests/test_validate_catalog_equivalence_exhaustive_wiring.py tests/test_semantic_oracle_exhaustive_streaming.py tests/test_catalog_equivalence.py tests/test_catalog_equivalence_full_l2.py -q
+  # 47 passed, 1 skipped
+python -m pytest tests/test_repo_structure.py tests/test_agent_infrastructure.py -q   # 56 passed
+python -m pytest -q   # 482 passed, 3 skipped
+```
+
+### Validation CLIs run
+```bash
+CRYPTO_RECORDER_DATA_ROOT="$(pwd)/data_raw" python3 convert_day.py --date 2026-06-12 \
+  --staging --catalog-root /tmp/tier2_ref_catalog --symbols ADAUSDT \
+  --venues BINANCE_SPOT --allow-partial-overwrite
+# (v1 replay build and candidate catalog build were driven via direct Python calls
+# into stores.replay_writer.ReplayWriter(schema_version=1) and
+# validation.replay_catalog_reconstruct.generate_catalog_from_replay(); the exhaustive
+# oracle comparison was driven directly via validation.catalog_compare's public
+# functions — see "Evidence for any new validation claim" above for exact calls.)
+```
+
+### Known limitations / out of scope
+- Phase 6 (external-merge/SQLite-replacement ordering), a full Tier-3
+  representative production-day build, format-selection Phase 7, a custom
+  binary format, Phase 9 self-contained-replay acceptance, the
+  raw-retention deletion gate, staging lifecycle/locking/quarantine/
+  backlog reconciliation, disk-monitor/systemd changes, a selected-
+  reconstruction CLI, production deployment/data cleanup, uv migration,
+  and any KovacsTrader change are all explicitly **not** started, per the
+  approved checkpoint's scope boundary.
+- No real-build peak-RSS/MemoryMax measurement was taken against the real
+  ADAUSDT v1 build in this session (see above) — only structural/
+  synthetic bounded-memory evidence is reported.
+- `U`/`u`/`pu`, `trade_id`/`agg_trade_id`, `market_type`, and
+  `quality_flags` remain uncompacted in v1, per the matrix's own
+  "pending proof"/"benchmark-needed" status — not an oversight.
+- The Tier-2 result covers exactly one symbol (ADAUSDT) and one day
+  (2026-06-12) on BINANCE_SPOT; it does not cover BINANCE_USDTF (futures)
+  or any other symbol, and must not be read as satisfying the later,
+  explicitly separate Tier-3 representative-day gate.
+
+---
+
+## 2026-07-24 — Issue #20 Phase 1 second follow-up correction: gating book checkpoints/Depth10, complete fenced-range digest, RAM-bounded raw-to-replay metadata comparison
+
+### Change summary
+- A further review of the pushed head (`9fbdf92`) correctly found that
+  the exhaustive trade/delta wiring was correct, but the acceptance path
+  still weakened four mandatory checks: `book_checkpoints` and
+  `order_book_depth10` were marked `"gating": False` full-day-list
+  diagnostics; fenced-range comparison only checked the reference's
+  3-example truncation and treated a candidate's extra fence as
+  expected/non-gating (via a `gating_passed` carve-out); and
+  quality-flag comparison collected a full day into two Python lists and
+  compared them as an order-independent multiset, which can miss a flag
+  moved from one event to another.
+- **Book checkpoints — now streaming and gating**: added
+  `reconstruct_book_checkpoints_streaming()` and
+  `compare_book_checkpoints_streaming()` to `validation/catalog_compare.py`.
+  These process a windowed `OrderBookDeltas` iterator sequentially,
+  retaining only the current top-N book state plus the handful of already-
+  captured checkpoint snapshots — never calling `list()` on a complete
+  day — and add a deterministic SHA-256 hash per checkpoint
+  (`old_hash`/`new_hash`/`hash_match`) alongside the existing top-of-book
+  comparison. `validation/validate_catalog_equivalence.py`'s
+  `_compare_depth_for_instrument()` now feeds this from a second,
+  independent pair of `iter_order_book_deltas_windowed()` iterators
+  (checkpoints need their own traversal separate from the exhaustive delta
+  comparison, since a generator can only be consumed once) and its
+  `passed` result is ANDed into the overall `passed` for that instrument.
+  The full-day `load_order_book_deltas()`-based `compare_book_checkpoints()`
+  path is no longer called by the acceptance path at all (the function
+  itself remains in `catalog_compare.py` for other callers/tests).
+- **Depth10 — now gating when enabled, honestly skipped when disabled**:
+  added `iter_order_book_depth10_windowed()` (same closed-window boundary
+  design as the trade/delta loaders) and
+  `compare_order_book_depth10_exhaustive()` (positional, no sampling, no
+  re-sorting, full per-level bid/ask comparison) to
+  `validation/catalog_compare.py`. When `emit_depth10=True`, this result
+  gates `passed`; when explicitly disabled, the acceptance path reports
+  `{"skipped": True, "passed": True, "reason": "emit_depth10 disabled"}`
+  rather than silently treating an unevaluated-but-would-have-failed
+  comparison as passing.
+- **Fenced ranges — complete-collection digest, no truncation carve-out**:
+  added `canonical_fence_digest()` and its underlying
+  `fence_canonical_key()` to `converter/depth_phase2.py` (shared by both
+  `convert_day.py`, which now computes `canonical_count`/`canonical_digest`
+  over the COMPLETE per-symbol `Phase2ReplayMetrics.fenced_ranges` list —
+  already fully materialized in memory by the existing depth-conversion
+  engine, so this adds no new full-day materialization — alongside the
+  existing 3-example `examples` field, and `validation/catalog_compare.py`,
+  whose new `compare_fenced_ranges_digest()` compares that count+digest
+  against the candidate manifest's actual fenced-range list for the
+  symbol). `validation/validate_catalog_equivalence.py`'s
+  `_compare_fenced_ranges_for_symbol()` now gates directly on this
+  comparator's `passed` — an extra candidate fence, or a difference beyond
+  the 3rd reference example, correctly fails; the previous
+  `gating_passed`/"extra_in_new is expected and non-gating" carve-out is
+  removed entirely.
+- **Quality/continuity metadata — RAM-bounded, event-identity-keyed, not a
+  multiset**: added `compare_event_metadata_exhaustive()` to
+  `validation/catalog_compare.py` — a generic, streaming, positional
+  comparator over two already-canonically-ordered record streams, with
+  `compare_fields` including identity fields (`raw_index`, `session_seq`,
+  etc.) alongside content fields (`quality_flags`, `U`, `u`, `pu`,
+  `is_desync`, etc.), so a value that moved from event i to event j is
+  detected as a mismatch at both positions even though a pure multiset
+  comparison of just the moved value would see no difference at all.
+  `validation/validate_catalog_equivalence.py` replaces
+  `_compare_quality_flags_for_symbol()`/`_collect_quality_flags_from_raw()`/
+  `_collect_quality_flags_from_replay()` with
+  `_compare_raw_to_replay_metadata_for_symbol()`, which sorts the raw side
+  into the canonical `(stream_session_id, session_seq, raw_index)` /
+  `(trade_stream_session_id, trade_session_seq, raw_index)` order via
+  `converter.spool.RawRecordSpool` (an existing disk-backed bounded spool,
+  reused rather than sorting a full-day Python list in memory) and streams
+  the replay side via `stores.replay_reader.ReplayReader` (already
+  guaranteed sorted by the replay-store contract). Both channels
+  (depth_v2, trade_v2) are filtered during raw normalization to only the
+  record types the replay writer actually converts (`snapshot_seed`/
+  `depth_update` for depth, `trade`/`agg_trade` for trades — matching
+  `pipeline/build_replay_store.py`'s `_convert_depth_record()`/
+  `_convert_trade_record()` exactly), to avoid spurious "extra on the raw
+  side" mismatches from record types (e.g. `sync_state`) the replay writer
+  intentionally never converts.
+- **Bug found and fixed while wiring the metadata comparator**: raw records
+  read via `converter.readers.stream_raw_records()` do not carry a
+  `raw_index` field (it is assigned by the replay writer during
+  conversion, via `enumerate()` over the full unfiltered raw stream); the
+  first version of the raw-side normalizer read a nonexistent
+  `rec.get("raw_index")` (always `None`), causing every position to
+  spuriously mismatch even on an otherwise-identical clean day. Fixed by
+  assigning `raw_index` locally using the same global (unfiltered)
+  enumeration order the replay writer uses, before inserting into the
+  sorting spool — verified directly against
+  `pipeline/build_replay_store.py`'s `enumerate(stream_raw_records(...))`
+  pattern to confirm the numbering scheme matches exactly.
+- Added `tests/test_streaming_gating_bounded_memory.py` (6 tests):
+  empirical proofs, via a live-object-counter hooked into `__del__`, that
+  `compare_book_checkpoints_streaming()`,
+  `compare_order_book_depth10_exhaustive()`, and
+  `compare_event_metadata_exhaustive()` all stay bounded-memory
+  (peak simultaneously-alive objects independent of stream length, tested
+  at 20,000–50,000 synthetic events) while still detecting a difference
+  injected near the end of the stream — including, for the metadata
+  comparator, a value moved between two events with the overall multiset
+  unchanged (the exact gap a multiset comparison has).
+- Rewrote `tests/test_validate_catalog_equivalence_exhaustive_wiring.py`
+  (23 tests, up from 12) to prove, through the real, unmodified
+  `validate_catalog_equivalence()` orchestration: all the previously-
+  proven trade/delta/instrument/continuity scenarios, plus new coverage
+  for a book-checkpoint value mismatch (asserting `"gating"` is absent
+  from the result and the aggregate `book_checkpoints` block is exactly
+  `{"passed": False}`, not a diagnostic-shaped dict); an enabled-Depth10
+  mismatch and an enabled-Depth10 reorder (both failing); Depth10
+  explicitly disabled reporting `skipped=True, passed=True`; a
+  fenced-range mismatch where only the 4th of 4 fences differs (proving
+  the 3-example truncation gap is closed); an extra candidate fenced
+  range (proving `extra_in_new` is no longer treated as expected); and,
+  via a real raw-JSONL → real `convert_day.py` → real replay-build
+  pipeline with only the raw-side generator monkeypatched for each
+  scenario: a quality flag swapped between the two depth_update events
+  with the overall multiset unchanged, a changed `u` continuity ID, a
+  flipped `is_desync` state, a missing diagnostic event, and an extra
+  diagnostic event — each correctly failing the real orchestration's
+  `report["status"]`. Two regression guards were also updated: a static
+  check that the module no longer imports any of the sampled/multiset/
+  full-day-list comparators or loaders (now including
+  `compare_depth10_semantic`, `compare_book_checkpoints`,
+  `compare_fenced_ranges_semantic`, `compare_quality_flags_semantic`,
+  `load_order_book_deltas`, `load_order_book_depth10` in addition to the
+  previously-guarded names), and a call-counting spy proving
+  `compare_trade_ticks_exhaustive`, `compare_order_book_deltas_exhaustive`,
+  and `compare_book_checkpoints_streaming` are genuinely invoked during a
+  real run.
+- No compact replay schema was changed. This remains Phase 1 (oracle
+  hardening) work, still gating any future compact schema implementation
+  (Phase 5+, not started).
+
+### Files/packages touched
+- `validation/catalog_compare.py` (new streaming checkpoint reconstruction,
+  Depth10 windowed loader + exhaustive comparator, fenced-range digest
+  comparator, generic event-metadata comparator)
+- `validation/validate_catalog_equivalence.py` (rewired
+  `_compare_depth_for_instrument()`, `_compare_fenced_ranges_for_symbol()`;
+  replaced quality-flags collectors with
+  `_compare_raw_to_replay_metadata_for_symbol()` and its
+  `_iter_sorted_raw_depth()`/`_iter_sorted_raw_trades()`/normalizer
+  helpers)
+- `converter/depth_phase2.py` (new `fence_canonical_key()`,
+  `canonical_fence_digest()`)
+- `convert_day.py` (computes and persists `canonical_count`/
+  `canonical_digest` per symbol in `per_symbol_fenced_ranges`)
+- `tests/test_streaming_gating_bounded_memory.py` (new — 6 tests)
+- `tests/test_validate_catalog_equivalence_exhaustive_wiring.py` (rewritten
+  — 23 tests)
+- `CHANGELOG.md` (`[Unreleased]` → `Added`)
+- `docs/CHANGE_AUDIT.md` (this entry)
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] docs/REPO_STRUCTURE.md (no folder/file contract change)
+- [x] docs/PROJECT_STATUS.md (reviewed; no validated/deferred status
+  changed — this remains oracle-hardening tooling, not a new real-data
+  validation run against a representative production day)
+- [x] docs/IMPLEMENTATION_AUDIT.md (reviewed; consistent with the existing
+  Phase 1/2/3 entries — this correction strengthens, not contradicts, the
+  "Phase 1 oracle (implemented)" references already recorded there)
+- [x] relevant feature docs:
+  - docs/VALIDATION.md (reviewed; `validate_catalog_equivalence` CLI
+    description remains accurate — internal comparison logic changed, the
+    documented CLI invocation/flags did not)
+
+### Docs updated
+- [x] CHANGELOG.md
+- No docs update required because: `docs/VALIDATION.md`'s existing
+  CLI-level description remains accurate; no new CLI flags or status/gate
+  claims were added.
+
+### Status / validation impact
+- Validated status changed: no
+- Deferred status changed: no
+- New claims added: no — this proves the corrected oracle wiring is
+  gating and bounded-memory via synthetic/local integration tests; it does
+  not constitute a new semantic-equivalence validation run against real
+  production data, and does not change the `full_l2`/v2.0.0 gate status.
+- Evidence for any new validation claim: n/a (no new validation claim made)
+
+### Tests run
+```bash
+source .venv/bin/activate
+python -m pytest tests/test_semantic_oracle_exhaustive_streaming.py tests/test_semantic_oracle_detects_injected_faults.py tests/test_windowed_loader_boundaries.py tests/test_validate_catalog_equivalence_exhaustive_wiring.py tests/test_streaming_gating_bounded_memory.py tests/test_catalog_equivalence.py tests/test_catalog_equivalence_full_l2.py tests/test_pipeline_validation.py -q   # 82 passed, 2 skipped
+python -m pytest tests/test_repo_structure.py tests/test_agent_infrastructure.py -q   # 56 passed
+python -m pytest -q   # 414 passed, 3 skipped
+```
+
+### Validation CLIs run
+```bash
+none required for this change type — no config or deployment file was
+touched; the wiring is exercised directly by the test suites above.
+```
+
+### Known limitations / out of scope
+- `_collect_quality_flags_from_raw()`/`_collect_quality_flags_from_replay()`
+  from the prior correction were removed entirely (not merely deprecated),
+  since the new event-identity-keyed comparator fully supersedes them;
+  `compare_quality_flags_semantic()` itself remains in
+  `validation/catalog_compare.py` for lightweight/Tier-1 ad-hoc use, now
+  explicitly documented as superseded for the acceptance path.
+- No representative production-day (Tier 3: 2026-07-22/23) run of the
+  corrected wiring was performed in this session — proven only against
+  synthetic (Tier 1) data via real, on-disk Nautilus catalogs, a real
+  raw→convert_day.py→replay-build pipeline, and empirical bounded-memory
+  proofs, which is exactly what "prove the wiring before using it as a
+  gate" requires before any real-data run.
+- The book-checkpoint and Depth10 comparisons still issue a second,
+  independent pass over the windowed delta/Depth10 iterators (once for
+  the exhaustive comparison, once for checkpoints/Depth10 respectively),
+  doubling the on-disk read for those channels versus a hypothetical
+  single-pass design; this trade-off is documented in
+  `_compare_depth_for_instrument()`'s docstring and was judged acceptable
+  to keep each comparator's memory bounded and independently testable,
+  not optimized further in this correction.
+
+---
+
+## 2026-07-24 — Issue #20 Phase 1 follow-up correction: wire exhaustive oracle into the real acceptance path, fix duplicate semantics, fix windowed-loader boundary bug
+
+### Change summary
+- A review of the previously pushed head (`7ca0854`) correctly found that
+  the Phase 1 correction's exhaustive/streaming comparators and windowed
+  loaders were added to `validation/catalog_compare.py` but never wired
+  into `validation/validate_catalog_equivalence.py` — the actual function
+  the CLI and any future Tier-2/Tier-3 acceptance run calls. The real
+  orchestration still used `load_trade_ticks()` +
+  `compare_trade_ticks_semantic()` (sampled) and `load_order_book_deltas()` +
+  `compare_order_book_deltas_semantic()` (multiset). This entry corrects
+  that gap and two further defects found while doing so.
+- **Wired into the real path** (`validation/validate_catalog_equivalence.py`,
+  `validate_catalog_equivalence()` and `_compare_depth_for_instrument()`):
+  - `load_instruments()` + `compare_instruments_semantic()` — instrument
+    identity/precision now gates `report["comparison"]["instrument_precision"]`.
+  - `iter_trade_ticks_windowed()` + `compare_trade_ticks_exhaustive()` —
+    replaces the sampled trade comparison entirely; gates
+    `comparison["by_instrument"][iid]["trade_ticks"]`.
+  - `iter_order_book_deltas_windowed()` + `compare_order_book_deltas_exhaustive()` —
+    replaces the multiset delta comparison entirely; gates
+    `comparison["by_instrument"][iid]["order_book_deltas"]`.
+  - `compare_continuity_diagnostics_semantic()` — new
+    `_load_old_convert_report()` reads convert_day.py's own report JSON
+    (`catalog_root.parent / "convert_reports" / f"{date}.json"`, per
+    convert_day.py's own `_save_report()`) for `per_symbol_depth`, compared
+    against the candidate manifest's `depth_diagnostics`; gates
+    `continuity_diagnostics`.
+  - `compare_fenced_ranges_semantic()` — reference-side
+    `per_symbol_fenced_ranges[...]["examples"]` (convert_day.py only
+    records up to 3 example fences per symbol, not the full list) against
+    the candidate manifest's `fenced_ranges` filtered to that venue/symbol.
+    Documented explicitly: `extra_in_new` is expected whenever the
+    candidate legitimately has more than 3 fences (a reference-side
+    data-shape truncation, not an equivalence failure) and does not gate;
+    only `missing_in_new` (every reference example must be reproduced) is
+    gating, exposed as a new `gating_passed` field.
+  - `compare_quality_flags_semantic()` — new
+    `_collect_quality_flags_from_raw()`/`_collect_quality_flags_from_replay()`
+    compare quality_flags read directly from `data_raw` (via
+    `converter.readers.stream_raw_records()`) against the replay_store the
+    candidate builds from that same raw source (via
+    `stores.replay_reader.ReplayReader`). Documented explicitly why: neither
+    convert_day.py's Nautilus catalog output nor its own report JSON
+    persists a per-event quality_flags stream, so there is no "old Nautilus
+    catalog vs new Nautilus catalog" comparison available for this field —
+    raw is the one place it exists on both a reference and candidate side.
+  - Every one of the above `passed` results now contributes to
+    `report["status"]`.
+  - `compare_book_checkpoints()` and Depth10 comparison remain wired but
+    are now explicit non-gating diagnostics (new `"gating": False` field on
+    each): both still require full-day list materialization
+    (`compare_book_checkpoints()` calls `list(...)` on its inputs; there is
+    no windowed/streaming equivalent for either today), which the bounded-
+    memory acceptance path is specifically designed to avoid. This is a
+    documented, deliberate limitation, not silently hidden — closing it is
+    explicitly out of scope for this correction and left as future work.
+  - The legacy sampled/multiset comparators and the full-day
+    `load_trade_ticks()`/`load_order_book_deltas()`-as-primary-loader
+    pattern are no longer imported by `validate_catalog_equivalence.py` at
+    all (confirmed by a new static regression test, see below).
+- **Corrected duplicate-event semantics** (`validation/catalog_compare.py`):
+  two identical ordered streams now correctly pass even when both contain
+  the exact same duplicate event at the same position — equivalence means
+  the reference and candidate streams are identical, including identical
+  duplicate occurrences. The prior version incorrectly treated "a
+  duplicate exists on either side" as an independent failure condition.
+  Removed `_BoundedDedupeWindow` (which stored keys in a Python `list` and
+  called `pop(0)` on eviction — O(N) per eviction once the window filled,
+  an O(N×window) cost across a full stream) entirely, rather than merely
+  replacing it with a `collections.deque`: the pre-existing positional/
+  length comparison already fully detects every duplicate-related
+  discrepancy that can actually indicate non-equivalence (an extra,
+  missing, or differently-positioned duplicate shifts every subsequent
+  position). This keeps `compare_trade_ticks_exhaustive()`/
+  `compare_order_book_deltas_exhaustive()` O(N) end-to-end, remaining
+  practical at 200M+ events per the issue's requirement.
+- **Found and fixed a real windowed-loader boundary bug**
+  (`validation/catalog_compare.py`): `iter_trade_ticks_windowed()`/
+  `iter_order_book_deltas_windowed()` previously assumed Nautilus's
+  `catalog.trade_ticks(start=a, end=b)`/`catalog.order_book_deltas(start=a,
+  end=b)` queries were half-open `[a, b)`. Direct testing against a real
+  on-disk `ParquetDataCatalog` (new
+  `tests/test_windowed_loader_boundaries.py`) proved this false: the query
+  is inclusive on **both** `a` and `b` — confirmed directly by querying
+  `start=0, end=1000` against a single event at `ts=1000` and observing it
+  returned. The previous window-chaining logic
+  (`next_window_start = previous_window_end`) therefore double-yielded any
+  event landing exactly on an internal window boundary (reproduced
+  directly: `[0, 999, 1000, 1000, 1001, 2999]` instead of
+  `[0, 999, 1000, 1001, 2999]`). Both loaders now partition the caller's
+  half-open `[start_ns, end_ns)` range into non-overlapping **closed**
+  sub-windows (`window_end = min(window_start + window_ns - 1,
+  end_ns - 1)`, next `window_start = window_end + 1`), safe because all
+  Nautilus event timestamps are integer nanoseconds. Re-verified after the
+  fix: every boundary-position event (overall start; immediately
+  before/on/after an internal boundary; immediately before the overall
+  end) is yielded exactly once, in order, for both loaders, and windowed
+  iteration matches a single unwindowed full-range query exactly.
+  `window_ns` remains fully configurable (two different window sizes
+  proven to yield identical results against the same data); docstrings no
+  longer claim a fixed time window is a strict event-count/RSS bound —
+  only that it bounds query result size per window, to be tuned against
+  measured per-window RSS on real production data (issue #20 Tier 3).
+- Added `tests/test_validate_catalog_equivalence_exhaustive_wiring.py`
+  (new, 12 tests): end-to-end integration tests that monkeypatch only the
+  build steps (`_run_old_converter`, `_run_new_pipeline`, `_prepare_dir`)
+  to no-ops so each test can pre-construct fully controlled real Nautilus
+  catalogs (via `ParquetDataCatalog.write_data()`) plus a matching
+  convert_day.py-shaped report and replay manifest, then calls the real,
+  unmodified `validate_catalog_equivalence()` — proving the orchestration
+  itself, not just the comparator helpers in isolation, fails for: a trade
+  mismatch beyond the legacy sampled comparator's 100 positions; reordered
+  trades (content-swapped between adjacent timestamp slots, since
+  Nautilus's catalog enforces monotonically increasing `ts_init` at write
+  time — a literal object swap cannot be written to a real catalog, which
+  is itself a documented finding of this work); reordered commutative-
+  looking depth deltas (with a sanity assertion that the non-gating
+  book-checkpoint diagnostic legitimately still matches, demonstrating
+  exactly why the exhaustive comparison must be the actual gate);
+  extra/missing trades; an instrument precision/increment mismatch; a
+  continuity (resync-count) mismatch; a fenced-range mismatch; and a
+  quality-flags mismatch. Plus a passing baseline and two regression
+  guards: a static check that `compare_trade_ticks_semantic`,
+  `compare_order_book_deltas_semantic`, and `load_trade_ticks` are no
+  longer attributes of the `validate_catalog_equivalence` module (would
+  fail immediately if a future change re-adds those imports), and a
+  call-counting spy proving `compare_trade_ticks_exhaustive`/
+  `compare_order_book_deltas_exhaustive` are genuinely invoked (not merely
+  importable-but-unused) during a real run.
+- No compact replay schema was changed. This remains Phase 1 (oracle
+  hardening) work, still gating any future compact schema implementation
+  (Phase 5+, not started).
+
+### Files/packages touched
+- `validation/validate_catalog_equivalence.py` (real acceptance-path wiring)
+- `validation/catalog_compare.py` (duplicate-semantics fix, windowed-loader
+  boundary-bug fix)
+- `tests/test_semantic_oracle_exhaustive_streaming.py` (updated duplicate
+  tests to match corrected semantics)
+- `tests/test_windowed_loader_boundaries.py` (new — 6 tests)
+- `tests/test_validate_catalog_equivalence_exhaustive_wiring.py` (new — 12 tests)
+- `CHANGELOG.md` (`[Unreleased]` → `Added`)
+- `docs/CHANGE_AUDIT.md` (this entry)
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] docs/REPO_STRUCTURE.md (no folder/file contract change)
+- [x] docs/PROJECT_STATUS.md (reviewed; no validated/deferred status
+  changed — this remains oracle-hardening tooling, not a new real-data
+  validation run)
+- [x] docs/IMPLEMENTATION_AUDIT.md (reviewed; consistent with the existing
+  Phase 1/2/3 entries — this correction strengthens, not contradicts, the
+  "Phase 1 oracle (implemented)" reference already recorded there)
+- [x] relevant feature docs:
+  - docs/VALIDATION.md (reviewed; `validate_catalog_equivalence` CLI
+    description remains accurate — internal comparison logic changed, the
+    documented CLI invocation/flags did not, aside from the additive
+    `--window-hours` flag)
+
+### Docs updated
+- [x] CHANGELOG.md
+- No docs update required because: `docs/VALIDATION.md`'s existing
+  CLI-level description remains accurate; the new `--window-hours` flag
+  is additive and self-documenting via `--help`.
+
+### Status / validation impact
+- Validated status changed: no
+- Deferred status changed: no
+- New claims added: no — this proves the *oracle wiring* is correct via
+  synthetic/local integration tests; it does not constitute a new
+  semantic-equivalence validation run against real production data, and
+  does not change the `full_l2`/v2.0.0 gate status.
+- Evidence for any new validation claim: n/a (no new validation claim made)
+
+### Tests run
+```bash
+source .venv/bin/activate
+python -m pytest tests/test_semantic_oracle_exhaustive_streaming.py tests/test_semantic_oracle_detects_injected_faults.py tests/test_windowed_loader_boundaries.py tests/test_validate_catalog_equivalence_exhaustive_wiring.py -q   # 50 passed
+python -m pytest tests/test_repo_structure.py tests/test_agent_infrastructure.py -q   # 56 passed
+python -m pytest -q   # 397 passed, 3 skipped
+```
+
+### Validation CLIs run
+```bash
+none required for this change type — no schema, systemd, or deployment
+file was touched; the wiring is exercised directly by the new
+integration-test suite above.
+```
+
+### Known limitations / out of scope
+- `compare_book_checkpoints()` and Depth10 comparison remain full-day
+  list-materializing and are explicitly non-gating diagnostics — a
+  windowed/streaming equivalent for either is out of scope for this
+  correction and remains future work.
+- `_collect_quality_flags_from_raw()`/`_collect_quality_flags_from_replay()`
+  are not themselves windowed/bounded-memory (they materialize a Python
+  list of quality_flags values for the requested venue/symbol/date) —
+  acceptable for now since `quality_flags` values are small compared to
+  full event objects, but this should be revisited if quality_flags volume
+  becomes a real memory concern for a full production day.
+- No representative production-day (Tier 3: 2026-07-22/23) run of the
+  corrected wiring was performed in this session — proven only against
+  synthetic (Tier 1) data via real, on-disk Nautilus catalogs and a
+  genuine end-to-end orchestration call, which is exactly what "prove the
+  wiring before using it as a gate" requires before any real-data run.
+- The `--window-hours` CLI default (1 hour) has not been validated against
+  measured per-window RSS on real production data; it remains a
+  configurable starting point per the docstring's explicit caveat, not a
+  proven-safe value.
+
+---
+
+## 2026-07-24 — Issue #20 Phase 1 correction: exhaustive, order-preserving, bounded-memory oracle comparison (closes sampling/multiset/streaming gap)
+
+### Change summary
+- A follow-up review of the already-committed Phase 1 oracle-hardening
+  work correctly identified that it was still insufficient for the
+  issue's actual requirement: `compare_trade_ticks_semantic()` samples up
+  to `sample_count` (default 100) positions after re-sorting both streams
+  by `(ts_event, trade_id)`, and `compare_order_book_deltas_semantic()` is
+  a multiset comparison that also re-sorts before comparing. Verified
+  directly (and demonstrated in the new test suite) that both designs
+  have real, non-hypothetical blind spots:
+  - a difference placed at a position the sampler does not select is
+    invisible to `compare_trade_ticks_semantic()`;
+  - a pure reordering of two otherwise-identical-content trades/deltas is
+    invisible to both the sampled comparator (same trade_id set, no
+    missing/extra keys) and the multiset comparator (same multiset);
+  - a reordering of two independent, non-conflicting depth updates that
+    happens to produce an *identical final book state* is invisible even
+    to `compare_book_checkpoints()`'s deterministic book-state
+    reconstruction, since the checkpoint only observes the state *after*
+    both deltas have been applied, not the order they arrived in.
+- Added `compare_trade_ticks_exhaustive()` and
+  `compare_order_book_deltas_exhaustive()` to `validation/catalog_compare.py`:
+  both compare every event at its original stream position via
+  `itertools.zip_longest` (no re-sorting, no sampling), so a reordering,
+  an out-of-sample-range difference, or an extra/missing event anywhere
+  in the stream is detected. Neither function materializes either input
+  stream into a list internally — they accept and consume arbitrary
+  iterables (including one-shot generators), keeping memory bounded and
+  independent of total event count.
+- Added `_BoundedDedupeWindow` (O(window) memory) to detect duplicate
+  events using a bounded recent-window lookback per stream side — a
+  documented, deliberate trade-off against a true O(total-event-count)
+  global duplicate check, which would itself violate the bounded-memory
+  requirement for a complete production day's tens/hundreds of millions
+  of events. The docstring states this trade-off explicitly: a duplicate
+  whose two occurrences are farther apart than the window will not be
+  flagged by this specific check.
+- Added `iter_trade_ticks_windowed()` and `iter_order_book_deltas_windowed()`
+  to `validation/catalog_compare.py`: bounded-memory catalog loaders that
+  fetch in fixed time windows (default 1 hour) via repeated
+  `catalog.trade_ticks()`/`catalog.order_book_deltas()` calls, rather than
+  materializing an entire requested time range in one call the way
+  `load_trade_ticks()`/`load_order_book_deltas()` do. These are the
+  necessary companion loaders for the new exhaustive comparators to
+  actually achieve bounded memory end-to-end against a real catalog for a
+  complete production day (issue #20 Tier 3), not just within the
+  comparator function itself.
+- Added `tests/test_semantic_oracle_exhaustive_streaming.py` (11 tests):
+  - a difference outside the legacy sampler's selected positions is
+    missed by the legacy comparator and caught by the new one (sanity
+    assertion on the legacy comparator's "false pass" included, to prove
+    the gap is real, not assumed);
+  - a pure reordering of two independent depth deltas is reported as
+    equal by the multiset comparator and as a mismatch by the exhaustive
+    one (same structure: sanity assertion on the multiset comparator's
+    "false pass" included);
+  - extra trade appended / missing trade / extra delta — all detected via
+    `first_length_divergence_position`;
+  - duplicate trade added (new-side duplicate) and duplicate trade removed
+    (old-side-only duplicate) — both detected via
+    `duplicate_events_new`/`duplicate_events_old` respectively;
+  - reordered trades at positions outside the legacy sampler's selection —
+    detected, with an explicit sanity check that the legacy comparator's
+    `missing_keys`/`extra_keys` stay empty (proving a set-based check
+    alone cannot see a pure reordering);
+  - reordered commutative-looking depth deltas producing an *identical*
+    final book state — verified via `compare_book_checkpoints()` reporting
+    `passed=True` (sanity check that the scenario is genuinely
+    commutative), while `compare_order_book_deltas_exhaustive()` reports
+    `passed=False`;
+  - two bounded-memory + late-difference proofs (one for trades at
+    n=20,000, one for deltas at n=5,000): a `_LiveCounter`/`_FakeTick` pair
+    tracks how many synthetic event objects are simultaneously alive via
+    Python's refcounting `__del__` hook (not merely asserted from
+    implementation reading), proving peak simultaneous liveness stays
+    under 100 objects — independent of n — while a single difference
+    injected 3–5 positions before the end of each stream is still
+    detected, proving the entire stream is genuinely scanned rather than
+    truncated or sampled.
+- The pre-existing sampled/multiset comparators
+  (`compare_trade_ticks_semantic()`, `compare_order_book_deltas_semantic()`)
+  are unchanged and retained — they remain useful for fast
+  summary-level comparisons during iterative development (Tier 1/2); the
+  new exhaustive comparators are the ones required for the Tier 3
+  representative-production-day gate and are additive, not a replacement.
+- No compact replay schema, builder, staging-cleanup, or raw-retention
+  behavior was changed. This is a correction within Phase 1 (oracle
+  hardening), which continues to gate any future compact schema
+  implementation (Phase 5+, not started).
+
+### Files/packages touched
+- `validation/catalog_compare.py` (extended — 2 new exhaustive comparators,
+  2 new bounded-memory catalog loaders, 1 new dedupe-window helper)
+- `tests/test_semantic_oracle_exhaustive_streaming.py` (new — 11 tests)
+- `CHANGELOG.md` (`[Unreleased]` → `Added`)
+- `docs/CHANGE_AUDIT.md` (this entry)
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] docs/REPO_STRUCTURE.md (no folder/file contract change —
+  `validation/` already owns `catalog_compare.py`)
+- [x] docs/PROJECT_STATUS.md (reviewed; no validated/deferred status
+  changed — this is oracle tooling correction, not a new validation run
+  against real data)
+- [x] docs/IMPLEMENTATION_AUDIT.md (reviewed; consistent with the Phase 2-3
+  entry, which already references "the Phase 1 oracle (implemented)" —
+  this correction strengthens, not contradicts, that reference)
+- [x] relevant feature docs:
+  - docs/VALIDATION.md (reviewed; existing `validate_catalog_equivalence`
+    CLI description remains accurate — the new comparators are additive
+    library functions, not yet wired into the CLI's default profile
+    output, consistent with the prior Phase 1 entry's same known
+    limitation)
+
+### Docs updated
+- [x] CHANGELOG.md
+- No docs update required because: this is additive comparator/loader
+  tooling correcting a gap within the already-documented Phase 1 scope;
+  no new CLI surface, status, or gate changed.
+
+### Status / validation impact
+- Validated status changed: no
+- Deferred status changed: no
+- New claims added: no — this proves the *oracle* now performs exhaustive,
+  order-preserving, bounded-memory comparison on synthetic data; it does
+  not constitute a new semantic-equivalence validation run against real
+  data, and does not change the `full_l2`/v2.0.0 gate status.
+- Evidence for any new validation claim: n/a (no new validation claim made)
+
+### Tests run
+```bash
+source .venv/bin/activate
+python -m pytest tests/test_semantic_oracle_exhaustive_streaming.py -q   # 11 passed
+python -m pytest tests/test_semantic_oracle_exhaustive_streaming.py \
+  tests/test_semantic_oracle_detects_injected_faults.py \
+  tests/test_catalog_equivalence.py tests/test_catalog_equivalence_full_l2.py \
+  tests/test_semantic_equivalence.py tests/test_replay_catalog_reconstruct.py -q   # 41 passed, 1 skipped
+python -m pytest tests/test_repo_structure.py tests/test_agent_infrastructure.py -q   # 56 passed
+python -m pytest -q   # 377 passed, 3 skipped
+```
+
+### Validation CLIs run
+```bash
+none required for this change type — no schema, config, or deployment
+file was touched; the new comparators/loaders are exercised directly by
+the new pytest suite above.
+```
+
+### Known limitations / out of scope
+- The new comparison functions are not yet wired into
+  `validation/validate_catalog_equivalence.py`'s default output — same
+  known limitation already recorded in the prior Phase 1 entry; that
+  integration is deferred until the compact schema (Phase 5+, not started)
+  determines the exact manifest/report field shapes to compare against.
+- `_BoundedDedupeWindow`'s duplicate detection is bounded-window, not
+  global — a duplicate whose two occurrences are farther apart than
+  `dedupe_window` (default 100,000 events) will not be flagged. This is a
+  documented, deliberate trade-off, not an oversight: true global
+  duplicate detection over hundreds of millions of events would itself
+  require unbounded memory.
+- No representative production-day (Tier 3: 2026-07-22/23) or even local
+  real-data (Tier 2) run of the new exhaustive comparators was performed
+  in this session — this correction is proven only against synthetic
+  (Tier 1) data and a live-object-counter memory proof, which is exactly
+  what "prove the oracle before using it as a gate" requires before any
+  real-data run.
+- `iter_trade_ticks_windowed()`/`iter_order_book_deltas_windowed()` were
+  not exercised against a real on-disk Nautilus catalog in this session's
+  test suite (no test writes a multi-hour synthetic catalog and asserts
+  the windowed loader issues multiple bounded `catalog.trade_ticks()`
+  calls); the loaders' correctness rests on straightforward, directly
+  auditable logic (a `while` loop advancing a fixed time window) rather
+  than an integration test in this commit. Adding that integration test is
+  explicitly left as a candidate follow-up, not claimed as already done.
+
+---
+
+## 2026-07-24 — Issue #20 Phase 4: deliberate repository-boundary and guard alignment for a future selected-scope reconstruction CLI
+
+### Change summary
+- `docs/REPO_STRUCTURE.md`'s `pipeline/` role text previously stated
+  pipeline "does not contain a product-facing catalog-generation CLI
+  (removed; see docs/ARCHITECTURE.md)" — an absolute prohibition dating
+  from issue #17's removal of the old unscoped `pipeline/generate_catalog.py`.
+  Issue #20 Phase 4 requires reversing that prohibition for one narrow,
+  explicitly bounded case: a development-computer selected-reconstruction
+  CLI that builds a **temporary** Nautilus full-L2 catalog for an
+  explicitly requested venue/symbol list and start/end time window only —
+  never an unscoped, all-history/all-universe rebuild, and never an
+  unattended Linux production service.
+- Updated the `pipeline/` role description in `docs/REPO_STRUCTURE.md` to
+  permit exactly one such CLI, while explicitly re-stating four hard
+  prohibitions that must hold regardless: no default/silent expansion to
+  "all symbols/all venues/all history"; no permanent all-universe catalog;
+  no unattended systemd/production service; and the caller must always
+  explicitly supply both a venue/symbol scope and a start/end window.
+  Named the historical `pipeline/generate_catalog.py` shape as
+  permanently forbidden by name and by its unscoped design, distinct from
+  any future scoped CLI (which must use a different name).
+- Added a 2026-07-24 entry to the `docs/REPO_STRUCTURE.md` Amendment Log
+  documenting this contract change and pointing at the rewritten guard
+  test.
+- Rewrote (did not delete or weaken) the corresponding guard test in
+  `tests/test_repo_structure.py`:
+  `test_pipeline_does_not_contain_generate_catalog_cli()` →
+  `test_pipeline_reconstruction_cli_stays_explicitly_scoped()`. The new
+  test (a) still asserts `pipeline/generate_catalog.py` must never exist —
+  the old unscoped name stays permanently forbidden — and (b) additionally
+  scans every *other* module in `pipeline/` (i.e. anything beyond the
+  three known, already-existing modules `build_replay_store.py`,
+  `daily_build.py`, `raw_manifest.py`) for unscoped-reconstruction text
+  markers (`all_symbols`, `all_venues`, `full_universe`, `--all-history`,
+  etc.), so that once a future selected-reconstruction CLI is added, this
+  guard will immediately fail if it silently reintroduces an unscoped
+  default. No reconstruction CLI exists in the repository yet, so this
+  half of the test is presently forward-looking/vacuously satisfied — it
+  is exercised and will start actively gating the moment such a file is
+  added in a future implementation phase.
+- Verified the existing `test_docs_do_not_reference_pipeline_audit_modules()`
+  guard (which forbids the historical dotted-module import path for the
+  removed catalog CLI appearing in any `docs/*.md` file) is not tripped by
+  this change: all new text in `docs/REPO_STRUCTURE.md` uses the slash-path
+  form (`` `pipeline/generate_catalog.py` ``), confirmed via a direct grep
+  for the dotted form before committing.
+- No selected-reconstruction CLI, no compact schema, and no other pipeline/
+  module was implemented in this commit. This is a deliberate,
+  documented, test-enforced contract change only, per AGENTS.md's
+  allowance for updating a guard "when the product contract truly
+  changes."
+
+### Files/packages touched
+- `docs/REPO_STRUCTURE.md` (role text + amendment-log entry)
+- `tests/test_repo_structure.py` (guard test rewritten, not deleted)
+- `CHANGELOG.md` (`[Unreleased]` → `Added`)
+- `docs/CHANGE_AUDIT.md` (this entry)
+
+### Docs reviewed
+- [x] AGENTS.md (Section 2 folder-boundary rules; Section 5 "a guard may be
+  updated when the product contract truly changes" — the basis for this
+  change being permitted at all)
+- [x] docs/REPO_STRUCTURE.md (this is the file amended)
+- [x] docs/PROJECT_STATUS.md (reviewed; no validated/deferred status
+  changed — no CLI was implemented, only the future contract for one)
+- [x] docs/IMPLEMENTATION_AUDIT.md (reviewed; consistent with the Phase
+  2-3 design entry immediately above, which already anticipates a future
+  selected-reconstruction CLI without implementing one)
+- [x] relevant feature docs:
+  - docs/ARCHITECTURE.md (reviewed; its "does not build a feature/label
+    layer or a general-purpose consumer catalog" statement remains
+    accurate — a *selected, temporary* catalog for an explicit
+    venue/symbol/window is a distinct, narrower thing than a
+    general-purpose consumer catalog, and is not yet implemented)
+
+### Docs updated
+- [x] CHANGELOG.md
+- [x] docs/REPO_STRUCTURE.md
+- No further docs update required because: `docs/ARCHITECTURE.md` and
+  `docs/PROJECT_STATUS.md` describe *current, implemented* behavior, which
+  is unchanged by this contract-only amendment; the amendment itself lives
+  in `docs/REPO_STRUCTURE.md` per the "identify the right existing home"
+  rule.
+
+### Status / validation impact
+- Validated status changed: no
+- Deferred status changed: no
+- New claims added: no — no reconstruction CLI is claimed as implemented;
+  the amendment explicitly states "No such CLI exists yet in this
+  repository."
+- Evidence for any new validation claim: n/a (no new validation claim made)
+
+### Tests run
+```bash
+source .venv/bin/activate
+python -m pytest tests/test_repo_structure.py tests/test_agent_infrastructure.py -q   # 56 passed
+python -m pytest -q   # 366 passed, 3 skipped
+```
+
+### Validation CLIs run
+```bash
+grep -n "pipeline[.]generate_catalog" docs/REPO_STRUCTURE.md   # no matches (dotted forbidden form absent)
+```
+
+### Known limitations / out of scope
+- No selected-reconstruction CLI was implemented — this commit only
+  updates the repository contract and its guard test ahead of a future
+  implementation phase (Phase 6/7 of the approved plan, not started).
+- The guard's "unscoped marker" scan is a text-content heuristic on any
+  future `pipeline/*.py` file, not a semantic/AST analysis of its actual
+  CLI argument parser; it is deliberately simple and forward-looking, and
+  will need to be revisited once the actual future CLI's argument names
+  are known, without weakening its current forbidding assertions.
+- This is Phase 4 of the issue #20 plan. Per the approved plan, Phases
+  0-4 (baseline, oracle + failure-injection proof, raw-retention/legacy/
+  traceability/versioning design, finalized field/consumer/integrity
+  matrix, and this repository-boundary alignment) are now all complete;
+  compact physical replay schema implementation (Phase 5+) requires the
+  explicit review checkpoint the approved plan calls for before it may
+  begin.
+
+---
+
+## 2026-07-24 — Issue #20 Phases 2–3: raw-retention safety, legacy-v0 inventory, traceability, versioning design, and finalized field/consumer/integrity matrix
+
+### Change summary
+- **Design/documentation only — no code was changed in this commit.** Both
+  phases are documented as new sections appended to
+  `docs/IMPLEMENTATION_AUDIT.md` rather than as two separate commits,
+  because Phase 3's matrix directly builds on and cross-references Phase
+  2's design conclusions (e.g. the `native_payload_hash`/`quality_flags`
+  "unresolved/unproven" status in the matrix is defined by Phase 2's
+  traceability-design and consumer-proof sections) — splitting them into
+  two commits within the same file via interactive patch staging was
+  judged more fragile than a single reviewable append covering both,
+  given both are strictly additive, non-destructive documentation.
+- **Phase 2 — Raw-retention safety contract**: corrected a false assumption
+  from the previously-approved plan. Verified directly in code that
+  `disk_monitor.py::cleanup_old_data()` **already** automatically deletes
+  raw data above `CRYPTO_RECORDER_DISK_SOFT_LIMIT_GB`, and that
+  `get_oldest_date_dir()`'s `venue → channel → symbol → date` glob makes
+  `depth_v2` and `trade_v2` for the same symbol/date independently
+  deletable — i.e. `data_raw` is not retained forever, and the current
+  deletion unit is not atomic across the channels of one logical
+  partition. Documented a 9-point precondition gate (replay
+  exists/complete/checksummed/self-contained/gate-passed, etc.) that must
+  hold before any raw deletion of a corrected, atomic per-partition
+  deletion unit is permitted, fail-closed by default, layered as an
+  additive safety check over the existing (unmodified in this commit)
+  `cleanup_old_data()` mechanism.
+- **Phase 2 — Legacy-v0 inventory design**: documented the
+  rebuildable/not-rebuildable/uncertain classification approach for
+  existing v0 partitions, given that raw availability can no longer be
+  assumed. Non-rebuildable/uncertain partitions are designed to be
+  preserved with the legacy v0 reader kept available indefinitely (not a
+  fixed migration window); reader removal is conditioned on an explicit
+  future inventory run proving zero dependency.
+- **Phase 2 — Traceability design**: documented the planned replacement
+  integrity hierarchy (raw file/chunk checksums → source
+  offset/ordinal → block checksums → published-file checksums →
+  deterministic event-to-source mapping) that must be implemented and
+  proven equivalent-or-stronger than the current per-row
+  `native_payload_hash` before that field may be demoted or removed. This
+  explicitly reverses the prior plan draft's "hash demotion is low risk"
+  framing to "unresolved, pending proof."
+- **Phase 2 — Versioning/`encoding_profile` design**: documented that a
+  missing `schema_version` today means legacy v0 (today's manifest has no
+  version fields at all, verified against `docs/REPLAY_STORE.md`'s
+  manifest example), and designed a new `encoding_profile` manifest field
+  as the build-configuration identity needed for a future
+  deterministic-rebuild proof.
+- **Phase 3 — Finalized field/consumer/integrity matrix**: audited every
+  column of `stores/replay_schema.py`'s current `DEPTH_REPLAY_SCHEMA` and
+  `TRADE_REPLAY_SCHEMA` (verified directly in code) and classified each by
+  writer, current representation, reconstruction consumer, audit/
+  integrity consumer, semantic necessity, partition-constancy, proposed
+  compact representation, and migration concern. No field is approved for
+  removal or repacking by this matrix — every compaction candidate is
+  explicitly gated on a named, not-yet-satisfied proof condition (e.g. the
+  4-condition fixed-point round-trip proof for `bids`/`asks`/`price`/
+  `quantity`, or the consumer-and-semantics proof for `quality_flags`).
+- This entry, together with the Phase 1 oracle (`validation/catalog_compare.py`
+  + `tests/test_semantic_oracle_detects_injected_faults.py`, already
+  committed), constitutes the review-checkpoint evidence the approved plan
+  requires before any compact physical replay schema implementation
+  (Phase 5+) may begin.
+
+### Files/packages touched
+- `docs/IMPLEMENTATION_AUDIT.md` (extended — two new top-level sections)
+- `CHANGELOG.md` (`[Unreleased]` → `Added`)
+- `docs/CHANGE_AUDIT.md` (this entry)
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] docs/REPO_STRUCTURE.md (no folder/file contract change — content
+  added to an existing, already-owned doc, not a new file)
+- [x] docs/PROJECT_STATUS.md (reviewed; no validated/deferred status
+  changed — this is design documentation, not a new validated/deferred
+  claim)
+- [x] docs/IMPLEMENTATION_AUDIT.md (this is the file extended)
+- [x] relevant feature docs:
+  - docs/REPLAY_STORE.md (reviewed; its documented schema/manifest example
+    remains accurate as the *current* v0 state — the new sections in
+    IMPLEMENTATION_AUDIT.md explicitly describe the *planned* future
+    schema/manifest, not a change to what REPLAY_STORE.md documents today)
+  - docs/FULL_L2_REPLAY_CATALOG_PLAN.md (reviewed; no gate status changed)
+
+### Docs updated
+- [x] CHANGELOG.md
+- [x] docs/IMPLEMENTATION_AUDIT.md
+- No further docs update required because: `docs/REPLAY_STORE.md` and
+  `docs/ARCHITECTURE.md` describe the *current* (v0, unchanged) schema and
+  architecture, which remains accurate; the new design content is
+  explicitly forward-looking and lives in `docs/IMPLEMENTATION_AUDIT.md`
+  (the ground-truth/audit-history doc) rather than duplicated elsewhere.
+
+### Status / validation impact
+- Validated status changed: no
+- Deferred status changed: no
+- New claims added: no — every claim in the new sections is explicitly
+  labeled "design only, not implemented" / "planned" / "unresolved" /
+  "unproven," per the honesty-labeling requirement; no capability is
+  claimed as done.
+- Evidence for any new validation claim: n/a (no new validation claim made)
+
+### Tests run
+```bash
+source .venv/bin/activate
+python -m pytest tests/test_agent_infrastructure.py tests/test_repo_structure.py -q   # 56 passed
+python -m pytest -q   # 366 passed, 3 skipped (unchanged from Phase 1 — docs-only change)
+```
+
+### Validation CLIs run
+```bash
+none required beyond the honesty-guard tests above — no schema, config,
+or deployment file was touched; docs/CHANGE_AUDIT.md and CHANGELOG.md
+updates are covered by the standard change-audit compliance check.
+```
+
+### Known limitations / out of scope
+- No code implementing any part of this design (raw-retention gate,
+  legacy-v0 inventory scan, traceability hierarchy, `encoding_profile`
+  field, or schema changes implied by the matrix) was written in this
+  commit — per the approved plan, that requires the Phase 0–4 review
+  checkpoint (this entry plus the already-committed Phase 1 oracle) to be
+  reviewed and approved first.
+- The field/consumer/integrity matrix does not yet cover any *new* fields
+  a future compact schema might introduce (e.g. a mantissa/scale pair) —
+  it only audits what exists in the current `stores/replay_schema.py`,
+  which is the correct scope for a "before you remove/repack anything,
+  prove it" audit.
+- No representative production-day or KovacsTrader-contract verification
+  was performed as part of this design work — the KovacsTrader contract
+  question was already resolved (non-blocking; CryptoRecorder exposes
+  exact logical values via a future versioned `ReplayReader` regardless of
+  physical schema) in the previously-approved plan and is not re-litigated
+  here.
+
+---
+
+## 2026-07-24 — Issue #20 Phase 1: semantic-oracle coverage audit, missing comparisons, failure-injection proof
+
+### Change summary
+- Coverage-audited `validation/catalog_compare.py` against the issue #20
+  full semantic-equivalence contract (instrument identity/precision;
+  ordered TradeTicks; ordered OrderBookDeltas incl. actions/sides/prices/
+  sizes/flags/sequence/timestamps; snapshot seeds; clear/reset; sync/
+  desync/resync; continuity gaps/fenced ranges; session/day boundaries;
+  Depth10; quality-flag behavior; deterministic book-state checkpoints).
+  Found the existing comparators already cover: TradeTicks, OrderBookDeltas
+  (incl. CLEAR/snapshot flags since `action`/`flags` are compared fields),
+  Depth10, and 7-checkpoint deterministic book-state reconstruction.
+- Identified and closed five gaps that the pre-existing comparators could
+  not detect, because none of the corresponding data is visible in the
+  Nautilus catalog objects themselves:
+  - `compare_instruments_semantic()` (new) — the prior `load_instrument_ids()`
+    only compared the *set* of instrument ids; it could not detect a wrong
+    `price_precision`/`size_precision`/`price_increment`/`size_increment`
+    on an otherwise-correctly-named instrument, which would silently
+    corrupt exact-decimal reconstruction downstream.
+  - `compare_continuity_diagnostics_semantic()` (new) — compares
+    snapshot-seed/resync/desync/fenced-range **counts** between the
+    reference route's `convert_day.py` `per_symbol_depth` report and the
+    candidate route's `validation/replay_catalog_reconstruct.py` manifest
+    `depth_diagnostics` section. Both originate from the same shared
+    `converter.depth_phase2.Phase2ReplayMetrics` dataclass, but the two
+    call sites independently renamed the aggregated fields (e.g.
+    `resync_count` vs. `resyncs`, `fenced_ranges` count vs.
+    `fenced_range_count`) — the new comparator normalizes both naming
+    conventions rather than assuming either one.
+  - `compare_fenced_ranges_semantic()` (new) — per-fence content
+    comparison (venue/symbol/start/end/severity/reason), not just a count,
+    for routes/versions that expose the fence list (the candidate manifest
+    already does via `manifest["fenced_ranges"]`).
+  - `compare_quality_flags_semantic()` (new) — compares `quality_flags` by
+    decoded JSON content (a multiset of parsed values), not raw string
+    equality, since the replay schema stores it as a JSON-encoded string
+    that could differ in key order/whitespace without differing
+    semantically.
+- Added `tests/test_semantic_oracle_detects_injected_faults.py` (19 tests):
+  for each required fault class, starts from an otherwise-passing synthetic
+  reference/candidate pair and injects exactly one deliberate corruption,
+  asserting the relevant comparator flips from `passed=True` to
+  `passed=False`. Covers: wrong trade price, wrong trade timestamp, dropped
+  trade, dropped delta, wrong sequence number, wrong flag, wrong side,
+  missing snapshot-seed/CLEAR delta, wrong Depth10 level, a mismatched
+  deterministic book-state checkpoint (plus a matching-checkpoints sanity
+  check), wrong instrument precision, a missing instrument, wrong
+  snapshot/resync/desync/fenced-range counts (three separate injected-count
+  tests), a missing fenced range by content, and a corrupted quality-flag
+  value.
+- Added a structural independence test
+  (`test_reference_and_candidate_decoders_are_independently_implemented`)
+  proving `validation/catalog_compare.py` does not import
+  `stores.replay_depth_adapter`/`stores.replay_reader`/`stores.replay_writer`,
+  and `stores/replay_depth_adapter.py` does not import
+  `validation.catalog_compare` — i.e. the oracle and the candidate's
+  schema-specific decoding logic cannot silently share a bug through a
+  direct import dependency. The only intentionally shared component
+  remains `converter/depth_phase2.py`'s book-replay engine (unchanged,
+  already the documented shared component per
+  `docs/IMPLEMENTATION_AUDIT.md`).
+- No compact replay schema, builder, staging-cleanup, or raw-retention
+  behavior was implemented or changed in this commit — this is oracle
+  hardening only, per the plan's requirement that the oracle be proven
+  before any schema code is written.
+
+### Files/packages touched
+- `validation/catalog_compare.py` (extended — 5 new comparison functions)
+- `tests/test_semantic_oracle_detects_injected_faults.py` (new — 19 tests)
+- `CHANGELOG.md` (`[Unreleased]` → `Added`)
+- `docs/CHANGE_AUDIT.md` (this entry)
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] docs/REPO_STRUCTURE.md (no folder/file contract change —
+  `validation/` already owns `catalog_compare.py`)
+- [x] docs/PROJECT_STATUS.md (no validated/deferred status changed — the
+  oracle is validation *tooling*; it does not itself change the `full_l2`
+  validated/deferred gate status)
+- [x] docs/IMPLEMENTATION_AUDIT.md (reviewed; no ground-truth claim changed)
+- [x] relevant feature docs:
+  - docs/VALIDATION.md (reviewed; existing `validate_catalog_equivalence`
+    CLI description remains accurate — new comparison functions are
+    additive library functions, not yet wired into the CLI's default
+    profile output; that wiring is deferred to the schema-implementation
+    phase per the approved plan, since it depends on which manifest/report
+    fields the finalized schema actually produces)
+
+### Docs updated
+- [x] CHANGELOG.md
+- No docs update required because: this is additive comparator tooling
+  with no new CLI surface and no status/gate change; the existing
+  `docs/VALIDATION.md` description of `validate_catalog_equivalence` and
+  `catalog_compare` remains accurate.
+
+### Status / validation impact
+- Validated status changed: no
+- Deferred status changed: no
+- New claims added: no — this proves the *oracle* detects injected faults
+  in synthetic data; it does not itself constitute a new semantic-
+  equivalence validation run against real data, and does not change the
+  `full_l2`/v2.0.0 gate status.
+- Evidence for any new validation claim: n/a (no new validation claim made)
+
+### Tests run
+```bash
+source .venv/bin/activate
+python -m pytest tests/test_semantic_oracle_detects_injected_faults.py -q   # 19 passed
+python -m pytest tests/test_catalog_equivalence.py tests/test_catalog_equivalence_full_l2.py \
+  tests/test_semantic_equivalence.py tests/test_replay_catalog_reconstruct.py -q   # 11 passed, 1 skipped
+python -m pytest -q   # 366 passed, 3 skipped
+```
+
+### Validation CLIs run
+```bash
+none required for this change type — no schema, config, or deployment
+file was touched; the new comparison functions are exercised directly by
+the new pytest suite above.
+```
+
+### Known limitations / out of scope
+- The new comparison functions are not yet wired into
+  `validation/validate_catalog_equivalence.py`'s default output — that
+  integration is deferred until the compact schema (Phase 5+, not started
+  in this session) determines the exact manifest/report field shapes to
+  compare against.
+- `compare_fenced_ranges_semantic()` is forward-looking on the reference
+  side: `convert_day.py`'s own per-symbol report today only exposes a
+  fenced-range *count*, not the per-fence list — the content-level
+  comparator is exercised here against synthetic data and is ready for the
+  reference side once/if a per-fence list is exported there; until then,
+  `compare_continuity_diagnostics_semantic()`'s count-level comparison is
+  the one actually usable against today's `convert_day.py` output.
+- No representative production-day or even local real-data (Tier 2) run of
+  the extended oracle was performed in this session — per the approved
+  plan, Tier 3 requires production-server access this session does not
+  have; this Phase 1 work is proven only against synthetic (Tier 1) data,
+  which is exactly what "prove the oracle before using it as a gate" is
+  meant to establish.
+
+---
+
+## 2026-07-24 — Issue #20 Phase 0: baseline storage-audit breakdown (allocated/apparent, per-unit, root-wide scratch scan)
+
+### Change summary
+- Extended `validation/audit_storage_size.py` (audit-only, no build/transform
+  logic added) to report **allocated** bytes (`st_blocks * 512`) alongside
+  the existing **apparent** bytes (`st_size`) for every measured component,
+  since sparse/compressed filesystems can make these differ meaningfully —
+  the issue #20 size-acceptance gate requires both, not just one.
+- Added per-trade, per-depth-event, and per-depth-level byte estimates,
+  computed from a partition's `manifest.json` record counts plus an exact
+  depth-level count read via `pyarrow.parquet.ParquetFile.iter_batches()`.
+  These are explicitly labeled orientation-only in the report `note` field:
+  depth events carry a varying number of book levels, so a flat "bytes per
+  replay row" average (as used in the issue's own ≈39.7/≈15.9 bytes/row
+  orientation figures) can be misleading on its own.
+- Added `audit_scratch_bytes()` and a new `--scratch-only` CLI mode: a
+  **root-wide** scan of `.staging_*` / `.backup_*` / `.quarantine_*`
+  directories under `replay_root/venue=*/symbol=*/`, independent of any
+  single venue/symbol/date being queried. This directly targets the known
+  gap where the existing builder only checks the *current* build's own
+  `.staging_{date}_{symbol}` path (confirmed in
+  `pipeline/build_replay_store.py` and `stores/replay_writer.py`), which is
+  why the real BANKUSDT `2026-07-21` staging orphan was never rediscovered
+  by later BANKUSDT builds for other dates. This CLI **only measures** —
+  it does not delete, quarantine, or otherwise mutate any discovered
+  directory. No lifecycle/cleanup logic was added or changed.
+- Missing manifests, zero record counts, and missing/unreadable
+  `depth.parquet` files all report `None` for the affected per-unit metric
+  (never a false `0`), consistent with the repo's existing
+  fail-visibly-not-silently-zero convention used elsewhere (e.g.
+  `disk_monitor.py`'s `DirectoryMeasurement`).
+- This is Phase 0 ("reproducible baseline") of the issue #20 compact-replay-
+  storage plan. No replay schema (`stores/replay_schema.py`), builder
+  (`pipeline/build_replay_store.py`), staging-cleanup, or raw-retention
+  behavior was touched — this change is read-only measurement tooling.
+
+### Files/packages touched
+- `validation/audit_storage_size.py` (extended)
+- `tests/test_audit_storage_size.py` (new — 11 tests)
+- `CHANGELOG.md` (`[Unreleased]` → `Added`)
+- `docs/CHANGE_AUDIT.md` (this entry)
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] docs/REPO_STRUCTURE.md (no folder/file contract change — `validation/`
+  already owns `audit_storage_size.py`; no new top-level package added)
+- [x] docs/PROJECT_STATUS.md (no validated/deferred status changed by this
+  measurement-only change)
+- [x] docs/IMPLEMENTATION_AUDIT.md (no ground-truth claim changed)
+- [x] relevant feature docs:
+  - docs/FULL_L2_REPLAY_CATALOG_PLAN.md (reviewed; no gate status changed)
+  - docs/VALIDATION.md (reviewed; `audit_storage_size` CLI reference
+    remains accurate — flags added are additive, existing usage unchanged)
+
+### Docs updated
+- [x] CHANGELOG.md
+- No docs update required because: this is an additive, backward-compatible
+  extension to an existing audit-only CLI (no new CLI, no schema change, no
+  status/gate change); `docs/VALIDATION.md`'s existing description of
+  `audit_storage_size` remains accurate without edits.
+
+### Status / validation impact
+- Validated status changed: no
+- Deferred status changed: no
+- New claims added: no — this is instrumentation only; it does not itself
+  claim any storage-size reduction or gate result. The issue #20 plan's
+  Tier-3 (representative-day) gate still requires production-server
+  execution, which this change does not perform.
+- Evidence for any new validation claim: n/a (no new validation claim made)
+
+### Tests run
+```bash
+source .venv/bin/activate
+python -m pytest tests/test_audit_storage_size.py -q   # 11 passed
+python -m pytest tests/test_repo_structure.py tests/test_agent_infrastructure.py -q   # 56 passed
+python -m pytest -q                                     # 347 passed, 3 skipped
+```
+
+### Validation CLIs run
+```bash
+python -m validation.audit_storage_size --venue BINANCE_SPOT --symbol ADAUSDT --date 2026-06-12 \
+  --replay-root <local test fixture> --json   # exercised via tests/test_audit_storage_size.py
+```
+`python -m validation.audit_change_compliance --staged` was not run in this
+session because commit staging is out of scope for this plan-mode-derived
+implementation increment (task only requested "start implementation", not
+committing); this entry documents the change ahead of any future commit so
+the compliance check can be run at commit time.
+
+### Known limitations / out of scope
+- No replay schema, builder lifecycle, staging cleanup, raw-retention gate,
+  semantic-oracle hardening, or reconstruction CLI work was implemented in
+  this increment — per the reviewed issue #20 plan, those require the
+  Phase 0–4 review checkpoint (semantic oracle + failure-injection proof +
+  field/consumer/integrity matrix + raw-retention/legacy/traceability
+  design) to complete and be reviewed before any schema code is written.
+- Per-column (individual Parquet field) byte-contribution estimation is not
+  yet implemented — only per-trade/per-depth-event/per-depth-level
+  aggregates are provided. A true per-column breakdown (e.g. via Parquet
+  column-chunk metadata) is deferred to a follow-up within Phase 0.
+- No representative production-day (Tier 3: 2026-07-22 or 2026-07-23) data
+  was measured — this workspace only has local raw data for
+  2026-06-10..12; running this CLI against a real production day requires
+  server access, per the plan's own Tier-3 logistics note.
+- `--scratch-only` is measurement-only; no quarantine/deletion lifecycle was
+  implemented — that remains future work per the plan's fail-closed staging
+  lifecycle design (Phase 11 of the reviewed plan).
+
+---
+
+## 2026-07-23 — Correction: bound the daily replay-build timeout at 23h instead of infinity
+
+### Change summary
+- Corrects the immediately-preceding 2026-07-23 entry below ("Remove 1-hour
+  systemd start timeout on replay-build service"), which set
+  `TimeoutStartSec=infinity`. That entry is **not** rewritten (append-only
+  history); this entry supersedes its conclusion.
+- `systemd/cryptorecorder-replay-build.service`: `TimeoutStartSec` changed
+  from `infinity` to `23h`. Rationale: the daily timer fires once at `01:00
+  UTC`; systemd does not start a new instance of a service while an existing
+  invocation is still active. An unbounded timeout could therefore let a
+  genuinely stuck job remain active indefinitely, silently blocking every
+  later scheduled run — a worse failure mode than the original 1-hour cap
+  being too short. `23h` gives ample room for a long daily build of the
+  previous completed UTC day across a large symbol universe, while still
+  guaranteeing systemd terminates a stuck/hung run before the next `01:00
+  UTC` activation. `Restart=no`, `RestartSec=300`,
+  `StartLimitIntervalSec=86400`, `StartLimitBurst=3`, and `MemoryMax` are
+  all unchanged.
+- `systemd/cryptorecorder-replay-build.service` comments: corrected to no
+  longer claim the installed daily service performs `--force` rebuilds or
+  arbitrary multi-day backfills. The installed service only ever builds the
+  previous completed UTC day via `pipeline.daily_build --date yesterday`;
+  manual force rebuilds/backfills use the documented CLI or a separately
+  controlled transient systemd scope with its own explicit timeout.
+- `systemd/cryptorecorder-replay-build.timer`: removed the stale comment
+  "Run after the legacy converter has had time to finish the previous UTC
+  day" (converter systemd automation was removed from the supported
+  architecture in an earlier PR #18 commit). Replaced with "Run at 01:00
+  UTC, after the previous UTC recording day has closed."
+- `docs/OPERATIONS.md`: rewrote the "Start timeout" and "Durable progress on
+  restart" paragraphs in "Replay-build memory and restart behaviour" to
+  describe the `23h` contract (not `infinity`), the explicit tradeoff (1h
+  too short / infinity rejected / 23h chosen), what happens if the ceiling
+  is reached (systemd marks invocation failed, no restart per `Restart=no`,
+  operator must inspect journal and rerun manually), and that manual force
+  rebuilds/backfills are a separate, manually-run CLI/scope action, not part
+  of the installed daily service.
+- `CHANGELOG.md`: corrected the `[Unreleased]` "Changed" entry (still
+  unreleased, so edited in place rather than appended twice) to describe
+  the final `23h` value, the infinity-considered-and-rejected tradeoff, the
+  timer comment fix, and the corrected installed-service contract
+  description.
+- No Python source, recorder behavior, raw/replay schema, replay ordering,
+  reconstruction, converter automation, KovacsTrader integration, Syncthing,
+  or issue #20 uv work was touched.
+
+### Files/packages touched
+- `systemd/cryptorecorder-replay-build.service`
+- `systemd/cryptorecorder-replay-build.timer`
+- `docs/OPERATIONS.md`
+- `CHANGELOG.md`
+- `docs/CHANGE_AUDIT.md`
+- `tests/test_agent_infrastructure.py` (5 new lightweight systemd-contract tests)
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] docs/REPO_STRUCTURE.md (no folder/file contract change)
+- [x] docs/OPERATIONS.md
+- [x] docs/PROJECT_STATUS.md (no validated/deferred status affected)
+
+### Docs updated
+- [x] CHANGELOG.md (corrected in place; still `[Unreleased]`)
+- [x] docs/OPERATIONS.md
+- No docs/PROJECT_STATUS.md update required because: operational systemd
+  tuning correction, not a validated/deferred status change.
+
+### Status / validation impact
+- Validated status changed: no
+- Deferred status changed: no
+- New claims added: no
+- No production validation is claimed: the 23h ceiling has not been
+  exercised against an actual long-running production build on a real
+  server; this remains a deployment-time observation, not something
+  asserted as already proven here.
+
+### Tests run
+```bash
+pytest tests/test_agent_infrastructure.py -q   # 33 passed (5 new)
+pytest tests/test_repo_structure.py -q         # 23 passed
+pytest -q                                       # 336 passed, 3 skipped
+```
+
+### Validation CLIs run
+```bash
+python -m validation.audit_change_compliance --base main   # PASS
+bash -n scripts/deploy_linux_server.sh                       # OK (no output)
+./scripts/deploy_linux_server.sh --target all --dry-run
+  # Clean; only cryptorecorder-recorder.service,
+  # cryptorecorder-replay-build.service, cryptorecorder-replay-build.timer
+  # planned; no converter unit referenced.
+systemd-analyze verify systemd/cryptorecorder-replay-build.service
+  # Fails on this dev machine only: unit references the production path
+  # /home/zsom/services/CryptoRecorder/.venv/bin/python, which does not
+  # exist here. Pre-existing condition unrelated to this change (confirmed
+  # via git diff that only the TimeoutStartSec/comment block changed).
+systemd-analyze verify systemd/cryptorecorder-replay-build.timer
+  # Exit 0. One pre-existing warning ("Unknown key name 'Timezone' in
+  # section 'Timer', ignoring") on a line this change did not touch
+  # (confirmed via git diff — only the OnCalendar comment line changed).
+```
+
+### Known limitations / out of scope
+- No real production host run was performed to observe a >1h build
+  completing under the new 23h ceiling; this is a systemd configuration
+  correction, not a runtime-validated claim.
+- The prior 2026-07-23 audit entry describing `TimeoutStartSec=infinity` is
+  left as historical record per the append-only policy; it is superseded by
+  this entry, not deleted or edited.
+
+## 2026-07-23 — Remove 1-hour systemd start timeout on replay-build service
+
+### Change summary
+- `systemd/cryptorecorder-replay-build.service`: `TimeoutStartSec` changed
+  from `3600` (1 hour) to `infinity`. The unit is `Type=oneshot`; systemd
+  treats a `oneshot` unit as "hung" if it has not exited before
+  `TimeoutStartSec` elapses and will `SIGTERM`/`SIGKILL` it. A finite 1-hour
+  cap risked systemd killing an in-progress, otherwise-healthy replay build
+  (e.g. a `--force` rebuild, a large multi-day backfill, or a run across the
+  full top50 universe) purely for exceeding the wall-clock budget, not for
+  any actual failure. `Restart=no`, `RestartSec=300`, and
+  `StartLimitIntervalSec=86400`/`StartLimitBurst=3` in `[Unit]` are
+  unchanged — restart-attempt capping is unaffected; only the single-run
+  maximum duration is removed.
+- `docs/OPERATIONS.md`: added a new "Start timeout" paragraph in the
+  "Replay-build memory and restart behaviour" section explaining the
+  `TimeoutStartSec=infinity` setting, why the previous 1-hour value was
+  risky, and that `StartLimitIntervalSec`/`StartLimitBurst` still bound
+  restart attempts (not run duration).
+- `CHANGELOG.md`: added an `[Unreleased]` "Changed" entry documenting the
+  value change and rationale, cross-referencing the `docs/OPERATIONS.md`
+  section.
+- No change needed in `INSTALL.md`, `docs/REPLAY_STORE.md`, or
+  `scripts/deploy_linux_server.sh`: none of them hardcode or document the
+  specific `TimeoutStartSec` value; `INSTALL.md`'s manual-install steps just
+  copy/render the unit file as-is via `sed`, so the new value propagates
+  automatically.
+- No test asserted the old `3600` value (verified via repo-wide grep), so no
+  test changes were required.
+
+### Files/packages touched
+- `systemd/cryptorecorder-replay-build.service`
+- `docs/OPERATIONS.md`
+- `CHANGELOG.md`
+- `docs/CHANGE_AUDIT.md`
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] docs/REPO_STRUCTURE.md (no folder/file contract change — same file, edited in place)
+- [x] docs/OPERATIONS.md
+- [x] docs/PROJECT_STATUS.md (no validated/deferred status affected)
+- [x] INSTALL.md (confirmed no hardcoded timeout value to update)
+- [x] docs/REPLAY_STORE.md (confirmed no mention of this setting)
+
+### Docs updated
+- [x] CHANGELOG.md
+- [x] docs/OPERATIONS.md
+- No docs/PROJECT_STATUS.md update required because: this is an operational
+  systemd tuning change, not a validated/deferred status change.
+- No docs/REPO_STRUCTURE.md update required because: no files added, moved,
+  or removed.
+
+### Status / validation impact
+- Validated status changed: no
+- Deferred status changed: no
+- New claims added: no
+
+### Tests run
+```bash
+pytest -q   # 331 passed, 3 skipped
+```
+
+### Validation CLIs run
+```bash
+systemd-analyze verify systemd/cryptorecorder-replay-build.service
+  # Fails on this dev machine only because the unit references the production
+  # path /home/zsom/services/CryptoRecorder/.venv/bin/python, which does not
+  # exist here. Pre-existing condition unrelated to this change (confirmed
+  # the same failure occurs on the unmodified file too); TimeoutStartSec=infinity
+  # itself introduces no new parse/verify error.
+python -m validation.audit_change_compliance --staged   # PASS
+```
+
+### Known limitations / out of scope
+- Not verified on an actual production host that a long-running (>1 hour)
+  build now completes without being killed — this dev-machine change only
+  removes the systemd-side cap; real long-duration production verification
+  remains a separate deployment-time check.
+
+## 2026-07-22 — Follow-up 3: fix FileNotFoundError in stale-staging-cleanup test finally block
+
+### Change summary
+- Codex, running as root inside a container, found that
+  `test_stale_staging_cleanup_fails_closed` in
+  `tests/test_replay_memory_bounded.py` fails: when `shutil.rmtree` succeeds
+  despite the removed write bit (root ignores the write-permission check
+  that normally blocks the delete on a non-root user), the test's own
+  `finally` block still unconditionally calls `staging_dir.chmod(...)` on a
+  directory that no longer exists, raising `FileNotFoundError` and turning a
+  passing regression test into a failure in that environment. This
+  contradicted the audit-entry claim of a full, reliable suite pass.
+- `tests/test_replay_memory_bounded.py`: guarded the `finally` block with
+  `if staging_dir.exists():` before calling `chmod`, so the cleanup is a
+  no-op (not an error) when `rmtree` already removed the directory.
+- Verified the fix logic directly with a standalone script that reproduces
+  the "directory already gone" condition and confirms the guarded chmod no
+  longer raises. Could not literally re-run as root on this dev machine (no
+  passwordless sudo available), but the guard is unconditionally correct:
+  `chmod` on a path is only ever attempted if it still exists.
+
+### Files/packages touched
+- `tests/test_replay_memory_bounded.py`
+- `docs/CHANGE_AUDIT.md`
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] docs/REPO_STRUCTURE.md
+
+### Docs updated
+- No docs update required because: test-only fix, no status/API/schema change.
+- CHANGELOG not required because: this is a test-infrastructure-only fix (a
+  regression test's own cleanup logic), with no user-facing behavior, API,
+  schema, or status change.
+
+### Status / validation impact
+- Validated status changed: no
+- Deferred status changed: no
+
+### Tests run
+```bash
+pytest tests/test_replay_memory_bounded.py -q   # 47 passed
+pytest -q                                        # 331 passed, 3 skipped
+```
+
+### Validation CLIs run
+```bash
+python -m validation.audit_change_compliance --base main   # PASS
+```
+
+### Known limitations / out of scope
+- Not re-verified under an actual root/container environment on this
+  machine (no privileged access available); fix was validated via isolated
+  logic simulation instead of the full pytest run as root.
+
+## 2026-07-22 — Follow-up 2: add exact wording-variant checks Codex asked for
+
+### Change summary
+- Codex reviewed commit `1f7a3f2` (superseded by `a0fe13b`, which already
+  reworded the stale `CHANGELOG.md` sentence) and asked that the guard test
+  also check the literal substrings `"template files remain in the repo"`
+  and `"remain in the repo as manual/reference templates"` (after whitespace
+  normalization), rather than relying only on the proximity regex added in
+  the prior follow-up.
+- `tests/test_repo_structure.py::test_docs_do_not_claim_deleted_converter_systemd_files_exist`:
+  added those two exact phrases (plus `"remain in the repo as manual"`) to
+  `forbidden_normalized_phrases`, in addition to the existing regex, so the
+  check is both explicit/auditable and resilient to further rewording.
+- Re-confirmed via `grep_search` across all `*.md` files that the only
+  remaining occurrence of `"template files remain in the repo as
+  manual/reference templates"` is the intentionally-quoted historical
+  narration inside the append-only `docs/CHANGE_AUDIT.md` log entry below
+  (exempted from the check by design), not any current-state doc.
+
+### Files/packages touched
+- `tests/test_repo_structure.py`
+- `docs/CHANGE_AUDIT.md`
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] docs/REPO_STRUCTURE.md
+- [x] CHANGELOG.md (re-confirmed no stale current-state claim remains)
+
+### Docs updated
+- No further CHANGELOG.md/IMPLEMENTATION_AUDIT.md changes needed: already
+  correct from the prior follow-up commit (`a0fe13b`).
+
+### Status / validation impact
+- Validated status changed: no
+- Deferred status changed: no
+
+### Tests run
+```bash
+pytest tests/test_repo_structure.py -q   # 23 passed
+pytest -q                                 # 331 passed, 3 skipped
+```
+
+### Validation CLIs run
+```bash
+python -m validation.audit_change_compliance --base main   # PASS
+```
+
+### Known limitations / out of scope
+- No code changes in this follow-up; test hardening only.
+
+## 2026-07-22 — Follow-up: stale converter-template claim also present in an older CHANGELOG.md entry
+
+### Change summary
+- Codex flagged that the `[Unreleased]` CHANGELOG.md entry immediately below
+  the corrected one still said (about `INSTALL.md`'s note): "the converter
+  systemd template files remain in the repo as manual/reference templates
+  only and must not be installed on the production server." This wording
+  differs from the phrases the previous session's guard test checked for
+  ("kept in the repo as manual..." / "converter systemd templates remain"),
+  so it slipped through unnoticed.
+- `CHANGELOG.md`: reworded that older entry to describe the note as a
+  point-in-time historical fact ("at the time of this change... those unit
+  files were subsequently **deleted** in a later PR #18 finalization
+  commit... `INSTALL.md` no longer contains that note") instead of present
+  tense current-state language.
+- `docs/IMPLEMENTATION_AUDIT.md` lines 493-495: re-checked; already correctly
+  states the files "were deleted from the repository in PR #18 finalization"
+  from the prior session's fix. No further change needed there.
+- `tests/test_repo_structure.py::test_docs_do_not_claim_deleted_converter_systemd_files_exist`:
+  broadened from an exact-phrase list to also match a proximity regex
+  (`convert(er)? ... remain ... repo|manual`) so future wording variants of
+  the same stale claim are caught. Verified the new regex matches the
+  original stale sentence via a standalone sanity check before relying on it.
+
+### Files/packages touched
+- `CHANGELOG.md`
+- `tests/test_repo_structure.py`
+- `docs/CHANGE_AUDIT.md`
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] docs/REPO_STRUCTURE.md
+- [x] docs/IMPLEMENTATION_AUDIT.md (re-verified lines 480-505, already correct)
+- [x] CHANGELOG.md (full file grepped for remaining stale phrasing)
+
+### Docs updated
+- [x] CHANGELOG.md
+- No docs/PROJECT_STATUS.md update required: validated/deferred status unchanged
+- No docs/IMPLEMENTATION_AUDIT.md change needed: already correct
+
+### Status / validation impact
+- Validated status changed: no
+- Deferred status changed: no
+- New claims added: no
+
+### Tests run
+```bash
+pytest tests/test_repo_structure.py -q   # 23 passed
+pytest -q                                 # 331 passed, 3 skipped
+```
+
+### Validation CLIs run
+```bash
+python -m validation.audit_change_compliance --base main   # PASS
+```
+
+### Known limitations / out of scope
+- No code changes in this follow-up; documentation + guard-test only.
+
+## 2026-07-22 — PR #18 final Codex findings: post-publish validation, cleanup-failure preservation, force-rebuild backup safety, converter doc consistency
+
+### Change summary
+- `stores/replay_writer.py`: extracted `validate_partition(partition_dir)` as a
+  single shared source of truth for partition validity (manifest exists,
+  parses, `status == "complete"`, both parquet files exist, checksums match).
+  `publish()` now calls it immediately after `os.replace(staging, output)`
+  succeeds. If validation fails, the invalid new output is quarantined to
+  `.quarantine_{date}_{symbol}`, the previous valid backup (if any) is
+  restored to canonical, and `publish()` raises `RuntimeError` instead of
+  returning normally — closing the P1 gap where a missing/corrupt post-replace
+  destination could still report `status="success"`. The obsolete backup is
+  now deleted only *after* the new canonical partition validates (never
+  before).
+- `pipeline/build_replay_store.py`: `_partition_is_valid()` now delegates to
+  `stores.replay_writer.validate_partition()` instead of duplicating checksum
+  logic, so ReplayWriter's post-publish check and the skip-if-valid/crash-
+  recovery check can never disagree about what "valid" means.
+- `pipeline/build_replay_store.py`: the primary-failure exception handler in
+  `build_replay_for_symbol()` now wraps `writer.cleanup_staging()` in its own
+  `try/except`. A secondary cleanup failure is appended to `status["errors"]`
+  alongside the primary failure instead of escaping and replacing the handled
+  per-symbol result — closing the P1 gap where `run_build_replay_store()`
+  could stop mid-loop on a cleanup exception.
+- `pipeline/build_replay_store.py`: removed the `force=True` pre-build block
+  that blindly deleted `.backup_*` before any replacement had been built or
+  validated. `recover_partition_state()` now runs unconditionally (even under
+  `force=True`); a `fail` action (ambiguous/invalid states) still fails
+  closed under `--force`, and a `skip` action under `force=True` falls through
+  to rebuild instead of returning `skipped` — but no longer deletes the
+  backup pre-emptively. The existing `publish()` backup<-canonical<-staging
+  rotation now naturally protects the last known-good copy through forced
+  rebuild failures.
+- `docs/IMPLEMENTATION_AUDIT.md`: corrected the current-state claim that
+  `systemd/cryptorecorder-convert.service`/`.timer` "are kept in the repo as
+  manual/reference templates" — they were deleted in PR #18 finalization.
+- `CHANGELOG.md`: reworded a quoted description of the old INSTALL.md note so
+  it no longer contains the literal stale-claim phrase itself.
+- `tests/test_repo_structure.py`: added
+  `test_docs_do_not_claim_deleted_converter_systemd_files_exist()` — a guard
+  test asserting both converter unit files stay deleted and that no
+  current-state doc (excluding the append-only `docs/CHANGE_AUDIT.md` log)
+  claims they still exist as manual/reference templates.
+- `tests/test_replay_memory_bounded.py`: 13 new tests covering post-publish
+  validation (normal success, fault-injected missing output, corrupt
+  manifest, checksum mismatch, backup-not-deleted-until-validated, backup
+  still deleted on validated success), cleanup-failure preservation (single
+  symbol + multi-symbol continuation), and all 5 required `--force` rebuild
+  scenarios (valid/no-backup success and failure, missing-canonical/valid-
+  backup success and failure, invalid-canonical/valid-backup preserved).
+
+### Files/packages touched
+- `stores/replay_writer.py`
+- `pipeline/build_replay_store.py`
+- `tests/test_replay_memory_bounded.py`
+- `tests/test_repo_structure.py`
+- `docs/IMPLEMENTATION_AUDIT.md`
+- `CHANGELOG.md`
+- `docs/CHANGE_AUDIT.md`
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] docs/REPO_STRUCTURE.md
+- [x] docs/PROJECT_STATUS.md
+- [x] docs/IMPLEMENTATION_AUDIT.md
+- [x] relevant feature docs: docs/REPLAY_STORE.md, docs/DAILY_BUILD_PIPELINE.md
+
+### Docs updated
+- [x] CHANGELOG.md
+- [x] docs/IMPLEMENTATION_AUDIT.md
+- No docs/PROJECT_STATUS.md update required: validated/deferred status unchanged
+- No docs/REPO_STRUCTURE.md update required: no folder/file contract change
+  (no files added or removed in this pass — the converter systemd files were
+  already deleted in the prior commit)
+
+### Status / validation impact
+- Validated status changed: no
+- Deferred status changed: no
+- New claims added: no
+- Evidence: n/a — correctness/safety fixes with no new validation paths
+
+### Tests run
+```bash
+pytest tests/test_replay_memory_bounded.py -q     # 47 passed
+pytest tests/test_daily_build.py -q                # 9 passed
+pytest tests/test_replay_store.py -q               # 3 passed
+pytest tests/test_replay_catalog_reconstruct.py -q # 4 passed
+pytest tests/test_catalog_equivalence_full_l2.py -q # 2 passed
+pytest tests/test_agent_infrastructure.py -q        # 28 passed
+pytest tests/test_repo_structure.py -q              # 23 passed
+pytest -q                                           # 331 passed, 3 skipped
+```
+
+### Validation CLIs run
+```bash
+python -m validation.audit_change_compliance --base main   # PASS
+bash -n scripts/deploy_linux_server.sh                       # OK (no output = valid syntax)
+systemd-analyze verify systemd/cryptorecorder-replay-build.service
+  # Fails on this dev machine: references production path
+  # /home/zsom/services/CryptoRecorder/.venv/bin/python, which does not exist
+  # here. Pre-existing condition unrelated to this change; not a regression.
+./scripts/deploy_linux_server.sh --target all --dry-run
+  # Confirms only cryptorecorder-recorder.service,
+  # cryptorecorder-replay-build.service, cryptorecorder-replay-build.timer are
+  # targeted; no converter unit referenced.
+```
+
+### Known limitations / out of scope
+- Real Linux production service validation (actual systemd start/enable on
+  the production host) was not performed and is out of scope for a dev-machine
+  change; noted as pending in the PR comment.
+- No changes to recorder.py, raw schema, replay schema, replay ordering,
+  Nautilus reconstruction, Syncthing, KovacsTrader integration, or the uv
+  migration (issue #20).
+- Merge remains deferred; this change is pushed to
+  `refactor/recorder-replay-only` only.
+
+## 2026-07-22 — PR #18 finalization: fail-closed crash-recovery state machine, best-effort backup deletion, converter systemd files deleted
+
+### Change summary
+- `pipeline/build_replay_store.py`: extracted `recover_partition_state()` helper
+  handling all 7 filesystem state combinations (Cases A-G). Old inline crash-recovery
+  only handled Case A and silently dropped invalid backups. New helper handles:
+  Case A (restore valid backup), Case B (fail on invalid backup + no output),
+  Case C (skip + remove stale backup), Case D (quarantine invalid + restore backup),
+  Case E (both invalid, fail and preserve), Case F (valid, no backup, skip),
+  Case G (missing, no backup, rebuild). `build_replay_for_symbol()` now calls this
+  helper instead of inline ad-hoc checks.
+- `pipeline/build_replay_store.py`: backup deletion after successful
+  `os.replace(staging, output)` is now best-effort — failure logs a warning and
+  does NOT re-raise. Previously any backup deletion exception was propagated,
+  turning a successful publication into a build failure.
+- `pipeline/build_replay_store.py`: all `status["status"] = "error"` replaced
+  with `"failed"` — `pipeline.daily_build` counts `r["status"] == "failed"`;
+  the old `"error"` value was silently excluded from the failed-partition count.
+- `systemd/cryptorecorder-convert.service` and `systemd/cryptorecorder-convert.timer`
+  deleted from the repository — converter systemd automation is not part of the
+  supported production architecture. The deploy script already stops/removes any
+  installed converter units (unchanged).
+- `INSTALL.md`: updated `> **Note:**` to correctly state that the converter systemd
+  files were deleted, not "kept as templates".
+- `docs/OPERATIONS.md`: updated converter unit reference from "is not installed" to
+  "deleted from the repository in PR #18".
+- `docs/REPO_STRUCTURE.md`: added amendment log entry for deletion of converter
+  systemd files.
+- `tests/test_replay_memory_bounded.py`: 10 new regression and failure injection tests
+  covering Cases A-G, best-effort backup deletion, and fail-closed scratch cleanup.
+
+### Files/packages touched
+- `pipeline/build_replay_store.py`
+- `systemd/cryptorecorder-convert.service` (deleted)
+- `systemd/cryptorecorder-convert.timer` (deleted)
+- `tests/test_replay_memory_bounded.py`
+- `INSTALL.md`
+- `CHANGELOG.md`
+- `docs/CHANGE_AUDIT.md`
+- `docs/OPERATIONS.md`
+- `docs/REPO_STRUCTURE.md`
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] docs/REPO_STRUCTURE.md
+- [x] docs/PROJECT_STATUS.md
+- [x] docs/IMPLEMENTATION_AUDIT.md
+- [x] relevant feature docs: docs/REPLAY_STORE.md, docs/OPERATIONS.md, docs/DAILY_BUILD_PIPELINE.md
+
+### Docs updated
+- [x] CHANGELOG.md
+- [x] docs/OPERATIONS.md
+- [x] docs/REPO_STRUCTURE.md (amendment log entry added)
+- [x] INSTALL.md
+- No docs/PROJECT_STATUS.md update required: validated/deferred status unchanged
+
+### Status / validation impact
+- Validated status changed: no
+- Deferred status changed: no
+- New claims added: no
+- Evidence: n/a — correctness/safety fixes with no new validation paths
+
+### Tests run
+```
+pytest tests/test_replay_memory_bounded.py -q   → 34 passed
+pytest -q                                        → 317 passed, 3 skipped
+```
+
+### Validation CLIs run
+```
+python -m validation.audit_change_compliance --base main   → PASS
+```
+
+### Known limitations / out of scope
+- Linux production validation (DEXEUSDT 2026-07-21, 12 GiB cgroup) cannot be run
+  from the dev machine — noted as pending in PR comment.
+- `test_staging_to_output_rename_failure_restores_backup` requires `_force_staging`
+  constructor parameter which was not added in this pass; that test was not written.
+  The publish() restore-on-failure path is covered by the existing
+  `test_publish_preserves_existing_partition_on_replace_error` test.
+- No changes to recorder.py, raw schema, replay schema, or replay ordering.
+
+## 2026-07-22 — Crash-recovery, fail-closed cleanup, partition layout, INSTALL.md (PR #18)
+
+### Change summary
+- `pipeline/build_replay_store.py`: startup crash-recovery — if `output_dir`
+  is missing and `.backup_{date}_{symbol}` exists (mid-publish SIGKILL state),
+  validates and restores the backup before proceeding; fails closed if restore
+  fails; removes invalid backups. Handles both missing-output and
+  both-exist cases.
+- `pipeline/build_replay_store.py`: stale-staging cleanup now catches rmtree
+  exceptions and verifies the directory is gone; returns `status=error` if
+  cleanup fails, refusing to build on stale state (`ignore_errors` removed).
+- `stores/replay_writer.py`: `finalize_staging()` removes the empty
+  `scratch/` subdirectory after spools are closed, so published partitions
+  contain only supported files and no subdirectories.
+- `stores/replay_writer.py`: `cleanup_staging()` now raises `RuntimeError`
+  if `shutil.rmtree` fails (instead of logging a warning and continuing), 
+  so callers see the failure.
+- `INSTALL.md`: manual installation loop, `systemd-analyze verify` command,
+  enable/start/stop/status blocks, and troubleshooting section all updated to
+  remove `cryptorecorder-convert.service`/`.timer` as active production units.
+  Removed the "converter timer date seems wrong" troubleshooting section. Added
+  `> **Note:**` clarifying converter templates remain for manual local use only.
+- `tests/test_replay_memory_bounded.py`: 3 new regression tests:
+  `test_published_partition_layout_is_clean`,
+  `test_crash_recovery_restores_backup_on_startup`,
+  `test_stale_staging_cleanup_fails_closed`.
+
+### Files/packages touched
+- `pipeline/build_replay_store.py`
+- `stores/replay_writer.py`
+- `tests/test_replay_memory_bounded.py`
+- `INSTALL.md`
+- `CHANGELOG.md`
+- `docs/CHANGE_AUDIT.md`
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] docs/REPO_STRUCTURE.md
+- [x] docs/PROJECT_STATUS.md
+- [x] docs/IMPLEMENTATION_AUDIT.md
+- [x] relevant feature docs: docs/REPLAY_STORE.md, docs/OPERATIONS.md
+
+### Docs updated
+- [x] CHANGELOG.md
+- No other docs update required: code fixes only; status is unchanged
+
+### Status / validation impact
+- Validated status changed: no
+- Deferred status changed: no
+- New claims added: no
+- Evidence: n/a — these are defensive/correctness fixes; no new validation paths
+
+### Tests run
+```
+pytest tests/test_replay_memory_bounded.py -q   → 24 passed
+pytest -q                                       → 307 passed, 3 skipped
+```
+
+### Validation CLIs run
+```
+python -m validation.audit_change_compliance --base main   (run before commit)
+```
+
+### Known limitations / out of scope
+- DEXEUSDT production server test still pending (requires production server).
+- PR description update (item 5 from review) done by the author as a PR comment.
+
+## 2026-07-22 — Fix spool lifetime, atomic publication, force-rebuild, stale docs (PR #18)
+
+### Change summary
+- `stores/replay_writer.py`: spool files moved from system temp to
+  `staging_dir/scratch/` — stale staging cleanup now also removes orphaned
+  SQLite spools; `_spool_temp_dir` removed from constructor (no longer
+  configurable separately — spools are always co-located with staging).
+- `stores/replay_writer.py`: `publish()` now does a backup/restore atomic
+  swap — renames existing valid partition to `.backup_{date}_{symbol}` before
+  `os.replace(staging→output)`, restores backup on failure; the previously
+  valid partition can no longer be lost by a failed rename.
+- `pipeline/build_replay_store.py`: added `force` kwarg and `--force` CLI
+  flag; skip-if-valid respects `force=True`; documents the provenance contract
+  (without `--force`, output integrity is validated, raw inputs are not).
+- `tests/test_replay_memory_bounded.py`: 4 new tests — spool-in-staging, stale
+  staging removes spools, backup/restore on replace error, force-rebuild.
+- `docs/OPERATIONS.md`: fixed stale `crypto-recorder` unit name in quick-
+  reference commands → `cryptorecorder-recorder`.
+- `docs/IMPLEMENTATION_AUDIT.md`: removed stale feature-store audit content
+  from active `Smoke-Tested` section (feature-store was removed in issue #17).
+- `docs/CHANGE_AUDIT.md`: updated previous entry's Docs-updated section.
+- `CHANGELOG.md`: added `[Unreleased]` section for P1/P2 fixes.
+- Real-data RAM test: BTCUSDT 2026-06-12 (509 MB raw) — pending `/usr/bin/time
+  -v` peak RSS output.
+
+### Files/packages touched
+- `stores/replay_writer.py`
+- `pipeline/build_replay_store.py`
+- `tests/test_replay_memory_bounded.py`
+- `docs/OPERATIONS.md`
+- `docs/IMPLEMENTATION_AUDIT.md`
+- `CHANGELOG.md`
+- `docs/CHANGE_AUDIT.md`
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] docs/REPO_STRUCTURE.md
+- [x] docs/PROJECT_STATUS.md
+- [x] docs/IMPLEMENTATION_AUDIT.md
+- [x] docs/REPLAY_STORE.md, docs/OPERATIONS.md, docs/FULL_L2_REPLAY_CATALOG_PLAN.md
+
+### Docs updated
+- [x] CHANGELOG.md
+- [ ] README.md — no public interface change; not required
+- [ ] docs/PROJECT_STATUS.md — no new validated/deferred status change
+- [ ] docs/REPO_STRUCTURE.md — no new folders/files
+- [x] docs/OPERATIONS.md — fixed stale unit name in quick-reference
+- [x] docs/IMPLEMENTATION_AUDIT.md — removed stale feature-store smoke content
+
+### Status / validation impact
+- Validated status changed: no
+- Deferred status changed: no
+- New claims added: no
+- Evidence for any new validation claim:
+  - n/a
+
+### Tests run
+```
+pytest tests/test_replay_memory_bounded.py   # 21 passed (incl. 4 new tests)
+pytest -q                                    # 304 passed, 3 skipped
+```
+
+### Validation CLIs run
+```
+python -m validation.audit_change_compliance --base main   (pending — run after commit)
+Real-data BTCUSDT 2026-06-12 RAM test:
+  BINANCE_SPOT:  835,403 depth + 3,112,086 trades
+  BINANCE_USDTF: 563,875 depth + 3,200,399 trades
+  Maximum RSS:   855,432 kB (~835 MiB) — well under 12 GiB systemd MemoryMax
+  Exit status:   0
+```
+
+### Known limitations / out of scope
+- `REPLAY_SPOOL_TEMP_DIR` config in `config.py` and `cryptorecorder.env.example`
+  is now dead (spools always use staging/scratch). Will be removed in a
+  follow-up cleanup.
+- Production DEXEUSDT 2026-07-21 test still requires the production server.
+- uv migration (issue #20) excluded.
+
+---
+
+## 2026-07-22 — Memory-bounded replay-store builder (PR #18)
+
+### Change summary
+- `stores/replay_writer.py`: replaced unbounded `depth_batches`/`trade_batches`
+  Python-list accumulation with disk-backed SQLite spooling via
+  `converter.spool.RawRecordSpool`; incremental Parquet writing via
+  `pyarrow.parquet.ParquetWriter`; added `cleanup_staging()` method
+- `pipeline/build_replay_store.py`: import `REPLAY_SPOOL_TEMP_DIR`; pass
+  `spool_temp_dir` to `ReplayWriter`; added `_partition_is_valid()` helper with
+  checksum validation; skip-if-valid logic; stale staging removal;
+  `cleanup_staging()` on error
+- `pipeline/daily_build.py`: track `skipped` partitions; treat skipped-valid as
+  success; update log and return dict
+- `config.py`: added `REPLAY_SPOOL_TEMP_DIR` (optional, env-controlled)
+- `systemd/cryptorecorder-replay-build.service`: `Restart=on-failure` →
+  `Restart=no`; `StartLimitIntervalSec=86400` / `StartLimitBurst=3` in `[Unit]`
+- `systemd/cryptorecorder.env.example`: documented `CRYPTO_RECORDER_REPLAY_SPOOL_TEMP_DIR`
+- `tests/test_replay_memory_bounded.py`: new file, 17 regression tests
+- `CHANGELOG.md`: updated `[Unreleased]`
+
+### Files/packages touched
+- `stores/replay_writer.py`
+- `pipeline/build_replay_store.py`
+- `pipeline/daily_build.py`
+- `config.py`
+- `systemd/cryptorecorder-replay-build.service`
+- `systemd/cryptorecorder.env.example`
+- `tests/test_replay_memory_bounded.py`
+- `CHANGELOG.md`
+- `docs/CHANGE_AUDIT.md`
+- `docs/REPLAY_STORE.md`
+- `docs/OPERATIONS.md`
+- `docs/PROJECT_STATUS.md`
+- `INSTALL.md`
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] docs/REPO_STRUCTURE.md
+- [x] docs/PROJECT_STATUS.md
+- [x] docs/IMPLEMENTATION_AUDIT.md
+- [x] relevant feature docs: docs/REPLAY_STORE.md, docs/OPERATIONS.md,
+      docs/FULL_L2_REPLAY_CATALOG_PLAN.md, docs/VALIDATION.md
+
+### Docs updated
+- [x] CHANGELOG.md
+- [ ] README.md — no public interface change; not required
+- [x] docs/PROJECT_STATUS.md — updated replay_store v0 bullet to reflect memory-bounded writer and fixed restart policy; noted production RAM measurement still pending
+- [ ] docs/REPO_STRUCTURE.md — no new folders/files; not required
+- [x] docs/REPLAY_STORE.md — removed stale "v0 write limitation" bullet; replaced "Future optimization" note with implemented-solution description; updated Processing Details section
+- [x] docs/OPERATIONS.md — added "Replay-build memory and restart behaviour" section documenting bounded writes, spool temp dir, `Restart=no`, durable forward progress, and recovery commands
+- [x] INSTALL.md — removed stale `legacy-converter` target from deploy command reference
+
+### Status / validation impact
+- Validated status changed: no
+- Deferred status changed: no
+- New claims added: no
+- Evidence for any new validation claim:
+  - n/a
+
+### Tests run
+```
+pytest tests/test_replay_memory_bounded.py         # 17 passed
+pytest tests/test_replay_store.py                  # 3 passed
+pytest tests/test_streaming_conversion_memory.py   # 10 passed
+pytest tests/test_daily_build.py                   # 9 passed
+pytest tests/test_agent_infrastructure.py          # passed
+pytest tests/test_repo_structure.py                # passed
+pytest -q                                          # 300 passed, 3 skipped
+```
+
+### Validation CLIs run
+```
+python -m validation.audit_change_compliance --base main   # PASS
+bash -n scripts/deploy_linux_server.sh                     # OK
+systemd-analyze verify systemd/cryptorecorder-replay-build.service
+  # expected path-only warning on dev machine (no /home/zsom)
+```
+
+### Known limitations / out of scope
+- Real-data DEXEUSDT 2026-07-21 test not run — production raw data unavailable
+  on development machine. Required command documented in CHANGELOG.md.
+- uv migration (issue #20) explicitly excluded.
+- No changes to recorder.py, phase2_depth.py, native_trades.py, storage.py,
+  raw schemas, replay-store v0 schema, or existing production data.
+
+---
+
+
+
 ---
 
 ## Example of a GOOD entry
@@ -188,9 +4895,840 @@ status claims are honest.
 
 ## Audit entries (newest first)
 
+## 2026-07-21 — Deployment boundary: converter removed from automated production systemd path (issue #17 follow-up)
+
+### Change summary
+- `scripts/deploy_linux_server.sh`: removed `legacy-converter` from
+  `VALID_TARGETS` (it is no longer a deployable `--target`); `--target all`
+  now only installs/controls `cryptorecorder-recorder.service` and
+  `cryptorecorder-replay-build.{service,timer}`. Removed the now-dead
+  `legacy-converter)` cases from `units_for_target()`/`control_for_target()`,
+  and dropped it from `selected_targets()`'s `all` expansion.
+- Added `cryptorecorder-convert.service` and `cryptorecorder-convert.timer`
+  to the `cleanup_stale_units()` `STALE_UNITS` list, so any copy already
+  installed on an existing server is stopped/disabled/removed automatically
+  on the next deploy, matching how the pre-issue-#17 feature-build units are
+  already handled.
+- Marked `systemd/cryptorecorder-convert.service` and `.timer` as
+  manual/reference-only templates via an in-file comment (not rendered or
+  installed by the deploy script for any target); the files themselves were
+  **not** deleted.
+- `docs/OPERATIONS.md`: updated the "Targets" table, "Safety notes" stale-unit
+  list, and "Service groups"/ordering text in the Linux Server Layout section
+  to remove `legacy-converter` and correct the "daily chain runs convert →
+  replay" claim (`replay-build` reads directly from `data_raw` via
+  `pipeline.raw_manifest` and never depended on converter output — there was
+  no real ordering dependency to begin with).
+- `docs/IMPLEMENTATION_AUDIT.md`: added a new "Completed Cleanup Items
+  (2026-07-21 — deployment boundary...)" entry documenting this change.
+- `CHANGELOG.md`: added a new `[Unreleased]` `### Changed (PR #18 —
+  deployment boundary...)` section.
+- `tests/test_agent_infrastructure.py`: removed `legacy-converter` from
+  `DEPLOY_TARGETS`; added `cryptorecorder-convert.timer`/`.service` to
+  `LEGACY_STALE_UNITS`; added two new regression tests —
+  `test_deploy_script_rejects_legacy_converter_target` (asserts
+  `--target legacy-converter` now fails like any unknown target) and
+  `test_deploy_script_all_target_never_installs_converter` (asserts
+  `--target all --dry-run` output never mentions `cryptorecorder-convert`).
+
+### Files/packages touched
+- scripts/deploy_linux_server.sh
+- systemd/cryptorecorder-convert.service
+- systemd/cryptorecorder-convert.timer
+- docs/OPERATIONS.md
+- docs/IMPLEMENTATION_AUDIT.md
+- CHANGELOG.md
+- tests/test_agent_infrastructure.py
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] docs/REPO_STRUCTURE.md
+- [x] docs/PROJECT_STATUS.md
+- [x] docs/IMPLEMENTATION_AUDIT.md
+- [x] relevant feature docs:
+  - docs/OPERATIONS.md (Deployment Script Reference, Linux Server Layout)
+
+### Docs updated
+- [x] CHANGELOG.md
+- [ ] README.md — no change needed; deployment-path detail, not a user-facing feature description
+- [ ] docs/PROJECT_STATUS.md — no change needed; this is a deployment-boundary change, not a validated/deferred data-path status change
+- [ ] docs/REPO_STRUCTURE.md — no change needed; no top-level folder added/removed, `systemd/` package purpose text is unchanged
+- [x] relevant feature docs:
+  - docs/OPERATIONS.md
+  - docs/IMPLEMENTATION_AUDIT.md
+
+### Status / validation impact
+- Validated status changed: no
+- Deferred status changed: no
+- New claims added: no — this narrows the automated production deployment surface; it does not change the validated/deferred status of `convert_day.py`, the full_l2 replay path, or any data artifact
+- Evidence for any new validation claim: n/a
+
+### Tests run
+```bash
+source .venv/bin/activate
+pytest tests/test_agent_infrastructure.py -q   # 28 passed
+pytest -q                                       # 283 passed, 3 skipped
+```
+
+### Validation CLIs run
+```bash
+bash scripts/deploy_linux_server.sh --target all --dry-run --no-systemd
+# confirms units: cryptorecorder-recorder.service cryptorecorder-replay-build.service cryptorecorder-replay-build.timer
+bash scripts/deploy_linux_server.sh --target legacy-converter --dry-run --no-systemd
+# confirms exit 1: invalid --target 'legacy-converter' (expected: all recorder replay-build)
+python -m validation.audit_change_compliance --base main
+```
+
+### Known limitations / out of scope
+- No converter/reconstruction Python code was removed or modified:
+  `convert_day.py`, `converter/`, and `validation/replay_catalog_reconstruct.py`
+  remain fully in place and required for replay building, validation, and
+  local test-computer catalog reconstruction.
+- The `systemd/cryptorecorder-convert.{service,timer}` unit-file templates
+  were kept in the repo (marked manual/reference-only) rather than deleted;
+  deleting them was judged out of scope since the task only required removing
+  the converter from the *active* deployment path, not the reference templates.
+- This change was not tested against a real production server (no `sudo`/
+  real systemd actions were run); only `--dry-run --no-systemd` was exercised,
+  consistent with this being a WSL/dev sandbox, not the production host.
+- Full_l2 broader top50/multi-day validation remains deferred, unaffected by
+  this change (no data-path code was touched).
+- Merge remains deferred; this change is pushed to
+  `refactor/recorder-replay-only` only, per explicit instruction.
+
 ---
 
-## 2026-07-09 — Conventional commits enforcement (commit-msg hook + AGENTS.md Section 7)
+---
+## 2026-07-21 — PR #18 third review round: exchangeinfo-only no_data classification, disk-report timestamp consistency, stale changelog claims (issues #17, #19)
+
+### Change summary
+- `pipeline/daily_build.py` — `run_build_replay_store()` now filters eligible
+  venue/symbol partitions by actual raw channel coverage (`depth_v2`/`trade_v2`
+  in `ELIGIBLE_REPLAY_CHANNELS`) instead of assuming every raw-manifest
+  "symbol" entry is a market symbol. A date containing only an `exchangeinfo`
+  partition (e.g. `data_raw/<venue>/exchangeinfo/EXCHANGEINFO/<date>/`) now
+  attempts zero replay partitions and reports `no_data`, never `failed`.
+  `EXCHANGEINFO` can never become an attempted replay symbol even if a caller
+  explicitly passes `--symbols EXCHANGEINFO`, because filtering is based on
+  channel coverage, not a literal symbol-name exclusion — so other future
+  non-market metadata channels are protected the same way.
+- `disk_monitor.py` — `_check_disk_usage_locked()`'s top-level `"timestamp"`
+  field now uses `time_utils.local_now_iso()` (Europe/Budapest) instead of a
+  bare UTC `now.isoformat()`, matching the already-local-time skipped/overlap
+  path and the documented `docs/OPERATIONS.md` contract. Internal
+  `measured_at`, growth-history epoch ordering, and measurement-age/staleness
+  calculations are untouched and remain UTC/epoch-based.
+- `docs/OPERATIONS.md` — added an explicit `timestamp` row to the
+  `disk_usage.json` fields table clarifying the Europe/Budapest top-level
+  contract and that internal growth calculations stay UTC/epoch-based.
+- `CHANGELOG.md` — the two pre-issue-#17 `[Unreleased]` "Changed" blocks that
+  described `pipeline/generate_catalog.py --profile full_l2` and
+  `docs/GENERATE_CATALOG.md`/`docs/FEATURE_STORE.md` as if still active are
+  now explicitly headed "(historical — ... superseded)" with an inline note
+  stating the CLI and both doc files were later removed by issue #17 and do
+  not exist today. No history was deleted; only the currently-active-state
+  framing was corrected.
+- Tests: `tests/test_daily_build.py` (4 new: exchangeinfo-only → `no_data`,
+  exchangeinfo + one valid symbol → only the valid symbol attempted, explicit
+  `--symbols EXCHANGEINFO` filtering still yields `no_data`, main() exits
+  nonzero); `tests/test_disk_monitor_fail_safe.py` (3 new: normal report
+  timestamp carries the Europe/Budapest offset, the overlapping/no-prior path
+  carries the same offset, the timestamp change does not alter
+  growth/measurement-age logic); `tests/test_agent_infrastructure.py` (1 new:
+  `[Unreleased]` may not present the removed `generate_catalog` CLI or the
+  deleted feature/catalog docs as currently available outside a
+  historical/removed context).
+
+### Files/packages touched
+- pipeline/daily_build.py
+- disk_monitor.py
+- docs/OPERATIONS.md
+- CHANGELOG.md
+- tests/test_daily_build.py
+- tests/test_disk_monitor_fail_safe.py
+- tests/test_agent_infrastructure.py
+- docs/CHANGE_AUDIT.md (this entry)
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] docs/REPO_STRUCTURE.md
+- [x] docs/PROJECT_STATUS.md
+- [x] docs/IMPLEMENTATION_AUDIT.md
+- [x] relevant feature docs:
+  - docs/OPERATIONS.md, docs/DAILY_BUILD_PIPELINE.md, docs/FULL_L2_REPLAY_CATALOG_PLAN.md
+
+### Docs updated
+- [x] CHANGELOG.md
+- [ ] README.md — no change needed; no user-facing behavior/API change
+- [ ] docs/PROJECT_STATUS.md — no validated/deferred status change; these are
+  bugfixes to already-documented statuses (`no_data` classification,
+  timestamp contract), not new capability claims
+- [ ] docs/REPO_STRUCTURE.md — no structural change
+- [x] relevant feature docs:
+  - docs/OPERATIONS.md (added `timestamp` field row to the `disk_usage.json` table)
+
+### Status / validation impact
+- Validated status changed: no
+- Deferred status changed: no
+- New claims added: no — this entry corrects a stale-claim framing bug in
+  `CHANGELOG.md`, it does not add or remove any validated/deferred capability
+- Evidence for any new validation claim:
+  - n/a
+
+### Tests run
+```bash
+pytest tests/test_daily_build.py -q                                    # 9 passed
+pytest tests/test_disk_monitor_fail_safe.py tests/test_disk_monitor_cleanup.py -q  # 36 passed
+pytest tests/test_repo_structure.py tests/test_agent_infrastructure.py -q  # 49 passed
+pytest -q                                                               # 282 passed, 3 skipped
+```
+
+### Validation CLIs run
+```bash
+python -m validation.audit_change_compliance --base main   # RESULT: PASS
+```
+
+### Known limitations / out of scope
+- Broader top50/multi-day `full_l2` equivalence remains deferred (unchanged
+  by this entry).
+- No production data, services, or `/etc/cryptorecorder/cryptorecorder.env`
+  were touched; all tests use `tmp_path`-scoped temporary roots.
+- The ADAUSDT replay-equivalence smoke was not re-run as part of this change
+  (no code path it depends on — `convert_day.py`, replay writer/reader
+  schemas, catalog reconstruction — was touched); see final report for the
+  smoke-availability statement.
+
+---
+## 2026-07-20 — PR #18 second review round: fail-closed disk monitor, data_raw-only retention accounting, daily_build failed status, deploy-script legacy cleanup + honest flags, stale doc references (issues #17, #19)
+
+### Change summary
+- `disk_monitor.py` — `check_disk_usage()` now forces
+  `retention_measurement_trustworthy=False` whenever a scan is skipped due to
+  an overlapping scan already in progress (`skipped_duplicate=True`), even if
+  the previous cycle's own report was trustworthy; adds a `WARNING`/`ERROR`
+  alert and downgrades `monitoring_health` to at least `degraded`.
+  `cleanup_old_data()` now explicitly refuses to act (`return False`)
+  whenever the current cycle's report has `skipped_duplicate=True`.
+- `disk_monitor.py` — `percent_of_soft_limit`, `percent_of_hard_limit`,
+  `growth_rate_gb_day`, and `days_to_full` are now all `null` whenever the
+  current cycle's `data_raw` measurement is not itself fresh and successful
+  (never derived from the persisted last-known-good fallback).
+- `disk_monitor.py` — soft/hard-limit and cleanup-target comparisons,
+  `percent_of_soft_limit`/`percent_of_hard_limit`, and growth-rate/
+  `days_to_full` are now derived exclusively from fresh `data_raw` usage
+  (`data_raw_gb_for_retention`), never from `total_gb` (the cross-root
+  `data_raw + catalog + meta + state` observability sum, which may span
+  different filesystems). `GrowthSample.total_bytes` renamed to
+  `GrowthSample.data_raw_bytes` throughout the module and its tests.
+- `pipeline/daily_build.py` — `run_build_replay_store()` now reports
+  `"failed"` (distinct from `"partial"` and `"no_data"`) when one or more
+  venue/symbol partitions were attempted and *none* succeeded.
+  `generate_daily_report()` propagates `"failed"` distinctly rather than
+  collapsing it into `"partial"`.
+- `scripts/deploy_linux_server.sh` — `cleanup_stale_units()` now removes
+  every legacy/renamed unit name this repo has ever shipped
+  (`crypto-recorder.service`, `nautilus-convert.{service,timer}`,
+  `cryptorecorder-daily-build.{service,timer}`, in addition to the existing
+  `cryptorecorder-feature-build.{service,timer}`), runs for every `--target`,
+  and now runs before `install_units`. `--user`/`--app-dir`/`--env-file` are
+  now rendered into each installed unit file via `sed`
+  (`User=`/`Group=`/`WorkingDirectory=`/`ExecStart=`/`EnvironmentFile=`), and
+  `--data-root` is rendered into a newly created env file's
+  `CRYPTO_RECORDER_*_ROOT` values (an existing env file is still never
+  overwritten).
+- Corrected stale systemd unit name references: `docs/DAILY_BUILD_PIPELINE.md`
+  (11 occurrences of `cryptorecorder-daily-build.{service,timer}` -> the real
+  `cryptorecorder-replay-build.{service,timer}`), `docs/ARCHITECTURE.md` (2
+  occurrences, same rename), `INSTALL.md` (`nautilus-convert.{service,timer}`
+  -> the real `cryptorecorder-convert.{service,timer}` in Troubleshooting).
+- Corrected stale "tracked retention usage (data_raw + catalog + meta +
+  state)" comments to reflect data_raw-only retention semantics in
+  `config.py`, `systemd/cryptorecorder.env.example`, `docs/OPERATIONS.md`,
+  and `INSTALL.md`.
+- `docs/ARCHITECTURE.md` and `docs/DAILY_BUILD_PIPELINE.md` now document all
+  four `daily_build` report statuses (`success`/`partial`/`failed`/`no_data`).
+- `docs/OPERATIONS.md`'s Deployment Script Reference updated to describe the
+  rendering behavior of `--user`/`--app-dir`/`--data-root`/`--env-file` and
+  the expanded stale-unit cleanup list.
+
+### Files/packages touched
+- disk_monitor.py
+- tests/test_disk_monitor_fail_safe.py
+- pipeline/daily_build.py
+- tests/test_daily_build.py
+- scripts/deploy_linux_server.sh
+- tests/test_agent_infrastructure.py
+- config.py
+- systemd/cryptorecorder.env.example
+- docs/OPERATIONS.md
+- docs/ARCHITECTURE.md
+- docs/DAILY_BUILD_PIPELINE.md
+- INSTALL.md
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] docs/REPO_STRUCTURE.md
+- [x] docs/PROJECT_STATUS.md
+- [x] docs/IMPLEMENTATION_AUDIT.md
+- [x] relevant feature docs:
+  - docs/OPERATIONS.md, docs/ARCHITECTURE.md, docs/DAILY_BUILD_PIPELINE.md,
+    INSTALL.md
+
+### Docs updated
+- [x] CHANGELOG.md
+- [ ] README.md — no change needed; no stale references found in this file
+- [ ] docs/PROJECT_STATUS.md — no status/claim change; full_l2 top50/multi-day
+  validation remains pending as before
+- [ ] docs/REPO_STRUCTURE.md — no structural change (no files added/removed)
+- [x] relevant feature docs:
+  - docs/OPERATIONS.md, docs/ARCHITECTURE.md, docs/DAILY_BUILD_PIPELINE.md,
+    INSTALL.md, systemd/cryptorecorder.env.example
+
+### Status / validation impact
+- Validated status changed: no
+- Deferred status changed: no
+- New claims added: no — this entry fixes fail-open/fail-closed edge cases,
+  accounting scope, deployment honesty, and stale references; it does not
+  change what is validated vs deferred (full_l2 top50/multi-day validation
+  remains pending, as before)
+- Evidence for any new validation claim:
+  - n/a
+
+### Tests run
+```bash
+pytest -q
+# 274 passed, 3 skipped
+
+pytest tests/test_disk_monitor_fail_safe.py tests/test_disk_monitor_cleanup.py -q
+# 33 passed
+
+pytest tests/test_daily_build.py -q
+# 5 passed
+
+pytest tests/test_agent_infrastructure.py -q
+# 26 passed
+```
+
+### Validation CLIs run
+```bash
+python -m validation.audit_change_compliance --base main
+# RESULT: PASS (64 changed files vs main)
+
+python -m pipeline.build_replay_store --date 2026-06-12 --symbols ADAUSDT \
+  --data-root ./data_raw --replay-root /tmp/cr_smoke_replay
+# Built replay: BINANCE_SPOT/ADAUSDT/2026-06-12 (412336 depth, 124457 trades)
+# Built replay: BINANCE_USDTF/ADAUSDT/2026-06-12 (442834 depth, 401883 trades)
+# Replay build complete: 2 successful, 0 failed, 855170 depth, 526340 trades
+
+python -m validation.audit_replay_store --date 2026-06-12 --symbols ADAUSDT \
+  --venues BINANCE_SPOT,BINANCE_USDTF --replay-root /tmp/cr_smoke_replay
+# depth/trades parquet for both venues: sorted=true, 0 duplicate sequence
+# keys, schema OK, no errors
+
+python -m pipeline.daily_build --date 2026-06-12 --symbols ADAUSDT \
+  --data-root ./data_raw --replay-root /tmp/cr_smoke_replay \
+  --report-root /tmp/cr_daily_reports
+# status=success, runtime=38.7s, 2/2 symbols, 855170 depth, 526340 trades
+
+bash scripts/deploy_linux_server.sh --target all --dry-run --user customuser \
+  --app-dir /opt/customdir --data-root /srv/customdata \
+  --env-file /etc/customenv/cr.env
+# confirmed all 4 custom values appear in the rendered dry-run plan and none
+# of the hardcoded defaults leak through
+```
+All commands ran against temporary roots (`/tmp/...`) using the existing
+local `./data_raw` fixture; no production data, `/etc` files, or running
+services were touched. Temp directories were removed after the run.
+
+### Known limitations / out of scope
+- Broader top50/multi-day `full_l2` equivalence validation remains pending
+  (unchanged from before this entry); the `v2.0.0` gate is still not declared.
+- No live systemd install/enable/start was performed (out of scope — dry-run
+  only, no root/sudo access in this environment).
+- The migration/cleanup test for the deploy script's `cleanup_stale_units()`
+  verifies the unit-name list and rendered-flag behavior via source
+  inspection and `--dry-run` output, not a live `/etc/systemd/system`
+  install, since this environment has no sudo/systemd access.
+
+---
+## 2026-07-20 — complete PR #18 remaining work: strip feature-store residue, harden structure tests, fix daily_build false-success, correct systemd/doc references (issues #17, #19)
+
+### Change summary
+- Merged current `main` into `refactor/recorder-replay-only` (via cherry-pick of
+  commit `9c639b8` from `fix/disk-monitor-fail-safe-measurement`, completed as
+  `45356f9`), resolving conflicts in `CHANGELOG.md`, `docs/PROJECT_STATUS.md`, and
+  `docs/CHANGE_AUDIT.md` by hand.
+- Stripped feature-store naming from `validation/audit_storage_size.py`: removed
+  the `feature_root` parameter, its `feature_store` report component, and the
+  `--feature-root` CLI flag (the feature-store subsystem no longer exists).
+- Deleted `docs/GUARANTEES.md` — fully superseded by the existing
+  "System Guarantees" section in `docs/ARCHITECTURE.md`; no unique content lost.
+- Deleted root-level `inspect_catalog.py` — dead code from a stale merge, not
+  imported anywhere, with a docstring referencing a nonexistent `validators/`
+  package. `validation/catalog_inspect.py` is the real, currently-used CLI.
+- Reverted `validate.py` to its working form: the `main`-branch merge had
+  regressed it to import unused `cryptofeed`/`yaml` dependencies, reference a
+  nonexistent `converter.book` module, and hardcode paths instead of using
+  `config.py`'s configurable `DATA_ROOT`/`META_ROOT`/`STATE_ROOT`.
+- Hardened `tests/test_repo_structure.py` with 7 new tests enforcing the exact
+  root Python/other file sets and exact `docs/` file set from
+  `docs/REPO_STRUCTURE.md`, absence of stray Python files in `docs/`, absence of
+  feature-store config roots/CLI flags/systemd units, and absence of
+  `validators` imports. Updated `docs/REPO_STRUCTURE.md`'s Root-Level Files
+  table to list every real root `.py` module (several were previously missing).
+- Fixed `pipeline/daily_build.py`'s false-success bug: `run_build_replay_store()`
+  now reports `"no_data"` (distinct from `"success"`) when zero raw partitions
+  were eligible for the date, instead of falsely reporting `"success"`.
+  `generate_daily_report()` checks `"no_data"` explicitly before the generic
+  `"partial"` fallback. `main()` now logs a warning and returns nonzero for any
+  non-`"success"` status. Added `tests/test_daily_build.py` (4 new tests) and
+  updated `docs/DAILY_BUILD_PIPELINE.md`'s status-semantics documentation.
+- Deleted stale duplicate systemd unit files superseded by the units actually
+  referenced by `scripts/deploy_linux_server.sh`: `systemd/crypto-recorder.service`
+  (superseded by `cryptorecorder-recorder.service`),
+  `systemd/nautilus-convert.{service,timer}` (superseded by
+  `cryptorecorder-convert.{service,timer}`), and
+  `systemd/cryptorecorder-daily-build.{service,timer}` (superseded by
+  `cryptorecorder-replay-build.{service,timer}`).
+- Corrected numerous stale documentation references: `INSTALL.md`'s
+  `crypto-recorder.service`/`nautilus-convert.*` unit names and a duplicate
+  `## 10.` heading; `AGENTS.md`'s and `docs/OPERATIONS.md`'s broken
+  self-referential "merged from the former `OPERATIONS.md`" provenance notes
+  and a broken same-file link; similar self-referential provenance notes in
+  `docs/ARCHITECTURE.md` and `docs/IMPLEMENTATION_AUDIT.md`; a stale
+  `pipeline/audit_replay_store.py` table row in `docs/ARCHITECTURE.md` (real
+  path is `validation/audit_replay_store.py`); a duplicate
+  `[OPERATIONS.md](OPERATIONS.md)` link in `docs/PROJECT_STATUS.md`; a
+  misleading `--date today` example in `docs/DAILY_BUILD_PIPELINE.md` (only
+  `YYYY-MM-DD` and `yesterday` are implemented); and added a new
+  "Replay Store Validation" section to `docs/VALIDATION.md` documenting
+  `validation.audit_replay_store`, `validation.validate_catalog_equivalence`,
+  and `validation.audit_change_compliance` (previously undocumented there).
+
+### Files/packages touched
+- validation/audit_storage_size.py
+- docs/GUARANTEES.md (deleted)
+- inspect_catalog.py (deleted)
+- validate.py
+- tests/test_repo_structure.py
+- docs/REPO_STRUCTURE.md
+- pipeline/daily_build.py
+- tests/test_daily_build.py (new)
+- docs/DAILY_BUILD_PIPELINE.md
+- systemd/crypto-recorder.service (deleted)
+- systemd/nautilus-convert.service (deleted)
+- systemd/nautilus-convert.timer (deleted)
+- systemd/cryptorecorder-daily-build.service (deleted)
+- systemd/cryptorecorder-daily-build.timer (deleted)
+- systemd/cryptorecorder-recorder.service
+- systemd/cryptorecorder.env.example
+- scripts/deploy_linux_server.sh
+- INSTALL.md
+- AGENTS.md
+- docs/OPERATIONS.md
+- docs/ARCHITECTURE.md
+- docs/IMPLEMENTATION_AUDIT.md
+- docs/PROJECT_STATUS.md
+- docs/VALIDATION.md
+- CHANGELOG.md
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] docs/REPO_STRUCTURE.md
+- [x] docs/PROJECT_STATUS.md
+- [x] docs/IMPLEMENTATION_AUDIT.md
+- [x] relevant feature docs:
+  - docs/DAILY_BUILD_PIPELINE.md, docs/VALIDATION.md, docs/OPERATIONS.md,
+    docs/ARCHITECTURE.md, INSTALL.md
+
+### Docs updated
+- [x] CHANGELOG.md
+- [ ] README.md — no change needed; no stale references found in this file
+- [x] docs/PROJECT_STATUS.md — fixed duplicate link and stale "Date" header
+- [x] docs/REPO_STRUCTURE.md — root-file table completed; amendment log entry added
+- [x] relevant feature docs:
+  - docs/DAILY_BUILD_PIPELINE.md, docs/VALIDATION.md, docs/OPERATIONS.md,
+    docs/ARCHITECTURE.md, docs/IMPLEMENTATION_AUDIT.md, INSTALL.md, AGENTS.md
+
+### Status / validation impact
+- Validated status changed: no
+- Deferred status changed: no
+- New claims added: no — this entry fixes structural/doc/test defects and stale
+  references; it does not change what is validated vs deferred (full_l2
+  top50/multi-day validation remains pending, as before)
+- Evidence for any new validation claim:
+  - n/a
+
+### Tests run
+```bash
+pytest -q
+# 267 passed, 3 skipped
+
+pytest tests/test_repo_structure.py tests/test_replay_store.py \
+  tests/test_pipeline_validation.py tests/test_agent_infrastructure.py -q
+# 22 passed (test_repo_structure.py); 36 passed, 1 skipped (combined others)
+
+pytest tests/test_daily_build.py -q
+# 4 passed
+```
+
+### Validation CLIs run
+```bash
+python -m validation.audit_change_compliance --base main
+# RESULT: PASS (52 changed files vs main)
+
+python -m pipeline.build_replay_store --date 2026-06-12 --symbols ADAUSDT \
+  --data-root ./data_raw --replay-root /tmp/tmp.fRQ8vNOyNf/replay_store
+# Built replay: BINANCE_SPOT/ADAUSDT/2026-06-12 (412336 depth, 124457 trades)
+# Built replay: BINANCE_USDTF/ADAUSDT/2026-06-12 (442834 depth, 401883 trades)
+# Replay build complete: 2 successful, 0 failed
+
+python -m validation.audit_replay_store --date 2026-06-12 --symbols ADAUSDT \
+  --venues BINANCE_SPOT --replay-root /tmp/tmp.fRQ8vNOyNf/replay_store
+# depth.parquet: 412336 rows, sorted=true, 0 duplicate sequence keys, schema OK
+# trades.parquet: 124457 rows, sorted=true, 0 duplicate sequence keys, schema OK
+```
+All commands ran against temporary roots (`/tmp/...`) using the existing local
+`./data_raw` fixture; no production data, `/etc` files, or running services
+were touched.
+
+### Known limitations / out of scope
+- Broader top50/multi-day `full_l2` equivalence validation remains pending
+  (unchanged from before this entry); the `v2.0.0` gate is still not declared.
+- No live systemd install/enable/start was performed (out of scope — this is a
+  documentation/reference correction pass, not a deployment).
+- The `full_l2` semantic-equivalence smoke re-run (`convert_day.py` vs
+  `validate_catalog_equivalence --profile full_l2`) was not re-executed in this
+  session; the existing ADAUSDT smoke evidence in `docs/PROJECT_STATUS.md` and
+  `docs/IMPLEMENTATION_AUDIT.md` is unchanged and still applies.
+
+---
+## 2026-07-20 — fix disk monitor false-zero reporting and fail-open cleanup (issue #19)
+
+### Change summary
+- Rewrote `disk_monitor.py` to eliminate the false-zero measurement defect: a
+  failed/timed-out recursive `du` scan previously returned numeric `0.0`, which was
+  published as `data_raw_gb=0.0` and silently disabled capacity alerts and
+  automatic cleanup (observed ~442 timeouts since June 2 against a ~410GB raw tree
+  with a 30s hard-coded timeout).
+- Added `measure_directory()` / `DirectoryMeasurement` (`ok`, `status` — one of
+  `ok`/`missing`/`timeout`/`command_error`/`malformed_output`/`error`, `error`,
+  `value_bytes`, `measured_at`, `duration_seconds`) so a failure can never be
+  represented as a bare numeric zero. A genuinely empty directory still reports
+  `ok=True, status="ok"`.
+- Switched the scan command from `du -sb` (apparent size) to `du -s -B1` (allocated
+  bytes) — documented as the intended, more honest-for-retention semantics.
+- Added last-known-good persistence (`state/disk_monitor_state.json`): on measurement
+  failure the monitor falls back to the prior successful value marked `stale=True`
+  with `measurement_age_seconds`; if no prior value exists the field is `null`, never
+  `0`. State survives process restarts (loaded in `DiskMonitor.__init__`).
+- `state/disk_usage.json` now reports per-component `measurement_ok` /
+  `measurement_status` / `measurement_error` / `measurement_timestamp` /
+  `measurement_age_seconds` / `stale`, a top-level `monitoring_health`
+  (`healthy`/`degraded`/`unhealthy`), and an `alerts` list. Retention percentages,
+  growth rate, and `days_to_full` are `null` (never derived) when the backing data is
+  unknown/stale.
+- `cleanup_old_data()` now fails closed: it refuses to run or continue unless the
+  current cycle's `data_raw` measurement is fresh and successful
+  (`retention_measurement_trustworthy=True`), re-validating before every destructive
+  deletion phase, and logs an `ERROR` (with a report alert) when skipped.
+- Added independent filesystem-capacity reporting via `measure_filesystem()`
+  (`shutil.disk_usage`), exposed under `filesystem.*` in the report, with its own
+  `DISK_FS_FREE_WARN_GB`/`DISK_FS_FREE_CRITICAL_GB` thresholds — kept semantically
+  separate from the raw-retention `DISK_SOFT_LIMIT_GB`/`DISK_HARD_LIMIT_GB` limits.
+- Growth-rate/`days_to_full` now use real sample timestamps (bounded, persisted
+  `GrowthSample` history capped by `DISK_HISTORY_MAX_SAMPLES`/`DISK_HISTORY_MAX_AGE_SEC`),
+  only recording a sample when every monitored root was measured fresh and
+  successfully in the same cycle; non-increasing timestamps are rejected; growth and
+  `days_to_full` are `null` when the valid sample span is under 1 hour.
+- Added an `asyncio.Lock` around `check_disk_usage()` to prevent overlapping scans;
+  an overlapping call returns the previous report with `skipped_duplicate=True`
+  instead of queuing or running concurrently. The lock is released via `async with`
+  on every exception path.
+- Report and companion-state writes are now atomic (`tempfile.NamedTemporaryFile` in
+  the same directory + `os.replace()`), with the temp file cleaned up on any
+  write failure.
+- `config.py`: added `DISK_SCAN_TIMEOUT_SEC` (default 60s, validated > 0),
+  `DISK_MEASUREMENT_STALE_AFTER_SEC`, `DISK_FS_FREE_WARN_GB`,
+  `DISK_FS_FREE_CRITICAL_GB`, `DISK_HISTORY_MAX_SAMPLES`, `DISK_HISTORY_MAX_AGE_SEC`;
+  existing `DISK_SOFT_LIMIT_GB`/`DISK_HARD_LIMIT_GB`/`DISK_CLEANUP_TARGET_GB` env vars
+  are unchanged for backward compatibility.
+- `recorder.py`: `disk_check_task()` updated to use `usage.get('data_raw_gb')` (no
+  longer defaults a missing/None value to `0`) before comparing against the soft
+  limit.
+- Added `tests/test_disk_monitor_fail_safe.py` (30 new tests) covering: successful/
+  empty/missing/timeout/nonzero-exit/malformed-output/unexpected-exception `du`
+  parsing; invalid-timeout config validation; last-known-good fallback marked
+  stale; restart-persisted state; no-prior-value → `null`; staleness alert;
+  misleading percentage/growth omission; cleanup skipped on unknown/stale
+  measurement with no destructive `shutil.rmtree` call; independent filesystem
+  capacity fields and low-free-space alert; separate retention/filesystem threshold
+  semantics; atomic report writing and temp-file cleanup on failure; growth from
+  real timestamps, short-span exclusion, non-increasing-timestamp rejection,
+  failed/stale-sample exclusion; overlapping-scan prevention and lock release on
+  exception.
+- Updated `tests/test_disk_monitor_cleanup.py`'s two existing fakes to include
+  `retention_measurement_trustworthy: True` (new required field in the cleanup
+  trust contract) — no behavioral change to those tests' assertions.
+- No production data, service, or `/etc` changes were made. No destructive cleanup
+  was run against real data during implementation or testing (temp dirs / mocks
+  only).
+
+### Files/packages touched
+- `disk_monitor.py` (rewritten)
+- `recorder.py` (`disk_check_task` — safe `.get()` for `data_raw_gb`)
+- `config.py` (new disk-monitor env vars + docstring clarifying retention vs
+  filesystem-threshold semantics)
+- `systemd/cryptorecorder.env.example` (documented new env vars)
+- `tests/test_disk_monitor_fail_safe.py` (new)
+- `tests/test_disk_monitor_cleanup.py` (updated fakes for the trust contract)
+- `docs/ARCHITECTURE.md` (new "Disk Monitoring Safety Invariant" section)
+- `docs/OPERATIONS.md` (new "Disk Monitoring" field/alert/threshold reference)
+- `docs/IMPLEMENTATION_AUDIT.md` (addendum under Section A)
+- `docs/PROJECT_STATUS.md` (new validated bullet + `Last updated` bump)
+- `INSTALL.md` (runtime file table: `disk_usage.json` description +
+  `disk_monitor_state.json` row)
+- `CHANGELOG.md` (`[Unreleased]` → new "Fixed" section)
+- `docs/CHANGE_AUDIT.md` (this entry)
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] docs/REPO_STRUCTURE.md
+- [x] docs/PROJECT_STATUS.md
+- [x] docs/IMPLEMENTATION_AUDIT.md
+- [x] relevant feature docs:
+  - docs/ARCHITECTURE.md, docs/OPERATIONS.md, docs/VALIDATION.md (no disk-monitor
+    content existed there; not amended), CHANGELOG.md
+
+### Docs updated
+- [x] CHANGELOG.md
+- [ ] README.md
+- [x] docs/PROJECT_STATUS.md
+- [ ] docs/REPO_STRUCTURE.md
+- [x] relevant feature docs:
+  - docs/ARCHITECTURE.md, docs/OPERATIONS.md, docs/IMPLEMENTATION_AUDIT.md,
+    INSTALL.md, systemd/cryptorecorder.env.example
+- No docs update required for README.md/REPO_STRUCTURE.md because: no new
+  top-level files/folders or root-entrypoint changes were introduced; this is an
+  internal-module fix within the existing `disk_monitor.py` file already listed
+  in `docs/REPO_STRUCTURE.md`.
+
+### Status / validation impact
+- Validated status changed: yes — `docs/PROJECT_STATUS.md` gained a new
+  "Disk monitoring (fail-safe measurement)" validated bullet.
+- Deferred status changed: no.
+- New claims added: yes — the fail-safe measurement behavior is claimed as
+  validated by the focused test suite below; **real-server verification is
+  explicitly NOT claimed** (deployment/log/report inspection is documented as a
+  manual, not-yet-performed checklist item — see PR body).
+- Evidence for any new validation claim:
+  - `pytest tests/test_disk_monitor_fail_safe.py tests/test_disk_monitor_cleanup.py -q`
+    → `30 passed`
+  - Full suite: `pytest -q` → `266 passed, 3 skipped`
+
+### Tests run
+```bash
+source .venv/bin/activate
+pytest tests/test_disk_monitor_fail_safe.py tests/test_disk_monitor_cleanup.py -q
+pytest -q
+```
+
+### Validation CLIs run
+```bash
+python -m validation.audit_change_compliance --staged
+```
+
+### Known limitations / out of scope
+- Real production-server verification (restarting the monitor/recorder service,
+  inspecting logs and `disk_usage.json` against the actual ~410GB raw tree) was
+  **not performed** as part of this change — see the manual deployment/
+  verification checklist in the PR description. No production data or services
+  were touched.
+- `get_dir_size_gb()` is retained only as a best-effort single-directory helper
+  for cleanup log messages; it is not used for any retention/cleanup decision
+  (which relies solely on the current cycle's `data_raw` `DirectoryMeasurement`).
+- Concurrent/parallel scanning across roots was deliberately **not** introduced
+  (roots are measured sequentially against the same disk) since the issue asked
+  to avoid concurrent recursive scans unless benchmarked as safe; no such
+  benchmark was performed in this change.
+- `disk_check_task()` in `recorder.py` still runs on a fixed
+  `DISK_CHECK_INTERVAL_SEC` sleep loop (unchanged); the new `asyncio.Lock`-based
+  overlap guard lives inside `DiskMonitor.check_disk_usage()` itself, which is
+  sufficient because `disk_check_task()` awaits each cycle in sequence and does
+  not spawn concurrent calls itself — this is noted for completeness, not as a
+  gap.
+
+
+---
+
+## 2026-07-15 — Issue #17: narrow scope to recorder + replay-store ownership, remove feature-store subsystem
+
+### Change summary
+- Removed the entire **feature-store subsystem**: `stores/feature_schema.py`,
+  `stores/feature_calc.py`, `stores/feature_writer.py`,
+  `pipeline/build_feature_store.py`, `validation/audit_feature_store.py`,
+  `tests/test_feature_store.py`, and the
+  `systemd/cryptorecorder-feature-build.{service,timer}` units.
+- Removed `pipeline/generate_catalog.py` as a **product/runtime CLI**. Moved its
+  `generate_catalog_from_replay` reconstruction logic and helpers to
+  `validation/replay_catalog_reconstruct.py` — an internal, CLI-less,
+  validation-only helper used exclusively by
+  `validation/validate_catalog_equivalence.py`. Renamed
+  `tests/test_generate_catalog_full_l2.py` to
+  `tests/test_replay_catalog_reconstruct.py` and removed
+  `tests/test_generate_catalog.py` (trades_only product-CLI tests, no longer
+  applicable).
+- Removed `config.py`: `FEATURE_ROOT`, `LABEL_ROOT`, `CATALOG_JOBS_ROOT`.
+  `ARCHIVE_DAYS_ROOT` is unaffected (still a placeholder, not implemented).
+- Simplified `pipeline/daily_build.py`: removed `--steps`, `--timeframes`,
+  `--feature-root` CLI flags and the feature-build execution path. It now
+  always scans raw coverage and builds the replay store only; report shape no
+  longer contains a `feature_build` section.
+- Deleted `docs/FEATURE_STORE.md` and `docs/GENERATE_CATALOG.md` rather than
+  leaving tombstones — the fixed docs/ file count drops from 14 to 12.
+- Rewrote `docs/REPO_STRUCTURE.md` (12-file contract, narrowed `pipeline/`,
+  `stores/`, `validation/` package definitions, updated CLI Command Reference,
+  new Amendment Log entry), `docs/IMPLEMENTATION_AUDIT.md` (feature-store
+  sections marked removed with preservation banners, historical evidence
+  retained), `docs/PROJECT_STATUS.md` (Validated/Deferred sections updated,
+  replay_store framed as the stable external contract for downstream
+  repositories), `docs/ARCHITECTURE.md` (removed the "Feature Store" storage
+  layer and "Build Feature Store"/"Generate Catalog" pipeline sections,
+  replaced with the validation-only `validation.replay_catalog_reconstruct`
+  helper description), `docs/DAILY_BUILD_PIPELINE.md` (fully rewritten,
+  replay-only), `docs/OPERATIONS.md` (removed `feature-build` service group and
+  `FEATURE_ROOT`/`CATALOG_JOBS_ROOT`/`LABEL_ROOT` path rows), `docs/REPLAY_STORE.md`,
+  `docs/FULL_L2_REPLAY_CATALOG_PLAN.md`, `docs/AI_WORKFLOW.md`, `docs/README.md`,
+  `README.md` (root), `AGENTS.md`, and `.github/copilot-instructions.md`.
+- Rewrote `tests/test_repo_structure.py`: added
+  `test_pipeline_does_not_contain_feature_store_modules()` and
+  `test_pipeline_does_not_contain_generate_catalog_cli()`; updated
+  `test_docs_do_not_reference_pipeline_audit_modules()` forbidden-pattern list;
+  updated `test_validation_contains_audit_and_equivalence_modules()` required
+  module list; removed `test_validation_audit_feature_store_cli_help()`.
+- Updated `tests/test_agent_infrastructure.py` `DEPLOY_TARGETS` (removed
+  `feature-build`); updated `tests/test_semantic_equivalence.py` and
+  `tests/test_replay_depth_adapter.py` to reference
+  `validation.replay_catalog_reconstruct` instead of the removed
+  `pipeline/generate_catalog.py` module.
+- Cleaned `scripts/deploy_linux_server.sh` (removed the `feature-build` target
+  throughout: `VALID_TARGETS`, help text, unit/control case statements,
+  directory creation list, plus an explicit stale-unit cleanup step that
+  stops/disables/removes any previously-installed
+  `cryptorecorder-feature-build.{service,timer}` on `all`/`replay-build`
+  deploys so upgraded servers don't keep firing the removed
+  `daily_build --steps features` command), `systemd/cryptorecorder.env.example` (removed
+  `CRYPTO_RECORDER_FEATURE_ROOT`, `CRYPTO_RECORDER_CATALOG_JOBS_ROOT`,
+  `CRYPTO_RECORDER_LABEL_ROOT`), `systemd/cryptorecorder-replay-build.service`
+  (removed the now-nonexistent `--steps replay` flag), and `scripts/README.md`.
+- Updated package docstrings: `pipeline/__init__.py`, `stores/__init__.py`,
+  `validation/__init__.py`.
+- `validation/audit_change_compliance.py`: `_REPLAY_CATALOG_PATTERNS` no longer
+  includes `stores/feature`, `pipeline/build_feature`, `pipeline/generate_catalog`,
+  or `validation/audit_feature`.
+- `validation/audit_storage_size.py` deliberately left unchanged (see "Known
+  limitations" below).
+
+### Files/packages touched
+- pipeline/__init__.py, pipeline/daily_build.py
+- pipeline/build_feature_store.py (deleted), pipeline/generate_catalog.py (deleted)
+- stores/__init__.py
+- stores/feature_schema.py, stores/feature_calc.py, stores/feature_writer.py (all deleted)
+- stores/replay_depth_adapter.py
+- validation/__init__.py
+- validation/audit_feature_store.py (deleted)
+- validation/replay_catalog_reconstruct.py (new)
+- validation/audit_change_compliance.py
+- config.py
+- tests/test_repo_structure.py
+- tests/test_agent_infrastructure.py
+- tests/test_semantic_equivalence.py
+- tests/test_replay_depth_adapter.py
+- tests/test_feature_store.py (deleted)
+- tests/test_generate_catalog.py (deleted)
+- tests/test_generate_catalog_full_l2.py → tests/test_replay_catalog_reconstruct.py (renamed)
+- scripts/acceptance_test.py, scripts/deploy_linux_server.sh, scripts/README.md
+- systemd/cryptorecorder.env.example, systemd/cryptorecorder-replay-build.service
+- systemd/cryptorecorder-feature-build.service, systemd/cryptorecorder-feature-build.timer (both deleted)
+- docs/REPO_STRUCTURE.md, docs/IMPLEMENTATION_AUDIT.md, docs/PROJECT_STATUS.md,
+  docs/ARCHITECTURE.md, docs/DAILY_BUILD_PIPELINE.md, docs/OPERATIONS.md,
+  docs/REPLAY_STORE.md, docs/FULL_L2_REPLAY_CATALOG_PLAN.md, docs/AI_WORKFLOW.md,
+  docs/README.md
+- docs/FEATURE_STORE.md, docs/GENERATE_CATALOG.md (both deleted)
+- README.md (root), AGENTS.md, .github/copilot-instructions.md
+- CHANGELOG.md
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] docs/REPO_STRUCTURE.md
+- [x] docs/PROJECT_STATUS.md
+- [x] docs/IMPLEMENTATION_AUDIT.md
+- [x] relevant feature docs:
+  - docs/ARCHITECTURE.md, docs/DAILY_BUILD_PIPELINE.md, docs/OPERATIONS.md,
+    docs/REPLAY_STORE.md, docs/FULL_L2_REPLAY_CATALOG_PLAN.md,
+    docs/AI_WORKFLOW.md, docs/README.md, docs/VALIDATION.md (verified, no
+    change needed), INSTALL.md (verified, no change needed)
+
+### Docs updated
+- [x] CHANGELOG.md
+- [x] README.md
+- [x] docs/PROJECT_STATUS.md
+- [x] docs/REPO_STRUCTURE.md
+- [x] relevant feature docs:
+  - docs/ARCHITECTURE.md, docs/DAILY_BUILD_PIPELINE.md, docs/OPERATIONS.md,
+    docs/REPLAY_STORE.md, docs/FULL_L2_REPLAY_CATALOG_PLAN.md,
+    docs/AI_WORKFLOW.md, docs/README.md, docs/IMPLEMENTATION_AUDIT.md
+
+### Status / validation impact
+- Validated status changed: no — the previously validated
+  `data_raw -> replay_store` contract and the ADAUSDT single-day `full_l2`
+  smoke evidence are unchanged and preserved verbatim in
+  `docs/PROJECT_STATUS.md` and `docs/IMPLEMENTATION_AUDIT.md`.
+- Deferred status changed: no new deferrals added beyond removing the
+  feature-store/label-store scope entirely (it is no longer "deferred", it is
+  "not this repository's responsibility").
+- New claims added: no. This is a scope-narrowing and cleanup change; no new
+  validation claims were made. Broader top50/multi-day full_l2 equivalence
+  (the `v2.0.0` gate) remains explicitly not claimed.
+- Evidence for any new validation claim:
+  - n/a — no new validation claims; existing ADAUSDT smoke evidence preserved
+    unchanged.
+
+### Tests run
+```bash
+source .venv/bin/activate && pytest -q
+# 227 passed, 3 skipped
+```
+
+### Validation CLIs run
+```bash
+# none required — this change removes/renames modules and rewrites docs; it
+# does not alter recorder, converter, or replay-store semantics. The existing
+# ADAUSDT full_l2 smoke evidence was not re-run because no code paths it
+# exercises were modified (only its call site moved from
+# pipeline/generate_catalog.py to validation/replay_catalog_reconstruct.py with
+# behavior otherwise unchanged, and this is covered by the passing pytest run
+# above, including tests/test_replay_catalog_reconstruct.py and
+# tests/test_catalog_equivalence_full_l2.py).
+```
+
+### Known limitations / out of scope
+- `validation/audit_storage_size.py` still has a generic `--feature-root` CLI
+  flag and a `feature_store` component label for measuring arbitrary directory
+  sizes. Left unchanged deliberately: it imports nothing from the deleted
+  feature-store modules and is a generic size-measurement tool, not a
+  feature-store consumer. Renaming its flag was judged out of scope for this
+  issue.
+- Broader top50/multi-day `full_l2` validation (the `v2.0.0` gate) is still
+  pending; not addressed by this change.
+- Issue #15 (the superseded `generate_catalog` product-CLI proposal) needs to
+  be manually commented on and closed as "not planned" on GitHub — not done as
+  part of this local change; requires user confirmation before performing any
+  GitHub write action.
+- Pushing the `refactor/recorder-replay-only` branch and opening a PR are not
+  done as part of this change; both require explicit user confirmation first
+  per this repository's operational safety rules.
+
 
 ### Change summary
 - Created `.githooks/commit-msg` — bash hook that validates every commit message
@@ -406,3 +5944,364 @@ python -m validation.audit_change_compliance --staged
 - The pre-commit hook must be activated manually per-clone via
   `git config core.hooksPath .githooks` (see INSTALL.md).
 - No changes to recorder, stores, pipeline, or converter code.
+
+## 2026-07-31 — Issue #20 Phase 7 partial-source full-universe evidence aggregation
+
+### Change summary
+- Aggregated the already persisted external full-day schema-v2 evidence for
+  the accepted three-day local fixture; no builder, partition validator,
+  deep-integrity validator, raw scanner, convert_day.py, or Nautilus
+  reconstruction was rerun.
+- Recorded 150/150 successful schema-v2.0.1 builds (72 spot, 78 futures),
+  150/150 successful routine/deep validation subprocesses, zero reported deep
+  problems, zero anonymous trades, valid source identities/checksums/scales,
+  no duplicate or staging partitions, and final replay size
+  4,137,099,264 allocated bytes / 4,134,547,170 apparent bytes.
+- Preserved the strict supervisor classification as FAILED: MemoryMax reached
+  10,737,418,240 bytes and memory.max events totaled 855,983, while swap,
+  OOM, OOM-kill, and OOM-group-kill remained zero.
+- Derived the non-exact conservative missing-tail estimate solely from
+  persisted per-partition build result fields: 1,681,900 bytes allowance and
+  4,138,781,164 bytes observed plus allowance, still below 5 GiB.
+
+### Files/packages touched
+- docs/PROJECT_STATUS.md
+- docs/FULL_L2_REPLAY_CATALOG_PLAN.md
+- docs/CHANGE_AUDIT.md
+- CHANGELOG.md
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] docs/REPO_STRUCTURE.md
+- [x] docs/PROJECT_STATUS.md
+- [x] docs/IMPLEMENTATION_AUDIT.md
+- [x] docs/FULL_L2_REPLAY_CATALOG_PLAN.md
+- [x] docs/OPERATIONS.md
+- [x] docs/AI_WORKFLOW.md
+- [x] CHANGELOG.md
+
+### Docs updated
+- [x] docs/PROJECT_STATUS.md — recorded the partial-source full-universe
+  storage/build evidence and exact independent classifications.
+- [x] docs/FULL_L2_REPLAY_CATALOG_PLAN.md — recorded Phase 7 storage evidence
+  without promoting semantic equivalence, raw completeness, v2.0.0, or
+  production status.
+- [x] CHANGELOG.md — added the current Unreleased evidence summary.
+- [x] docs/CHANGE_AUDIT.md — this entry.
+- [ ] README.md — no change needed; this is validation evidence/status detail.
+
+### Status / validation impact
+- Issue #20 Phase 7 core acceptance: PASS WITH OPERATIONAL CAVEATS.
+- Replay functionality: PASS from persisted 150/150 build and validation
+  evidence.
+- Routine/deep integrity: PASS, 150/150 with zero reported problems.
+- Observed 5 GiB storage gate: PASS.
+- 2 GiB stretch gate: FAIL.
+- Bounded execution without swap or OOM: PASS.
+- Zero memory-pressure events and strict supervisor contract: FAILED because
+  memory.max was nonzero.
+- Raw completeness: PARTIAL / NOT PROVEN for 50 missing D+1 depth directories.
+- No further full-day rebuild is required for Phase 7 acceptance.
+- Memory-headroom optimization is a separate follow-up concern.
+- No production deployment, Phase 8 completion, or v2.0.0 declaration.
+
+### Persisted evidence
+- External report:
+  /home/z0055upd/cryptorecorder_phase7_bench/full_day_schema_v2_partial_source_2026-06-11_20260731T130753Z/reports/final_acceptance_report.json
+- Report SHA-256:
+  7dd82ba51b54d990c9c4fe37565402489eeaa9da58d90384a2f47f92a961a772
+- The FAILED sentinel and the original full run evidence remain external and
+  untouched.
+
+### Tests run
+git diff --check
+python -m validation.audit_change_compliance --staged
+pytest tests/test_repo_structure.py tests/test_agent_infrastructure.py -q
+
+### Validation CLIs run
+none — this is a documentation-only status update, and rerunning any
+builder/validator/reconstruction command was explicitly prohibited.
+
+### Known limitations / out of scope
+- This evidence uses the accepted partial-source fixture and is not complete
+  raw-day proof.
+- The strict supervisor is not represented as COMPLETE.
+- The 2 GiB stretch target was not reached.
+- Per-symbol memory-pressure attribution was not persisted.
+- No repository source, test, raw data, replay artifact, FAILED sentinel,
+  production service, deployment, Phase 8, or Issue #20 closure was changed.
+
+## 2026-07-31 — Issue #20 closure checkpoint 1 selected reconstruction boundary
+
+### Change summary
+- Added `pipeline.reconstruct_selected_catalog`, the one contract-permitted
+  development-computer CLI/API for explicit selected temporary Nautilus
+  catalogs. It requires replay/output roots, nonempty venue/symbol lists,
+  timezone-aware `[start,end)` endpoints, a safe job ID, and an intentional
+  profile (`full_l2` or `trades_only`).
+- Reused `validation.replay_catalog_reconstruct` as the sole reconstruction
+  engine; added only per-partition output accounting to that engine.
+- Added fail-closed replay/schema/checksum/instrument/carry preflight,
+  before/after identity verification, canonical consumed-partition and catalog
+  inventories, safe same-parent staging, exact-job overwrite, and atomic final
+  publication. Missing dependencies report the pinned Nautilus requirement.
+- Updated current repository, architecture, validation, operation, status, and
+  plan contracts without changing `convert_day.py` or replay semantics.
+
+### Files/packages touched
+- `pipeline/reconstruct_selected_catalog.py`
+- `pipeline/__init__.py`
+- `validation/replay_catalog_reconstruct.py`
+- `tests/test_reconstruct_selected_catalog.py`
+- `tests/test_repo_structure.py`
+- `README.md`
+- `docs/ARCHITECTURE.md`
+- `docs/REPO_STRUCTURE.md`
+- `docs/PROJECT_STATUS.md`
+- `docs/FULL_L2_REPLAY_CATALOG_PLAN.md`
+- `docs/VALIDATION.md`
+- `docs/OPERATIONS.md`
+- `docs/IMPLEMENTATION_AUDIT.md`
+- `CHANGELOG.md`
+- `docs/CHANGE_AUDIT.md`
+
+### Docs reviewed and updated
+- [x] AGENTS.md and `.github/copilot-instructions.md`
+- [x] docs/REPO_STRUCTURE.md
+- [x] docs/PROJECT_STATUS.md
+- [x] docs/IMPLEMENTATION_AUDIT.md
+- [x] docs/FULL_L2_REPLAY_CATALOG_PLAN.md
+- [x] docs/VALIDATION.md
+- [x] docs/OPERATIONS.md
+- [x] docs/ARCHITECTURE.md
+- [x] README.md
+- [x] CHANGELOG.md
+
+### Status / validation impact
+- The explicitly selected development-computer reconstruction CLI/API is now
+  supported. Its internal engine remains shared with equivalence validation.
+- It is not a Linux service/timer, persistent catalog lifecycle, feature store,
+  backtest, strategy, risk, or execution boundary.
+- Broader top50/multi-day validation, v2.0.0, lifecycle/backlog/production
+  integration, uv migration, deployment, PR creation, and Issue #20 closure
+  remain deferred and were not started.
+
+### Tests run
+```bash
+git diff --check
+python -m py_compile pipeline/reconstruct_selected_catalog.py \
+  validation/replay_catalog_reconstruct.py \
+  tests/test_reconstruct_selected_catalog.py
+pytest -q tests/test_reconstruct_selected_catalog.py \
+  tests/test_repo_structure.py tests/test_agent_infrastructure.py
+# 84 passed
+
+pytest -q tests/test_reconstruct_selected_catalog.py \
+  tests/test_replay_catalog_reconstruct.py tests/test_replay_store.py \
+  tests/test_replay_fail_closed_hardening.py \
+  tests/test_replay_hierarchical_integrity_v2.py \
+  tests/test_replay_depth_adapter.py tests/test_replay_depth_repartitioning.py \
+  tests/test_replay_sync_continuity.py tests/test_catalog_equivalence.py \
+  tests/test_catalog_equivalence_full_l2.py tests/test_pipeline_validation.py \
+  tests/test_repo_structure.py tests/test_agent_infrastructure.py
+# 222 passed, 2 skipped
+
+pytest -q
+# 773 passed, 3 skipped
+```
+
+No repository linter is configured; none was installed for this checkpoint.
+
+### Validation CLIs and real smoke
+```bash
+bash scripts/run_under_cgroup.sh 10G <external-cgroup-evidence> \
+  cr-p7-selected-smoke-185710 -- \
+  .venv/bin/python -m pipeline.reconstruct_selected_catalog \
+  --replay-root <preserved-schema-v2-replay> \
+  --venues BINANCE_SPOT --symbols ADAUSDT \
+  --start 2026-06-11T12:00:00Z --end 2026-06-11T12:05:00Z \
+  --output-root <external-job-root> --job-id ada-intraday-full-l2 \
+  --profile full_l2
+```
+
+- Exit 0; 51.436815298 seconds; peak 640,143,360 bytes; effective
+  MemoryMax 10,737,418,240; swap 0; memory.high/max 0; OOM/OOM-kill 0.
+- Pinned-Nautilus read verification: 475 TradeTicks, 3,328 flattened
+  OrderBookDelta rows, 227 Depth10 objects; exact catalog inventory digest and
+  end-exclusive upper bound verified.
+- External job manifest SHA-256:
+  `7d3eef0020c210911d485dff5f1d9d933e55981c70b0a95edb9a3b13446011ff`.
+
+### Known limitations / out of scope
+- The smoke is one selected symbol and five-minute output window using already
+  accepted schema-v2 replay; it is not another semantic matrix, replay build,
+  top50/multi-day gate, or production acceptance.
+- `convert_day.py`, replay rows/schema/ordering, the ten-case representative
+  evidence, and the 150-partition storage evidence were unchanged.
+- Checkpoints 2-4, PR creation, Issue #20 mutation/closure, production
+  deployment, Phase 8, retention, uv, and KovacsTrader were not started.
+
+## 2026-08-01 — Issue #20 closure checkpoint 2 replay lifecycle and operations
+
+### Change summary
+- Added a single nonblocking Linux `fcntl.flock` lifecycle boundary shared by
+  direct replay builds, bounded daily/backlog orchestration, cross-date
+  recovery, exact-partition replacement, publication, and retention proof
+  planning. Kernel ownership is authoritative; unsafe lock paths and ambiguous
+  replay lifecycle state fail closed.
+- Extended daily replay construction to an oldest-first bounded lookback with
+  explicit schema/source policies, eight non-collapsed partition outcomes,
+  nonzero incomplete/deferred behavior, and fsynced atomic per-date/run
+  reports bound to run/lock/repository/root identity.
+- Preserved per-partition atomic publication while making backup/staging/
+  quarantine recovery root-wide and bounded. Quarantine is preserved and
+  corrupt/unknown/symlinked/multiple-candidate state is refused.
+- Replaced persistent-catalog monitoring with one bounded replay
+  classification scan, actual-filesystem capacity grouping, replay growth and
+  transient-pressure visibility, stale/null failure semantics, and old
+  staging/backup alerts.
+- Removed the automatic single-channel raw deletion behavior. Automatic
+  mutation is disabled even if configured; the remaining API is a proof-only
+  paired depth/trade retention plan under the common lock. Durable
+  transaction journal/move/rollback/recovery remains deliberately absent.
+- Updated the uninstalled replay-build service template to explicitly use
+  schema 2, seven lookback days, at most three build dates, `Restart=no`,
+  `MemoryMax=12G`, and `MemorySwapMax=0`; deployment dry-run validates those
+  fields without starting a service.
+
+### Files/packages touched
+- `pipeline/replay_lifecycle.py`
+- `pipeline/daily_build.py`
+- `pipeline/build_replay_store.py`
+- `stores/replay_writer.py`
+- `disk_monitor.py`
+- `config.py`
+- `scripts/deploy_linux_server.sh`
+- `systemd/cryptorecorder-replay-build.service`
+- `systemd/cryptorecorder.env.example`
+- `tests/test_replay_lifecycle.py`
+- `tests/test_daily_backlog_lifecycle.py`
+- `tests/test_replay_build_policy.py`
+- `tests/test_replay_monitoring_retention.py`
+- `tests/test_disk_monitor_cleanup.py`
+- `tests/test_disk_monitor_fail_safe.py`
+- `tests/test_agent_infrastructure.py`
+- `tests/test_repo_structure.py`
+- `README.md`
+- `docs/ARCHITECTURE.md`
+- `docs/DAILY_BUILD_PIPELINE.md`
+- `docs/REPLAY_STORE.md`
+- `docs/OPERATIONS.md`
+- `docs/PROJECT_STATUS.md`
+- `docs/IMPLEMENTATION_AUDIT.md`
+- `docs/REPO_STRUCTURE.md`
+- `CHANGELOG.md`
+- `docs/CHANGE_AUDIT.md`
+
+### Docs reviewed and updated
+- [x] AGENTS.md and `.github/copilot-instructions.md`
+- [x] `docs/REPO_STRUCTURE.md`
+- [x] `docs/PROJECT_STATUS.md`
+- [x] `docs/IMPLEMENTATION_AUDIT.md`
+- [x] `docs/FULL_L2_REPLAY_CATALOG_PLAN.md` (reviewed; no semantic-gate
+  status changed, so no edit required)
+- [x] `docs/OPERATIONS.md`
+- [x] `docs/ARCHITECTURE.md`
+- [x] `docs/DAILY_BUILD_PIPELINE.md`
+- [x] `docs/REPLAY_STORE.md`
+- [x] README.md and CHANGELOG.md
+- [x] `docs/VALIDATION.md` (reviewed; validation CLI contracts are unchanged,
+  so no edit required)
+
+### Status / validation impact
+- Repository-side schema-v2 lifecycle/backlog/reporting, monitoring, and
+  bounded service-template behavior are implemented and locally validated.
+- The service template is intended production configuration but has not been
+  installed, deployed, enabled, started, or production-accepted.
+- Existing production replay is not automatically migrated. Source-changed
+  and incompatible partitions require separate explicit exact-partition
+  policies; corrupt replay remains a hard failure.
+- Automatic raw retirement is not implemented. The old unsafe destructive
+  behavior is disabled; proof-only reporting does not authorize deletion.
+- Replay row semantics, physical schemas, ordering, precision, cross-day
+  repartitioning, recorder ingestion, raw layout, and `convert_day.py` are
+  unchanged.
+
+### Tests run
+```bash
+git diff --check
+python -m compileall -q config.py disk_monitor.py pipeline stores tests
+bash -n scripts/deploy_linux_server.sh
+bash scripts/deploy_linux_server.sh --target replay-build --dry-run --no-systemd
+
+pytest -q tests/test_replay_lifecycle.py \
+  tests/test_daily_backlog_lifecycle.py tests/test_replay_build_policy.py \
+  tests/test_replay_monitoring_retention.py tests/test_daily_build.py \
+  tests/test_disk_monitor_fail_safe.py tests/test_disk_monitor_cleanup.py \
+  tests/test_replay_store.py tests/test_replay_fail_closed_hardening.py \
+  tests/test_replay_memory_bounded.py \
+  tests/test_replay_hierarchical_integrity_v2.py \
+  tests/test_replay_depth_repartitioning.py \
+  tests/test_replay_scale_selection_and_eligibility.py \
+  tests/test_replay_sync_continuity.py \
+  tests/test_replay_trade_identifier_normalization.py \
+  tests/test_replay_catalog_reconstruct.py \
+  tests/test_reconstruct_selected_catalog.py \
+  tests/test_agent_infrastructure.py tests/test_repo_structure.py
+# 380 passed
+
+pytest -q
+# 820 passed, 3 skipped
+```
+
+No repository linter is configured/installed; none was installed for this
+checkpoint.
+
+### Validation CLIs and isolated real smoke
+The external, non-production smoke used only
+`BINANCE_SPOT/ADAUSDT/2026-06-11`, fresh replay/report roots, and four separate
+12 GiB/zero-swap cgroup scopes:
+
+```bash
+python -m pipeline.daily_build --date 2026-06-11 \
+  --venues BINANCE_SPOT --symbols ADAUSDT --backlog-days 1 \
+  --max-build-dates 1 --schema-version 2 \
+  --data-root <existing-local-data_raw> \
+  --replay-root <external-smoke-root>/replay \
+  --report-root <external-smoke-root>/reports
+
+python -m validation.audit_replay_store \
+  --replay-root <external-smoke-root>/replay --date 2026-06-11 \
+  --venues BINANCE_SPOT --symbols ADAUSDT \
+  --report-path <external-smoke-root>/audit_report.json
+
+# routine validate_partition + audit_partition_deep + anonymous-trade check
+# then the identical daily_build invocation again
+```
+
+- First run: `built`; 303,293 depth and 129,824 trade rows; 45.080917421s;
+  1,196,359,680-byte peak.
+- Replay audit and deep integrity: passed; exact manifest counts/checksums,
+  sorted streams, zero duplicates, zero deep problems, zero anonymous trades.
+- Second run: `skipped_valid`; 8.040619785s; 165,552,128-byte peak.
+- All four scopes: effective MemoryMax 12,884,901,888 bytes,
+  MemorySwapMax/swap 0, memory.low/high/max 0, OOM/OOM-kill/group-kill 0.
+- Published partition: 8,110,080 allocated / 8,101,903 apparent bytes; no
+  staging or backup remained.
+- External smoke-summary SHA-256:
+  `1aacc5f402f9a42c17fe6aac71b1c92cd3b77494d4d64e44357918be9d3c7561`.
+
+### Known limitations / out of scope
+- The smoke is one isolated venue/symbol/date lifecycle check, not top50,
+  broad multi-day semantics, v2.0.0, another representative matrix, or
+  production acceptance.
+- No production data/replay root, `/etc` environment, running unit, recorder,
+  converter, selected-catalog semantic output, or existing external evidence
+  was modified.
+- The 12 GiB service policy still needs the separately authorized owner-run
+  isolated production acceptance. Memory-headroom optimization remains a
+  follow-up.
+- Durable transactional raw retirement is not implemented; no raw data was
+  moved or deleted.
+- uv migration, PR creation, Issue #20 modification/closure, deployment,
+  Phase 8, retention execution, and KovacsTrader work were not started.
