@@ -400,6 +400,16 @@ replacement policy. A matching v2/source partition is `skipped_valid`; changed
 source is `source_changed_rebuild_required`; legacy/incompatible schema is
 `incompatible_schema_rebuild_required`; corrupt replay is `failed`.
 
+Schema-v2 builds retry an exact hourly plain-to-compressed raw transition only
+after abandoning the entire partition attempt and its staging. The retry is
+limited to three attempts, and no mixed-representation source identity is
+published. An identified plain source must match the replacement's decoded
+bytes. A persistent ambiguous source or unrelated raw mutation fails.
+Root reconciliation tolerates only the real `.stfolder` directory and real
+`.stignore` file as inert external metadata. CryptoRecorder does not install,
+configure, control, or validate Syncthing; its replication is not an archive
+or restore implementation.
+
 ## Auditing Replay Store
 
 Use the non-mutating audit CLI to verify a replay partition after building:

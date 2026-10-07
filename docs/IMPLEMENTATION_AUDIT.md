@@ -30,6 +30,18 @@ replay_store -> pipeline.reconstruct_selected_catalog -> temporary catalog
   replay_catalog_reconstruct engine; broader top50/multi-day validation pending
 ```
 
+## 2026-10-07 development correction — replay root and raw transition
+
+The audited `zsomborsserver` replay-build service failed during root
+reconciliation because operator-managed Syncthing created `.stfolder`; raw
+recording continued, but completed dates after 2026-09-25 were not built.
+A separate 2026-09-25 `BINANCE_SPOT/UNIUSDT` attempt lost a selected adjacent-day
+plain JSONL file while the recorder completed its Zstandard replacement.
+The replay pipeline now tolerates two exact root metadata types and retries
+only proven exact hourly representation transitions at the whole-partition
+boundary. This change is development-tested only. Server repair, 11-day
+backfill, production acceptance, and broader full-L2 validation remain pending.
+
 ## Issue #20 owner-approved closure amendment — checkpoint 4 source blocker
 
 At repository checkpoint

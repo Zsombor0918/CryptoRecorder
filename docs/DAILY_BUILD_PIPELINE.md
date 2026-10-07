@@ -69,7 +69,10 @@ does not reacquire the lock.
 Before raw/backlog inspection, one bounded scan covers the configured replay
 root across every date. It recognizes only canonical `date=YYYY-MM-DD`
 partitions and canonical `.staging_*`, `.backup_*`, `.quarantine_*`, and
-`.lifecycle` artifacts. It never follows symlinks.
+`.lifecycle` artifacts. At the replay root only, it also tolerates the
+external operator-owned `.stfolder` directory and `.stignore` regular file
+when each is a real, non-symlink entry. It does not inspect or act on either.
+Every other unknown entry remains an error. It never follows symlinks.
 
 - A valid canonical partition is authoritative. A single obsolete valid
   backup is removed only through this safe cleanup path.
@@ -125,6 +128,18 @@ For schema 2, reuse requires the complete replay manifest and files to pass
 routine validation, current builder identity to match, and a new strict raw
 source-identity scan to equal the stored manifest identity.
 
+Each build attempt selects one D-1/D/D+1 depth plus D trade raw-file inventory
+for pre-build identity, strict streaming, and post-build identity. A selected
+hourly `.jsonl` changing to one readable `.jsonl.zst` or `.jsonl.gz` aborts
+that attempt, removes its staging, and starts again from a fresh inventory.
+Temporary plain/compressed coexistence receives the same bounded treatment.
+There are at most three attempts, with 200 ms between inventories; exhaustion
+fails the partition. Reuse identity scans use the same bound. Missing or corrupt
+replacements, unrelated I/O, other inventory drift, and raw checksum changes
+remain failures. The pre/post identity comparison still controls publication.
+When the plain bytes were already identified, a compressed replacement must
+also decode to those same bytes; an altered decoded stream is a hard failure.
+
 - Source change defaults to `source_changed_rebuild_required`; use
   `--rebuild-source-changed` for an intentional exact-partition replacement.
 - Legacy/incompatible schema or builder defaults to
@@ -165,6 +180,11 @@ installed, run, or production-accepted in this checkpoint. The existing
 `/etc/cryptorecorder/cryptorecorder.env` is not modified automatically.
 Memory-headroom optimization remains a follow-up after Phase 7's accepted
 10 GiB pressure evidence.
+
+The later 2026-10-07 `zsomborsserver` audit found the supported service
+policy installed. That finding does not close production acceptance; the
+replay root metadata failure had prevented backlog processing since
+2026-09-26. The development correction and server recovery are separate steps.
 
 ## Local isolated smoke
 

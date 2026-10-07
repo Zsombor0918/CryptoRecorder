@@ -9,6 +9,7 @@ import gzip
 import hashlib
 import json
 import logging
+import re
 from pathlib import Path
 from typing import Optional
 
@@ -31,6 +32,168 @@ logger = logging.getLogger(__name__)
 # still surfaces via the existing per-venue error collection below rather
 # than being silently hidden.
 ELIGIBLE_MARKET_CHANNELS = frozenset({"depth_v2", "trade_v2"})
+
+
+class RawRepresentationTransition(RuntimeError):
+    """A selected plain hourly file is being replaced by one compressed sibling."""
+
+    def __init__(self, logical_path: Path, detail: str) -> None:
+        self.logical_path = logical_path
+        super().__init__(f"raw representation transition at {logical_path}: {detail}")
+
+
+class ReplayRawInventory(dict):
+    """Selected paths plus attempt-local plain-byte baselines (not manifest data)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.plain_hashes: dict[Path, str] = {}
+
+
+def _logical_raw_path(path: Path) -> Path:
+    name = path.name
+    if name.endswith(".jsonl.zst"):
+        return path.with_name(name[:-4])
+    if name.endswith(".jsonl.gz"):
+        return path.with_name(name[:-3])
+    return path
+
+
+def _is_exact_hour(path: Path) -> bool:
+    """Limit transition recovery to an hourly file in its own UTC-day directory."""
+    return re.fullmatch(
+        rf"{re.escape(path.parent.name)}T(?:[01][0-9]|2[0-3])\.jsonl",
+        path.name,
+    ) is not None
+
+
+def _validate_compressed_replacement(
+    path: Path, *, expected_plain_sha256: str | None = None,
+) -> None:
+    """Prove a sole replacement is a closed, readable compressed file."""
+    before = (path.stat().st_size, _sha256_file(path))
+    opener = zstd.open if path.suffix == ".zst" else gzip.open
+    decoded_digest = hashlib.sha256()
+    with opener(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(65536), b""):
+            decoded_digest.update(chunk)
+    after = (path.stat().st_size, _sha256_file(path))
+    if before != after:
+        raise RuntimeError(f"compressed replacement changed while validating: {path}")
+    if expected_plain_sha256 is not None and decoded_digest.hexdigest() != expected_plain_sha256:
+        raise RuntimeError(f"decoded content differs from selected plain source: {path}")
+
+
+def _selected_raw_files(channel_dir: Path) -> tuple[Path, ...]:
+    files = tuple(_iter_consumed_raw_files(channel_dir))
+    variants: dict[Path, list[Path]] = {}
+    for path in files:
+        variants.setdefault(_logical_raw_path(path), []).append(path)
+    for logical, paths in variants.items():
+        if len(paths) < 2:
+            continue
+        if (len(paths) == 2 and _is_exact_hour(logical) and logical in paths and
+                sum(path.suffix in (".zst", ".gz") for path in paths) == 1):
+            raise RawRepresentationTransition(logical, "compression variants: plain and compressed siblings coexist")
+        _assert_no_compression_variants(list(paths), context=str(channel_dir))
+    return files
+
+
+def select_replay_raw_inventory(
+    venue: str, symbol: str, date: str, data_root: Path,
+) -> ReplayRawInventory:
+    """Select exactly the schema-v2 inputs for one replay partition attempt."""
+    from datetime import date as calendar_date, timedelta
+
+    day = calendar_date.fromisoformat(date)
+    inventory = ReplayRawInventory()
+    for source_date in ((day - timedelta(days=1)).isoformat(), date,
+                        (day + timedelta(days=1)).isoformat()):
+        directory = data_root / venue / "depth_v2" / symbol / source_date
+        inventory[("depth_v2", source_date)] = _selected_raw_files(directory)
+    directory = data_root / venue / "trade_v2" / symbol / date
+    inventory[("trade_v2", date)] = _selected_raw_files(directory)
+    return inventory
+
+
+def capture_plain_raw_hashes(
+    inventory: ReplayRawInventory, identity: dict,
+    venue: str, symbol: str, date: str, data_root: Path,
+) -> None:
+    """Retain decoded-byte baselines for plain inputs, including excluded depth."""
+    known = {
+        data_root / entry["path"]: entry["sha256"]
+        for entries in identity["channels"].values() for entry in entries
+        if entry["path"].endswith(".jsonl")
+    }
+    for paths in inventory.values():
+        for path in paths:
+            if path.suffix != ".jsonl":
+                continue
+            if path in known:
+                inventory.plain_hashes[path] = known[path]
+                continue
+            try:
+                inventory.plain_hashes[path] = _sha256_file(path)
+            except FileNotFoundError as exc:
+                check_selected_raw_disappearance(
+                    inventory, path, venue, symbol, date, data_root
+                )
+                raise RuntimeError(f"selected raw input disappeared: {path}") from exc
+
+
+def verify_plain_raw_hashes(
+    inventory: ReplayRawInventory,
+    venue: str, symbol: str, date: str, data_root: Path,
+) -> None:
+    """Keep same-path mutations of otherwise excluded plain inputs fail-closed."""
+    for path, expected in inventory.plain_hashes.items():
+        try:
+            current = _sha256_file(path)
+        except FileNotFoundError as exc:
+            check_selected_raw_disappearance(
+                inventory, path, venue, symbol, date, data_root
+            )
+            raise RuntimeError(f"selected raw input disappeared: {path}") from exc
+        if current != expected:
+            raise RuntimeError(f"selected raw content changed during build: {path}")
+
+
+def assert_replay_inventory_unchanged(
+    selected: dict[tuple[str, str], tuple[Path, ...]],
+    venue: str, symbol: str, date: str, data_root: Path,
+) -> None:
+    """Reject drift; retry only an exact plain-to-compressed replacement."""
+    current = select_replay_raw_inventory(venue, symbol, date, data_root)
+    if current == selected:
+        return
+    changed = [(key, old, current[key]) for key, old in selected.items()
+               if old != current[key]]
+    if len(changed) == 1:
+        _key, old, new = changed[0]
+        removed = set(old) - set(new)
+        added = set(new) - set(old)
+        if len(removed) == len(added) == 1:
+            plain, compressed = next(iter(removed)), next(iter(added))
+            if (plain.suffix == ".jsonl" and _is_exact_hour(plain) and
+                    compressed in (Path(f"{plain}.zst"), Path(f"{plain}.gz"))):
+                _validate_compressed_replacement(
+                    compressed,
+                    expected_plain_sha256=getattr(selected, "plain_hashes", {}).get(plain),
+                )
+                raise RawRepresentationTransition(plain, f"now represented by {compressed.name}")
+    raise RuntimeError(f"selected raw inventory changed for {venue}/{symbol}/{date}; refusing mixed source evidence")
+
+
+def check_selected_raw_disappearance(
+    selected: dict[tuple[str, str], tuple[Path, ...]],
+    missing: Path, venue: str, symbol: str, date: str, data_root: Path,
+) -> None:
+    """Raise a transition only when ENOENT has the exact valid replacement."""
+    if (missing.suffix != ".jsonl" or not _is_exact_hour(missing) or
+            not any(missing in files for files in selected.values())):
+        return
+    assert_replay_inventory_unchanged(selected, venue, symbol, date, data_root)
 
 
 def _iter_consumed_raw_files(channel_dir: Path) -> "list[Path]":
@@ -131,6 +294,7 @@ def compute_raw_source_identity(
     *,
     include_record_counts: bool = False,
     strict: bool = False,
+    inventory: Optional[dict[tuple[str, str], tuple[Path, ...]]] = None,
 ) -> dict:
     """Record per-file identity (path + SHA-256 + size) for the raw files that
     back one venue/symbol/date/channel set.
@@ -217,7 +381,10 @@ def compute_raw_source_identity(
         cumulative = 0
         channel_failed = False
         if channel_dir.exists():
-            selected_files = _iter_consumed_raw_files(channel_dir)
+            selected_files = (
+                inventory[(channel, date_str)] if inventory is not None
+                else _iter_consumed_raw_files(channel_dir)
+            )
             if strict:
                 _assert_no_compression_variants(
                     selected_files,
@@ -238,6 +405,14 @@ def compute_raw_source_identity(
                         entry["record_range"] = [cumulative, cumulative + record_count]
                         cumulative += record_count
                     entries.append(entry)
+                except FileNotFoundError as exc:
+                    if strict and inventory is not None:
+                        check_selected_raw_disappearance(
+                            inventory, fpath, venue, symbol, date_str, data_root
+                        )
+                    channel_failed = True
+                    if strict:
+                        raise RuntimeError(f"Could not read selected raw input {fpath}: {exc}") from exc
                 except Exception as exc:
                     channel_failed = True
                     logger.warning(f"Could not checksum raw file {fpath}: {exc}")
