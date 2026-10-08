@@ -93,6 +93,73 @@ An entry may be skipped **only** for:
 - <or "none — task fully completed">
 ```
 
+## 2026-10-07 — Repair replay root coexistence and raw compression races
+
+### Change summary
+- Tolerate only correctly typed, non-symlink `.stfolder` and `.stignore` at
+  the replay root, without traversing or recovering either.
+- Hold one schema-v2 raw inventory through identity and streaming; retry only
+  exact hourly plain-to-compressed transitions after discarding staging, with
+  three total attempts and two 200 ms waits. Check decoded replacement bytes
+  against the identified plain source when a baseline exists.
+- Add deterministic root and race regressions and correct current audited
+  `zsomborsserver` path/installation wording without changing historical gates.
+
+### Files/packages touched
+- `pipeline/replay_lifecycle.py`, `pipeline/raw_manifest.py`,
+  `pipeline/build_replay_store.py`
+- `tests/test_replay_lifecycle.py`, `tests/test_replay_compression_race.py`,
+  `tests/test_replay_fail_closed_hardening.py`
+- `docs/DAILY_BUILD_PIPELINE.md`, `docs/REPLAY_STORE.md`,
+  `docs/OPERATIONS.md`, `docs/IMPLEMENTATION_AUDIT.md`,
+  `docs/PROJECT_STATUS.md`, `docs/CHANGE_AUDIT.md`, `CHANGELOG.md`
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] docs/REPO_STRUCTURE.md
+- [x] docs/PROJECT_STATUS.md
+- [x] docs/IMPLEMENTATION_AUDIT.md
+- [x] relevant feature docs: docs/FULL_L2_REPLAY_CATALOG_PLAN.md,
+  docs/OPERATIONS.md, docs/AI_WORKFLOW.md, docs/DAILY_BUILD_PIPELINE.md,
+  docs/REPLAY_STORE.md
+
+### Docs updated
+- [x] CHANGELOG.md
+- [ ] README.md — no overview or public CLI change
+- [x] docs/PROJECT_STATUS.md — installed-service evidence corrected; acceptance remains pending
+- [ ] docs/REPO_STRUCTURE.md — no contract or file-layout change
+- [x] relevant feature docs: docs/DAILY_BUILD_PIPELINE.md,
+  docs/REPLAY_STORE.md, docs/OPERATIONS.md, docs/IMPLEMENTATION_AUDIT.md
+
+### Status / validation impact
+- Validated status changed: no; installation evidence was corrected, not promoted to acceptance.
+- Deferred status changed: no.
+- New claims added: development-only regression and synthetic audit evidence.
+- Evidence for any new validation claim: focused `141 passed`; ordinary suite
+  `883 passed, 3 skipped`; synthetic schema-v2 audit had matching counts,
+  checksums, sorted rows, and no errors.
+
+### Tests run
+```bash
+uv lock --check
+UV_PROJECT_ENVIRONMENT=/home/zsom/.cache/cryptorecorder-replay-dev-env uv sync --frozen --no-default-groups --extra reconstruction --group dev
+/home/zsom/.cache/cryptorecorder-replay-dev-env/bin/pytest -q tests/test_replay_lifecycle.py tests/test_daily_backlog_lifecycle.py tests/test_replay_build_policy.py tests/test_replay_depth_repartitioning.py tests/test_replay_fail_closed_hardening.py tests/test_replay_store.py tests/test_repo_structure.py tests/test_replay_compression_race.py
+/home/zsom/.cache/cryptorecorder-replay-dev-env/bin/pytest -q tests/
+```
+
+### Validation CLIs run
+```bash
+/home/zsom/.cache/cryptorecorder-replay-dev-env/bin/python -m validation.audit_replay_store --replay-root /tmp/cryptorecorder-replay-audit-final.WOQETc/replay --date 2026-01-03 --symbols ADAUSDT --venues BINANCE_SPOT
+/home/zsom/.cache/cryptorecorder-replay-dev-env/bin/python -m validation.audit_change_compliance --staged
+```
+
+### Known limitations / out of scope
+- No production command, deployment, backfill, or production validation.
+- No recorder/raw schema/layout, manifest contract, builder version,
+  Syncthing management, archive/restore, or full-L2 acceptance change.
+- The separate production operator must review and run the rollout and
+  recovery runbook; the 11 missing dates and 2026-09-25 UNIUSDT remain pending.
+
 ## 2026-08-04 — Decouple production replay scale derivation from Nautilus
 
 ### Change summary

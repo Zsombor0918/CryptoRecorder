@@ -350,6 +350,20 @@ def reconcile_replay_root(
     for venue_dir in _iter_structure_entries_bounded(root, counter, max_entries):
         if venue_dir.name == ".lifecycle":
             continue
+        if venue_dir.name in (".stfolder", ".stignore"):
+            if venue_dir.is_symlink():
+                raise ReplayLifecycleSafetyError(
+                    f"unknown/unsafe replay-root entry: {venue_dir}"
+                )
+            expected_type = (
+                venue_dir.is_dir() if venue_dir.name == ".stfolder"
+                else venue_dir.is_file()
+            )
+            if not expected_type:
+                raise ReplayLifecycleSafetyError(
+                    f"unknown/unsafe replay-root entry: {venue_dir}"
+                )
+            continue
         venue_match = _VENUE_RE.fullmatch(venue_dir.name)
         if not venue_match or venue_dir.is_symlink() or not venue_dir.is_dir():
             raise ReplayLifecycleSafetyError(f"unknown/unsafe replay-root entry: {venue_dir}")

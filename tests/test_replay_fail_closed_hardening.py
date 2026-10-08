@@ -585,9 +585,9 @@ def test_v2_build_propagates_transient_midstream_raw_read_error(
     raw_root = _sample_raw_root(tmp_path)
     real_strict_stream = build_module._stream_raw_records_strict
 
-    def transient_failure(venue, symbol, channel, date, data_root):
+    def transient_failure(venue, symbol, channel, date, data_root, **kwargs):
         for record in real_strict_stream(
-            venue, symbol, channel, date, data_root
+            venue, symbol, channel, date, data_root, **kwargs
         ):
             yield record
             if channel == "trade_v2":

@@ -412,8 +412,9 @@ is not imported by the production replay writer.
 
 Services continue to execute `<app-dir>/.venv/bin/python`. They never execute
 uv, resolve dependencies, update the lock, or access a package index at
-startup. Repository templates have not yet been deployed or production-
-accepted.
+startup. The 2026-10-07 `zsomborsserver` audit found an installed replay-build
+service using the supported schema-v2 and resource policy. That installation
+does not complete production acceptance or the broader full-L2 gate.
 
 ### Legacy `.venv` migration and rollback
 
@@ -438,20 +439,30 @@ ambiguous interrupted state requires operator diagnosis rather than cleanup.
 
 ## Canonical production paths
 
+The `zsomborsserver` configuration was audited on 2026-10-07. Its installed
+runtime env overrides the generic repository template defaults. Confirm these
+values from the installed unit and env again before a later rollout; no server
+operation was performed as part of the development correction.
+
 | Name | Value | Notes |
 |------|-------|-------|
-| `APP_DIR` | `/home/zsom/services/CryptoRecorder` | repository checkout on the server |
+| `APP_DIR` | `/home/zsombor0918/services/CryptoRecorder` | audited server checkout |
 | `VENV` | `$APP_DIR/.venv` | Python virtualenv |
-| `ENV_FILE` | `/etc/cryptorecorder/cryptorecorder.env` | non-secret runtime env (copied from the template) |
-| `DATA_BASE` | `/data/cryptorecorder` | parent of all generated data roots |
+| `ENV_FILE` | `/etc/cryptorecorder/cryptorecorder.env` | installed runtime env; preserve its contents |
+| `DATA_ROOT` | `/data/cryptorecorder/data_raw` | audited raw root; read-only for replay recovery |
+| `REPLAY_ROOT` | `/home/zsombor0918/sync/replay_store` | audited published replay root |
+| `STATUS_AREA` | `/home/zsombor0918/status` | audited operational status/report area; confirm exact report root from env |
 
-Generated data roots under `DATA_BASE` (see `config.py` and the env template):
+The generic `config.py` and env template defaults are examples, not this
+server's installed root selection. In particular, the published replay root
+is outside `/data/cryptorecorder`. The archived-days value remains only a
+placeholder; inspect the installed env for its actual configured value.
 
-```
-/data/cryptorecorder/data_raw          # CRYPTO_RECORDER_DATA_ROOT
-/data/cryptorecorder/replay_store       # CRYPTO_RECORDER_REPLAY_ROOT
-/data/cryptorecorder/archive_days       # CRYPTO_RECORDER_ARCHIVE_DAYS_ROOT (placeholder)
-```
+The replay root may also contain `.stfolder` (real directory) and `.stignore`
+(real regular file), owned by the external operator-managed Syncthing setup.
+CryptoRecorder only tolerates those entries at the root. It does not install,
+configure, control, or validate Syncthing, and replication does not prove
+backup or archive recoverability.
 
 > `archive_days` is a **placeholder** root. No archive, Syncthing, or import/restore
 > code reads or writes it yet. `FEATURE_ROOT`, `CATALOG_JOBS_ROOT`, and `LABEL_ROOT`

@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -34,6 +35,13 @@ from stores.replay_writer import (
     validate_v2_source_identity,
 )
 from stores.replay_schema import BUILDER_VERSION_V1, BUILDER_VERSION_V2
+from pipeline.raw_manifest import (
+    RawRepresentationTransition,
+    assert_replay_inventory_unchanged,
+    capture_plain_raw_hashes,
+    select_replay_raw_inventory,
+    verify_plain_raw_hashes,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -227,6 +235,7 @@ def _stream_repartitioned_depth_records(
     data_root: Path,
     *,
     strict: bool = False,
+    inventory=None,
 ):
     """Yield (raw_index, raw_record, source_date) triples for ``date``'s
     depth_v2 channel, applying the EXACT SAME event-time repartitioning
@@ -274,6 +283,8 @@ def _stream_repartitioned_depth_records(
                     "depth_v2",
                     source_date,
                     data_root,
+                    inventory=inventory,
+                    target_date=date,
                 )
                 if strict
                 else stream_raw_records(
@@ -369,6 +380,9 @@ def _stream_raw_records_strict(
     channel: str,
     date: str,
     data_root: Path,
+    *,
+    inventory=None,
+    target_date: str | None = None,
 ):
     """Strict build-side equivalent of ``stream_raw_records``.
 
@@ -381,12 +395,16 @@ def _stream_raw_records_strict(
     from pipeline.raw_manifest import (
         _assert_no_compression_variants,
         _iter_consumed_raw_files,
+        check_selected_raw_disappearance,
     )
 
     channel_dir = data_root / venue / channel / symbol / date
     if not channel_dir.exists():
         return
-    selected_files = _iter_consumed_raw_files(channel_dir)
+    selected_files = (
+        inventory[(channel, date)] if inventory is not None
+        else _iter_consumed_raw_files(channel_dir)
+    )
     _assert_no_compression_variants(
         selected_files,
         context=f"{venue}/{channel}/{symbol}/{date}",
@@ -394,6 +412,12 @@ def _stream_raw_records_strict(
     for file_path in selected_files:
         try:
             yield from _iter_raw_file_records(file_path)
+        except FileNotFoundError as exc:
+            if inventory is not None:
+                check_selected_raw_disappearance(
+                    inventory, file_path, venue, symbol, target_date or date, data_root
+                )
+            raise RuntimeError(f"Could not read selected raw input {file_path}: {exc}") from exc
         except Exception as exc:
             raise RuntimeError(
                 f"Could not read selected raw input {file_path} during "
@@ -410,6 +434,7 @@ def compute_depth_repartitioned_source_identity(
     *,
     include_record_counts: bool = False,
     strict: bool = False,
+    inventory=None,
 ) -> dict:
     """Compute the depth_v2 ``source_identity`` channel entry in the SAME
     repartitioned ``raw_index`` space that
@@ -449,6 +474,7 @@ def compute_depth_repartitioned_source_identity(
         _assert_no_compression_variants,
         _iter_consumed_raw_files,
         _sha256_file,
+        check_selected_raw_disappearance,
     )
 
     target_start_ns, target_end_ns = _depth_target_bounds_ns(date)
@@ -463,7 +489,10 @@ def compute_depth_repartitioned_source_identity(
             channel_dir = data_root / venue / "depth_v2" / symbol / source_date
             if not channel_dir.exists():
                 continue
-            selected_files = _iter_consumed_raw_files(channel_dir)
+            selected_files = (
+                inventory[("depth_v2", source_date)] if inventory is not None
+                else _iter_consumed_raw_files(channel_dir)
+            )
             if strict:
                 _assert_no_compression_variants(
                     selected_files,
@@ -499,6 +528,12 @@ def compute_depth_repartitioned_source_identity(
                             entry["record_count"] = target_index - file_start_index
                             entry["record_range"] = [file_start_index, target_index]
                         entries.append(entry)
+                except FileNotFoundError as exc:
+                    if strict and inventory is not None:
+                        check_selected_raw_disappearance(
+                            inventory, fpath, venue, symbol, date, data_root
+                        )
+                    raise RuntimeError(f"Could not read selected raw input {fpath}: {exc}") from exc
                 except Exception as exc:
                     if strict:
                         raise RuntimeError(
@@ -524,6 +559,7 @@ def compute_repartitioned_source_identity(
     *,
     include_record_counts: bool = False,
     strict: bool = False,
+    inventory=None,
 ) -> dict:
     """Merge the repartitioned depth_v2 source identity
     (:func:`compute_depth_repartitioned_source_identity`) with the
@@ -540,11 +576,13 @@ def compute_repartitioned_source_identity(
         data_root,
         include_record_counts=include_record_counts,
         strict=strict,
+        inventory=inventory,
     )
     trade_identity = compute_raw_source_identity(
         venue, symbol, date, ["trade_v2"], data_root=data_root,
         include_record_counts=include_record_counts,
         strict=strict,
+        inventory=inventory,
     )
     channels = {
         "depth_v2": depth_identity["channels"]["depth_v2"],
@@ -1321,6 +1359,9 @@ def _build_replay_for_symbol_locked(
                     )
                     return status
             try:
+                inventory = select_replay_raw_inventory(
+                    venue, symbol, date, data_root
+                )
                 live_source_identity = compute_repartitioned_source_identity(
                     venue,
                     symbol,
@@ -1328,6 +1369,16 @@ def _build_replay_for_symbol_locked(
                     data_root,
                     include_record_counts=True,
                     strict=True,
+                    inventory=inventory,
+                )
+                capture_plain_raw_hashes(
+                    inventory, live_source_identity, venue, symbol, date, data_root
+                )
+                assert_replay_inventory_unchanged(
+                    inventory, venue, symbol, date, data_root
+                )
+                verify_plain_raw_hashes(
+                    inventory, venue, symbol, date, data_root
                 )
                 validate_v2_source_identity(
                     live_source_identity,
@@ -1335,6 +1386,8 @@ def _build_replay_for_symbol_locked(
                     symbol,
                     date,
                 )
+            except RawRepresentationTransition:
+                raise
             except Exception as exc:
                 status["status"] = "failed"
                 status["outcome"] = "failed"
@@ -1429,6 +1482,7 @@ def _build_replay_for_symbol_locked(
 
     writer: "ReplayWriter | None" = None
     pre_build_raw_identity = None
+    inventory = None
     try:
         writer = ReplayWriter(
             replay_root, venue, symbol, date,
@@ -1444,18 +1498,27 @@ def _build_replay_for_symbol_locked(
         # second snapshot below. This is inside the cleanup scope because the
         # writer has already created its staging directory.
         if schema_version in (1, 2):
+            if schema_version == 2:
+                inventory = select_replay_raw_inventory(
+                    venue, symbol, date, data_root
+                )
             pre_build_raw_identity = compute_repartitioned_source_identity(
                 venue,
                 symbol,
                 date,
                 data_root,
                 strict=(schema_version == 2),
+                inventory=inventory,
             )
             if schema_version == 2 and not pre_build_raw_identity.get("complete"):
                 raise RuntimeError(
                     f"Cannot build schema_version=2 replay for "
                     f"{venue}/{symbol}/{date}: selected raw source identity "
                     "is incomplete before streaming"
+                )
+            if schema_version == 2:
+                capture_plain_raw_hashes(
+                    inventory, pre_build_raw_identity, venue, symbol, date, data_root
                 )
         # Stream depth records (issue #20 Phase 7: cross-day event-time
         # repartitioned, matching convert_day.py's reference rule exactly —
@@ -1470,6 +1533,7 @@ def _build_replay_for_symbol_locked(
             date,
             data_root,
             strict=(schema_version == 2),
+            inventory=inventory,
         ):
             raw_record = dict(raw_record)
             raw_record["raw_index"] = raw_index
@@ -1491,6 +1555,7 @@ def _build_replay_for_symbol_locked(
                 "trade_v2",
                 date,
                 data_root,
+                inventory=inventory,
             )
             if schema_version == 2
             else stream_raw_records(
@@ -1531,7 +1596,13 @@ def _build_replay_for_symbol_locked(
                 venue, symbol, date, data_root,
                 include_record_counts=(schema_version == 2),
                 strict=(schema_version == 2),
+                inventory=inventory,
             )
+
+            if schema_version == 2:
+                assert_replay_inventory_unchanged(
+                    inventory, venue, symbol, date, data_root
+                )
 
             # issue #20 Phase 7 review point 6 (TOCTOU): compare the
             # pre-streaming snapshot against this post-streaming one
@@ -1560,6 +1631,11 @@ def _build_replay_for_symbol_locked(
                     "that would describe different raw bytes than were "
                     "actually streamed/converted. Rebuild from a stable raw "
                     "snapshot."
+                )
+
+            if schema_version == 2:
+                verify_plain_raw_hashes(
+                    inventory, venue, symbol, date, data_root
                 )
 
             writer.set_source_identity(post_build_raw_identity)
@@ -1620,6 +1696,19 @@ def _build_replay_for_symbol_locked(
             f"({writer.depth_count} depth, {writer.trade_count} trades)"
         )
 
+    except RawRepresentationTransition as transition:
+        if writer is not None:
+            try:
+                writer.cleanup_staging()
+            except Exception as cleanup_error:
+                status["status"] = "failed"
+                status["outcome"] = "failed"
+                status["errors"].append(
+                    f"Cannot retry raw transition at {transition.logical_path}: "
+                    f"staging cleanup failed: {cleanup_error}"
+                )
+                return status
+        raise
     except Exception as primary_error:
         status["status"] = "failed"
         status["outcome"] = "failed"
@@ -1681,12 +1770,34 @@ def build_replay_for_symbol(
         rebuild_source_changed=rebuild_source_changed,
         replace_incompatible=replace_incompatible,
     )
+    def run_attempts(context):
+        attempts = 3 if schema_version == 2 else 1
+        for attempt in range(1, attempts + 1):
+            try:
+                return _build_replay_for_symbol_locked(
+                    venue, symbol, date, data_root, replay_root,
+                    lifecycle_context=context, **kwargs,
+                )
+            except RawRepresentationTransition as exc:
+                logger.warning(
+                    "Replay %s/%s/%s raw transition attempt %d/%d: %s",
+                    venue, symbol, date, attempt, attempts, exc,
+                )
+                if attempt == attempts:
+                    return {
+                        "venue": venue, "symbol": symbol, "date": date,
+                        "status": "failed", "outcome": "failed",
+                        "depth_count": 0, "trade_count": 0,
+                        "errors": [
+                            f"Raw representation retry exhausted after {attempts} "
+                            f"attempts for {exc.logical_path}: {exc}"
+                        ],
+                    }
+                time.sleep(0.2)
+        raise AssertionError("unreachable retry state")
+
     if lifecycle_context is not None:
-        return _build_replay_for_symbol_locked(
-            venue, symbol, date, data_root, replay_root,
-            lifecycle_context=lifecycle_context,
-            **kwargs,
-        )
+        return run_attempts(lifecycle_context)
 
     effective_report_root = Path(report_root or (Path(replay_root) / ".lifecycle" / "reports"))
     try:
@@ -1696,11 +1807,7 @@ def build_replay_for_symbol(
             report_root=effective_report_root,
         ) as context:
             reconcile_replay_root(context)
-            return _build_replay_for_symbol_locked(
-                venue, symbol, date, data_root, replay_root,
-                lifecycle_context=context,
-                **kwargs,
-            )
+            return run_attempts(context)
     except ReplayLifecycleSafetyError as exc:
         return {
             "venue": venue,

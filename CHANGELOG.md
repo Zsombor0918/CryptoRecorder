@@ -68,6 +68,13 @@ passes.** Until then, broader full-L2 equivalence stays **deferred** (see
 ## [Unreleased]
 
 ### Fixed
+- **Replay root coexistence and raw compression transitions** — lifecycle
+  reconciliation accepts only real root `.stfolder` and `.stignore` metadata
+  of their expected types. Schema-v2 builds and reuse checks use one selected
+  raw inventory per attempt and retry exact hourly plain-to-compressed
+  transitions at most three times, discarding staging before a new attempt.
+  Ambiguous or unrelated changes still fail closed. Development verification
+  does not constitute deployment or production acceptance.
 - **Production replay exchangeInfo dependency boundary** — generic Binance
   exchangeInfo loading, filter lookup, and decimal-precision helpers now live
   once in dependency-free `converter.exchange_info`. The compact replay writer

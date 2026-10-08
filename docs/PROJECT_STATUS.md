@@ -46,7 +46,8 @@ validated without recorded evidence.
   fsyncs both Parquet files plus instrument/manifest metadata and staging,
   then fsyncs parent-directory rename transitions. The intended repository
   service explicitly requests schema 2 and keeps `Restart=no`, 12 GiB, and
-  zero swap, but it has not been installed or production-accepted.
+  zero swap. The 2026-10-07 `zsomborsserver` audit found this replay-build
+  policy installed on that server; production acceptance remains pending.
 
 **Replay lifecycle isolated smoke (checkpoint 2)**
 

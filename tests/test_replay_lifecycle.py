@@ -43,6 +43,65 @@ def _valid(path: Path) -> bool:
     return (path / "VALID").is_file()
 
 
+@pytest.mark.parametrize("markers", [(".stfolder",), (".stignore",),
+                                      (".stfolder", ".stignore")])
+def test_external_root_markers_are_inert(tmp_path: Path, markers: tuple[str, ...]) -> None:
+    replay = tmp_path / "replay"
+    replay.mkdir()
+    for marker in markers:
+        path = replay / marker
+        if marker == ".stfolder":
+            path.mkdir()
+            (path / "unknown_nested_entry").write_text("untouched")
+        else:
+            path.write_text("/.lifecycle\n")
+    with _lock(tmp_path) as context:
+        assert reconcile_replay_root(context) == []
+    assert all((replay / marker).exists() for marker in markers)
+    if ".stfolder" in markers:
+        assert (replay / ".stfolder" / "unknown_nested_entry").is_file()
+
+
+@pytest.mark.parametrize("marker,kind", [
+    (".stfolder", "file"), (".stfolder", "symlink"),
+    (".stignore", "directory"), (".stignore", "symlink"),
+    (".unexpected", "file"), (".unexpected", "directory"),
+])
+def test_external_marker_wrong_type_and_unknown_root_entries_fail_closed(
+    tmp_path: Path, marker: str, kind: str,
+) -> None:
+    replay = tmp_path / "replay"
+    replay.mkdir()
+    path = replay / marker
+    if kind == "directory":
+        path.mkdir()
+    elif kind == "symlink":
+        target = tmp_path / "target"
+        target.mkdir()
+        path.symlink_to(target)
+    else:
+        path.write_text("x")
+    with _lock(tmp_path) as context:
+        with pytest.raises(ReplayLifecycleSafetyError, match="unknown/unsafe replay-root"):
+            reconcile_replay_root(context)
+
+
+@pytest.mark.parametrize("marker", [".stfolder", ".stignore"])
+@pytest.mark.parametrize("level", ["venue", "symbol"])
+def test_external_marker_names_below_root_remain_unknown(
+    tmp_path: Path, marker: str, level: str,
+) -> None:
+    parent = tmp_path / "replay" / "venue=BINANCE_SPOT"
+    if level == "symbol":
+        parent /= "symbol=ADAUSDT"
+    path = parent / marker
+    path.parent.mkdir(parents=True)
+    path.mkdir()
+    with _lock(tmp_path) as context:
+        with pytest.raises(ReplayLifecycleSafetyError, match="unknown/unsafe venue entry|unknown replay artifact"):
+            reconcile_replay_root(context)
+
+
 def test_exclusive_lock_rejects_concurrent_owner_and_releases(tmp_path: Path) -> None:
     with _lock(tmp_path) as first:
         first.assert_held(tmp_path / "replay")
