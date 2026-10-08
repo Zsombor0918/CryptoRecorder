@@ -672,3 +672,67 @@ This document states what CryptoRecorder guarantees and what it does not.
 records depth and trades via native WebSockets, replays them through exact
 Decimal book state, and produces Nautilus `OrderBookDeltas` and `TradeTick`
 objects suitable for backtesting research.**
+
+## Durable recording-scope retirement evidence (contract 1)
+
+`recording_coverage.py` owns the shared recorder state contract. Native feeds
+start only after an immutable session-start record and its atomic ledger head
+are durable under `COVERAGE_ROOT` (default `STATE_ROOT/recording_coverage`).
+Starts contain the exact sorted selected universe, digest, UTC time, process,
+repository/version identity, random session ID, dataset identity, sequence,
+and predecessor start hash. An exclusive recorder lock spans the session;
+a separate ledger lock serializes start/final writes with replay proof use.
+There is one authoritative ledger per dataset. All recorder processes must
+use this protocol; legacy/bypassing writers and privileged coordinated
+rewriting of data plus evidence are outside this unsigned trust model.
+
+Shutdown stops native producers and cancels/joins background feed tasks before
+closing storage admission. Storage reports queue/write/drop/error counts,
+writer task results, handle-close failures, and compression failures/timeouts.
+Zero drops and errors are required for this conservative retirement proof;
+WebSocket reconnects do not invalidate physical scope closure. Compression
+workers fsync and hash completed compressed files off the ingest path, before
+removing their sources and fsyncing the raw parent directory. Finalization
+uses those bounded cached identities, rather than rehashing a long session
+under the shutdown watchdog. Existing hourly inputs are explicitly marked
+`unowned_raw_files`; opening a file cannot retroactively certify old bytes.
+
+Only a successful shutdown can publish `closed_clean`. Failed closure has a
+`failed` final or remains open; watchdog exit and evidence-publication failure
+leave untrusted evidence. Start/final files are immutable, exclusive
+publications. Temporary files are file-fsynced; publication is directory-
+fsynced before the pending hard link is removed. A crash may resurrect that
+unsynced pending unlink and block the ledger conservatively. No cleanup
+heuristic silently upgrades interrupted evidence.
+
+A missing-D+1 schema-v2 build can use the last selected session only when it
+closed at least one hour before D ends and a timely successor excludes the
+symbol. Every intervening handoff up to the readiness horizon must be clean
+and ordered; a later selection, unknown/open handoff, overlapping sessions,
+missing start, or conflicting raw owner blocks proof. The operational horizon
+is D+1 01:00 UTC; offline equivalence requires all of D+1 to have elapsed.
+Every selected D-1/D/D+1 depth and D trade file must have exactly one matching
+session binding, including SHA-256 and size, and must be compressed, regular,
+and free of symlinks/variants. This intentionally conservative first contract
+can defer days spanning several owning sessions or inherited hourly files.
+It proves physical recording scope, not uninterrupted market coverage.
+
+Retirement-backed attempts hold the ledger's shared lock through publication,
+inventory evidence once, and recheck marker contents/file identity and all raw
+bindings before streaming, after construction, and immediately before rename.
+New recorder sessions cannot start while that proof is used. Non-cooperative
+changes abort publication; marker changes are never compression retries.
+Bounds are 4,096 ledger entries, 64 MiB of serialized ledger records, 250,000
+session file identities, and 72 entries per selected raw-hour directory.
+Overflow fails closed and requires a separately designed ledger maintenance
+procedure; no automatic evidence pruning is implemented.
+
+Dataset identity is a portable random identifier carried in the hash-linked
+ledger. Explicitly transferred raw/evidence bundles are verified by relative
+raw paths and exact bytes, rather than absolute source paths. Recorder startup
+additionally verifies the ledger head's local raw-root binding (path/device/
+inode digest), preventing a copied ledger from silently starting another
+recorder. The reader supports a read-only transferred bundle; recorder root
+migration/rebinding is separate work. See OPERATIONS.md for bootstrap and
+rollback limits. Raw JSONL schemas, naming, event-time selection, replay rows,
+and `convert_day.py` are unchanged.

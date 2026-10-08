@@ -50,6 +50,12 @@ with `--extra reconstruction`; for tests, add both that extra and `--group
 dev`. See [INSTALL.md](INSTALL.md). Runtime services continue to execute
 `.venv/bin/python` and never invoke uv.
 
+Recorder sessions now write durable recording-scope evidence under
+`STATE_ROOT/recording_coverage`. The replay builder can use verified clean
+symbol retirement when D+1 is absent; historical sessions without evidence
+remain deferred. Custom raw roots require explicit `--coverage-root` for this
+route. See [rollout and trust limits](docs/OPERATIONS.md#recording-coverage-ledger-and-forward-only-rollout).
+
 Run the recorder:
 
 ```bash

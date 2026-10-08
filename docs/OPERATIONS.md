@@ -1045,3 +1045,154 @@ All depth_v2 records have `record_type` and `stream_session_id`.
 }
 ```
 Lifecycle markers do NOT consume `trade_session_seq`.
+
+## Recording coverage ledger and forward-only rollout
+
+`CRYPTO_RECORDER_COVERAGE_ROOT` defaults to
+`CRYPTO_RECORDER_STATE_ROOT/recording_coverage`. The existing service commands,
+timer, raw roots and replay roots do not change. Only the development checkout
+was modified; the following is a future owner-run runbook, not an executed
+production deployment.
+
+The ledger contains `.recorder.lock` (exclusive process lifetime),
+`.ledger.lock` (shared build/exclusive start-final publication), `head.json`,
+`<32-hex-session-id>.start.json`, and optional `.final.json`. The version-1
+start stores sequence/predecessor hash, selected universe/digest, dataset ID,
+canonical microsecond UTC start, host/PID and repository/application identity.
+The head binds the last start/count and local recorder raw-root identity.
+A final stores the start hash, ingestion-stopped/finalized UTC times, shutdown
+reason, producer result, structured storage closure, touched raw relative
+paths/hashes/sizes, inherited `unowned_raw_files`, errors, and `closed_clean`
+or `failed`. An absent final means open/untrusted. Compression/writer failures
+and drops prevent clean proof, while ordinary reconnects remain visible in
+existing health reports. Never edit, backdate, delete, or reconstruct evidence
+from logs. Pending/unknown/duplicate/unsafe entries block use; preserve them
+for diagnosis. There is no automatic ledger cleanup or rebind command.
+
+The protocol assumes the same authoritative ledger accompanies every session.
+Do not point a recorder at a fresh ledger to bypass an error or run a legacy
+recorder beside it. A read-only explicit transferred bundle is supported, but
+moving the active raw root requires a separate reviewed recorder rebind plan.
+Rollbacks to pre-marker recorder code stop new proof continuity; builds must
+use ordinary D+1 evidence until an explicit recovery plan is accepted.
+
+### Future production preflight and backups
+
+Use these audited values, confirming the installed env still agrees. Set
+`APPROVED_SHA` to the exact reviewed commit and `PREVIOUS_SHA` to the preserved
+currently deployed commit; do not copy unreviewed placeholder values.
+
+```bash
+APP_DIR=/home/zsombor0918/services/CryptoRecorder
+ENV_FILE=/etc/cryptorecorder/cryptorecorder.env
+DATA_ROOT=/data/cryptorecorder/data_raw
+STATE_ROOT=/home/zsombor0918/status
+COVERAGE_ROOT="$STATE_ROOT/recording_coverage"
+REPLAY_ROOT=/home/zsombor0918/sync/replay_store
+REPORT_ROOT="$STATE_ROOT/replay_reports"
+cd "$APP_DIR"
+git status --short --branch
+git rev-parse HEAD
+git show --stat "$APPROVED_SHA"
+systemctl status cryptorecorder-recorder.service cryptorecorder-replay-build.service --no-pager
+systemctl list-timers cryptorecorder-replay-build.timer --all --no-pager
+systemctl cat cryptorecorder-recorder.service cryptorecorder-replay-build.service cryptorecorder-replay-build.timer
+lslocks --output PID,COMMAND,PATH
+cat "$REPLAY_ROOT/.lifecycle/build.lock"
+df -h "$DATA_ROOT" "$STATE_ROOT" "$REPLAY_ROOT"
+jq '{spot:.spot.selected_raw,futures:.futures.selected_raw}' "$STATE_ROOT/startup_coverage.json"
+```
+
+If a replay build is active, leave it to complete before a checkout change.
+Preserve the exact previous SHA and installed units/env in an operator-chosen
+new private backup directory (mode 700), with env copy readable only by its
+owner. Do not print secrets or overwrite an existing backup. Record root
+values, active universe, unit diffs and evidence inventory with that backup.
+No preflight command changes the running recorder or its raw files.
+
+```bash
+./scripts/deploy_linux_server.sh --target recorder --dry-run --install-only
+```
+
+Inspect the planned unit/env diff: paths and recorder/replay commands remain
+unchanged; no systemd template edit is required for this feature. Do not run a
+real deploy wrapper unless its full plan (including legacy-unit cleanup) has
+separate owner approval. A checkout-only rollout with the existing locked
+production environment avoids unnecessary unit/env mutations; the dependency
+lock is unchanged. Preserve `CRYPTO_RECORDER_STATE_ROOT` and existing data,
+replay and report overrides. The default coverage location needs no new env
+line; an explicit coverage override must point to the same retained ledger.
+
+### Bootstrap and supervised restart acceptance
+
+1. Choose a supervised restart window and temporarily stop only the replay
+   timer after the active replay build has completed. Preserve its enabled/
+   active state for restoration. Stop the recorder gracefully while the old
+   approved code remains available; confirm it is inactive before changing
+   the checkout to the reviewed SHA. These service actions require the
+   separately approved production rollout.
+2. The old process has no contract start and cannot be certified. Its last
+   selected universe/historical October 1/2 deferrals stay unresolved. If the
+   new session inherits an existing hour, that file is unowned for proof. A
+   later clean session/day with wholly owned D-1/D raw inputs is the safe
+   acceptance target. An alternative is a supervised UTC boundary start;
+   neither option certifies the preceding process.
+3. Check the frozen production environment, then start the new recorder with
+   its unchanged installed unit. Watch for a durable new start plus matching
+   head **before** the `Native depth/trade recorder enabled` log messages.
+
+```bash
+.venv/bin/python -m validation.validate_dependency_environment --kind production
+sudo systemctl start cryptorecorder-recorder.service
+journalctl -u cryptorecorder-recorder.service -n 150 --no-pager
+jq . "$COVERAGE_ROOT/head.json"
+```
+
+4. Verify 50+50 active coverage, queue/drop/compression telemetry, and unchanged
+   raw path/record shape. During a separately supervised restart of this
+   newly marker-enabled process, verify its immutable final has clean producer
+   and storage results, zero drop/write/compression errors, and exact final
+   file identities. If any predicate fails, retain open/failed evidence and
+   investigate; never change it to clean. Start the successor and confirm its
+   predecessor link. Normal same-universe restarts certify closure but do not
+   claim a symbol retired.
+5. First exercise retirement using isolated synthetic data like the development
+   fixture, or wait for a naturally removed symbol whose required raw scope
+   is wholly owned. Do not change the live universe merely to force a smoke.
+   After the horizon elapses, use **new isolated** replay/report roots:
+
+```bash
+.venv/bin/python -m pipeline.daily_build --date "$TARGET_DATE" \
+  --venues "$VENUE" --symbols "$SYMBOL" --backlog-days 1 --max-build-dates 1 \
+  --schema-version 2 --data-root "$DATA_ROOT" --coverage-root "$COVERAGE_ROOT" \
+  --replay-root "$ISOLATED_REPLAY_ROOT" --report-root "$ISOLATED_REPORT_ROOT"
+.venv/bin/python -m validation.audit_replay_store \
+  --date "$TARGET_DATE" --venues "$VENUE" --symbols "$SYMBOL" \
+  --replay-root "$ISOLATED_REPLAY_ROOT" \
+  --report-path "$ISOLATED_REPORT_ROOT/retirement_audit.json"
+```
+
+Confirm `built`, `clean_retirement_evidence`, matching evidence digest,
+complete row/checksum/source/provenance validation and no staging/backup
+residue; repeat the same build and confirm `skipped_valid`. Keep synthetic
+raw, ledger and outputs in separate operator-approved temporary roots.
+Only after acceptance restore the timer's prior state. Observe an ordinary
+D+1 build as well. If the existing external Syncthing setup replicates a
+published replay partition, inspect its copied manifest/file hashes only;
+do not alter Syncthing configuration or claim archive/backup recoverability.
+
+### Rollback and remaining work
+
+After any active replay build completes, stop the timer and recorder under the
+approved rollback plan, preserve failed/open/new evidence and reports, and
+restore the exact previously recorded approved checkout and installed unit
+copies if changed. Verify the restored locked environment before restarting,
+and restore the timer's previous state. Do not remove raw data, session state,
+published replay, quarantine, backups or reports. Never automatically reuse
+old retirement proof after legacy code ran outside the protocol; retain D+1
+readiness and request a separately reviewed continuity recovery design.
+
+This forward-only rollout cannot resolve the original 21 October 1 or 12
+October 2 partitions. Real-server retirement acceptance, long-session evidence
+size/performance, ledger maintenance/root migration and broader top50/multi-day
+full-L2 acceptance remain separate pending work.

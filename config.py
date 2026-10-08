@@ -67,6 +67,10 @@ REPLAY_ROOT: Final = Path(
 ).expanduser()
 
 # Daily build reports
+COVERAGE_ROOT: Final = Path(
+    os.environ.get("CRYPTO_RECORDER_COVERAGE_ROOT", str(STATE_ROOT / "recording_coverage"))
+).expanduser()
+
 DAILY_REPORT_ROOT: Final = Path(
     os.environ.get("CRYPTO_RECORDER_DAILY_REPORT_ROOT", str(STATE_ROOT / "daily_build_reports"))
 ).expanduser()

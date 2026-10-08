@@ -67,6 +67,15 @@ passes.** Until then, broader full-L2 equivalence stays **deferred** (see
 
 ## [Unreleased]
 
+### Added — recording retirement evidence
+- Durable, versioned recorder start/final evidence under the state root,
+  explicit storage closure results and compressed-file hashes, and a
+  fail-closed schema-v2 missing-D+1 retirement route with manifest/report
+  provenance. Normal D+1 readiness, raw JSONL schema/layout, native feed
+  semantics, replay encoding, and `convert_day.py` are preserved. Synthetic
+  development validation does not certify historical partitions or deploy
+  production; broader full-L2 and real-server acceptance remain pending.
+
 ### Fixed
 - **Replay root coexistence and raw compression transitions** — lifecycle
   reconciliation accepts only real root `.stfolder` and `.stignore` metadata

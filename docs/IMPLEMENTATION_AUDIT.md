@@ -318,10 +318,10 @@ Automated tests cover:
 - Validator skips unsupported profiles (`depth10`).
 - Real-data equivalence behind `pytest.mark.realdata`.
 
-Last full local suite:
+Last full local suite (2026-10-08 locked development environment):
 
 ```text
-834 passed, 3 skipped
+961 passed, 3 skipped
 ```
 
 The checkpoint-3 dependency/deployment/reconstruction/lifecycle/guard focus is
@@ -1332,3 +1332,21 @@ above) and the Phase 2 design (raw-retention, legacy-v0, traceability,
 versioning — design only, see above), constitutes the review checkpoint the
 approved plan requires before any compact physical schema implementation
 begins.
+
+## 2026-10-08 development implementation — recording retirement evidence
+
+The recorder now publishes durable pre-feed starts and immutable shutdown
+finals under a separate state ledger. Storage returns explicit closure results
+and caches fsynced compressed-file identities. Existing raw JSONL records,
+paths, native depth/trade feeds, and `convert_day.py` were not rewritten.
+The missing-D+1 schema-v2 route verifies a clean early stop, ordered excluding
+sessions, exact raw ownership and immutability, and records its proof in replay
+manifests and daily reports. Existing D+1 readiness remains the normal route.
+
+This is development implementation and synthetic validation only. The original
+21 October 1 and 12 October 2 historical production partitions are not certified
+or recovered. Real-server rollout, restart/retirement acceptance, production
+performance, ledger compaction/root migration, and broad top50/multi-day
+semantics remain pending. Ledger evidence is unsigned and requires one
+retained authoritative ledger and exclusively marker-enabled recorder writers.
+See the dated CHANGE_AUDIT entry for final commands and measured results.

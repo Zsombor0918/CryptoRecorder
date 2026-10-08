@@ -28,6 +28,7 @@ VALIDATION = ROOT / "validation"
 # Kept in sync with the "Root-Level Files (allowed)" table in
 # docs/REPO_STRUCTURE.md. If you add/remove a root file, update both.
 ALLOWED_ROOT_PY_FILES = {
+    "recording_coverage.py",
     "recorder.py",
     "phase2_depth.py",
     "native_trades.py",

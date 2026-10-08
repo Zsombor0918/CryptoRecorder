@@ -898,6 +898,23 @@ def validate_partition(partition_dir: Path) -> bool:
             manifest = json.load(f)
         if manifest.get("status") != "complete":
             return False
+        readiness_version = manifest.get("readiness_contract_version")
+        if readiness_version is not None and (type(readiness_version) is not int or readiness_version != 1 or "readiness_evidence" not in manifest):
+            return False
+        if manifest.get("integrity", {}).get("readiness_evidence") is not None and "readiness_evidence" not in manifest:
+            return False
+        if "readiness_evidence" in manifest:
+            if readiness_version != 1:
+                return False
+            from recording_coverage import validate_provenance
+            validate_provenance(manifest["readiness_evidence"], manifest["venue"], manifest["symbol"], manifest["date"])
+            if manifest.get("schema_version") == 2 and manifest.get("integrity", {}).get("readiness_evidence") != manifest["readiness_evidence"]:
+                return False
+            sources = {e["path"]: {"sha256": e["sha256"], "size_bytes": e["size_bytes"]}
+                       for entries in manifest.get("source_identity", {}).get("channels", {}).values()
+                       for e in entries}
+            if sources != manifest["readiness_evidence"]["raw_files"]:
+                return False
         for key, path in (("depth_checksum", depth_path), ("trades_checksum", trades_path)):
             expected = manifest.get(key)
             if not expected:
@@ -1796,6 +1813,11 @@ class ReplayWriter:
         never computes this itself."""
         self._source_identity = source_identity
 
+    def set_readiness_evidence(self, evidence: dict) -> None:
+        from recording_coverage import validate_provenance
+        validate_provenance(evidence, self.venue, self.symbol, self.date)
+        self._readiness_evidence = evidence
+
     # ------------------------------------------------------------------
     # Lazy spool init
     # ------------------------------------------------------------------
@@ -2215,6 +2237,12 @@ class ReplayWriter:
             }
 
         self._manifest = manifest
+        evidence = getattr(self, "_readiness_evidence", None)
+        if evidence is not None:
+            manifest["readiness_contract_version"] = 1
+            manifest["readiness_evidence"] = evidence
+            if self.schema_version == 2:
+                manifest["integrity"]["readiness_evidence"] = evidence
         return manifest
 
     def publish(self, instrument_metadata: "Optional[dict]" = None) -> Path:
@@ -2255,6 +2283,9 @@ class ReplayWriter:
         logger.info(f"Wrote manifest: {manifest_path}")
 
         _fsync_directory(self.staging_dir)
+        guard = getattr(self, "readiness_guard", None)
+        if guard is not None:
+            guard()
 
         # Atomic publication with backup/restore so the existing valid partition
         # is never lost if the replacement fails (I/O error, permissions, etc.).

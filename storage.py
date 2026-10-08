@@ -47,6 +47,8 @@ class CompressionManager:
         self.completed = 0
         self.failed = 0
         self.last_error: Optional[str] = None
+        self.completed_files: dict[Path, dict] = {}
+        self.coverage_errors: list[str] = []
         self._started = False
         self._closed = False
 
@@ -62,8 +64,7 @@ class CompressionManager:
     async def enqueue(self, file_path: Path) -> None:
         """Queue a closed JSONL file for compression."""
         if self._closed:
-            logger.warning("Compression manager closed; leaving uncompressed file: %s", file_path)
-            return
+            raise RuntimeError(f"compression manager closed: {file_path}")
         if not file_path.exists() or file_path.stat().st_size <= 0:
             return
         await self.start()
@@ -93,14 +94,28 @@ class CompressionManager:
         """Compress file with zstd. Only removes source on success."""
         loop = asyncio.get_running_loop()
 
-        def compress() -> None:
+        def compress() -> dict:
             dst = Path(f"{file_path}.zst")
             with open(file_path, "rb") as f_in:
                 with zstd.open(str(dst), "wb", cctx=zstd.ZstdCompressor(level=3)) as f_out:
                     f_out.write(f_in.read())
+            from recording_coverage import file_identity, _fsync_dir
+            fd = os.open(dst, os.O_RDONLY | os.O_NOFOLLOW)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            identity = file_identity(dst)
             os.remove(file_path)
+            _fsync_dir(dst.parent)
+            return identity
 
-        await loop.run_in_executor(None, compress)
+        identity = await loop.run_in_executor(None, compress)
+        from recording_coverage import MAX_RAW_FILES
+        if len(self.completed_files) < MAX_RAW_FILES:
+            self.completed_files[Path(f"{file_path}.zst")] = identity
+        elif not self.coverage_errors:
+            self.coverage_errors.append("compressed-file evidence bound exceeded")
 
     async def shutdown(
         self,
@@ -138,7 +153,11 @@ class CompressionManager:
 
         for _ in self.tasks:
             await self.queue.put(None)
-        await asyncio.gather(*self.tasks, return_exceptions=True)
+        results = await asyncio.gather(*self.tasks, return_exceptions=True)
+        for result in results:
+            if isinstance(result, BaseException):
+                self.failed += 1
+                self.last_error = f"compression worker failed: {result}"
         self.tasks.clear()
 
     def get_telemetry(self) -> Dict[str, Any]:
@@ -160,6 +179,9 @@ class FileRotator:
         self.file_handles: Dict[str, object] = {}
         self.lock = asyncio.Lock()
         self.compression_manager = compression_manager
+        self.closure_errors: list[str] = []
+        self.touched_files: set[Path] = set()
+        self.preexisting_files: set[Path] = set()
 
     def get_file_key(self, venue: str, symbol: str, channel: str) -> str:
         """Generate unique key for a file."""
@@ -214,6 +236,7 @@ class FileRotator:
                 try:
                     self.file_handles[key].close()
                 except Exception as exc:
+                    self.closure_errors.append(f"file close failed: {file_path}: {exc}")
                     logger.warning("Error closing file %s: %s", file_path, exc)
                 del self.file_handles[key]
 
@@ -233,6 +256,7 @@ class FileRotator:
                 await CompressionManager(worker_count=1)._compress_file(file_to_compress)
                 logger.debug("Rotated and compressed: %s", file_to_compress)
         except Exception as exc:
+            self.closure_errors.append(f"compression scheduling failed: {file_to_compress}: {exc}")
             logger.error("Error scheduling compression for %s: %s", file_to_compress, exc, exc_info=True)
             return file_to_compress
         return None
@@ -247,9 +271,16 @@ class FileRotator:
         async with self.lock:
             if key not in self.file_handles:
                 file_path = self.get_file_path(venue, symbol, channel)
+                if file_path not in self.touched_files and any(os.path.lexists(p) for p in (file_path, Path(f"{file_path}.zst"), Path(f"{file_path}.gz"))):
+                    self.preexisting_files.add(file_path)
                 handle = open(file_path, "a", encoding="utf-8")
                 self.file_handles[key] = handle
                 self.current_files[key] = (file_path, time.time())
+                from recording_coverage import MAX_RAW_FILES
+                if len(self.touched_files) < MAX_RAW_FILES:
+                    self.touched_files.add(file_path)
+                elif "touched-file evidence bound exceeded" not in self.closure_errors:
+                    self.closure_errors.append("touched-file evidence bound exceeded")
 
             return self.file_handles[key]
 
@@ -303,6 +334,7 @@ class AsyncWriter:
         self.queue: asyncio.Queue[dict] = asyncio.Queue(maxsize=self.queue_max_size)
         self.running = True
         self.write_count = 0
+        self.write_errors = 0
         self.drop_count = 0
         self.enqueued_count = 0
         self.queue_high_watermark = 0
@@ -331,6 +363,8 @@ class AsyncWriter:
 
     async def enqueue(self, record: dict) -> None:
         """Enqueue a record for writing using channel-specific backpressure."""
+        if not self.running:
+            raise RuntimeError(f"writer already stopped: {self.writer_id}")
         if self.channel == DEPTH_V2_CHANNEL:
             await self._enqueue_depth(record)
             return
@@ -426,6 +460,7 @@ class AsyncWriter:
             except asyncio.CancelledError:
                 break
             except Exception as exc:
+                self.write_errors += 1
                 logger.error("Error in writer task for %s: %s", self.writer_id, exc, exc_info=True)
                 await asyncio.sleep(1)
 
@@ -448,6 +483,7 @@ class AsyncWriter:
             handle.flush()
             self.write_count += len(batch)
         except Exception as exc:
+            self.write_errors += 1
             logger.error("Error writing batch for %s: %s", self.writer_id, exc, exc_info=True)
 
     async def shutdown(self) -> None:
@@ -476,6 +512,7 @@ class AsyncWriter:
             "drop_count": self.drop_count,
             "enqueued_count": self.enqueued_count,
             "write_count": self.write_count,
+            "write_errors": self.write_errors,
             "blocked": self.blocked_since_monotonic is not None,
             "current_block_sec": round(current_block_sec, 3),
             "max_block_sec": round(max(self.max_block_sec, current_block_sec), 3),
@@ -494,6 +531,8 @@ class StorageManager:
         self.writer_tasks: Dict[str, asyncio.Task] = {}
         self.lock = asyncio.Lock()
         self._last_telemetry_log_time = 0.0
+        self._closing = False
+        self._inflight = 0
 
     async def get_writer(self, venue: str, symbol: str, channel: str) -> AsyncWriter:
         """Get or create a writer for venue/symbol/channel."""
@@ -511,23 +550,38 @@ class StorageManager:
 
     async def write_record(self, venue: str, symbol: str, channel: str, record: dict) -> None:
         """Enqueue a record for writing."""
-        writer = await self.get_writer(venue, symbol, channel)
-        await writer.enqueue(record)
+        if self._closing:
+            raise RuntimeError("storage already closing")
+        self._inflight += 1
+        try:
+            writer = await self.get_writer(venue, symbol, channel)
+            await writer.enqueue(record)
+        finally:
+            self._inflight -= 1
 
-    async def shutdown(self) -> None:
+    async def shutdown(self) -> dict:
         """Shutdown all writers, flush queues, close files, and drain compression."""
         logger.info("Shutting down storage manager...")
+        self._closing = True
+        errors = []
+        deadline = time.monotonic() + 10
+        while self._inflight and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        if self._inflight:
+            errors.append("enqueue operations did not stop")
 
         for writer in self.writers.values():
             await writer.shutdown()
 
         if self.writer_tasks:
             try:
-                await asyncio.wait_for(
+                results = await asyncio.wait_for(
                     asyncio.gather(*self.writer_tasks.values(), return_exceptions=True),
                     timeout=10,
                 )
+                errors.extend(f"writer task failed: {result}" for result in results if isinstance(result, BaseException))
             except asyncio.TimeoutError:
+                errors.append("writer tasks timed out")
                 logger.warning("Writer tasks did not finish in 10s - cancelling")
                 for task in self.writer_tasks.values():
                     if not task.done():
@@ -536,7 +590,51 @@ class StorageManager:
 
         await self.rotator.close_all(compress=True)
         await self.compression_manager.shutdown()
+        errors.extend(self.rotator.closure_errors)
+        errors.extend(self.compression_manager.coverage_errors)
+        writers = self.get_writer_telemetry()["writers"]
+        compression = self.compression_manager.get_telemetry()
+        result = {
+            "queues_drained": not self._inflight and not errors and all(
+                w["queue_size"] == 0 and w["enqueued_count"] == w["write_count"]
+                and w["write_errors"] == 0 and w["drop_count"] == 0
+                for w in writers.values()),
+            "files_closed": not self.rotator.file_handles and not self.rotator.current_files and not self.rotator.closure_errors,
+            "compression_drained": compression["queued"] == 0 and compression["active"] == 0 and compression["failed"] == 0 and compression["last_error"] is None,
+            "writers": writers, "compression": compression, "errors": errors,
+        }
         logger.info("Storage manager shutdown complete")
+        return result
+
+    def coverage_raw_files(self) -> dict:
+        """Hash final session-touched market files only after storage shutdown.
+
+        No raw marker or raw record is written. Ambiguous variants and failures
+        leave the session untrusted. Hashing is streamed and bounded.
+        """
+        from recording_coverage import CoverageError, MAX_RAW_FILES, _safe_path
+        if len(self.rotator.touched_files) > MAX_RAW_FILES:
+            raise CoverageError("session raw inventory bound exceeded")
+        files = {}
+        for plain in sorted(self.rotator.touched_files):
+            relative = plain.relative_to(DATA_ROOT)
+            if relative.parts[1] not in {DEPTH_V2_CHANNEL, TRADE_V2_CHANNEL}:
+                continue
+            if plain.exists() or plain.is_symlink() or Path(f"{plain}.gz").exists():
+                raise CoverageError(f"uncompressed/ambiguous session raw file: {plain}")
+            compressed = Path(f"{plain}.zst")
+            _safe_path(compressed)
+            identity = self.compression_manager.completed_files.get(compressed)
+            if identity is None or compressed.stat().st_size != identity["size_bytes"]:
+                raise CoverageError(f"missing compression identity: {compressed}")
+            files[compressed.relative_to(DATA_ROOT).as_posix()] = identity
+        return files
+
+    def coverage_unowned_files(self) -> list[str]:
+        """Existing hourly bytes cannot be retroactively owned by this session."""
+        return sorted(Path(f"{p}.zst").relative_to(DATA_ROOT).as_posix()
+                      for p in self.rotator.preexisting_files
+                      if p.relative_to(DATA_ROOT).parts[1] in {DEPTH_V2_CHANNEL, TRADE_V2_CHANNEL})
 
     def get_write_counts(self) -> Dict[str, int]:
         """Get write counts for all writers (for monitoring)."""

@@ -604,3 +604,29 @@ ls -lh /path/to/replay_store/venue=BINANCE_SPOT/symbol=BTCUSDT/date=2026-06-15/
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) — Overall pipeline
 - [DAILY_BUILD_PIPELINE.md](DAILY_BUILD_PIPELINE.md) — How to build
+
+## Additive retirement readiness provenance
+
+A schema-v2 partition built through retirement has
+`readiness_contract_version: 1` and `readiness_evidence`, also copied into
+`integrity.readiness_evidence`. The evidence contains mode, contract version,
+venue/symbol/date, owning session ID, portable dataset identity, UTC horizon,
+exact selected raw hashes/sizes, and the inventoried start/final/head payloads
+with exact marker SHA-256 identities. Its canonical payload SHA-256 is exposed
+in reports. Marker file identity is attempt evidence; logical marker hashes
+and raw paths remain usable after an explicit bundle transfer.
+
+Routine validation verifies the complete evidence contract, marker hashes,
+clean closure and ordered excluding handoffs, evidence digest, exact raw scope
+against `source_identity`, and identical integrity copy. Missing/malformed or
+contradictory provenance fails; ordinary historical partitions without this
+additive field retain their existing reader/audit contract.
+
+Physical schemas, Parquet encoding and row semantics, format/schema versions,
+and the normalization builder version (`v2.0.1`) are unchanged. The separate
+versioned readiness contract changes authorization/provenance only, so there
+is no blanket builder-version migration or forced rebuild of ordinary older
+partitions. Existing v2.0.0 compatibility and its normalization replacement
+policy are unchanged. No readiness field is added to an ordinary D+1 build.
+The bounded full ledger is embedded for self-contained auditability; evidence
+adds manifest bytes and has not been benchmarked over long production sessions.

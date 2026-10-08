@@ -19,7 +19,7 @@ from typing import Optional
 
 import zstandard as zstd
 
-from config import DATA_ROOT, DAILY_REPORT_ROOT, REPLAY_ROOT, REPLAY_SCHEMA_VERSION
+from config import DATA_ROOT, DAILY_REPORT_ROOT, REPLAY_ROOT, REPLAY_SCHEMA_VERSION, COVERAGE_ROOT
 from converter.readers import stream_raw_records
 from converter.spool import DedupeSet
 from converter.depth_repartition import (
@@ -1171,6 +1171,8 @@ def _build_replay_for_symbol_locked(
     lifecycle_context=None,
     rebuild_source_changed: bool = False,
     replace_incompatible: bool = False,
+    coverage_root: Optional[Path] = None,
+    retirement_evidence: Optional[dict] = None,
 ) -> dict:
     """
     Build replay store for a single venue/symbol/date.
@@ -1246,6 +1248,14 @@ def _build_replay_for_symbol_locked(
         "trade_count": 0,
         "errors": [],
     }
+
+    if retirement_evidence is not None:
+        from recording_coverage import recheck_proof
+        recheck_proof(retirement_evidence, coverage_root, data_root)
+        status["readiness_mode"] = "clean_retirement_evidence"
+        status["readiness_evidence_sha256"] = retirement_evidence["sha256"]
+    elif check_repartition_readiness and retirement_evidence is None:
+        status["readiness_mode"] = "next_day_final_hour" if require_complete_next_day else "next_day_t00"
 
     import shutil as _shutil
 
@@ -1341,7 +1351,7 @@ def _build_replay_for_symbol_locked(
             # its exact raw-source identity. Reuse therefore requires the same
             # readiness proof as a fresh build and a fresh, strict identity
             # scan of the currently selected raw files.
-            if check_repartition_readiness:
+            if check_repartition_readiness and retirement_evidence is None:
                 readiness_reason = check_depth_repartition_readiness(
                     venue,
                     symbol,
@@ -1398,6 +1408,19 @@ def _build_replay_for_symbol_locked(
                 )
                 logger.error(status["errors"][-1])
                 return status
+            if existing_manifest.get("readiness_evidence") is not None:
+                from recording_coverage import validate_provenance, snapshot
+                saved = existing_manifest["readiness_evidence"]
+                validate_provenance(saved, venue, symbol, date)
+                current = snapshot(coverage_root)
+                if any(
+                    {key: current.get(name, {}).get(key) for key in ("payload", "sha256", "size_bytes")}
+                    != {key: entry[key] for key in ("payload", "sha256", "size_bytes")}
+                    for name, entry in saved["records"].items() if name != "head.json"
+                ):
+                    raise RuntimeError("published retirement evidence disagrees with live ledger")
+                status["readiness_mode"] = saved["mode"]
+                status["readiness_evidence_sha256"] = saved["sha256"]
             if existing_manifest.get("source_identity") != live_source_identity:
                 if rebuild_source_changed:
                     force = True
@@ -1443,7 +1466,7 @@ def _build_replay_for_symbol_locked(
     # single-day library fixtures; every operator and canonical validation
     # entry point enables it explicitly.
     readiness_reason = None
-    if check_repartition_readiness:
+    if check_repartition_readiness and retirement_evidence is None:
         readiness_reason = check_depth_repartition_readiness(
             venue,
             symbol,
@@ -1684,8 +1707,13 @@ def _build_replay_for_symbol_locked(
         except Exception as e:
             logger.warning(f"Could not load instrument metadata for {venue}/{symbol}: {e}")
 
-        # Finalize and publish
+        # Retirement evidence is adjacent provenance, never a raw identity key.
+        if retirement_evidence is not None:
+            writer.set_readiness_evidence(retirement_evidence)
+            writer.readiness_guard = lambda: recheck_proof(retirement_evidence, coverage_root, data_root)
         writer.finalize_staging()
+        if retirement_evidence is not None:
+            recheck_proof(retirement_evidence, coverage_root, data_root)
         writer.publish(instrument_metadata)
 
         status["depth_count"] = writer.depth_count
@@ -1746,6 +1774,7 @@ def build_replay_for_symbol(
     report_root: "Optional[Path]" = None,
     rebuild_source_changed: bool = False,
     replace_incompatible: bool = False,
+    coverage_root: Optional[Path] = None,
 ) -> dict:
     """Build one partition under the shared build-wide lifecycle lock.
 
@@ -1770,13 +1799,13 @@ def build_replay_for_symbol(
         rebuild_source_changed=rebuild_source_changed,
         replace_incompatible=replace_incompatible,
     )
-    def run_attempts(context):
+    def run_attempts(context, retirement_evidence=None, selected_coverage_root=None):
         attempts = 3 if schema_version == 2 else 1
         for attempt in range(1, attempts + 1):
             try:
                 return _build_replay_for_symbol_locked(
                     venue, symbol, date, data_root, replay_root,
-                    lifecycle_context=context, **kwargs,
+                    lifecycle_context=context, retirement_evidence=retirement_evidence, coverage_root=selected_coverage_root, **kwargs,
                 )
             except RawRepresentationTransition as exc:
                 logger.warning(
@@ -1796,8 +1825,37 @@ def build_replay_for_symbol(
                 time.sleep(0.2)
         raise AssertionError("unreachable retry state")
 
+    def run_with_evidence(context):
+        next_dir = data_root / venue / "depth_v2" / symbol / _depth_date_shift(date, 1)
+        missing_next_day = not os.path.lexists(next_dir)
+        manifest_path = replay_root / f"venue={venue}" / f"symbol={symbol}" / f"date={date}" / "manifest.json"
+        saved_evidence = False
+        if manifest_path.is_file():
+            try:
+                saved_evidence = json.loads(manifest_path.read_text()).get("readiness_evidence") is not None
+            except (OSError, ValueError):
+                pass  # Existing recovery/validation owns corrupt manifest handling.
+        if not (check_repartition_readiness and missing_next_day) and not saved_evidence:
+            return run_attempts(context)
+        if schema_version != 2:
+            return {"venue": venue, "symbol": symbol, "date": date, "status": "deferred", "outcome": "deferred_not_ready", "depth_count": 0, "trade_count": 0, "readiness_mode": "deferred_missing_evidence", "errors": [f"Missing next-day {_depth_date_shift(date, 1)} depth; retirement evidence requires schema 2"]}
+        effective_coverage_root = coverage_root
+        if effective_coverage_root is None and data_root.resolve() == DATA_ROOT.resolve():
+            effective_coverage_root = COVERAGE_ROOT
+        if effective_coverage_root is None or not Path(effective_coverage_root).exists():
+            reason = check_depth_repartition_readiness(venue, symbol, date, data_root, require_complete_next_day=require_complete_next_day)
+            return {"venue": venue, "symbol": symbol, "date": date, "status": "deferred", "outcome": "deferred_not_ready", "depth_count": 0, "trade_count": 0, "readiness_mode": "deferred_missing_evidence", "errors": [(reason or "published retirement proof requires its ledger") + " Missing retirement evidence; custom raw roots require explicit --coverage-root."]}
+        from recording_coverage import ledger_lock, retirement_proof
+        try:
+            with ledger_lock(Path(effective_coverage_root)):
+                proof = retirement_proof(Path(effective_coverage_root), data_root, venue, symbol, date, complete_next_day=require_complete_next_day) if missing_next_day else None
+                return run_attempts(context, proof, Path(effective_coverage_root))
+        except Exception as exc:
+            failed = isinstance(exc, OSError)
+            return {"venue": venue, "symbol": symbol, "date": date, "status": "failed" if failed else "deferred", "outcome": "failed" if failed else "deferred_not_ready", "depth_count": 0, "trade_count": 0, "readiness_mode": "deferred_untrusted_evidence", "errors": [f"coverage evidence failed closed: {exc}"]}
+
     if lifecycle_context is not None:
-        return run_attempts(lifecycle_context)
+        return run_with_evidence(lifecycle_context)
 
     effective_report_root = Path(report_root or (Path(replay_root) / ".lifecycle" / "reports"))
     try:
@@ -1807,7 +1865,7 @@ def build_replay_for_symbol(
             report_root=effective_report_root,
         ) as context:
             reconcile_replay_root(context)
-            return run_attempts(context)
+            return run_with_evidence(context)
     except ReplayLifecycleSafetyError as exc:
         return {
             "venue": venue,
@@ -1874,6 +1932,7 @@ Examples:
         choices=(0, 1, 2),
         help="Replay schema version (production default: 2; 0/1 remain available only for explicit historical validation)",
     )
+    parser.add_argument("--coverage-root", type=Path, default=None, help="Explicit retirement ledger root (required for custom raw roots)")
     args = parser.parse_args()
 
     data_root = args.data_root or DATA_ROOT
@@ -1922,6 +1981,7 @@ Examples:
                         result = build_replay_for_symbol(
                             venue, symbol, date_str, data_root, replay_root,
                             force=args.force,
+                            coverage_root=args.coverage_root,
                             schema_version=args.schema_version,
                             check_repartition_readiness=True,
                             lifecycle_context=lifecycle_context,
