@@ -75,6 +75,14 @@ passes.** Until then, broader full-L2 equivalence stays **deferred** (see
   transitions at most three times, discarding staging before a new attempt.
   Ambiguous or unrelated changes still fail closed. Development verification
   does not constitute deployment or production acceptance.
+- **Selected reconstruction instrument compatibility across dates** — selected
+  jobs now compare the canonical Nautilus instrument semantics actually emitted
+  from each target partition, rather than requiring byte-identical
+  `instrument.json` files. Harmless JSON formatting or unused exchangeInfo
+  differences no longer block a multi-day job; raw metadata hashes and sizes
+  remain bound in the consumed inventory, and contradictory reconstructed
+  instrument semantics still fail closed. The broader top50/multi-day
+  equivalence gate remains deferred.
 - **Production replay exchangeInfo dependency boundary** — generic Binance
   exchangeInfo loading, filter lookup, and decimal-precision helpers now live
   once in dependency-free `converter.exchange_info`. The compact replay writer

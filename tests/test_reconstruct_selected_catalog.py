@@ -1,6 +1,8 @@
 """Supported selected-catalog API/CLI contract and publication safety."""
 from __future__ import annotations
 
+import copy
+import hashlib
 import json
 import shutil
 import threading
@@ -16,6 +18,7 @@ from pipeline.reconstruct_selected_catalog import (
     MANIFEST_VERSION,
     SelectedCatalogError,
     SelectedCatalogRequest,
+    _instrument_reconstruction_fingerprint,
     _new_job_claim,
     _normalize_request,
     _parser,
@@ -80,6 +83,89 @@ def _build_supported_replay(tmp_path: Path) -> Path:
     )
     assert result["status"] == "success"
     return replay
+
+
+MULTIDAY_DATES = ("2026-06-12", "2026-06-13")
+
+
+def _instrument_document() -> dict:
+    return {
+        "venue": VENUE,
+        "symbol": SYMBOL,
+        "market_type": "spot",
+        "instrument_id": INSTRUMENT_ID,
+        "raw_symbol": SYMBOL,
+        "base_asset": "ADA",
+        "quote_asset": "USDT",
+        "baseAsset": "ADA",
+        "quoteAsset": "USDT",
+        "filters": [
+            {"filterType": "PRICE_FILTER", "tickSize": "0.0001"},
+            {"filterType": "LOT_SIZE", "stepSize": "0.1", "minQty": "0.1"},
+            {"filterType": "NOTIONAL", "minNotional": "5.0"},
+            {
+                "filterType": "MARKET_LOT_SIZE",
+                "stepSize": "0.0",
+                "minQty": "0.0",
+                "maxQty": "1000.0",
+            },
+        ],
+    }
+
+
+def _set_filter_value(document: dict, filter_type: str, field: str, value: str) -> None:
+    target = next(
+        item for item in document["filters"] if item["filterType"] == filter_type
+    )
+    target[field] = value
+
+
+def _multiday_preflight_from_instrument_json(
+    monkeypatch,
+    tmp_path: Path,
+    documents: dict[str, str],
+) -> tuple[SelectedCatalogRequest, dict]:
+    replay = tmp_path / "replay"
+    replay.mkdir()
+    for date in MULTIDAY_DATES:
+        (replay / f"venue={VENUE}" / f"symbol={SYMBOL}" / f"date={date}").mkdir(
+            parents=True
+        )
+    request = _request(
+        tmp_path,
+        replay,
+        profile="trades_only",
+        start="2026-06-12T00:00:00Z",
+        end="2026-06-14T00:00:00Z",
+        job_id="instrument-compatibility",
+    )
+
+    def inventory(_request, venue, symbol, date, roles):
+        raw = documents[date].encode()
+        document = json.loads(raw)
+        return {
+            "venue": venue,
+            "symbol": symbol,
+            "date": date,
+            "roles": sorted(roles),
+            "relative_path": (
+                f"venue={venue}/symbol={symbol}/date={date}"
+            ),
+            "files": {
+                "instrument.json": {
+                    "sha256": hashlib.sha256(raw).hexdigest(),
+                    "size_bytes": len(raw),
+                },
+            },
+            "instrument_reconstruction_fingerprint": (
+                _instrument_reconstruction_fingerprint(document, venue, symbol)
+            ),
+        }
+
+    monkeypatch.setattr(
+        "pipeline.reconstruct_selected_catalog._partition_inventory", inventory
+    )
+    return request, _preflight(_normalize_request(request))
 
 
 def _fake_preflight() -> dict:
@@ -241,6 +327,171 @@ def test_unsupported_declared_schema_format_fails(tmp_path: Path) -> None:
         _preflight(_normalize_request(request))
 
 
+def test_multiday_instrument_key_order_is_compatible_and_raw_hashes_stay_bound(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    document = _instrument_document()
+    reordered = {key: document[key] for key in reversed(document)}
+    first_raw = json.dumps(document, indent=2)
+    second_raw = json.dumps(reordered, separators=(",", ":"))
+    assert json.loads(first_raw) == json.loads(second_raw)
+    assert hashlib.sha256(first_raw.encode()).digest() != hashlib.sha256(
+        second_raw.encode()
+    ).digest()
+
+    request, preflight = _multiday_preflight_from_instrument_json(
+        monkeypatch,
+        tmp_path,
+        dict(zip(MULTIDAY_DATES, (first_raw, second_raw))),
+    )
+    target = preflight["partitions"]
+    assert len({item["files"]["instrument.json"]["sha256"] for item in target}) == 2
+    assert len({item["files"]["instrument.json"]["size_bytes"] for item in target}) == 2
+    assert len({
+        item["instrument_reconstruction_fingerprint"]["sha256"] for item in target
+    }) == 1
+    assert target[0]["instrument_reconstruction_fingerprint"]["canonical"] == (
+        target[1]["instrument_reconstruction_fingerprint"]["canonical"]
+    )
+
+    engine = _fake_engine()
+    original_generate = engine.generate_catalog_from_replay
+
+    def generate(*args, **kwargs):
+        status = original_generate(*args, **kwargs)
+        status["found_partitions"] = [
+            {"venue": VENUE, "symbol": SYMBOL, "date": date}
+            for date in MULTIDAY_DATES
+        ]
+        status["partition_record_counts"] = [
+            {
+                "venue": VENUE,
+                "symbol": SYMBOL,
+                "date": date,
+                "trade_ticks": 1,
+                "order_book_deltas": 0,
+                "order_book_depth10": 0,
+            }
+            for date in MULTIDAY_DATES
+        ]
+        return status
+
+    engine.generate_catalog_from_replay = generate
+    monkeypatch.setattr(
+        "pipeline.reconstruct_selected_catalog._preflight", lambda _request: preflight
+    )
+    monkeypatch.setattr(
+        "pipeline.reconstruct_selected_catalog._rehash_preflight",
+        lambda _request, original: original,
+    )
+    monkeypatch.setattr(
+        "pipeline.reconstruct_selected_catalog._load_engine", lambda: engine
+    )
+    monkeypatch.setattr(
+        "pipeline.reconstruct_selected_catalog._repository_commit", lambda: "1" * 40
+    )
+    result = reconstruct_selected_catalog(request=request)
+    manifest = json.loads((result / "job_manifest.json").read_text())
+    consumed = manifest["consumed_partition_inventory"]
+    assert len({item["files"]["instrument.json"]["sha256"] for item in consumed}) == 2
+    assert len({item["files"]["instrument.json"]["size_bytes"] for item in consumed}) == 2
+    assert len({
+        item["instrument_reconstruction_fingerprint"]["sha256"] for item in consumed
+    }) == 1
+
+
+def test_multiday_unused_market_lot_max_quantity_change_is_compatible(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    first = _instrument_document()
+    second = copy.deepcopy(first)
+    _set_filter_value(second, "MARKET_LOT_SIZE", "maxQty", "2500.0")
+
+    _request_value, preflight = _multiday_preflight_from_instrument_json(
+        monkeypatch,
+        tmp_path,
+        {
+            MULTIDAY_DATES[0]: json.dumps(first),
+            MULTIDAY_DATES[1]: json.dumps(second),
+        },
+    )
+    fingerprints = [
+        item["instrument_reconstruction_fingerprint"]
+        for item in preflight["partitions"]
+    ]
+    assert fingerprints[0] == fingerprints[1]
+    assert fingerprints[0]["canonical"]["max_quantity"] is None
+
+
+@pytest.mark.parametrize(
+    "filter_type,field,value",
+    [
+        ("PRICE_FILTER", "tickSize", "0.0002"),
+        ("LOT_SIZE", "stepSize", "0.2"),
+        ("LOT_SIZE", "minQty", "0.2"),
+        ("NOTIONAL", "minNotional", "6.0"),
+    ],
+)
+def test_multiday_reconstructed_instrument_filter_change_fails_closed(
+    monkeypatch,
+    tmp_path: Path,
+    filter_type: str,
+    field: str,
+    value: str,
+) -> None:
+    first = _instrument_document()
+    second = copy.deepcopy(first)
+    _set_filter_value(second, filter_type, field, value)
+
+    with pytest.raises(
+        SelectedCatalogError,
+        match="contradictory reconstructed instrument semantics",
+    ):
+        _multiday_preflight_from_instrument_json(
+            monkeypatch,
+            tmp_path,
+            {
+                MULTIDAY_DATES[0]: json.dumps(first),
+                MULTIDAY_DATES[1]: json.dumps(second),
+            },
+        )
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("baseAsset", "BTC"),
+        ("quoteAsset", "USDC"),
+        ("base_asset", "BTC"),
+        ("quote_asset", "USDC"),
+        ("symbol", "BTCUSDT"),
+        ("venue", "BINANCE_USDTF"),
+        ("market_type", "perpetual"),
+        ("instrument_id", "BTCUSDT.BINANCE"),
+        ("raw_symbol", "BTCUSDT"),
+    ],
+)
+def test_multiday_reconstructed_instrument_identity_change_fails_closed(
+    monkeypatch,
+    tmp_path: Path,
+    field: str,
+    value: str,
+) -> None:
+    first = _instrument_document()
+    second = copy.deepcopy(first)
+    second[field] = value
+
+    with pytest.raises(SelectedCatalogError, match="instrument metadata|instrument semantics"):
+        _multiday_preflight_from_instrument_json(
+            monkeypatch,
+            tmp_path,
+            {
+                MULTIDAY_DATES[0]: json.dumps(first),
+                MULTIDAY_DATES[1]: json.dumps(second),
+            },
+        )
+
+
 def test_safe_job_manifest_binds_replay_and_catalog_hashes(tmp_path: Path) -> None:
     replay = _build_supported_replay(tmp_path)
     result = reconstruct_selected_catalog(request=_request(tmp_path, replay))
@@ -255,6 +506,9 @@ def test_safe_job_manifest_binds_replay_and_catalog_hashes(tmp_path: Path) -> No
     assert consumed["files"]["depth.parquet"]["sha256"]
     assert consumed["files"]["trades.parquet"]["sha256"]
     assert consumed["files"]["instrument.json"]["sha256"]
+    assert consumed["files"]["instrument.json"]["size_bytes"]
+    assert consumed["instrument_reconstruction_fingerprint"]["sha256"]
+    assert consumed["instrument_reconstruction_fingerprint"]["canonical"]
     assert manifest["consumed_partition_inventory_digest"]["sha256"]
     assert manifest["catalog_tree_digest"]["sha256"]
     assert load_trade_ticks(result / "catalog", INSTRUMENT_ID)
@@ -364,6 +618,7 @@ def test_preflight_records_preceding_carry_and_multiday_scope(monkeypatch, tmp_p
             "date": date,
             "roles": sorted(roles),
             "files": {"instrument.json": {"sha256": "a" * 64}},
+            "instrument_reconstruction_fingerprint": {"sha256": "b" * 64},
         }
 
     monkeypatch.setattr("pipeline.reconstruct_selected_catalog._partition_inventory", inventory)
