@@ -93,6 +93,76 @@ An entry may be skipped **only** for:
 - <or "none — task fully completed">
 ```
 
+## 2026-10-10 — Compare reconstructed instrument semantics across dates
+
+### Change summary
+- Selected reconstruction preflight now compares canonical Nautilus
+  instrument semantics across target dates instead of raw `instrument.json`
+  file hashes.
+- Raw instrument metadata hashes and sizes remain bound in the consumed
+  partition inventory; changes to reconstructed identity or instrument
+  constraints still fail closed.
+- Added multi-day coverage for equivalent JSON with different byte
+  serialization, unused market-lot metadata changes, and contradictory
+  instrument semantics.
+
+### Files/packages touched
+- `pipeline/reconstruct_selected_catalog.py`
+- `tests/test_reconstruct_selected_catalog.py`
+- `CHANGELOG.md`
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] docs/REPO_STRUCTURE.md
+- [x] docs/PROJECT_STATUS.md
+- [x] docs/IMPLEMENTATION_AUDIT.md
+- [x] relevant feature docs:
+  - `docs/FULL_L2_REPLAY_CATALOG_PLAN.md`
+  - `docs/OPERATIONS.md`
+  - `docs/AI_WORKFLOW.md`
+  - `CHANGELOG.md`
+
+### Docs updated
+- [x] CHANGELOG.md
+- [ ] README.md — no user invocation or setup changes
+- [ ] docs/PROJECT_STATUS.md — no validation status changed
+- [ ] docs/REPO_STRUCTURE.md — no structure change
+- [ ] relevant feature docs:
+  - none; selected reconstruction contract and status remain unchanged
+- No docs update required because: this is a fail-closed
+  compatibility correction within the existing selected reconstruction
+  boundary; the changelog records the behavior, and no validation/deferred
+  status claim changed.
+
+### Status / validation impact
+- Validated status changed: no
+- Deferred status changed: no
+- New claims added: no
+- Evidence for any new validation claim:
+  - n/a
+
+### Tests run
+```bash
+uv lock --check
+uv run --frozen --no-sync --no-default-groups --extra reconstruction --group dev pytest tests/test_reconstruct_selected_catalog.py tests/test_replay_catalog_reconstruct.py tests/test_catalog_equivalence.py
+uv run --frozen --no-sync --no-default-groups --extra reconstruction --group dev pytest
+```
+- Focused reconstruction tests: 63 passed, 1 skipped.
+- Full suite: 873 passed, 3 skipped.
+
+### Validation CLIs run
+```bash
+none — no retained raw/replay/catalog fixture is available for a real-data
+equivalence run; focused synthetic reconstruction and manifest-binding tests
+passed instead.
+```
+
+### Known limitations / out of scope
+- The real-data full-L2 top50/multi-day equivalence gate remains deferred;
+  `convert_day.py` remains the production reference.
+- No raw data, replay partitions, or production catalog were changed or
+  validated.
+
 ## 2026-10-07 — Repair replay root coexistence and raw compression races
 
 ### Change summary

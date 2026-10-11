@@ -35,6 +35,7 @@ from validation.artifact_identity import load_json_object
 MANIFEST_VERSION = "cryptorecorder-selected-catalog-job-v1"
 INVENTORY_DIGEST_ALGORITHM = "sha256-canonical-json-v1"
 CATALOG_DIGEST_ALGORITHM = "sha256-catalog-tree-v1"
+INSTRUMENT_FINGERPRINT_ALGORITHM = "sha256-nautilus-instrument-semantics-v1"
 CLAIM_CONTRACT_VERSION = 1
 SUPPORTED_PROFILES = ("full_l2", "trades_only")
 _JOB_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -544,6 +545,10 @@ def _validate_instrument(document: Mapping[str, Any], venue: str, symbol: str) -
     if document.get("venue") != venue or document.get("symbol") != symbol:
         raise SelectedCatalogError(f"instrument metadata contradicts {venue}/{symbol}")
     info = document.get("exchange_info") if isinstance(document.get("exchange_info"), dict) else document
+    if "symbol" in info and info.get("symbol") != symbol:
+        raise SelectedCatalogError(
+            f"instrument exchange metadata contradicts {venue}/{symbol}"
+        )
     filters = info.get("filters")
     if not isinstance(filters, list) or not filters:
         raise SelectedCatalogError(f"instrument metadata has no exchange filters for {venue}/{symbol}")
@@ -554,6 +559,63 @@ def _validate_instrument(document: Mapping[str, Any], venue: str, symbol: str) -
         raise SelectedCatalogError(
             f"instrument metadata lacks exact PRICE_FILTER/LOT_SIZE increments for {venue}/{symbol}"
         )
+
+
+def _instrument_reconstruction_fingerprint(
+    document: Mapping[str, Any],
+    venue: str,
+    symbol: str,
+) -> dict[str, Any]:
+    """Return the canonical Nautilus instrument semantics emitted from metadata.
+
+    The reconstruction engine passes replay ``instrument.json`` through
+    ``build_instruments`` and writes the resulting Nautilus object.  Comparing
+    that object's canonical ``to_dict`` representation keeps this compatibility
+    gate coupled to the actual product behavior: JSON ordering and unused
+    exchangeInfo fields do not matter, while every emitted instrument field
+    does.  Raw ``instrument.json`` bytes remain independently hash-bound in the
+    consumed partition inventory.
+    """
+    _validate_instrument(document, venue, symbol)
+    metadata = dict(document)
+    if isinstance(document.get("exchange_info"), dict):
+        metadata = dict(document["exchange_info"])
+
+    try:
+        from converter.instruments import build_instruments
+
+        instruments = build_instruments(venue, [symbol], {symbol: metadata})
+        if len(instruments) != 1:
+            raise ValueError(f"expected one instrument, built {len(instruments)}")
+        instrument = instruments[0]
+        canonical = type(instrument).to_dict(instrument)
+        if not isinstance(canonical, dict) or not canonical:
+            raise ValueError("Nautilus instrument serialization was not a non-empty object")
+    except Exception as exc:
+        raise SelectedCatalogError(
+            f"could not derive reconstructed instrument semantics for {venue}/{symbol}"
+        ) from exc
+
+    declared_semantics = {
+        "market_type": "perpetual" if "USDTF" in venue else "spot",
+        "instrument_id": canonical.get("id"),
+        "raw_symbol": canonical.get("raw_symbol"),
+        "base_asset": canonical.get("base_currency"),
+        "quote_asset": canonical.get("quote_currency"),
+    }
+    for field, expected in declared_semantics.items():
+        if field in document and document.get(field) != expected:
+            raise SelectedCatalogError(
+                f"instrument metadata {field} contradicts reconstructed "
+                f"instrument semantics for {venue}/{symbol}"
+            )
+
+    digest = _canonical_digest(canonical, INSTRUMENT_FINGERPRINT_ALGORITHM)
+    return {
+        "algorithm": INSTRUMENT_FINGERPRINT_ALGORITHM,
+        "sha256": digest,
+        "canonical": canonical,
+    }
 
 
 def _partition_inventory(
@@ -588,7 +650,9 @@ def _partition_inventory(
             raise SelectedCatalogError(
                 f"replay manifest {field} contradicts partition path for {venue}/{symbol}/{date}"
             )
-    _validate_instrument(instrument, venue, symbol)
+    instrument_fingerprint = _instrument_reconstruction_fingerprint(
+        instrument, venue, symbol
+    )
     reader = ReplayReader(request.replay_root)
     try:
         schema_version = reader.get_schema_version(venue, symbol, date)
@@ -618,6 +682,7 @@ def _partition_inventory(
             "trades.parquet": {"sha256": trades_sha, "size_bytes": trades_bytes},
             "instrument.json": {"sha256": instrument_sha, "size_bytes": instrument_bytes},
         },
+        "instrument_reconstruction_fingerprint": instrument_fingerprint,
         "source_identity_digest": (
             _canonical_digest(manifest["source_identity"])
             if isinstance(manifest.get("source_identity"), dict)
@@ -677,16 +742,17 @@ def _preflight(request: _NormalizedRequest) -> dict[str, Any]:
     ]
     for venue in request.venues:
         for symbol in request.symbols:
-            instrument_hashes = {
-                item["files"]["instrument.json"]["sha256"]
+            instrument_fingerprints = {
+                item["instrument_reconstruction_fingerprint"]["sha256"]
                 for item in inventory
                 if item["venue"] == venue
                 and item["symbol"] == symbol
                 and "target" in item["roles"]
             }
-            if len(instrument_hashes) != 1:
+            if len(instrument_fingerprints) != 1:
                 raise SelectedCatalogError(
-                    f"target partitions have contradictory instrument metadata for {venue}/{symbol}"
+                    "target partitions produce contradictory reconstructed "
+                    f"instrument semantics for {venue}/{symbol}"
                 )
     return {
         "target_dates": list(dates),
