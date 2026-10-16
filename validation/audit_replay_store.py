@@ -207,7 +207,9 @@ def audit_replay_partition(
     manifest_depth_count = manifest.get("depth_record_count")
     manifest_trade_count = manifest.get("trade_record_count")
     readiness = {"present": "readiness_evidence" in manifest, "valid": True, "errors": []}
-    if readiness["present"] or manifest.get("integrity", {}).get("readiness_evidence") is not None:
+    if readiness["present"] or "readiness_contract_version" in manifest or any(
+        key in manifest.get("integrity", {}) for key in ("readiness_evidence", "readiness_evidence_sha256")
+    ):
         from stores.replay_writer import validate_partition
         readiness["valid"] = validate_partition(partition)
         proof = manifest.get("readiness_evidence", {})

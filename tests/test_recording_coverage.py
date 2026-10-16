@@ -77,7 +77,9 @@ def test_t00_to_t06_retirement_build_audits_and_reuses(fixture):
     manifest = json.loads((partition / "manifest.json").read_text())
     proof = manifest["readiness_evidence"]
     assert proof["sha256"] == result["readiness_evidence_sha256"]
-    assert manifest["integrity"]["readiness_evidence"] == proof
+    assert manifest["readiness_contract_version"] == proof["contract_version"] == 2
+    assert manifest["integrity"]["readiness_evidence_sha256"] == proof["sha256"]
+    assert (partition / "manifest.json").read_text().count('"readiness_evidence":') == 1
     assert build(fixture)["outcome"] == "skipped_valid"
     assert not list(fixture.replay.rglob(".staging*"))
 
@@ -195,10 +197,19 @@ def test_mutation_aborts_without_publication(fixture, monkeypatch, phase):
     assert not list(fixture.replay.rglob(".backup*"))
 
 
-def test_new_start_blocked_while_builder_owns_ledger(fixture):
+@pytest.mark.parametrize("operation", ["start", "final"])
+def test_publication_lock_wait_is_bounded(fixture, monkeypatch, operation):
+    sleeps = []
+    monkeypatch.setattr(coverage.time, "sleep", sleeps.append)
+    monkeypatch.setattr(coverage.time, "monotonic", lambda: 0)
     with coverage.ledger_lock(fixture.ledger):
-        with pytest.raises(coverage.CoverageError, match="busy"):
-            coverage.RecordingSession(fixture.ledger, fixture.raw, {VENUE: [SYMBOL]})
+        with pytest.raises(coverage.CoverageError, match="41/41 attempts"):
+            if operation == "start":
+                coverage.RecordingSession(fixture.ledger, fixture.raw, {VENUE: [SYMBOL]})
+            else:
+                finish_successor(fixture)
+    assert sleeps == [0.05] * 40
+    assert not (fixture.ledger / f"{fixture.successor.start['session_id']}.final.json").exists()
 
 
 @pytest.mark.parametrize("operation", ["fsync", "link", "replace"])
@@ -494,3 +505,328 @@ def test_wrong_venue_unknown_universe_and_shared_owners_defer(fixture):
     payload = json.loads(path.read_text()); payload['universe_digest'] = '0'*64
     write_payload(path, payload)
     assert build(fixture)['outcome'] == 'deferred_not_ready'
+
+
+def finish_successor(f):
+    return f.successor.finish({**f.storage, "writers": {}}, {}, producers_stopped=True,
+                              ingestion_stopped_at=coverage.utc_now(), errors=[], shutdown_reason="SIGTERM")
+
+
+def partition_path(f, symbol=SYMBOL):
+    return f.replay / f"venue={VENUE}" / f"symbol={symbol}" / f"date={DATE}"
+
+
+def populated_fixture(base, *, before=80, after=80, files_per_session=96):
+    """Synthetic unrelated history; no real feeds or existing raw data.
+
+    Whole canonical marker hashes are rebuilt only for this invented ledger.
+    Three symbols share an owner; no history session owns their raw inputs.
+    """
+    from datetime import timedelta
+    import shutil
+    f = make_fixture(base)
+    symbols = [SYMBOL, "UNIUSDT", "ETHUSDT"]
+    owner = copy.deepcopy(f.session.start)
+    owner["universe"] = {VENUE: sorted(symbols)}
+    owner["universe_digest"] = coverage.digest(owner["universe"])
+    final = copy.deepcopy(f.final)
+    for symbol in symbols[1:]:
+        for channel in ("depth_v2", "trade_v2"):
+            shutil.copytree(f.raw / VENUE / channel / SYMBOL, f.raw / VENUE / channel / symbol)
+        final["raw_files"].update({p.replace(f"/{SYMBOL}/", f"/{symbol}/"): i for p, i in f.files.items()})
+    rows = []
+    def history(index, timestamp):
+        start = {**copy.deepcopy(owner), "session_id": f"{index:032x}",
+                 "started_at": timestamp, "universe": {VENUE: ["HISTUSDT"]}}
+        start["universe_digest"] = coverage.digest(start["universe"])
+        end = {**copy.deepcopy(final), "session_id": start["session_id"],
+               "ingestion_stopped_at": timestamp, "finalized_at": timestamp,
+               "raw_files": {}, "unowned_raw_files": [], "storage": {**f.storage, "writers": {}}}
+        # Distinct canonical hours in each record, unrelated to fixture scope.
+        for n in range(files_per_session):
+            dt = datetime(2025, 1, 1, tzinfo=timezone.utc) + timedelta(hours=n)
+            path = f"{VENUE}/depth_v2/HISTUSDT/{dt:%Y-%m-%d}/{dt:%Y-%m-%dT%H}.jsonl.zst"
+            end["raw_files"][path] = {"sha256": coverage.digest([index, n]), "size_bytes": 128}
+        return start, end
+    for i in range(before):
+        timestamp = (datetime(2025, 12, 1, tzinfo=timezone.utc) + timedelta(minutes=i)).strftime("%Y-%m-%dT%H:%M:%S.000000Z")
+        rows.append(history(i + 1, timestamp))
+    rows += [(owner, final), (copy.deepcopy(f.successor.start), None)]
+    # The first start after the strict horizon proves the segment is complete.
+    rows.append(history(before + 1, "2026-01-03T00:00:00.000000Z"))
+    for i in range(after):
+        timestamp = (datetime(2026, 1, 4, tzinfo=timezone.utc) + timedelta(minutes=i)).strftime("%Y-%m-%dT%H:%M:%S.000000Z")
+        rows.append(history(before + 2 + i, timestamp))
+    previous = None
+    for sequence, (start, end) in enumerate(rows, 1):
+        start.update(sequence=sequence, previous=previous)
+        sha = coverage.digest(start)
+        previous = {"session_id": start["session_id"], "sha256": sha}
+        write_payload(f.ledger / f"{start['session_id']}.start.json", start)
+        if end is not None:
+            end["start_sha256"] = sha
+            write_payload(f.ledger / f"{start['session_id']}.final.json", end)
+    head = json.loads((f.ledger / "head.json").read_text())
+    head.update(count=len(rows), session_id=previous["session_id"], start_sha256=previous["sha256"])
+    write_payload(f.ledger / "head.json", head)
+    f.symbols = symbols
+    return f
+
+
+def test_large_history_multiple_partitions_store_only_relevant_records(tmp_path):
+    f = populated_fixture(tmp_path)
+    records = coverage.snapshot(f.ledger)
+    ledger_bytes = sum(e["size_bytes"] for e in records.values())
+    assert len(records) > 300 and ledger_bytes > 2_000_000
+    for symbol in f.symbols:
+        result = build_replay_for_symbol(VENUE, symbol, DATE, f.raw, f.replay,
+                                        schema_version=2, price_scale=2, qty_scale=2,
+                                        check_repartition_readiness=True, coverage_root=f.ledger)
+        assert result["outcome"] == "built", result
+        path = partition_path(f, symbol)
+        manifest_text = (path / "manifest.json").read_text()
+        manifest = json.loads(manifest_text)
+        proof = manifest["readiness_evidence"]
+        assert len(proof["records"]) == 4  # owner start/final, excluding start, boundary start
+        assert all("file_key" not in e for e in proof["records"].values())
+        assert len(manifest_text) < 60_000
+        assert manifest_text.count('"readiness_evidence":') == 1
+        assert manifest_text.count('"shutdown_reason":') == 1
+        assert validate_partition(path)
+        assert (result["depth_count"], result["trade_count"]) == (7, 7)
+    # Adding arbitrarily large unrelated tails cannot grow the same proof.
+    proof = coverage.retirement_proof(f.ledger, f.raw, VENUE, SYMBOL, DATE)
+    later = coverage.RecordingSession(f.ledger, f.raw, {VENUE: ["BTCUSDT"]})
+    later.release()
+    assert coverage.retirement_proof(f.ledger, f.raw, VENUE, SYMBOL, DATE) == proof
+    assert build(f)["outcome"] == "skipped_valid"
+    assert not list(f.replay.rglob(".staging*")) and not list(f.replay.rglob(".backup*"))
+
+
+@pytest.mark.parametrize("fault", ["owner_final", "successor", "boundary", "previous_hash", "raw_hash", "handoff", "duplicate", "version"])
+def test_compact_proof_rejects_missing_or_conflicting_material(tmp_path, fault):
+    f = populated_fixture(tmp_path, before=2, after=2, files_per_session=1)
+    proof = coverage.retirement_proof(f.ledger, f.raw, VENUE, SYMBOL, DATE)
+    records = proof["records"]
+    starts = sorted((n for n in records if n.endswith(".start.json")), key=lambda n: records[n]["payload"]["sequence"])
+    if fault == "owner_final": del records[f"{proof['session_id']}.final.json"]
+    elif fault == "successor": del records[starts[1]]
+    elif fault == "boundary": del records[starts[-1]]
+    elif fault == "raw_hash": next(iter(proof["raw_files"].values()))["sha256"] = "0" * 64
+    elif fault in {"previous_hash", "handoff"}:
+        entry = records[starts[1]] if fault == "previous_hash" else records[f"{proof['session_id']}.final.json"]
+        if fault == "previous_hash": entry["payload"]["previous"]["sha256"] = "0" * 64
+        else: entry["payload"]["finalized_at"] = "2026-01-01T07:00:00.000000Z"
+        entry["sha256"] = coverage.digest(entry["payload"])
+        entry["size_bytes"] = len(json.dumps(entry["payload"], sort_keys=True, separators=(",", ":")).encode())
+    elif fault == "duplicate": records["head.json"] = {k: v for k, v in coverage.snapshot(f.ledger)["head.json"].items() if k != "file_key"}
+    elif fault == "version": proof["contract_version"] = 999
+    proof["sha256"] = coverage.digest({k: v for k, v in proof.items() if k != "sha256"})
+    with pytest.raises(coverage.CoverageError): coverage.validate_provenance(proof, VENUE, SYMBOL, DATE)
+
+
+def test_version_one_existing_manifest_remains_valid_and_reusable(fixture):
+    assert build(fixture)["outcome"] == "built"
+    path = partition_path(fixture) / "manifest.json"
+    manifest = json.loads(path.read_text())
+    proof = manifest["readiness_evidence"]
+    proof["contract_version"] = 1
+    proof["records"] = coverage.snapshot(fixture.ledger)
+    proof["sha256"] = coverage.digest({k: v for k, v in proof.items() if k != "sha256"})
+    manifest["readiness_contract_version"] = 1
+    manifest["integrity"].pop("readiness_evidence_sha256")
+    manifest["integrity"]["readiness_evidence"] = proof
+    write_payload(path, manifest)
+    original = path.read_bytes()
+    assert validate_partition(path.parent)
+    assert build(fixture)["outcome"] == "skipped_valid"
+    assert path.read_bytes() == original
+
+
+def test_read_only_bundle_and_saved_partition_reuse(fixture, tmp_path):
+    import shutil
+    assert build(fixture)["outcome"] == "built"
+    bundle = tmp_path / "bundle"
+    f = SimpleNamespace(raw=bundle / "raw", ledger=bundle / "ledger", replay=bundle / "replay")
+    for source, dest in ((fixture.raw, f.raw), (fixture.ledger, f.ledger), (fixture.replay, f.replay)):
+        shutil.copytree(source, dest)
+    for root in (f.raw, f.ledger):
+        for path in root.rglob("*"):
+            path.chmod(0o500 if path.is_dir() else 0o400)
+        root.chmod(0o500)
+    before = {p: p.read_bytes() for p in f.ledger.iterdir()}
+    try:
+        assert build(f)["outcome"] == "skipped_valid"
+        f.replay = bundle / "fresh_replay"
+        assert build(f)["outcome"] == "built"
+        assert validate_partition(partition_path(f))
+        assert {p: p.read_bytes() for p in f.ledger.iterdir()} == before
+    finally:
+        for root in (f.raw, f.ledger):
+            root.chmod(0o700)
+            for path in root.rglob("*"):
+                path.chmod(0o700 if path.is_dir() else 0o600)
+
+
+@pytest.mark.parametrize("operation", ["start", "final"])
+def test_recorder_publication_waits_for_short_guard(fixture, monkeypatch, operation):
+    guard = coverage.ledger_lock(fixture.ledger)
+    guard.__enter__()
+    waits = []
+    def release_on_wait(seconds):
+        waits.append(seconds)
+        guard.__exit__(None, None, None)
+    monkeypatch.setattr(coverage.time, "sleep", release_on_wait)
+    if operation == "start":
+        successor = coverage.RecordingSession(fixture.ledger, fixture.raw, {VENUE: ["BTCUSDT"]})
+        successor.release()
+        assert (fixture.ledger / f"{successor.start['session_id']}.start.json").exists()
+    else:
+        assert finish_successor(fixture)["status"] == "closed_clean"
+    assert waits == [0.05]
+
+
+def test_shutdown_and_successor_during_build_preserve_clean_evidence(fixture, monkeypatch):
+    import recorder
+    from stores.replay_writer import ReplayWriter
+    from unittest.mock import AsyncMock
+    f = fixture
+    monkeypatch.setattr(recorder, "recording_session", f.successor)
+    for name in ("native_depth_recorder", "native_trade_recorder", "health_monitor", "disk_monitor"):
+        monkeypatch.setattr(recorder, name, None)
+    monkeypatch.setattr(recorder, "session_errors", [])
+    monkeypatch.setattr(recorder, "shutdown_event", asyncio.Event())
+    monkeypatch.setattr(recorder, "storage_manager", SimpleNamespace(
+        shutdown=AsyncMock(return_value={**f.storage, "writers": {}}),
+        coverage_raw_files=lambda: {}, coverage_unowned_files=lambda: []))
+    # Fake watchdog checks that publication remains covered by the time limit.
+    import threading
+    timers = []
+    class Timer:
+        def __init__(self, *args): self.cancelled = False; timers.append(self)
+        def start(self): pass
+        def cancel(self): self.cancelled = True
+    monkeypatch.setattr(threading, "Timer", Timer)
+    original_finish = f.successor.finish
+    def finish(*args, **kwargs):
+        assert not timers[0].cancelled
+        return original_finish(*args, **kwargs)
+    monkeypatch.setattr(f.successor, "finish", finish)
+    original = ReplayWriter.finalize_staging
+    def finalize(writer):
+        manifest = original(writer)
+        asyncio.run(recorder.shutdown([]))
+        successor = coverage.RecordingSession(f.ledger, f.raw, {VENUE: ["ETHUSDT"]})
+        successor.release()
+        return manifest
+    with monkeypatch.context() as m:
+        m.setattr(ReplayWriter, "finalize_staging", finalize)
+        result = build(f)
+    assert result["outcome"] == "failed" and "changed" in str(result["errors"])
+    final = json.loads((f.ledger / f"{f.successor.start['session_id']}.final.json").read_text())
+    assert final["status"] == "closed_clean" and timers[0].cancelled
+    assert not partition_path(f).exists() and not list(f.replay.rglob(".staging*"))
+    assert build(f)["outcome"] == "built"
+    assert build(f)["outcome"] == "skipped_valid"
+
+
+def test_raw_hashing_does_not_hold_ledger_lock(fixture, monkeypatch):
+    original = coverage.file_identity
+    count = 0
+    def identity(path):
+        nonlocal count
+        if path.is_relative_to(fixture.raw):
+            with coverage.ledger_lock(fixture.ledger, exclusive=True): count += 1
+        return original(path)
+    monkeypatch.setattr(coverage, "file_identity", identity)
+    assert build(fixture)["outcome"] == "built"
+    assert count > 0
+
+
+def test_publication_rename_is_guarded(fixture, monkeypatch):
+    from stores import replay_writer
+    original = replay_writer.os.replace
+    seen = []
+    def replace(source, target):
+        if Path(target) == partition_path(fixture):
+            with pytest.raises(coverage.CoverageError, match="busy"):
+                with coverage.ledger_lock(fixture.ledger, exclusive=True): pass
+            seen.append(True)
+        return original(source, target)
+    monkeypatch.setattr(replay_writer.os, "replace", replace)
+    assert build(fixture)["outcome"] == "built"
+    assert seen == [True]
+
+
+@pytest.mark.parametrize("kind", ["directory", "empty", "plain", "ambiguous"])
+def test_present_incomplete_next_day_never_uses_retirement(fixture, kind):
+    day = "2026-01-02"
+    path = fixture.raw / VENUE / "depth_v2" / SYMBOL / day
+    path.mkdir()
+    if kind == "directory": (path / f"{day}T00.jsonl.zst").mkdir()
+    elif kind in {"plain", "ambiguous"}:
+        (path / f"{day}T00.jsonl").write_text("{}\n")
+        if kind == "ambiguous": (path / f"{day}T00.jsonl.zst").write_bytes(zstd.ZstdCompressor().compress(b"{}\n"))
+    result = build(fixture)
+    assert result["outcome"] == "deferred_not_ready", result
+    assert result.get("readiness_mode") != "clean_retirement_evidence"
+
+
+@pytest.mark.parametrize("version", [1, 2])
+def test_reuse_refuses_changed_persisted_evidence(fixture, version):
+    assert build(fixture)["outcome"] == "built"
+    path = partition_path(fixture) / "manifest.json"
+    manifest = json.loads(path.read_text())
+    if version == 1:
+        proof = manifest["readiness_evidence"]
+        proof.update(contract_version=1, records=coverage.snapshot(fixture.ledger))
+        proof["sha256"] = coverage.digest({k: v for k, v in proof.items() if k != "sha256"})
+        manifest["readiness_contract_version"] = 1
+        manifest["integrity"].pop("readiness_evidence_sha256")
+        manifest["integrity"]["readiness_evidence"] = proof
+        write_payload(path, manifest)
+    before = path.read_bytes()
+    payload = json.loads(final_path(fixture).read_text())
+    payload["shutdown_reason"] = "changed after publication"
+    write_payload(final_path(fixture), payload)
+    result = build(fixture)
+    assert result["outcome"] != "skipped_valid" and "disagrees" in str(result["errors"])
+    assert path.read_bytes() == before
+    assert not list(fixture.replay.rglob(".backup*"))
+
+
+def test_relevant_intermediate_final_cannot_be_omitted(fixture):
+    f = fixture
+    with patch.object(coverage, "utc_now", return_value="2026-01-01T08:00:00.000000Z"):
+        finish_successor(f)
+    with patch.object(coverage, "utc_now", return_value="2026-01-01T08:01:00.000000Z"):
+        last = coverage.RecordingSession(f.ledger, f.raw, {VENUE: ["ETHUSDT"]})
+    last.release()
+    proof = coverage.retirement_proof(f.ledger, f.raw, VENUE, SYMBOL, DATE)
+    assert len(proof["records"]) == 6
+    del proof["records"][f"{f.successor.start['session_id']}.final.json"]
+    proof["sha256"] = coverage.digest({k: v for k, v in proof.items() if k != "sha256"})
+    with pytest.raises(coverage.CoverageError): coverage.validate_provenance(proof, VENUE, SYMBOL, DATE)
+
+
+def test_ledger_reading_never_holds_shared_lock(fixture, monkeypatch):
+    original = coverage.snapshot
+    def snapshot(root):
+        with coverage.ledger_lock(root, exclusive=True): pass
+        return original(root)
+    monkeypatch.setattr(coverage, "snapshot", snapshot)
+    assert build(fixture)["outcome"] == "built"
+    assert build(fixture)["outcome"] == "skipped_valid"
+
+
+def test_compact_manifest_rejects_duplicate_or_missing_digest(fixture):
+    assert build(fixture)["outcome"] == "built"
+    path = partition_path(fixture) / "manifest.json"
+    manifest = json.loads(path.read_text())
+    duplicate = copy.deepcopy(manifest)
+    duplicate["integrity"]["readiness_evidence"] = duplicate["readiness_evidence"]
+    write_payload(path, duplicate)
+    assert not validate_partition(path.parent)
+    manifest["integrity"].pop("readiness_evidence_sha256")
+    write_payload(path, manifest)
+    assert not validate_partition(path.parent)

@@ -1350,3 +1350,77 @@ performance, ledger compaction/root migration, and broad top50/multi-day
 semantics remain pending. Ledger evidence is unsigned and requires one
 retained authoritative ledger and exclusively marker-enabled recorder writers.
 See the dated CHANGE_AUDIT entry for final commands and measured results.
+
+## 2026-10-10 development follow-up — compact retirement proofs and bounded locks
+
+The original retirement implementation copied the whole ledger into every
+manifest twice and held a shared ledger lock throughout conversion. That could
+inflate manifests with unrelated session history and make nonblocking recorder
+start/final publication fail while replay was running.
+
+New readiness contract 2 preserves the smallest consecutive **whole-record**
+proof supported by ledger contract 1: owner start/final, every relevant
+excluding successor/handoff, and a boundary start at/after the horizon or the
+observed head. Exact record hashes, consecutive sequences, predecessor links,
+closure predicates, raw identities and scope remain checked. There is one
+serialized proof, with an integrity digest reference. Legacy readiness 1 is
+still validated and reused unchanged. Whole retained final records cannot be
+redacted under their existing hash, so long relevant sessions remain a size
+risk; this is not a Merkle/state-format redesign or ledger compaction.
+
+Ledger parsing and raw hashing run outside the shared lock; the bounded
+metadata check and canonical rename/fsync are guarded. Recorder publication
+retries only lock contention, at most 41 attempts/50 ms waits with a two-second
+deadline. The shutdown watchdog remains active through final publication.
+Deterministic tests overlap actual mocked recorder shutdown and successor
+startup with an in-flight replay build: clean final/start survive, changed
+proof aborts publication and cleans staging, then the rerun builds and reuses.
+
+### Synthetic resource observations (local WSL, not production acceptance)
+
+One run used three retired symbols, seven synthetic depth/trade rows each,
+80 prior and 80 later sessions with 384 raw identities per unrelated final.
+The full ledger remained authoritative for live validation. Compared with a
+small ledger using the same relevant session scope:
+
+| Observation | Small ledger | Populated ledger |
+|---|---:|---:|
+| Ledger records / canonical bytes | 14 / 15,470 | 326 / 10,268,935 |
+| Relevant proof records | 4 | 4 |
+| Compact canonical proof bytes | 12,628 | 12,631 |
+| Complete pretty-printed manifest bytes | 30,461 | 30,464 |
+| Ledger snapshot read/hash/parse | 1.3 ms | 71.4 ms |
+| Full live proof construction | 5.1 ms | 677.7 ms |
+| Build / reuse | 292 / 20 ms | 726 / 1,376 ms |
+| Routine validation / replay audit | 1.8 / 4.7 ms | 1.9 / 3.2 ms |
+| Longest shared ledger critical section | 1.7 ms | 6.6 ms |
+
+The process peaked at 158,468 KiB RSS, including Python/PyArrow/test imports
+and fixture generation; this does not isolate incremental evidence memory.
+A separate 32 MiB synthetic byte file took 16.3 ms to SHA-256 in 128 KiB
+chunks. A new empty-ledger session used five fsync calls and 43.2 ms; its clean
+final used two calls and 3.1 ms (total fsync time 45.2 ms). The storage-side
+compressed-hour path is unchanged: one extra compressed-byte hash pass,
+file-fsync and parent-fsync, cached identities for shutdown, no per-event proof
+hash. Live ledger reads still scale with all bounded records; the per-partition
+offline audit now scales with relevant proof records. Existing caps remain
+4,096 ledger entries, 64 MiB serialized records and 250,000 session identities;
+Python object overhead exceeds serialized size and no production RAM bound
+is inferred from this experiment.
+
+These single-run warm local-filesystem timings use tiny replay rows and
+synthetic histories; they do not measure a production recording session,
+filesystem under pressure, or worst-case fsync latency. They justify no service
+limit increase. Observe ledger/manifest growth, compression/lock/finalization
+latency, disk space and cgroup memory/OOM telemetry during later supervised
+acceptance. Evidence and retired replay have no automatic expiration, and
+raw retention remains proof-only even when configured on. INSTALL.md now
+matches that behavior. Production performance/acceptance and broader
+full-L2 validation remain deferred; `convert_day.py` remains the reference.
+
+Reproducible synthetic script and machine-readable observations were preserved
+outside the repository at
+`/tmp/cryptorecorder-retirement-followup-jds5n781/measure.py` and
+`measurements.json`. The matching CHANGE_AUDIT entry records test and CLI
+results. No production command, real recorder, existing raw modification,
+service action, dependency change, merge or push was performed.

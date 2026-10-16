@@ -434,7 +434,7 @@ async def shutdown(background_tasks: List[asyncio.Task]) -> None:
     if recording_session is not None:
         try:
             raw_files = await asyncio.to_thread(storage_manager.coverage_raw_files)
-            wd.cancel()
+            # Keep the shutdown watchdog active through durable evidence publication.
             final = recording_session.finish(
                 storage_closure, raw_files,
                 producers_stopped=not closure_errors,

@@ -673,7 +673,7 @@ records depth and trades via native WebSockets, replays them through exact
 Decimal book state, and produces Nautilus `OrderBookDeltas` and `TradeTick`
 objects suitable for backtesting research.**
 
-## Durable recording-scope retirement evidence (contract 1)
+## Durable recording-scope retirement evidence (ledger 1, readiness 2)
 
 `recording_coverage.py` owns the shared recorder state contract. Native feeds
 start only after an immutable session-start record and its atomic ledger head
@@ -717,11 +717,30 @@ and free of symlinks/variants. This intentionally conservative first contract
 can defer days spanning several owning sessions or inherited hourly files.
 It proves physical recording scope, not uninterrupted market coverage.
 
-Retirement-backed attempts hold the ledger's shared lock through publication,
-inventory evidence once, and recheck marker contents/file identity and all raw
-bindings before streaming, after construction, and immediately before rename.
-New recorder sessions cannot start while that proof is used. Non-cooperative
-changes abort publication; marker changes are never compression retries.
+Retirement-backed attempts optimistically read/hash the full ledger, then
+briefly lock and compare its exact file inventory and inode/size/mtime/ctime
+identities. Ledger JSON parsing, proof construction, raw hashing and replay
+conversion hold no shared ledger lock. Evidence changes abort the attempt;
+they are never compression retries. Raw inventory and hashes are rechecked
+before streaming and immediately before publication. The final metadata
+check and canonical rename/directory-fsync run under the shared lock; routine
+post-publication validation runs after releasing it.
+
+Recorder start/final publication waits at most 41 nonblocking lock attempts,
+50 ms apart, additionally capped by a two-second monotonic deadline. Only
+lock contention is retried. A remaining lock conflict is an explicit logged
+failure, never a clean final or authorized start. The recorder lifetime lock
+still rejects overlapping processes immediately. The shutdown watchdog stays
+active until evidence finalization completes. A normal shutdown/successor can
+proceed while replay conversion is running; the changed evidence makes that
+replay attempt fail safely and a later invocation can retry it.
+
+Readiness contract 2 stores the minimal consecutive whole-record proof once,
+with a digest reference under manifest integrity. Contract 1 remains readable
+and reusable without rewriting old partitions. Full live ledger validation
+and exact original record hashes remain authoritative. See REPLAY_STORE.md
+for the retained owner/handoff-final size limitation.
+
 Bounds are 4,096 ledger entries, 64 MiB of serialized ledger records, 250,000
 session file identities, and 72 entries per selected raw-hour directory.
 Overflow fails closed and requires a separately designed ledger maintenance

@@ -1409,16 +1409,11 @@ def _build_replay_for_symbol_locked(
                 logger.error(status["errors"][-1])
                 return status
             if existing_manifest.get("readiness_evidence") is not None:
-                from recording_coverage import validate_provenance, snapshot
+                from recording_coverage import validate_live_provenance
                 saved = existing_manifest["readiness_evidence"]
-                validate_provenance(saved, venue, symbol, date)
-                current = snapshot(coverage_root)
-                if any(
-                    {key: current.get(name, {}).get(key) for key in ("payload", "sha256", "size_bytes")}
-                    != {key: entry[key] for key in ("payload", "sha256", "size_bytes")}
-                    for name, entry in saved["records"].items() if name != "head.json"
-                ):
-                    raise RuntimeError("published retirement evidence disagrees with live ledger")
+                validate_live_provenance(saved, coverage_root)
+                if retirement_evidence is not None:
+                    recheck_proof(retirement_evidence, coverage_root, data_root)
                 status["readiness_mode"] = saved["mode"]
                 status["readiness_evidence_sha256"] = saved["sha256"]
             if existing_manifest.get("source_identity") != live_source_identity:
@@ -1710,10 +1705,9 @@ def _build_replay_for_symbol_locked(
         # Retirement evidence is adjacent provenance, never a raw identity key.
         if retirement_evidence is not None:
             writer.set_readiness_evidence(retirement_evidence)
-            writer.readiness_guard = lambda: recheck_proof(retirement_evidence, coverage_root, data_root)
+            from recording_coverage import proof_publication_guard
+            writer.readiness_guard = lambda: proof_publication_guard(retirement_evidence, coverage_root, data_root)
         writer.finalize_staging()
-        if retirement_evidence is not None:
-            recheck_proof(retirement_evidence, coverage_root, data_root)
         writer.publish(instrument_metadata)
 
         status["depth_count"] = writer.depth_count
@@ -1845,11 +1839,10 @@ def build_replay_for_symbol(
         if effective_coverage_root is None or not Path(effective_coverage_root).exists():
             reason = check_depth_repartition_readiness(venue, symbol, date, data_root, require_complete_next_day=require_complete_next_day)
             return {"venue": venue, "symbol": symbol, "date": date, "status": "deferred", "outcome": "deferred_not_ready", "depth_count": 0, "trade_count": 0, "readiness_mode": "deferred_missing_evidence", "errors": [(reason or "published retirement proof requires its ledger") + " Missing retirement evidence; custom raw roots require explicit --coverage-root."]}
-        from recording_coverage import ledger_lock, retirement_proof
+        from recording_coverage import retirement_proof
         try:
-            with ledger_lock(Path(effective_coverage_root)):
-                proof = retirement_proof(Path(effective_coverage_root), data_root, venue, symbol, date, complete_next_day=require_complete_next_day) if missing_next_day else None
-                return run_attempts(context, proof, Path(effective_coverage_root))
+            proof = retirement_proof(Path(effective_coverage_root), data_root, venue, symbol, date, complete_next_day=require_complete_next_day) if missing_next_day else None
+            return run_attempts(context, proof, Path(effective_coverage_root))
         except Exception as exc:
             failed = isinstance(exc, OSError)
             return {"venue": venue, "symbol": symbol, "date": date, "status": "failed" if failed else "deferred", "outcome": "failed" if failed else "deferred_not_ready", "depth_count": 0, "trade_count": 0, "readiness_mode": "deferred_untrusted_evidence", "errors": [f"coverage evidence failed closed: {exc}"]}

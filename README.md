@@ -53,8 +53,10 @@ dev`. See [INSTALL.md](INSTALL.md). Runtime services continue to execute
 Recorder sessions now write durable recording-scope evidence under
 `STATE_ROOT/recording_coverage`. The replay builder can use verified clean
 symbol retirement when D+1 is absent; historical sessions without evidence
-remain deferred. Custom raw roots require explicit `--coverage-root` for this
-route. See [rollout and trust limits](docs/OPERATIONS.md#recording-coverage-ledger-and-forward-only-rollout).
+remain deferred. Routine configured-root builds need no extra flag; custom raw
+roots require explicit `--coverage-root`. Preserve this authoritative ledger
+across sessions and deployments: coverage evidence and retired replay partitions
+do not expire automatically, and raw deletion remains disabled. See [rollout and trust limits](docs/OPERATIONS.md#recording-coverage-ledger-and-forward-only-rollout).
 
 Run the recorder:
 

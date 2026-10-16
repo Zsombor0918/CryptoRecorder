@@ -77,6 +77,18 @@ passes.** Until then, broader full-L2 equivalence stays **deferred** (see
   production; broader full-L2 and real-server acceptance remain pending.
 
 ### Fixed
+- **Retirement evidence size and recorder lock contention** — readiness
+  contract 2 embeds only the consecutive whole-record owner/successor proof
+  needed through its horizon, once, with an integrity digest reference.
+  Existing contract-1 evidence remains readable/reusable unchanged. Replay
+  conversion and hashing release the ledger lock; publication rechecks
+  evidence under a brief shared guard and recorder start/final contention
+  waits are bounded to two seconds/41 attempts. The shutdown watchdog remains
+  active through finalization. Corrected INSTALL raw-cleanup guidance and
+  documented persistent evidence, no automatic expiration, hard bounds and
+  synthetic resource costs. Raw/ledger record schemas, ordinary replay output,
+  service limits and `convert_day.py` remain unchanged; production acceptance
+  and broader full-L2 validation remain pending.
 - **Replay root coexistence and raw compression transitions** — lifecycle
   reconciliation accepts only real root `.stfolder` and `.stignore` metadata
   of their expected types. Schema-v2 builds and reuse checks use one selected

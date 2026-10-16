@@ -264,3 +264,22 @@ in its manifest. Reuse checks the preserved evidence against the live supplied
 ledger and independently verifies source identity. A transferred read-only
 bundle may be explicitly supplied, but every selected raw file must match.
 Historical October 1/2 partitions lacking this contract remain deferred.
+
+
+New retirement manifests use readiness contract 2: only the consecutive owner/
+successor records required through the horizon, stored once with an integrity
+digest reference. Contract-1 published evidence remains valid and is reused
+without rewriting it. Whole retained marker payloads cannot be redacted under
+the unchanged ledger hashes; long relevant sessions can still enlarge proofs.
+
+Routine configured-root builds need no new flag or enable setting. Keep the
+same persistent coverage ledger across deployments; custom raw roots require
+explicit `--coverage-root`. There is no automatic evidence or retired-partition
+expiration, and the seven-day raw-retention value is only proof-plan grace.
+
+Replay conversion no longer blocks recorder evidence publication. A recorder
+start/final during a retirement-backed attempt causes an evidence-change
+failure and handled staging cleanup; rerun that date after inspecting reports.
+Recorder start/final lock contention waits are bounded to two seconds/41
+attempts; see OPERATIONS.md. Ordinary D+1 behavior and the three-attempt raw
+compression policy remain unchanged.

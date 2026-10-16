@@ -1055,7 +1055,7 @@ was modified; the following is a future owner-run runbook, not an executed
 production deployment.
 
 The ledger contains `.recorder.lock` (exclusive process lifetime),
-`.ledger.lock` (shared build/exclusive start-final publication), `head.json`,
+`.ledger.lock` (brief shared checks/rename, exclusive start-final publication), `head.json`,
 `<32-hex-session-id>.start.json`, and optional `.final.json`. The version-1
 start stores sequence/predecessor hash, selected universe/digest, dataset ID,
 canonical microsecond UTC start, host/PID and repository/application identity.
@@ -1075,6 +1075,55 @@ recorder beside it. A read-only explicit transferred bundle is supported, but
 moving the active raw root requires a separate reviewed recorder rebind plan.
 Rollbacks to pre-marker recorder code stop new proof continuity; builds must
 use ordinary D+1 evidence until an explicit recovery plan is accepted.
+
+### Persistence, retention and bounded coordination
+
+Routine replay builds need **no extra flag** when using the configured raw
+root and persistent state root. Custom `--data-root` builds must supply
+`--coverage-root` explicitly. Preserve the same authoritative coverage ledger
+across sessions, checkout updates and deployments. Never initialize a fresh
+ledger to bypass corruption, a lock failure, a size bound or a root mismatch.
+Historical recordings made before the ledger remain uncertifiable by this
+route; an absent directory alone is not retirement evidence.
+
+There is **no automatic cleanup or expiration** for coverage evidence or
+retired replay partitions. `CRYPTO_RECORDER_RAW_RETENTION_DAYS=7` only sets a
+proof-plan grace period; raw deletion remains disabled and unimplemented.
+The existing hard bounds are 4,096 ledger directory entries, 64 MiB of record
+bytes, 250,000 raw identities per session and 72 entries per selected hourly
+raw directory. Hitting a bound fails closed and needs a separately reviewed
+maintenance plan. Do not delete evidence to regain capacity.
+
+Proof-backed replay no longer holds the ledger lock while reading/hashing
+ledger payloads, hashing raw files or converting records. Brief metadata
+checks detect mutation; final publication holds the shared lock only for the
+last metadata check and canonical rename/directory-fsync. Recorder start/final
+publication retries contention at most 41 times, with 50 ms waits and a
+maximum two-second monotonic deadline. It logs a wait, acquisition or explicit
+failure. Other I/O errors are not retried; an unsuccessful final stays
+untrusted and unsuccessful startup authorizes no native feed. The recorder's
+shutdown watchdog remains active through final evidence publication. This
+bound covers lock contention, not a kernel/filesystem operation stalled in I/O.
+
+A concurrent recorder shutdown or successor start may invalidate an in-flight
+replay proof. The handled build cleans its staging output, reports the changed
+evidence, and must be rerun; it never publishes a mixed proof. Already-valid
+partitions remain intact. There is no automatic evidence-mutation retry loop.
+Normal D+1 builds do not access the ledger.
+
+Monitor ledger entry/byte growth, individual final and manifest sizes,
+compression queue/latency and failures, coverage lock wait/finalization logs,
+replay deferrals/failures, disk space, process RSS and cgroup memory/OOM events.
+Compression adds one streamed SHA-256 read of completed compressed bytes,
+plus compressed-file and raw-parent fsync; there is no per-event proof hash.
+New recorder sessions perform five fsync calls (including the root-parent
+sync), finals two. Each initial live ledger read hashes every record twice
+and parses it once, then verifies canonical record hashes; source identity
+and raw proof verification add bounded streaming reads. Manifest/audit work
+now scales with relevant whole records, but a long owner session's full final
+can remain large. Synthetic timings are recorded in IMPLEMENTATION_AUDIT.md;
+they do not establish production performance or justify raising service limits.
+No new enable flag, retention behavior or resource setting was added.
 
 ### Future production preflight and backups
 

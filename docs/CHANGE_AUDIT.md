@@ -93,6 +93,83 @@ An entry may be skipped **only** for:
 - <or "none — task fully completed">
 ```
 
+## 2026-10-16 — bound retirement proof size and recorder coordination
+
+### Change summary
+- Add readiness-evidence contract version 2 with a compact, self-contained proof
+  containing only the owner and relevant successor chain; retain validation of
+  existing contract-1 evidence and store new proof material once in manifests.
+- Bound ledger-lock coordination so proof-backed publication cannot silently
+  block recorder shutdown or successor startup indefinitely. Hash and parse
+  ledger snapshots outside the lock and verify stable file identity around reads.
+- Correct raw-retention guidance and document ledger persistence, proof grace
+  periods, hard bounds, lock waits, and synthetic resource measurements.
+
+### Files/packages touched
+- `recording_coverage.py`, `recorder.py`, `pipeline/build_replay_store.py`.
+- `stores/replay_writer.py`, `validation/audit_replay_store.py`.
+- `tests/test_recording_coverage.py`.
+- `INSTALL.md`, `README.md`, `CHANGELOG.md`.
+- `docs/ARCHITECTURE.md`, `docs/DAILY_BUILD_PIPELINE.md`,
+  `docs/IMPLEMENTATION_AUDIT.md`, `docs/OPERATIONS.md`,
+  `docs/REPLAY_STORE.md`, `docs/VALIDATION.md`.
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] docs/REPO_STRUCTURE.md
+- [x] docs/PROJECT_STATUS.md
+- [x] docs/IMPLEMENTATION_AUDIT.md
+- [x] docs/FULL_L2_REPLAY_CATALOG_PLAN.md
+- [x] docs/OPERATIONS.md
+- [x] docs/AI_WORKFLOW.md
+- [x] CHANGELOG.md
+- [x] Relevant feature docs: ARCHITECTURE.md, DAILY_BUILD_PIPELINE.md,
+  REPLAY_STORE.md, VALIDATION.md, INSTALL.md.
+
+### Docs updated
+- [x] CHANGELOG.md
+- [x] README.md
+- [ ] docs/PROJECT_STATUS.md — not updated because validated/deferred status did
+  not change.
+- [ ] docs/REPO_STRUCTURE.md — not updated because the repository structure did
+  not change.
+- [x] Relevant feature docs: ARCHITECTURE.md, DAILY_BUILD_PIPELINE.md,
+  IMPLEMENTATION_AUDIT.md, OPERATIONS.md, REPLAY_STORE.md, VALIDATION.md,
+  INSTALL.md.
+
+### Status / validation impact
+- Validated status changed: no
+- Deferred status changed: no
+- New claims added: yes, limited to synthetic fixture and resource measurements.
+- Evidence for any new validation claim:
+  - Synthetic ADAUSDT replay build/reuse, replay audit and full-L2 equivalence
+    commands listed below; these do not establish production performance or
+    broader production acceptance.
+
+### Tests run
+```bash
+uv lock --check
+UV_PROJECT_ENVIRONMENT=/home/zsom/.cache/cryptorecorder-replay-dev-env uv sync --frozen --no-default-groups --extra reconstruction --group dev
+/home/zsom/.cache/cryptorecorder-replay-dev-env/bin/python -m pytest -q tests/test_recording_coverage.py
+/home/zsom/.cache/cryptorecorder-replay-dev-env/bin/python -m pytest tests/
+```
+- Results: focused 104 passed; full suite 987 passed, 3 skipped.
+
+### Validation CLIs run
+```bash
+python -m pipeline.daily_build --date 2026-01-01 --symbols ADAUSDT --venues BINANCE_SPOT --schema-version 2 --backlog-days 1 --max-build-dates 1 --data-root <synthetic-data> --coverage-root <synthetic-coverage> --replay-root <synthetic-replay> --report-root <synthetic-reports>
+python -m validation.audit_replay_store --replay-root <synthetic-replay> --date 2026-01-01 --symbols ADAUSDT --venues BINANCE_SPOT
+python -m validation.validate_catalog_equivalence --profile full_l2 --schema-version 2 <synthetic fixture arguments>
+```
+- Results: first build `built`, rerun `skipped_valid`; audit valid; synthetic
+  full-L2 equivalence passed.
+
+### Known limitations / out of scope
+- No merge, deployment, production validation, or push is part of this change.
+- No raw schema/layout or retention behavior changed; evidence does not expire
+  automatically, and no raw or replay data was deleted.
+- No broader top50 or multi-day full-L2 equivalence claim is made.
+
 ## 2026-10-10 — Compare reconstructed instrument semantics across dates
 
 ### Change summary

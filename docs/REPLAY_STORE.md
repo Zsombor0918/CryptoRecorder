@@ -607,26 +607,46 @@ ls -lh /path/to/replay_store/venue=BINANCE_SPOT/symbol=BTCUSDT/date=2026-06-15/
 
 ## Additive retirement readiness provenance
 
-A schema-v2 partition built through retirement has
-`readiness_contract_version: 1` and `readiness_evidence`, also copied into
-`integrity.readiness_evidence`. The evidence contains mode, contract version,
-venue/symbol/date, owning session ID, portable dataset identity, UTC horizon,
-exact selected raw hashes/sizes, and the inventoried start/final/head payloads
-with exact marker SHA-256 identities. Its canonical payload SHA-256 is exposed
-in reports. Marker file identity is attempt evidence; logical marker hashes
-and raw paths remain usable after an explicit bundle transfer.
+New schema-v2 retirement partitions use `readiness_contract_version: 2`.
+`readiness_evidence` is stored **once**, at the manifest top level;
+`integrity.readiness_evidence_sha256` references its canonical SHA-256.
+Ordinary D+1 partitions acquire no readiness fields. The immutable recorder
+ledger remains contract 1; no raw or ledger record is rewritten.
 
-Routine validation verifies the complete evidence contract, marker hashes,
-clean closure and ordered excluding handoffs, evidence digest, exact raw scope
-against `source_identity`, and identical integrity copy. Missing/malformed or
-contradictory provenance fails; ordinary historical partitions without this
-additive field retain their existing reader/audit contract.
+Contract 2 retains exact whole-record payloads, SHA-256 and byte sizes for:
+
+- the owning session's start and clean final;
+- every consecutive successor start and each final needed for a handoff
+  before the required horizon;
+- the first start at/after the horizon as the boundary witness, or the
+  observed ledger head if no such start exists.
+
+Consecutive sequence numbers and predecessor hashes prevent an omitted
+interior session. The boundary witness or matching head prevents truncating
+the relevant chain. Owner, universe, closure, horizon, raw scope, hashes,
+source identities, and evidence digest remain independently checked. The
+whole live ledger is still checked for gaps, unsafe entries and conflicting
+raw ownership when creating a proof. Earlier sessions and history after the
+boundary witness are not copied into each partition. Local inode/ctime
+mutation guards stay in memory and are not portable provenance.
+
+This is the minimum set of **whole immutable records** under the existing
+ledger's SHA-256 contract. A retained owner/handoff final still includes its
+complete session raw inventory and diagnostics: redacting those fields would
+break its original hash. Very long relevant sessions can therefore still
+produce large proofs. Per-field/Merkle state redesign is not implemented;
+there is no new recorder state format, enable flag, or resource limit.
+
+Existing readiness contract-1 partitions retain their original full snapshot
+and duplicate integrity copy. Validation dispatches explicitly on the recorded
+version; safe reuse verifies the saved records against the current ledger and
+leaves the manifest byte-for-byte intact. Unknown versions, missing/duplicated
+contract-2 proof fields, digest mismatch, changed relevant records, or invalid
+source identity fail closed. Explicit transferred read-only raw/ledger bundles
+support building and reuse without creating or rewriting their metadata.
 
 Physical schemas, Parquet encoding and row semantics, format/schema versions,
-and the normalization builder version (`v2.0.1`) are unchanged. The separate
-versioned readiness contract changes authorization/provenance only, so there
-is no blanket builder-version migration or forced rebuild of ordinary older
-partitions. Existing v2.0.0 compatibility and its normalization replacement
-policy are unchanged. No readiness field is added to an ordinary D+1 build.
-The bounded full ledger is embedded for self-contained auditability; evidence
-adds manifest bytes and has not been benchmarked over long production sessions.
+and the normalization builder version (`v2.0.1`) are unchanged. Existing
+v2.0.0 compatibility/replacement policy is unchanged. No ordinary partition
+requires migration. See OPERATIONS.md for locking, persistence and resource
+limits, and IMPLEMENTATION_AUDIT.md for synthetic measurements.

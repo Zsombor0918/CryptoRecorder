@@ -1,9 +1,10 @@
 """Unsigned, fail-closed physical recording-scope evidence (no market continuity claim).
 
 All recorder processes for a dataset must use this protocol and retain its ledger.
-A lifetime recorder lock prevents overlap. A separate ledger lock serializes start/
-final publication with retirement-backed replay attempts. Relative raw paths and exact hashes bind portable offline bundles. Recorder
-starts additionally bind the authoritative ledger to its local raw-root identity.
+A lifetime recorder lock prevents overlap. A separate ledger lock serializes
+start/final publication with brief replay evidence checks/publication. Relative
+raw paths and exact hashes bind portable offline bundles. Recorder starts
+additionally bind the authoritative ledger to its local raw-root identity.
 """
 from __future__ import annotations
 
@@ -11,15 +12,21 @@ import contextlib
 import fcntl
 import hashlib
 import json
+import logging
 import os
 import re
 import socket
 import stat
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-VERSION = 1
+VERSION = 1  # Immutable recorder ledger contract; unchanged.
+READINESS_VERSION = 2
+LOCK_ATTEMPTS = 41
+LOCK_DELAY_SECONDS = 0.05
+logger = logging.getLogger(__name__)
 MAX_RECORDS = 4096
 MAX_BYTES = 64 * 1024 * 1024
 MAX_RAW_FILES = 250_000
@@ -63,7 +70,8 @@ def _safe_path(path: Path, *, directory=False) -> None:
         raise CoverageError(f"multiply linked input: {path}")
 
 
-def file_identity(path: Path) -> dict:
+def _file_identity_with_key(path: Path) -> tuple[dict, list[int]]:
+    """Hash one stable regular file and return the inode metadata for that hash."""
     _safe_path(path)
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     with os.fdopen(fd, "rb") as handle:
@@ -73,25 +81,31 @@ def file_identity(path: Path) -> dict:
             h.update(chunk)
         after = os.fstat(handle.fileno())
     current = path.lstat()
-    key = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
+    key = lambda item: (item.st_dev, item.st_ino, item.st_size, item.st_mtime_ns, item.st_ctime_ns)
     if key(before) != key(after) or key(after) != key(current):
         raise CoverageError(f"input changed while hashing: {path}")
-    return {"size_bytes": before.st_size, "sha256": h.hexdigest()}
+    identity = {"size_bytes": before.st_size, "sha256": h.hexdigest()}
+    file_key = [current.st_dev, current.st_ino, current.st_mtime_ns, current.st_ctime_ns]
+    return identity, file_key
 
 
-def _read(path: Path) -> tuple[dict, dict]:
-    _safe_path(path)
+def file_identity(path: Path) -> dict:
+    return _file_identity_with_key(path)[0]
+
+
+def _read(path: Path) -> tuple[dict, dict, list[int]]:
     if path.stat().st_size > MAX_BYTES:
         raise CoverageError("coverage record size bound exceeded")
-    before = file_identity(path)
+    before, before_key = _file_identity_with_key(path)
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     with os.fdopen(fd, "rb") as handle:
         if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
             raise CoverageError("coverage input changed file type")
         payload = json.load(handle, object_pairs_hook=_unique_keys)
-    if file_identity(path) != before or not isinstance(payload, dict):
+    after, after_key = _file_identity_with_key(path)
+    if before != after or before_key != after_key or not isinstance(payload, dict):
         raise CoverageError("coverage record changed or is not an object")
-    return payload, before
+    return payload, before, before_key
 
 
 def _unique_keys(pairs):
@@ -140,21 +154,40 @@ def _publish(path: Path, payload: dict, *, replace=False) -> None:
 
 
 @contextlib.contextmanager
-def ledger_lock(root: Path, *, exclusive=False, recorder=False):
+def ledger_lock(root: Path, *, exclusive=False, recorder=False, wait=False):
     _safe_path(root, directory=True)
     root_info = root.stat()
     if root_info.st_uid != os.getuid() or root_info.st_mode & 0o022:
         raise CoverageError("unsafe coverage directory ownership/mode")
     path = root / (".recorder.lock" if recorder else ".ledger.lock")
-    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+    # Readers also work on transferred, read-only ledgers. Recorder bootstrap
+    # creates both lock files; readers never create or rewrite bundle metadata.
+    flags = (os.O_RDWR | os.O_CREAT) if exclusive else os.O_RDONLY
+    fd = os.open(path, flags | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
     try:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid != os.getuid():
             raise CoverageError("unsafe coverage lock")
-        fcntl.flock(fd, (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH) | fcntl.LOCK_NB)
+        attempts = LOCK_ATTEMPTS if wait else 1
+        deadline = time.monotonic() + (attempts - 1) * LOCK_DELAY_SECONDS
+        for attempt in range(1, attempts + 1):
+            try:
+                fcntl.flock(fd, (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH) | fcntl.LOCK_NB)
+                break
+            except BlockingIOError as exc:
+                remaining = deadline - time.monotonic()
+                if attempt == attempts or remaining <= 0:
+                    raise CoverageError(
+                        f"coverage ledger/recorder busy after {attempt}/{attempts} attempts; "
+                        "publication refused, evidence remains untrusted; retry after inspection"
+                    ) from exc
+                if attempt == 1:
+                    logger.warning("Coverage publication waiting for ledger lock (at most %.2fs)",
+                                   (attempts - 1) * LOCK_DELAY_SECONDS)
+                time.sleep(min(LOCK_DELAY_SECONDS, remaining))
+        if attempt > 1:
+            logger.info("Coverage ledger lock acquired on attempt %d/%d", attempt, attempts)
         yield
-    except BlockingIOError as exc:
-        raise CoverageError("coverage ledger/recorder busy; retry next run") from exc
     finally:
         os.close(fd)
 
@@ -210,28 +243,35 @@ def snapshot(root: Path) -> dict:
             continue
         if path.name not in {"head.json"} and not re.fullmatch(r"[0-9a-f]{32}\.(start|final)\.json", path.name):
             raise CoverageError(f"unknown/interrupted coverage entry: {path.name}")
-        payload, identity = _read(path)
+        payload, identity, file_key = _read(path)
         size += identity["size_bytes"]
         if size > MAX_BYTES:
             raise CoverageError("coverage ledger byte bound exceeded")
-        info = path.stat()
-        records[path.name] = {"payload": payload, **identity, "file_key": [info.st_dev, info.st_ino, info.st_mtime_ns, info.st_ctime_ns]}
+        records[path.name] = {"payload": payload, **identity, "file_key": file_key}
     return records
 
 
-def validate_chain(records: dict, binding: str) -> list[dict]:
+def _validate_records(records: dict) -> None:
     if not isinstance(records, dict) or len(records) > MAX_RECORDS:
         raise CoverageError("invalid embedded record inventory")
+    total_bytes = 0
     for name, entry in records.items():
         if not isinstance(entry, dict) or set(entry) != {"payload", "sha256", "size_bytes", "file_key"}:
             raise CoverageError("invalid embedded record shape")
         encoded = json.dumps(entry["payload"], sort_keys=True, separators=(",", ":")).encode()
-        if len(encoded) != entry["size_bytes"] or hashlib.sha256(encoded).hexdigest() != entry["sha256"]:
+        total_bytes += len(encoded)
+        if total_bytes > MAX_BYTES:
+            raise CoverageError("embedded ledger byte bound exceeded")
+        if type(entry["size_bytes"]) is not int or len(encoded) != entry["size_bytes"] or hashlib.sha256(encoded).hexdigest() != entry["sha256"]:
             raise CoverageError("embedded marker fingerprint mismatch")
         if name != "head.json" and not re.fullmatch(r"[0-9a-f]{32}\.(start|final)\.json", name):
             raise CoverageError("invalid embedded logical marker path")
         if not isinstance(entry["file_key"], list) or len(entry["file_key"]) != 4 or any(type(k) is not int for k in entry["file_key"]):
             raise CoverageError("invalid marker file identity")
+
+
+def validate_chain(records: dict, binding: str) -> list[dict]:
+    _validate_records(records)
     if not records:
         return []
     if "head.json" not in records:
@@ -250,8 +290,15 @@ def validate_chain(records: dict, binding: str) -> list[dict]:
     if len(starts) != count:
         raise CoverageError("missing/extra session start")
     starts.sort(key=lambda entry: entry.get("sequence", -1))
-    previous = None
-    for i, start in enumerate(starts, 1):
+    _validate_starts(records, binding, starts)
+    tail = starts[-1]
+    if head["session_id"] != tail["session_id"] or head["start_sha256"] != records[f"{tail['session_id']}.start.json"]["sha256"]:
+        raise CoverageError("ledger tail/head mismatch")
+    return starts
+
+
+def _validate_starts(records, binding, starts, *, first_sequence=1, previous=None):
+    for i, start in enumerate(starts, first_sequence):
         required = {"contract_version", "session_id", "sequence", "previous", "data_root_identity", "started_at", "universe", "universe_digest", "hostname", "pid", "repository_sha", "application_version", "status"}
         if set(start) != required or type(start["contract_version"]) is not int or start["contract_version"] != VERSION or start["status"] != "open":
             raise CoverageError("invalid session start contract")
@@ -266,7 +313,7 @@ def validate_chain(records: dict, binding: str) -> list[dict]:
         if universe != start["universe"] or digest(universe) != start["universe_digest"]:
             raise CoverageError("universe digest mismatch")
         started = parse_time(start["started_at"])
-        if i > 1 and started < parse_time(starts[i-2]["started_at"]):
+        if i > first_sequence and started < parse_time(starts[i-first_sequence-1]["started_at"]):
             raise CoverageError("reversed session times")
         previous = {"session_id": sid, "sha256": records[f"{sid}.start.json"]["sha256"]}
         final_name = f"{sid}.final.json"
@@ -274,12 +321,9 @@ def validate_chain(records: dict, binding: str) -> list[dict]:
             validate_final(start, records[final_name]["payload"])
             if records[final_name]["payload"]["start_sha256"] != records[f"{sid}.start.json"]["sha256"]:
                 raise CoverageError("final/start fingerprint mismatch")
-    if head["session_id"] != previous["session_id"] or head["start_sha256"] != previous["sha256"]:
-        raise CoverageError("ledger tail/head mismatch")
     for name in records:
         if name.endswith(".final.json") and f"{name[:32]}.start.json" not in records:
             raise CoverageError("orphan final record")
-    return starts
 
 
 def validate_final(start: dict, final: dict) -> None:
@@ -338,7 +382,7 @@ class RecordingSession:
         self._owner = ledger_lock(self.root, exclusive=True, recorder=True)
         self._owner.__enter__()
         try:
-            with ledger_lock(self.root, exclusive=True):
+            with ledger_lock(self.root, exclusive=True, wait=True):
                 records = snapshot(self.root)
                 local_binding = root_identity(self.data_root)
                 if records:
@@ -378,7 +422,7 @@ class RecordingSession:
             final = candidate
         except (CoverageError, KeyError, TypeError) as exc:
             final["errors"].append(str(exc))
-        with ledger_lock(self.root, exclusive=True):
+        with ledger_lock(self.root, exclusive=True, wait=True):
             _publish(self.root / f"{self.start['session_id']}.final.json", final)
         return final
 
@@ -401,7 +445,7 @@ def _scope_owner(records: dict, chain: list[dict], venue: str, symbol: str, date
         raise CoverageError("session closure untrusted")
     if parse_time(final["finalized_at"]) > boundary - timedelta(hours=1):
         raise CoverageError("closure too late to prove retirement")
-    successors = chain[owner["sequence"]:]
+    successors = chain[chain.index(owner) + 1:]
     if not successors or parse_time(successors[0]["started_at"]) >= boundary:
         raise CoverageError("no timely successor excluding retired symbol")
     previous = owner
@@ -418,7 +462,7 @@ def _scope_owner(records: dict, chain: list[dict], venue: str, symbol: str, date
 
 
 def retirement_proof(root: Path, data_root: Path, venue: str, symbol: str, date: str, *, complete_next_day=False) -> dict:
-    records = snapshot(root)
+    records = capture_snapshot(root)
     chain = validate_chain(records, records.get("head.json", {}).get("payload", {}).get("data_root_identity"))
     owner, final, horizon = _scope_owner(records, chain, venue, symbol, date, complete_next_day=complete_next_day)
     if datetime.now(timezone.utc) < horizon:
@@ -442,7 +486,14 @@ def retirement_proof(root: Path, data_root: Path, venue: str, symbol: str, date:
             raw[path] = identity
     if not raw or not any(f"/depth_v2/{symbol}/{date}/" in p for p in raw) or not any(f"/trade_v2/{symbol}/{date}/" in p for p in raw):
         raise CoverageError("required target-day raw inputs absent")
-    proof = {"contract_version": VERSION, "mode": "clean_retirement_evidence", "venue": venue, "symbol": symbol, "date": date, "session_id": owner["session_id"], "data_root_identity": owner["data_root_identity"], "horizon": horizon.isoformat(timespec="microseconds").replace("+00:00", "Z"), "raw_files": raw, "records": records}
+    selected = _proof_records(records, chain, owner, horizon)
+    proof = RetirementProof(contract_version=READINESS_VERSION, mode="clean_retirement_evidence",
+                            venue=venue, symbol=symbol, date=date, session_id=owner["session_id"],
+                            data_root_identity=owner["data_root_identity"],
+                            horizon=horizon.isoformat(timespec="microseconds").replace("+00:00", "Z"),
+                            raw_files=raw, records=selected)
+    # Attempt-only inode/ctime evidence is never serialized or transferred.
+    proof.ledger_stamp = _snapshot_stamp(records)
     proof["sha256"] = digest(proof)
     validate_provenance(proof, venue, symbol, date)
     return proof
@@ -450,15 +501,16 @@ def retirement_proof(root: Path, data_root: Path, venue: str, symbol: str, date:
 
 def validate_provenance(proof: dict, venue: str, symbol: str, date: str) -> None:
     required = {"contract_version", "mode", "venue", "symbol", "date", "session_id", "data_root_identity", "horizon", "raw_files", "records", "sha256"}
-    if not isinstance(proof, dict) or set(proof) != required or proof["contract_version"] != VERSION or proof["mode"] != "clean_retirement_evidence" or (proof["venue"], proof["symbol"], proof["date"]) != (venue, symbol, date):
+    if not isinstance(proof, dict) or set(proof) != required or type(proof["contract_version"]) is not int or proof["contract_version"] not in {1, READINESS_VERSION} or proof["mode"] != "clean_retirement_evidence" or (proof["venue"], proof["symbol"], proof["date"]) != (venue, symbol, date):
         raise CoverageError("invalid readiness provenance")
     if proof["sha256"] != digest({k: v for k, v in proof.items() if k != "sha256"}):
         raise CoverageError("readiness provenance digest mismatch")
-    chain = validate_chain(proof["records"], proof["data_root_identity"])
     boundary = datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=timezone.utc) + timedelta(days=1)
     horizon = parse_time(proof["horizon"])
     if horizon not in {boundary + timedelta(hours=1), boundary + timedelta(days=1)}:
         raise CoverageError("invalid readiness horizon")
+    chain = (validate_chain(proof["records"], proof["data_root_identity"])
+             if proof["contract_version"] == 1 else _validate_proof_records(proof))
     owner, final, expected_horizon = _scope_owner(proof["records"], chain, venue, symbol, date, complete_next_day=(horizon == boundary + timedelta(days=1)))
     if owner["session_id"] != proof["session_id"] or expected_horizon != horizon:
         raise CoverageError("readiness owner/horizon mismatch")
@@ -478,10 +530,151 @@ def validate_provenance(proof: dict, venue: str, symbol: str, date: str) -> None
             raise CoverageError("readiness raw source scope mismatch")
 
 
-def recheck_proof(proof: dict, root: Path, data_root: Path) -> None:
-    if snapshot(root) != proof["records"]:
+
+class RetirementProof(dict):
+    """Serializable contract plus a private, local-only mutation guard."""
+    ledger_stamp: dict
+
+
+def _proof_records(records, chain, owner, horizon):
+    """Minimal whole-record preimages supported by the unchanged SHA-256 ledger.
+
+    Keep owner through the first start at/after the horizon (boundary witness),
+    or through the observed head. Only finals needed for a pre-horizon handoff
+    are included. Whole immutable JSON records cannot safely be redacted.
+    """
+    names = set()
+    for index in range(chain.index(owner), len(chain)):
+        start = chain[index]
+        sid = start["session_id"]
+        names.add(f"{sid}.start.json")
+        if parse_time(start["started_at"]) >= horizon:
+            break
+        # The owner's final and every handoff *before* the horizon are needed.
+        if start == owner or (index + 1 < len(chain) and parse_time(chain[index + 1]["started_at"]) < horizon):
+            names.add(f"{sid}.final.json")
+    else:
+        names.add("head.json")
+    if not names <= records.keys():
+        raise CoverageError("missing relevant final/head record")
+    return {name: {key: records[name][key] for key in ("payload", "sha256", "size_bytes")}
+            for name in sorted(names)}
+
+
+def _validate_proof_records(proof):
+    records = proof["records"]
+    if not isinstance(records, dict) or len(records) > MAX_RECORDS:
+        raise CoverageError("invalid compact record inventory")
+    for entry in records.values():
+        if not isinstance(entry, dict) or set(entry) != {"payload", "sha256", "size_bytes"}:
+            raise CoverageError("invalid compact record shape")
+    # Reuse all ledger-contract predicates without persisting local inode data.
+    expanded = {name: {**entry, "file_key": [0, 0, 0, 0]} for name, entry in records.items()}
+    _validate_records(expanded)
+    starts = sorted((e["payload"] for n, e in records.items() if n.endswith(".start.json")),
+                    key=lambda s: s.get("sequence", -1))
+    if len(starts) < 2 or starts[0].get("session_id") != proof["session_id"]:
+        raise CoverageError("missing compact owner/successor")
+    first = starts[0]
+    sequence, previous = first.get("sequence"), first.get("previous")
+    if type(sequence) is not int or not 1 <= sequence <= MAX_RECORDS:
+        raise CoverageError("invalid compact first sequence")
+    if sequence == 1:
+        if previous is not None:
+            raise CoverageError("invalid first-session predecessor")
+    elif (not isinstance(previous, dict) or set(previous) != {"session_id", "sha256"}
+          or not isinstance(previous["session_id"], str) or not ID.fullmatch(previous["session_id"])
+          or not isinstance(previous["sha256"], str) or not SHA.fullmatch(previous["sha256"])):
+        raise CoverageError("invalid compact predecessor")
+    binding = proof["data_root_identity"]
+    if not isinstance(binding, str) or not SHA.fullmatch(binding):
+        raise CoverageError("invalid compact dataset identity")
+    _validate_starts(expanded, binding, starts, first_sequence=sequence, previous=previous)
+    horizon = parse_time(proof["horizon"])
+    tail = starts[-1]
+    if tail["sequence"] > MAX_RECORDS:
+        raise CoverageError("compact sequence bound exceeded")
+    if parse_time(tail["started_at"]) < horizon:
+        head = records.get("head.json", {}).get("payload", {})
+        expected = {"contract_version": VERSION, "count": tail["sequence"],
+                    "session_id": tail["session_id"],
+                    "start_sha256": records[f"{tail['session_id']}.start.json"]["sha256"],
+                    "data_root_identity": binding,
+                    "recorder_root_binding": head.get("recorder_root_binding")}
+        if (head != expected or type(head.get("count")) is not int
+                or type(head.get("contract_version")) is not int
+                or not isinstance(head.get("recorder_root_binding"), str)
+                or not SHA.fullmatch(head["recorder_root_binding"])):
+            raise CoverageError("compact chain does not reach observed head/horizon")
+    # Reject omitted interior links, excess history, and unnecessary finals.
+    if records != _proof_records(records, starts, first, horizon):
+        raise CoverageError("nonminimal/incomplete compact chain")
+    return starts
+
+
+def _snapshot_stamp(records):
+    return {name: [entry["size_bytes"], *entry["file_key"]] for name, entry in records.items()}
+
+
+def _ledger_stamp(root):
+    """Bounded metadata check only: no ledger parsing or raw hashing under SH."""
+    _safe_path(root, directory=True)
+    result = {}
+    for index, path in enumerate(root.iterdir()):
+        if index >= MAX_RECORDS:
+            raise CoverageError("coverage ledger scan bound exceeded")
+        _safe_path(path)
+        if path.name in {".ledger.lock", ".recorder.lock"}:
+            continue
+        info = path.stat()
+        result[path.name] = [info.st_size, info.st_dev, info.st_ino, info.st_mtime_ns, info.st_ctime_ns]
+    return result
+
+
+def capture_snapshot(root):
+    # Optimistic read: a recorder publication may make this attempt fail, but
+    # reading/decoding/hashing up to MAX_BYTES must never block the recorder.
+    records = snapshot(root)
+    with ledger_lock(root):
+        if _ledger_stamp(root) != _snapshot_stamp(records):
+            raise CoverageError("coverage evidence changed during snapshot")
+    return records
+
+
+def _check_attempt_stamp(proof, root):
+    stamp = getattr(proof, "ledger_stamp", None)
+    if stamp is None or _ledger_stamp(root) != stamp:
         raise CoverageError("coverage evidence changed during replay attempt")
+
+
+def recheck_proof(proof: dict, root: Path, data_root: Path) -> None:
+    with ledger_lock(root):
+        _check_attempt_stamp(proof, root)
     inventory = _retirement_inventory(proof["venue"], proof["symbol"], proof["date"], data_root)
     current = {e.relative_to(data_root).as_posix(): file_identity(e) for entries in inventory.values() for e in entries}
     if current != proof["raw_files"]:
         raise CoverageError("retirement raw inventory changed during replay attempt")
+    with ledger_lock(root):
+        _check_attempt_stamp(proof, root)
+
+
+@contextlib.contextmanager
+def proof_publication_guard(proof, root, data_root):
+    recheck_proof(proof, root, data_root)
+    # Only the bounded stat check and canonical rename/fsync are serialized.
+    with ledger_lock(root):
+        _check_attempt_stamp(proof, root)
+        yield
+
+
+def validate_live_provenance(proof, root):
+    validate_provenance(proof, proof["venue"], proof["symbol"], proof["date"])
+    current = capture_snapshot(root)
+    validate_chain(current, proof["data_root_identity"])
+    for name, entry in proof["records"].items():
+        if name != "head.json" and any(current.get(name, {}).get(key) != entry[key]
+                                      for key in ("payload", "sha256", "size_bytes")):
+            raise CoverageError("published retirement evidence disagrees with live ledger")
+    with ledger_lock(root):
+        if _ledger_stamp(root) != _snapshot_stamp(current):
+            raise CoverageError("coverage evidence changed during reuse")
