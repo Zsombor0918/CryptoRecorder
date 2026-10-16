@@ -206,6 +206,17 @@ def audit_replay_partition(
     trades_checksum = _sha256(trades_path)
     manifest_depth_count = manifest.get("depth_record_count")
     manifest_trade_count = manifest.get("trade_record_count")
+    readiness = {"present": "readiness_evidence" in manifest, "valid": True, "errors": []}
+    if readiness["present"] or "readiness_contract_version" in manifest or any(
+        key in manifest.get("integrity", {}) for key in ("readiness_evidence", "readiness_evidence_sha256")
+    ):
+        from stores.replay_writer import validate_partition
+        readiness["valid"] = validate_partition(partition)
+        proof = manifest.get("readiness_evidence", {})
+        readiness["mode"] = proof.get("mode") if isinstance(proof, dict) else None
+        readiness["sha256"] = proof.get("sha256") if isinstance(proof, dict) else None
+        if not readiness["valid"]:
+            readiness["errors"].append("retirement provenance/partition validation failed")
 
     return {
         "venue": venue,
@@ -217,6 +228,7 @@ def audit_replay_partition(
         "manifest_exists": manifest_path.exists(),
         "manifest_status": manifest.get("status"),
         "schema_version": schema_version,
+        "readiness_evidence_validation": readiness,
         "manifest_counts": {
             "depth_record_count": manifest_depth_count,
             "trade_record_count": manifest_trade_count,
@@ -305,7 +317,7 @@ def main() -> int:
         args.report_path.parent.mkdir(parents=True, exist_ok=True)
         args.report_path.write_text(payload)
     print(payload)
-    return 0
+    return 0 if all(p["readiness_evidence_validation"]["valid"] for p in report["partitions"]) else 1
 
 
 if __name__ == "__main__":

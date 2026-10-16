@@ -382,3 +382,29 @@ The deterministic native pipeline tracks these quality indicators:
 | `snapshot_seed_count` | Convert report | REST snapshots used to seed replay |
 | `queue_drop_total` | Heartbeat | WebSocket messages dropped due to backpressure |
 | `instruments_with_no_data` | Convert report | Instruments defined but missing raw data |
+
+## Retirement evidence validation
+
+`tests/test_recording_coverage.py` uses temporary T00–T06 raw/evidence fixtures
+and injects producer, writer, close, compression, publication and watchdog
+failures. It checks transfer/custom-root isolation, unknown lifecycle gaps,
+malformed/symlink/duplicate evidence, marker/raw mutation and reuse, plus a
+native-shaped synthetic full-L2 equivalence case through the strict retirement
+horizon. No production raw is read.
+
+`validation.audit_replay_store` includes
+`readiness_evidence_validation` for each partition. Retirement provenance is
+validated through the shared routine validator; an invalid retirement proof
+makes this CLI exit nonzero. Ordinary historical audit behavior is unchanged.
+A valid retirement audit is evidence about recorded scope and replay integrity,
+not an assertion of complete Binance market coverage or the broader full-L2 gate.
+
+
+The retirement follow-up tests also populate hundreds of synthetic ledger
+records, build multiple partitions, bound manifest growth by the relevant
+whole-record proof, reject duplicated contract-2 serialization, preserve
+contract-1 reuse, and build/reuse copied read-only bundles. Deterministic
+shutdown/successor overlap and lock timeout tests verify that conversion does
+not retain a shared ledger lock, the canonical rename is guarded, changed
+evidence prevents publication, and lock contention retries are bounded.
+Synthetic timings and full-L2 CLI results remain development evidence only.

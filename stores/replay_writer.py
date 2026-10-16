@@ -28,6 +28,7 @@ import logging
 import os
 import shutil
 import stat
+from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Optional
@@ -898,6 +899,30 @@ def validate_partition(partition_dir: Path) -> bool:
             manifest = json.load(f)
         if manifest.get("status") != "complete":
             return False
+        readiness_version = manifest.get("readiness_contract_version")
+        if readiness_version is not None and (type(readiness_version) is not int or readiness_version not in {1, 2} or "readiness_evidence" not in manifest):
+            return False
+        integrity = manifest.get("integrity", {})
+        if any(key in integrity for key in ("readiness_evidence", "readiness_evidence_sha256")) and "readiness_evidence" not in manifest:
+            return False
+        if "readiness_evidence" in manifest:
+            proof = manifest["readiness_evidence"]
+            if readiness_version not in {1, 2} or proof.get("contract_version") != readiness_version:
+                return False
+            from recording_coverage import validate_provenance
+            validate_provenance(proof, manifest["venue"], manifest["symbol"], manifest["date"])
+            if manifest.get("schema_version") != 2:
+                return False
+            if readiness_version == 1:
+                if integrity.get("readiness_evidence") != proof or "readiness_evidence_sha256" in integrity:
+                    return False
+            elif "readiness_evidence" in integrity or integrity.get("readiness_evidence_sha256") != proof["sha256"]:
+                return False
+            sources = {e["path"]: {"sha256": e["sha256"], "size_bytes": e["size_bytes"]}
+                       for entries in manifest.get("source_identity", {}).get("channels", {}).values()
+                       for e in entries}
+            if sources != manifest["readiness_evidence"]["raw_files"]:
+                return False
         for key, path in (("depth_checksum", depth_path), ("trades_checksum", trades_path)):
             expected = manifest.get(key)
             if not expected:
@@ -1796,6 +1821,11 @@ class ReplayWriter:
         never computes this itself."""
         self._source_identity = source_identity
 
+    def set_readiness_evidence(self, evidence: dict) -> None:
+        from recording_coverage import validate_provenance
+        validate_provenance(evidence, self.venue, self.symbol, self.date)
+        self._readiness_evidence = evidence
+
     # ------------------------------------------------------------------
     # Lazy spool init
     # ------------------------------------------------------------------
@@ -2215,6 +2245,15 @@ class ReplayWriter:
             }
 
         self._manifest = manifest
+        evidence = getattr(self, "_readiness_evidence", None)
+        if evidence is not None:
+            manifest["readiness_contract_version"] = evidence["contract_version"]
+            manifest["readiness_evidence"] = evidence
+            if self.schema_version == 2:
+                if evidence["contract_version"] == 1:
+                    manifest["integrity"]["readiness_evidence"] = evidence
+                else:
+                    manifest["integrity"]["readiness_evidence_sha256"] = evidence["sha256"]
         return manifest
 
     def publish(self, instrument_metadata: "Optional[dict]" = None) -> Path:
@@ -2255,54 +2294,55 @@ class ReplayWriter:
         logger.info(f"Wrote manifest: {manifest_path}")
 
         _fsync_directory(self.staging_dir)
-
+        guard = getattr(self, "readiness_guard", None)
         # Atomic publication with backup/restore so the existing valid partition
         # is never lost if the replacement fails (I/O error, permissions, etc.).
         backup_dir = self.output_dir.parent / f".backup_{self.date}_{self.symbol}"
         self.output_dir.parent.mkdir(parents=True, exist_ok=True)
 
-        new_installed = False
-        try:
-            # Step 1: rename existing output to backup (if it exists), then
-            # durably record that parent-directory transition.
-            if self.output_dir.exists():
-                if backup_dir.exists() or backup_dir.is_symlink():
-                    raise RuntimeError(
-                        f"Ambiguous publication state: backup already exists at "
-                        f"{backup_dir}. Run build-wide reconciliation while holding "
-                        "the replay lifecycle lock; refusing to delete it."
-                    )
-                os.replace(self.output_dir, backup_dir)
-                _fsync_directory(self.output_dir.parent)
+        with guard() if guard is not None else nullcontext():
+            new_installed = False
+            try:
+                # Step 1: rename existing output to backup (if it exists), then
+                # durably record that parent-directory transition.
+                if self.output_dir.exists():
+                    if backup_dir.exists() or backup_dir.is_symlink():
+                        raise RuntimeError(
+                            f"Ambiguous publication state: backup already exists at "
+                            f"{backup_dir}. Run build-wide reconciliation while holding "
+                            "the replay lifecycle lock; refusing to delete it."
+                        )
+                    os.replace(self.output_dir, backup_dir)
+                    _fsync_directory(self.output_dir.parent)
 
-            # Step 2: rename staging to canonical output and fsync its parent.
-            os.replace(self.staging_dir, self.output_dir)
-            new_installed = True
-            _fsync_directory(self.output_dir.parent)
-        except Exception:
-            # Durability preparation/publication failed. Move a newly installed
-            # candidate back to staging before restoring the prior canonical.
-            if new_installed and self.output_dir.exists() and not self.staging_dir.exists():
-                try:
-                    os.replace(self.output_dir, self.staging_dir)
-                    _fsync_directory(self.output_dir.parent)
-                except Exception as unpublish_err:
-                    logger.error(
-                        f"Could not withdraw unpublished candidate {self.output_dir}: "
-                        f"{unpublish_err}"
-                    )
-            if backup_dir.exists() and not self.output_dir.exists():
-                try:
-                    os.replace(backup_dir, self.output_dir)
-                    _fsync_directory(self.output_dir.parent)
-                    logger.warning(
-                        f"Publication failed; restored previous partition: {self.output_dir}"
-                    )
-                except Exception as restore_err:
-                    logger.error(
-                        f"Could not restore backup partition {backup_dir}: {restore_err}"
-                    )
-            raise
+                # Step 2: rename staging to canonical output and fsync its parent.
+                os.replace(self.staging_dir, self.output_dir)
+                new_installed = True
+                _fsync_directory(self.output_dir.parent)
+            except Exception:
+                # Durability preparation/publication failed. Move a newly installed
+                # candidate back to staging before restoring the prior canonical.
+                if new_installed and self.output_dir.exists() and not self.staging_dir.exists():
+                    try:
+                        os.replace(self.output_dir, self.staging_dir)
+                        _fsync_directory(self.output_dir.parent)
+                    except Exception as unpublish_err:
+                        logger.error(
+                            f"Could not withdraw unpublished candidate {self.output_dir}: "
+                            f"{unpublish_err}"
+                        )
+                if backup_dir.exists() and not self.output_dir.exists():
+                    try:
+                        os.replace(backup_dir, self.output_dir)
+                        _fsync_directory(self.output_dir.parent)
+                        logger.warning(
+                            f"Publication failed; restored previous partition: {self.output_dir}"
+                        )
+                    except Exception as restore_err:
+                        logger.error(
+                            f"Could not restore backup partition {backup_dir}: {restore_err}"
+                        )
+                raise
 
         # Step 3: canonical publication succeeded on the filesystem — but that
         # does not guarantee the published directory is a complete, valid

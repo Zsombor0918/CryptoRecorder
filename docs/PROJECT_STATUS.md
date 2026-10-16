@@ -1,7 +1,7 @@
 # Project Status
 
 **Version:** `v1.1.0-dev`
-**Last updated:** 2026-08-01
+**Last updated:** 2026-10-08
 
 This document is the single source of truth for **what is validated** vs **what is
 deferred** in CryptoRecorder. Keep it honest. Do not promote a deferred item to
@@ -346,3 +346,13 @@ repositories (e.g. KovacsTrader).
    top50/multi-day validation passes.
 
 See [OPERATIONS.md](OPERATIONS.md) for the service layout that runs these steps.
+
+## Recording retirement evidence — development checkpoint (2026-10-08)
+
+Contract-1 session evidence and the schema-v2 missing-D+1 readiness alternative
+are implemented and covered by synthetic recorder/storage/fault tests and a
+native-shaped full-L2 equivalence fixture. Ordinary production entrypoints,
+raw schemas/layout, replay encoding, and `convert_day.py` remain intact.
+Deployment and real-server closure/retirement acceptance remain pending;
+historical October 1/2 partitions without markers remain deferred. This adds
+no top50/multi-day, archive, Syncthing, restore, or v2.0.0 validation claim.

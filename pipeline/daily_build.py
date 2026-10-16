@@ -184,6 +184,7 @@ def run_build_replay_store(
     replace_incompatible: bool = False,
     allow_build: bool = True,
     venues: list[str] | None = None,
+    coverage_root: Path | None = None,
 ) -> dict:
     """Compatibility single-date API plus exact partition outcomes."""
     from pipeline.build_replay_store import build_replay_for_symbol
@@ -238,6 +239,7 @@ def run_build_replay_store(
             replay_root,
             schema_version=schema_version,
             check_repartition_readiness=check_repartition_readiness,
+            coverage_root=coverage_root,
             lifecycle_context=lifecycle_context,
             rebuild_source_changed=rebuild_source_changed,
             replace_incompatible=replace_incompatible,
@@ -440,6 +442,7 @@ def run_backlog(
     venues: list[str] | None = None,
     rebuild_source_changed: bool = False,
     replace_incompatible: bool = False,
+    coverage_root: Path | None = None,
 ) -> tuple[dict, int]:
     backlog_days = _bounded_positive("backlog-days", backlog_days, MAX_BACKLOG_DAYS)
     max_build_dates = _bounded_positive(
@@ -587,6 +590,7 @@ def run_backlog(
                     data_root,
                     replay_root,
                     check_repartition_readiness=True,
+                    coverage_root=coverage_root,
                     schema_version=schema_version,
                     lifecycle_context=context,
                     rebuild_source_changed=(
@@ -724,6 +728,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--symbols", default=None, help="Optional comma-separated symbol restriction")
     parser.add_argument("--venues", default=None, help="Optional comma-separated venue restriction")
     parser.add_argument("--data-root", type=Path, default=DATA_ROOT)
+    parser.add_argument("--coverage-root", type=Path, default=None, help="Explicit retirement ledger for custom raw roots")
     parser.add_argument("--replay-root", type=Path, default=REPLAY_ROOT)
     parser.add_argument("--report-root", type=Path, default=DAILY_REPORT_ROOT)
     parser.add_argument("--backlog-days", type=int, default=REPLAY_BACKLOG_DAYS)
@@ -752,6 +757,7 @@ def main() -> int:
                 raise ValueError("--venues did not contain any venue")
         _report, exit_code = run_backlog(
             newest_date=newest,
+            coverage_root=args.coverage_root,
             backlog_days=args.backlog_days,
             max_build_dates=args.max_build_dates,
             schema_version=args.schema_version,

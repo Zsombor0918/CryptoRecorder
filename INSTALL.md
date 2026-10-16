@@ -556,24 +556,25 @@ python scripts/acceptance_test.py --runtime 300
 python scripts/acceptance_test.py --skip-recorder
 ```
 
-## 14. Disk Cleanup Warning
+## 14. Disk Monitoring and Raw Retention
 
-While the live recorder is running, `disk_monitor.py` can delete the oldest raw
-date directories after raw data storage crosses:
+`disk_monitor.py` reports capacity and `cleanup_required`; it performs **no
+raw move or deletion**, even if `CRYPTO_RECORDER_RAW_RETENTION_ENABLED=1`.
+Keep that setting at its default `0`. The paired transaction journal,
+rollback, and startup recovery required for destructive retention do not exist.
 
-- raw soft limit: `750 GB`
-- raw cleanup target: `700 GB`
-- raw hard alert threshold: `850 GB`
+The raw soft limit (`750 GB`) and hard alert threshold (`850 GB`) apply to
+fresh raw-size policy alerts. The historical cleanup target (`700 GB`) is
+retained for configuration compatibility and does not trigger deletion.
+Filesystem free-space alerts are independent of those raw-size thresholds.
 
-All three thresholds apply to fresh `data_raw` disk usage only — never to
-filesystem capacity, and never to the cross-root observability total
-(`data_raw + catalog + meta + state`), which may span different filesystems
-and never drives cleanup decisions.
-
-Review those constants in `config.py` before a long-running server deployment.
-`RAW_RETENTION_DAYS = 7` exists in `config.py`, but the active cleanup logic is
-currently size-triggered. Catalog, `meta`, and `state` sizes are still reported
-for observability, but only raw data size triggers raw cleanup.
+`CRYPTO_RECORDER_RAW_RETENTION_DAYS=7` is a minimum grace period for the
+**proof-only retention plan**, not a seven-day deletion or expiration policy.
+Neither coverage evidence nor retired replay partitions expire automatically.
+Preserve the authoritative `CRYPTO_RECORDER_COVERAGE_ROOT` ledger across
+recorder sessions and deployments; never reset it to bypass a failure.
+See [OPERATIONS.md](docs/OPERATIONS.md#raw-retention) for current behavior and
+monitor disk space, ledger bounds, and unresolved capacity alerts.
 
 ## 15. Troubleshooting
 

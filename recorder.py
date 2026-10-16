@@ -42,6 +42,7 @@ from health_monitor import HealthMonitor
 from native_trades import BinanceNativeTradeRecorder
 from phase2_depth import BinanceNativeDepthRecorder
 from storage import StorageManager
+from recording_coverage import RecordingSession, utc_now
 from time_utils import local_now_iso
 
 # ============================================================================
@@ -68,6 +69,9 @@ disk_monitor: Optional[DiskMonitor] = None
 shutdown_event: Optional[asyncio.Event] = None
 native_depth_recorder: Optional[BinanceNativeDepthRecorder] = None
 native_trade_recorder: Optional[BinanceNativeTradeRecorder] = None
+recording_session: Optional[RecordingSession] = None
+session_errors: list[str] = []
+shutdown_reason: str = "shutdown_event"
 futures_enabled: bool = True
 futures_disabled_reason: str = ""
 
@@ -247,6 +251,7 @@ async def initialize() -> Dict[str, Any]:
 
     shutdown_event = asyncio.Event()
     storage_manager = StorageManager()
+    DATA_ROOT.mkdir(parents=True, exist_ok=True)
     health_monitor = HealthMonitor()
     disk_monitor = DiskMonitor(config)
 
@@ -328,7 +333,12 @@ def _refresh_trade_health_from_recorder() -> None:
 async def shutdown(background_tasks: List[asyncio.Task]) -> None:
     """Stop recorders → cancel tasks → flush storage → write heartbeat."""
     import threading, os as _os
-    global native_depth_recorder, native_trade_recorder
+    global native_depth_recorder, native_trade_recorder, recording_session
+    closure_errors = list(session_errors)
+    producer_tasks = [
+        task for native in (native_depth_recorder, native_trade_recorder)
+        if native is not None for task in native._tasks
+    ]
 
     # Watchdog: configurable hard timeout (default 120 s)
     def _force_exit():
@@ -349,8 +359,10 @@ async def shutdown(background_tasks: List[asyncio.Task]) -> None:
         try:
             await asyncio.wait_for(native_depth_recorder.shutdown(), timeout=10)
         except asyncio.TimeoutError:
+            closure_errors.append("native depth shutdown timed out")
             logger.warning("Native depth recorder shutdown timed out (10s) — continuing")
         except Exception as e:
+            closure_errors.append(f"native depth shutdown failed: {e}")
             logger.warning(f"Native depth recorder shutdown error (non-fatal): {e}")
         native_depth_recorder = None
 
@@ -359,8 +371,10 @@ async def shutdown(background_tasks: List[asyncio.Task]) -> None:
         try:
             await asyncio.wait_for(native_trade_recorder.shutdown(), timeout=10)
         except asyncio.TimeoutError:
+            closure_errors.append("native trade shutdown timed out")
             logger.warning("Native trade recorder shutdown timed out (10s) — continuing")
         except Exception as e:
+            closure_errors.append(f"native trade shutdown failed: {e}")
             logger.warning(f"Native trade recorder shutdown error (non-fatal): {e}")
 
         # Capture trade diagnostics before setting recorder to None
@@ -373,11 +387,18 @@ async def shutdown(background_tasks: List[asyncio.Task]) -> None:
         if not t.done():
             t.cancel()
     if background_tasks:
-        await asyncio.gather(*background_tasks, return_exceptions=True)
+        results = await asyncio.gather(*background_tasks, return_exceptions=True)
+        closure_errors.extend(f"background task failed: {r}" for r in results if isinstance(r, BaseException) and not isinstance(r, asyncio.CancelledError))
+    for task in producer_tasks:
+        if not task.done():
+            closure_errors.append("native producer still running")
+        elif not task.cancelled() and task.exception() is not None:
+            closure_errors.append(f"native producer failed: {task.exception()}")
+    ingestion_stopped_at = utc_now()
 
     # 5. Flush writers → close & compress files
     if storage_manager:
-        await storage_manager.shutdown()
+        storage_closure = await storage_manager.shutdown()
     if disk_monitor:
         await disk_monitor.shutdown()
 
@@ -410,6 +431,25 @@ async def shutdown(background_tasks: List[asyncio.Task]) -> None:
         except asyncio.TimeoutError:
             logger.debug(f"{len(orphans)} orphan tasks did not cancel in 5s")
 
+    if recording_session is not None:
+        try:
+            raw_files = await asyncio.to_thread(storage_manager.coverage_raw_files)
+            # Keep the shutdown watchdog active through durable evidence publication.
+            final = recording_session.finish(
+                storage_closure, raw_files,
+                producers_stopped=not closure_errors,
+                ingestion_stopped_at=ingestion_stopped_at,
+                errors=closure_errors, shutdown_reason=shutdown_reason,
+                unowned_raw_files=storage_manager.coverage_unowned_files(),
+            )
+            logger.log(logging.INFO if final["status"] == "closed_clean" else logging.ERROR,
+                       "Recording coverage finalized: session=%s status=%s errors=%s",
+                       final["session_id"], final["status"], final["errors"])
+        except Exception as exc:
+            logger.error("Coverage finalization failed; session remains untrusted: %s", exc, exc_info=True)
+        finally:
+            recording_session.release()
+            recording_session = None
     wd.cancel()
     logger.info("Recorder shutdown complete")
 
@@ -454,7 +494,7 @@ async def main() -> None:
     background_tasks: List[asyncio.Task] = []
 
     try:
-        global native_depth_recorder, native_trade_recorder
+        global native_depth_recorder, native_trade_recorder, recording_session, shutdown_reason
         universe = await initialize()
         startup_coverage = _build_startup_coverage(universe)
 
@@ -489,6 +529,16 @@ async def main() -> None:
             if venue in ("BINANCE_SPOT", "BINANCE_USDTF") and symbols
         }
 
+        # This durable start/head must precede every native feed. A failed
+        # evidence write prevents ingestion rather than creating a hidden session.
+        from pipeline.replay_lifecycle import repository_sha
+        recording_session = RecordingSession(
+            config.COVERAGE_ROOT, DATA_ROOT, native_symbols,
+            repository_sha=repository_sha(),
+            application_version=(config.PROJECT_ROOT / "VERSION").read_text().strip(),
+        )
+        logger.info("Durable recording session opened: %s", recording_session.start["session_id"])
+
         # Launch native depth recorder
         native_depth_recorder = BinanceNativeDepthRecorder(
             storage_manager=storage_manager,
@@ -517,6 +567,8 @@ async def main() -> None:
         loop = asyncio.get_running_loop()
 
         def _on_signal(sig_num):
+            global shutdown_reason
+            shutdown_reason = signal.Signals(sig_num).name
             logger.info(f"Received signal {sig_num}, shutting down …")
             shutdown_event.set()
 
@@ -529,6 +581,7 @@ async def main() -> None:
     except KeyboardInterrupt:
         logger.info("KeyboardInterrupt")
     except Exception as e:
+        session_errors.append(f"fatal recorder error: {e}")
         logger.error(f"Fatal: {e}", exc_info=True)
     finally:
         await shutdown(background_tasks)

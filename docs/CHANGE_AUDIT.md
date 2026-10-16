@@ -93,6 +93,150 @@ An entry may be skipped **only** for:
 - <or "none — task fully completed">
 ```
 
+## 2026-10-16 — retirement branch rebase onto current main
+
+### Change summary
+- Rebase the two retirement commits onto `origin/main` at `53771c9`.
+- Resolve the audit-log insertion conflicts by retaining every complete entry
+  in date order. There were no source-code conflicts.
+- Verify that retirement source files exactly match the pre-rebase branch and
+  that selected reconstruction source/tests exactly match current main.
+
+### Files/packages touched
+- `docs/CHANGE_AUDIT.md` (conflict resolution and this integration record).
+- Existing retirement commits replayed without source-code changes.
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] docs/REPO_STRUCTURE.md
+- [x] docs/PROJECT_STATUS.md
+- [x] docs/IMPLEMENTATION_AUDIT.md
+- [x] docs/FULL_L2_REPLAY_CATALOG_PLAN.md
+- [x] docs/OPERATIONS.md
+- [x] docs/AI_WORKFLOW.md
+- [x] CHANGELOG.md
+- [x] relevant feature docs: REPLAY_STORE.md, DAILY_BUILD_PIPELINE.md,
+  and the main/retirement audit entries retained by conflict resolution.
+
+### Docs updated
+- [x] docs/CHANGE_AUDIT.md
+- No docs update required because: the existing feature documentation and
+  CHANGELOG.md entries were preserved; this audit-only integration record
+  introduces no additional product behavior, structure or status change.
+
+### Status / validation impact
+- Validated status changed: no
+- Deferred status changed: no
+- New claims added: no production or broader equivalence claims.
+- Evidence for any new validation claim: synthetic integration checks below.
+
+### Tests run
+```bash
+uv lock --check
+UV_PROJECT_ENVIRONMENT=/home/zsom/.cache/cryptorecorder-replay-dev-env uv sync --frozen --no-default-groups --extra reconstruction --group dev
+/home/zsom/.cache/cryptorecorder-replay-dev-env/bin/python -m pytest -q tests/test_recording_coverage.py tests/test_replay_depth_repartitioning.py tests/test_replay_compression_race.py tests/test_daily_backlog_lifecycle.py tests/test_replay_store.py tests/test_writer_backpressure.py tests/test_staging_publish.py tests/test_repo_structure.py tests/test_agent_infrastructure.py tests/test_reconstruct_selected_catalog.py tests/test_replay_catalog_reconstruct.py tests/test_catalog_equivalence.py
+/home/zsom/.cache/cryptorecorder-replay-dev-env/bin/python -m pytest -q tests/
+```
+- Focused: 291 passed, 1 skipped. Full suite: 1002 passed, 3 skipped.
+- `git range-diff` showed only audit-entry context differences between the
+  original and replayed commits; explicit source comparisons were identical.
+
+### Validation CLIs run
+```bash
+# Locked Python, temporary synthetic fixture only. Run daily_build twice:
+python -m pipeline.daily_build --date 2026-01-01 --symbols ADAUSDT --venues BINANCE_SPOT --schema-version 2 --backlog-days 1 --max-build-dates 1 --data-root /tmp/cryptorecorder-retirement-rebase-cwlj4yr6/fixture/raw --coverage-root /tmp/cryptorecorder-retirement-rebase-cwlj4yr6/fixture/coverage --replay-root /tmp/cryptorecorder-retirement-rebase-cwlj4yr6/fixture/replay --report-root /tmp/cryptorecorder-retirement-rebase-cwlj4yr6/report-built
+# Second invocation uses report-reuse as report-root.
+python -m validation.audit_replay_store --replay-root /tmp/cryptorecorder-retirement-rebase-cwlj4yr6/fixture/replay --date 2026-01-01 --symbols ADAUSDT --venues BINANCE_SPOT --report-path /tmp/cryptorecorder-retirement-rebase-cwlj4yr6/audit.json
+CRYPTO_RECORDER_DATA_ROOT=/tmp/cryptorecorder-retirement-rebase-cwlj4yr6/fixture/raw CRYPTO_RECORDER_COVERAGE_ROOT=/tmp/cryptorecorder-retirement-rebase-cwlj4yr6/fixture/coverage python -m validation.validate_catalog_equivalence --date 2026-01-01 --symbols ADAUSDT --venues BINANCE_SPOT --data-root /tmp/cryptorecorder-retirement-rebase-cwlj4yr6/fixture/raw --work-root /tmp/cryptorecorder-retirement-rebase-cwlj4yr6/equivalence --old-catalog-root /tmp/cryptorecorder-retirement-rebase-cwlj4yr6/equivalence/old --replay-root /tmp/cryptorecorder-retirement-rebase-cwlj4yr6/equivalence/replay --new-catalog-root /tmp/cryptorecorder-retirement-rebase-cwlj4yr6/equivalence/new --report-path /tmp/cryptorecorder-retirement-rebase-cwlj4yr6/equivalence/report.json --profile full_l2 --schema-version 2
+```
+- Build/reuse: `built`, then `skipped_valid`, both 14 depth/7 trades.
+- Replay audit: valid evidence, matching counts/checksums, no errors.
+- Synthetic full-L2 equivalence: passed against unchanged `convert_day.py`.
+
+### Known limitations / out of scope
+- No merge into main, production operation, deployment, real recorder run,
+  raw-data mutation or deletion. Synthetic results do not establish production
+  performance or broader top50/multi-day full-L2 acceptance.
+- GitHub topic-branch history is updated only with an explicit expected-SHA
+  lease; the original tip remains available as a local backup ref.
+
+## 2026-10-16 — bound retirement proof size and recorder coordination
+
+### Change summary
+- Add readiness-evidence contract version 2 with a compact, self-contained proof
+  containing only the owner and relevant successor chain; retain validation of
+  existing contract-1 evidence and store new proof material once in manifests.
+- Bound ledger-lock coordination so proof-backed publication cannot silently
+  block recorder shutdown or successor startup indefinitely. Hash and parse
+  ledger snapshots outside the lock and verify stable file identity around reads.
+- Correct raw-retention guidance and document ledger persistence, proof grace
+  periods, hard bounds, lock waits, and synthetic resource measurements.
+
+### Files/packages touched
+- `recording_coverage.py`, `recorder.py`, `pipeline/build_replay_store.py`.
+- `stores/replay_writer.py`, `validation/audit_replay_store.py`.
+- `tests/test_recording_coverage.py`.
+- `INSTALL.md`, `README.md`, `CHANGELOG.md`.
+- `docs/ARCHITECTURE.md`, `docs/DAILY_BUILD_PIPELINE.md`,
+  `docs/IMPLEMENTATION_AUDIT.md`, `docs/OPERATIONS.md`,
+  `docs/REPLAY_STORE.md`, `docs/VALIDATION.md`.
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] docs/REPO_STRUCTURE.md
+- [x] docs/PROJECT_STATUS.md
+- [x] docs/IMPLEMENTATION_AUDIT.md
+- [x] docs/FULL_L2_REPLAY_CATALOG_PLAN.md
+- [x] docs/OPERATIONS.md
+- [x] docs/AI_WORKFLOW.md
+- [x] CHANGELOG.md
+- [x] Relevant feature docs: ARCHITECTURE.md, DAILY_BUILD_PIPELINE.md,
+  REPLAY_STORE.md, VALIDATION.md, INSTALL.md.
+
+### Docs updated
+- [x] CHANGELOG.md
+- [x] README.md
+- [ ] docs/PROJECT_STATUS.md — not updated because validated/deferred status did
+  not change.
+- [ ] docs/REPO_STRUCTURE.md — not updated because the repository structure did
+  not change.
+- [x] Relevant feature docs: ARCHITECTURE.md, DAILY_BUILD_PIPELINE.md,
+  IMPLEMENTATION_AUDIT.md, OPERATIONS.md, REPLAY_STORE.md, VALIDATION.md,
+  INSTALL.md.
+
+### Status / validation impact
+- Validated status changed: no
+- Deferred status changed: no
+- New claims added: yes, limited to synthetic fixture and resource measurements.
+- Evidence for any new validation claim:
+  - Synthetic ADAUSDT replay build/reuse, replay audit and full-L2 equivalence
+    commands listed below; these do not establish production performance or
+    broader production acceptance.
+
+### Tests run
+```bash
+uv lock --check
+UV_PROJECT_ENVIRONMENT=/home/zsom/.cache/cryptorecorder-replay-dev-env uv sync --frozen --no-default-groups --extra reconstruction --group dev
+/home/zsom/.cache/cryptorecorder-replay-dev-env/bin/python -m pytest -q tests/test_recording_coverage.py
+/home/zsom/.cache/cryptorecorder-replay-dev-env/bin/python -m pytest tests/
+```
+- Results: focused 104 passed; full suite 987 passed, 3 skipped.
+
+### Validation CLIs run
+```bash
+python -m pipeline.daily_build --date 2026-01-01 --symbols ADAUSDT --venues BINANCE_SPOT --schema-version 2 --backlog-days 1 --max-build-dates 1 --data-root <synthetic-data> --coverage-root <synthetic-coverage> --replay-root <synthetic-replay> --report-root <synthetic-reports>
+python -m validation.audit_replay_store --replay-root <synthetic-replay> --date 2026-01-01 --symbols ADAUSDT --venues BINANCE_SPOT
+python -m validation.validate_catalog_equivalence --profile full_l2 --schema-version 2 <synthetic fixture arguments>
+```
+- Results: first build `built`, rerun `skipped_valid`; audit valid; synthetic
+  full-L2 equivalence passed.
+
+### Known limitations / out of scope
+- No merge, deployment, production validation, or push is part of this change.
+- No raw schema/layout or retention behavior changed; evidence does not expire
+  automatically, and no raw or replay data was deleted.
+- No broader top50 or multi-day full-L2 equivalence claim is made.
+
 ## 2026-10-10 — Compare reconstructed instrument semantics across dates
 
 ### Change summary
@@ -162,6 +306,154 @@ passed instead.
   `convert_day.py` remains the production reference.
 - No raw data, replay partitions, or production catalog were changed or
   validated.
+
+## 2026-10-08 — durable clean symbol-retirement evidence (development only)
+
+### Change summary
+- Add contract-1 immutable recorder starts/finals and a hash-linked ledger head,
+  exact universe and raw ownership, an exclusive recorder lifetime lock and
+  shared/exclusive evidence lock. Starts are durable before native feeds.
+- Return explicit storage shutdown results; retain producer/task/write/drop/
+  close/compression failures. Fsync and hash final compressed outputs in the
+  existing background workers. Track inherited hours separately so old bytes
+  cannot become retroactive proof. Session file/ledger scans are bounded.
+- Allow only schema-v2 missing-D+1 partitions to use a clean early closure and
+  ordered excluding sessions. Hold evidence ownership through publication;
+  reject raw/marker mutation, unsafe inputs, lifecycle gaps and contradictions.
+- Add versioned adjacent readiness provenance and daily/audit reporting.
+  Preserve normal D+1 readiness, physical schemas/encoding, current builder
+  normalization version and old ordinary manifests. Explicit transferred
+  offline bundles bind exact raw bytes; active recorder root rebinding is refused.
+
+### Files/packages touched
+- `recording_coverage.py`, `recorder.py`, `storage.py`, `config.py`.
+- `pipeline/build_replay_store.py`, `pipeline/daily_build.py`.
+- `stores/replay_writer.py`, `validation/audit_replay_store.py`.
+- `tests/test_recording_coverage.py`, `tests/test_repo_structure.py`.
+- `README.md`, `CHANGELOG.md`, `docs/ARCHITECTURE.md`, `docs/OPERATIONS.md`,
+  `docs/DAILY_BUILD_PIPELINE.md`, `docs/REPLAY_STORE.md`,
+  `docs/IMPLEMENTATION_AUDIT.md`, `docs/PROJECT_STATUS.md`,
+  `docs/REPO_STRUCTURE.md`, `docs/VALIDATION.md`, `docs/CHANGE_AUDIT.md`.
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] docs/REPO_STRUCTURE.md
+- [x] docs/PROJECT_STATUS.md
+- [x] docs/IMPLEMENTATION_AUDIT.md
+- [x] docs/FULL_L2_REPLAY_CATALOG_PLAN.md
+- [x] docs/OPERATIONS.md
+- [x] docs/AI_WORKFLOW.md
+- [x] CHANGELOG.md
+- [x] Relevant feature docs: ARCHITECTURE.md, REPLAY_STORE.md,
+  DAILY_BUILD_PIPELINE.md, VALIDATION.md, CHANGE_AUDIT.md.
+
+### Docs updated
+- [x] CHANGELOG.md
+- [x] README.md
+- [x] docs/PROJECT_STATUS.md
+- [x] docs/REPO_STRUCTURE.md
+- [x] Relevant feature docs: ARCHITECTURE.md, OPERATIONS.md,
+  DAILY_BUILD_PIPELINE.md, REPLAY_STORE.md, IMPLEMENTATION_AUDIT.md, VALIDATION.md.
+- OPERATIONS.md contains the exact audited future production roots, preflight,
+  private backups, bootstrap limitation, supervised acceptance and rollback.
+  No new docs file/folder. Root helper is explicitly contract-amended.
+
+### Status / validation impact
+- Validated status changed: no production or broad semantic promotion.
+- Deferred status changed: no; historical recovery, production acceptance,
+  top50/multi-day/v2.0.0, archive/import and transactional deletion stay deferred.
+- New claims added: development implementation and deterministic synthetic tests only.
+- Evidence: focused 202 passed; full locked suite 961 passed, 3 skipped;
+  retirement smoke built 14 depth/7 trades, then skipped_valid; routine/audit/
+  deep integrity passed; strict retirement full-L2 comparison passed every gate.
+- VERSION, pyproject.toml and uv.lock unchanged: this is an unreleased development
+  fix, not a release or a dependency change. Additive readiness contract 1 does
+  not change row normalization or require ordinary v2.0.1 partitions to rebuild;
+  historical v2.0.0 reading/auditing and replacement policy remain unchanged.
+
+### Tests run
+```bash
+uv lock --check
+uv sync --frozen --no-default-groups --extra reconstruction --group dev
+.venv/bin/python -m compileall -q recording_coverage.py recorder.py storage.py pipeline stores validation tests/test_recording_coverage.py
+git diff --check
+.venv/bin/python -m pytest -q tests/test_recording_coverage.py tests/test_replay_depth_repartitioning.py tests/test_replay_compression_race.py tests/test_daily_backlog_lifecycle.py tests/test_replay_store.py tests/test_writer_backpressure.py tests/test_staging_publish.py tests/test_repo_structure.py tests/test_agent_infrastructure.py
+# 202 passed; existing dependency/datetime deprecation warnings.
+.venv/bin/python -m pytest -q tests/
+# 961 passed, 3 skipped; 13 existing deprecation warnings.
+```
+
+After the final operational logging addition, the coverage file was rerun.
+Final logs and synthetic evidence are external under
+`/tmp/cryptorecorder-retirement-20261008/`; generated data is not committed.
+The full suite includes byte-identical Parquet output under retirement versus
+ordinary readiness, pre-feed durable start checks, native failure/watchdog
+checks, preexisting-hour refusal, portable/custom-root checks, provenance
+corruption, final-directory-fsync failure and same-byte marker replacement.
+
+### Validation CLIs run
+
+The deterministic temporary fixture was created with
+`runpy.run_path('tests/test_recording_coverage.py')['make_fixture'](Path('/tmp/cryptorecorder-retirement-20261008/final-smoke'), depth_updates=True)`
+plus fixture-local exchangeInfo. No journal or production session was certified.
+`pipeline.daily_build.run_backlog` ran twice with that fixture's exact raw,
+coverage, replay and report roots, date 2026-01-01, one backlog/build date and
+schema 2: first built (14/7), second skipped_valid (14/7).
+
+```bash
+.venv/bin/python -m validation.audit_replay_store \
+  --replay-root /tmp/cryptorecorder-retirement-20261008/final-smoke/replay \
+  --date 2026-01-01 --venues BINANCE_SPOT --symbols ADAUSDT \
+  --report-path /tmp/cryptorecorder-retirement-20261008/final-smoke/audit.json
+# Exit 0; row counts/checksums match; sorted; no duplicate keys/errors;
+# readiness evidence present/valid. audit_partition_deep returned [].
+
+CRYPTO_RECORDER_DATA_ROOT=/tmp/cryptorecorder-retirement-20261008/final-smoke/raw \
+CRYPTO_RECORDER_COVERAGE_ROOT=/tmp/cryptorecorder-retirement-20261008/final-smoke/coverage \
+.venv/bin/python -m validation.validate_catalog_equivalence \
+  --date 2026-01-01 --symbols ADAUSDT --venues BINANCE_SPOT \
+  --data-root /tmp/cryptorecorder-retirement-20261008/final-smoke/raw \
+  --work-root /tmp/cryptorecorder-retirement-20261008/final-equivalence \
+  --old-catalog-root /tmp/cryptorecorder-retirement-20261008/final-equivalence/old \
+  --replay-root /tmp/cryptorecorder-retirement-20261008/final-equivalence/replay \
+  --new-catalog-root /tmp/cryptorecorder-retirement-20261008/final-equivalence/new \
+  --report-path /tmp/cryptorecorder-retirement-20261008/final-equivalence/report.json \
+  --profile full_l2 --schema-version 2 --overwrite
+# Exit 0 / passed: instrument identity/precision, 7/7 trades,
+# 35/35 flattened deltas, 14/14 Depth10, 7/7 checkpoints, continuity,
+# fences and raw/replay metadata all match unchanged convert_day.py.
+
+.venv/bin/python -m validation.audit_change_compliance --staged
+# Required PASS before commit.
+```
+
+Earlier development evidence is preserved: the first equivalence CLI invocation
+omitted required output roots and exited at argparse; a flat snapshot-only raw
+fixture then failed depth/checkpoint equivalence (reference did not consume its
+flat book payload). A new native-shaped seed/update fixture passed all gates.
+No converter/oracle rule was changed to make the comparison pass.
+
+### Known limitations / out of scope
+- Worktree `/home/zsom/CryptoRecorder-retirement`, branch
+  `fix/recorder-retirement-coverage-evidence`, starts at origin/main 3999d4b,
+  including the required merged compression/lifecycle fix. The original dirty
+  reconstruction worktree was preserved. No push, merge, SSH, server/data
+  access, unit/env edit or deployment occurred.
+- No edits to convert_day.py, phase2_depth.py, native_trades.py, raw record
+  schemas, on-disk naming, depth event-time repartitioning or trade semantics.
+- Physical scope closure is not market continuity. Evidence is unsigned and
+  assumes all dataset writers use one retained marker-enabled ledger.
+- The pre-deployment process has no start marker. Historical October 1/2
+  deferrals and inherited/bootstrap hourly files cannot be retroactively certified.
+- This initial contract conservatively refuses multi-owner/ambiguous inputs,
+  late retirement, unknown handoffs and evidence bounds. Ledger maintenance,
+  long-session size/performance acceptance and active root rebinding remain
+  future work. Whole-ledger embedding adds manifest overhead, unbenchmarked
+  on production sessions. Read-only bundle transfer is supported.
+- Production rollout/restart acceptance and broad top50/multi-day/full-L2
+  equivalence remain pending; no Syncthing configuration/archive/import,
+  deletion, persistent catalog, feature/label store, v2.0.0 declaration or
+  historical recovery was implemented.
 
 ## 2026-10-07 — Repair replay root coexistence and raw compression races
 

@@ -25,6 +25,7 @@ These are the only Python entrypoints and project files permitted at the root:
 | `phase2_depth.py` | `BinanceNativeDepthRecorder` — depth_v2 recording (core recorder module, never change without explicit task allowance) |
 | `native_trades.py` | `BinanceNativeTradeRecorder` — trade_v2 recording (core recorder module, never change without explicit task allowance) |
 | `storage.py` | Hourly-rotated JSONL(.zst) file writer (core recorder module, never change without explicit task allowance) |
+| `recording_coverage.py` | Dependency-free recorder session evidence contract and shared retirement-proof reader; no CLI |
 | `binance_universe.py` | Universe selection by 24h quote volume + futures precheck |
 | `health_monitor.py` | Publishes `state/heartbeat.json` |
 | `disk_monitor.py` | Replay-aware filesystem/capacity monitoring and non-destructive raw-retention planning |
@@ -404,8 +405,13 @@ replay_store -> pipeline.reconstruct_selected_catalog -> temporary catalog
 
 ## Amendment Log
 
+`recording_coverage.py` is a root-level, dependency-free recorder state-contract
+helper shared by recorder/storage and replay readiness. It owns no CLI, raw
+schema, replay encoding, or catalog semantics.
+
 | Date | Change |
 |---|---|
+| 2026-10-08 | Allow root `recording_coverage.py` for durable session evidence and its shared fail-closed reader; recorder lifecycle state does not belong in build-only `pipeline/` or replay-only `stores/`. No new folder or docs file. |
 | 2026-06-17 | Initial structure contract created; `validators/` removed, `converter/trade_coverage.py` added; audit CLIs moved from `pipeline/` to `validation/` |
 | 2026-06-17 | Added AI/deployment infrastructure: root files `AGENTS.md`, `VERSION`, `CHANGELOG.md`; `.github/copilot-instructions.md`; deployment/status docs; per-service systemd units; `scripts/deploy_linux_server.sh`; `tests/test_agent_infrastructure.py` |
 | 2026-07-09 | Added mandatory change-audit infrastructure: `docs/CHANGE_AUDIT.md`; `validation/audit_change_compliance.py`; `.githooks/pre-commit`; AGENTS.md Section 6; AI_WORKFLOW.md Step 7 |

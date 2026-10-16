@@ -236,3 +236,50 @@ and 129,824 trade rows, routine/deep validation passed, and the second
 invocation returned `skipped_valid`. Its highest peak was 1,196,359,680 bytes
 under the 12 GiB/zero-swap wrapper, with no pressure or OOM event. This does
 not validate the installed production service.
+
+## Missing D+1 and intentional symbol retirement
+
+The existing closed-T00 and strict closed-final-hour routes are unchanged.
+Only a truly absent D+1 depth directory enables the additional schema-v2
+retirement route. An existing but incomplete/ambiguous directory is deferred
+under the existing policy; it is never reinterpreted as retirement.
+
+Both build CLIs accept `--coverage-root PATH`. The configured default is used
+only for the configured raw root. A custom `--data-root` requires explicit
+`--coverage-root`; missing evidence remains `deferred_not_ready`. An immutable
+clean selected-session final, a continuous excluding successor chain, elapsed
+horizon, and exact compressed raw ownership are required. No journal, cached
+universe, mtime, or absent directory substitutes for this evidence.
+
+Partition reports expose `readiness_mode` (`next_day_t00`,
+`next_day_final_hour`, `clean_retirement_evidence`, or a precise deferred mode).
+Retirement builds/reuse expose `readiness_evidence_sha256`. They retain the
+normal `built`/`skipped_valid` outcomes. Untrusted/missing/busy evidence defers;
+generic I/O or evidence mutation during construction fails without an evidence
+retry. Existing safe raw representation retries stay bounded at three.
+
+A retirement-backed partition preserves contract version, ledger payloads and
+exact marker hashes, dataset/session identity, horizon, and exact raw bindings
+in its manifest. Reuse checks the preserved evidence against the live supplied
+ledger and independently verifies source identity. A transferred read-only
+bundle may be explicitly supplied, but every selected raw file must match.
+Historical October 1/2 partitions lacking this contract remain deferred.
+
+
+New retirement manifests use readiness contract 2: only the consecutive owner/
+successor records required through the horizon, stored once with an integrity
+digest reference. Contract-1 published evidence remains valid and is reused
+without rewriting it. Whole retained marker payloads cannot be redacted under
+the unchanged ledger hashes; long relevant sessions can still enlarge proofs.
+
+Routine configured-root builds need no new flag or enable setting. Keep the
+same persistent coverage ledger across deployments; custom raw roots require
+explicit `--coverage-root`. There is no automatic evidence or retired-partition
+expiration, and the seven-day raw-retention value is only proof-plan grace.
+
+Replay conversion no longer blocks recorder evidence publication. A recorder
+start/final during a retirement-backed attempt causes an evidence-change
+failure and handled staging cleanup; rerun that date after inspecting reports.
+Recorder start/final lock contention waits are bounded to two seconds/41
+attempts; see OPERATIONS.md. Ordinary D+1 behavior and the three-attempt raw
+compression policy remain unchanged.
