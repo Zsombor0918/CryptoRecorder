@@ -93,6 +93,73 @@ An entry may be skipped **only** for:
 - <or "none — task fully completed">
 ```
 
+## 2026-10-16 — retirement branch rebase onto current main
+
+### Change summary
+- Rebase the two retirement commits onto `origin/main` at `53771c9`.
+- Resolve the audit-log insertion conflicts by retaining every complete entry
+  in date order. There were no source-code conflicts.
+- Verify that retirement source files exactly match the pre-rebase branch and
+  that selected reconstruction source/tests exactly match current main.
+
+### Files/packages touched
+- `docs/CHANGE_AUDIT.md` (conflict resolution and this integration record).
+- Existing retirement commits replayed without source-code changes.
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] docs/REPO_STRUCTURE.md
+- [x] docs/PROJECT_STATUS.md
+- [x] docs/IMPLEMENTATION_AUDIT.md
+- [x] docs/FULL_L2_REPLAY_CATALOG_PLAN.md
+- [x] docs/OPERATIONS.md
+- [x] docs/AI_WORKFLOW.md
+- [x] CHANGELOG.md
+- [x] relevant feature docs: REPLAY_STORE.md, DAILY_BUILD_PIPELINE.md,
+  and the main/retirement audit entries retained by conflict resolution.
+
+### Docs updated
+- [x] docs/CHANGE_AUDIT.md
+- No docs update required because: the existing feature documentation and
+  CHANGELOG.md entries were preserved; this audit-only integration record
+  introduces no additional product behavior, structure or status change.
+
+### Status / validation impact
+- Validated status changed: no
+- Deferred status changed: no
+- New claims added: no production or broader equivalence claims.
+- Evidence for any new validation claim: synthetic integration checks below.
+
+### Tests run
+```bash
+uv lock --check
+UV_PROJECT_ENVIRONMENT=/home/zsom/.cache/cryptorecorder-replay-dev-env uv sync --frozen --no-default-groups --extra reconstruction --group dev
+/home/zsom/.cache/cryptorecorder-replay-dev-env/bin/python -m pytest -q tests/test_recording_coverage.py tests/test_replay_depth_repartitioning.py tests/test_replay_compression_race.py tests/test_daily_backlog_lifecycle.py tests/test_replay_store.py tests/test_writer_backpressure.py tests/test_staging_publish.py tests/test_repo_structure.py tests/test_agent_infrastructure.py tests/test_reconstruct_selected_catalog.py tests/test_replay_catalog_reconstruct.py tests/test_catalog_equivalence.py
+/home/zsom/.cache/cryptorecorder-replay-dev-env/bin/python -m pytest -q tests/
+```
+- Focused: 291 passed, 1 skipped. Full suite: 1002 passed, 3 skipped.
+- `git range-diff` showed only audit-entry context differences between the
+  original and replayed commits; explicit source comparisons were identical.
+
+### Validation CLIs run
+```bash
+# Locked Python, temporary synthetic fixture only. Run daily_build twice:
+python -m pipeline.daily_build --date 2026-01-01 --symbols ADAUSDT --venues BINANCE_SPOT --schema-version 2 --backlog-days 1 --max-build-dates 1 --data-root /tmp/cryptorecorder-retirement-rebase-cwlj4yr6/fixture/raw --coverage-root /tmp/cryptorecorder-retirement-rebase-cwlj4yr6/fixture/coverage --replay-root /tmp/cryptorecorder-retirement-rebase-cwlj4yr6/fixture/replay --report-root /tmp/cryptorecorder-retirement-rebase-cwlj4yr6/report-built
+# Second invocation uses report-reuse as report-root.
+python -m validation.audit_replay_store --replay-root /tmp/cryptorecorder-retirement-rebase-cwlj4yr6/fixture/replay --date 2026-01-01 --symbols ADAUSDT --venues BINANCE_SPOT --report-path /tmp/cryptorecorder-retirement-rebase-cwlj4yr6/audit.json
+CRYPTO_RECORDER_DATA_ROOT=/tmp/cryptorecorder-retirement-rebase-cwlj4yr6/fixture/raw CRYPTO_RECORDER_COVERAGE_ROOT=/tmp/cryptorecorder-retirement-rebase-cwlj4yr6/fixture/coverage python -m validation.validate_catalog_equivalence --date 2026-01-01 --symbols ADAUSDT --venues BINANCE_SPOT --data-root /tmp/cryptorecorder-retirement-rebase-cwlj4yr6/fixture/raw --work-root /tmp/cryptorecorder-retirement-rebase-cwlj4yr6/equivalence --old-catalog-root /tmp/cryptorecorder-retirement-rebase-cwlj4yr6/equivalence/old --replay-root /tmp/cryptorecorder-retirement-rebase-cwlj4yr6/equivalence/replay --new-catalog-root /tmp/cryptorecorder-retirement-rebase-cwlj4yr6/equivalence/new --report-path /tmp/cryptorecorder-retirement-rebase-cwlj4yr6/equivalence/report.json --profile full_l2 --schema-version 2
+```
+- Build/reuse: `built`, then `skipped_valid`, both 14 depth/7 trades.
+- Replay audit: valid evidence, matching counts/checksums, no errors.
+- Synthetic full-L2 equivalence: passed against unchanged `convert_day.py`.
+
+### Known limitations / out of scope
+- No merge into main, production operation, deployment, real recorder run,
+  raw-data mutation or deletion. Synthetic results do not establish production
+  performance or broader top50/multi-day full-L2 acceptance.
+- GitHub topic-branch history is updated only with an explicit expected-SHA
+  lease; the original tip remains available as a local backup ref.
+
 ## 2026-10-16 — bound retirement proof size and recorder coordination
 
 ### Change summary
