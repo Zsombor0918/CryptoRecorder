@@ -84,6 +84,33 @@ def test_t00_to_t06_retirement_build_audits_and_reuses(fixture):
     assert not list(fixture.replay.rglob(".staging*"))
 
 
+def test_segmented_retirement_keeps_exact_ownership_and_inventory_bound(fixture):
+    # Add the authorized filename representation without changing raw records
+    # or weakening any single-owner predicate. This is synthetic evidence only.
+    final = copy.deepcopy(fixture.final)
+    for channel in ("depth_v2", "trade_v2"):
+        relative = f"{VENUE}/{channel}/{SYMBOL}/{DATE}/{DATE}T06.jsonl.zst"
+        segment = relative.replace("T06.jsonl", "T05.segment-000001.jsonl")
+        (fixture.raw / relative).rename(fixture.raw / segment)
+        final["raw_files"][segment] = final["raw_files"].pop(relative)
+    write_payload(final_path(fixture), final)
+    assert build(fixture)["outcome"] == "built"
+    assert build(fixture)["outcome"] == "skipped_valid"
+    segment_path = fixture.raw / next(p for p in final["raw_files"] if "segment-" in p)
+    original = segment_path.read_bytes()
+    segment_path.write_bytes(original[:-1] + bytes([original[-1] ^ 1]))
+    assert build(fixture)["outcome"] != "skipped_valid"
+    segment_path.write_bytes(original)
+    # The former 24-hour x 3-representation bound remains 72 entries. Extra
+    # segments consume that budget; no silent increase or deletion is allowed.
+    directory = segment_path.parent
+    for n in range(66):
+        (directory / f"{DATE}T06.segment-{n + 1:06d}.jsonl.zst").write_bytes(original)
+    assert len(list(directory.iterdir())) == 73
+    with pytest.raises(coverage.CoverageError, match="inventory bound"):
+        coverage._retirement_inventory(VENUE, SYMBOL, DATE, fixture.raw)
+
+
 def test_closed_next_day_route_does_not_read_ledger(fixture):
     day = "2026-01-02"
     path = fixture.raw / VENUE / "depth_v2" / SYMBOL / day / f"{day}T00.jsonl.zst"

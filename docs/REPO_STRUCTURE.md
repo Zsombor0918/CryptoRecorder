@@ -225,6 +225,42 @@ recorder.log
 
 ## Rules
 
+### Additive same-hour raw filenames (Issue #30, 2026-10-17)
+
+The directory hierarchy and historical `YYYY-MM-DDTHH.jsonl[.zst|.gz]`
+names remain unchanged. One hourly basename cannot represent several immutable
+recording sessions or rotations: rewriting or appending its compressed bytes
+invalidates prior coverage and replay fingerprints. The task explicitly
+authorizes this narrow additive filename amendment on the development branch.
+
+New allocations use the original name when the hour has no artifacts, otherwise
+`YYYY-MM-DDTHH.segment-NNNNNN.jsonl[.zst]`, where NNNNNN is a six-digit positive
+ordinal (000001–999999), greater than every existing/reserved segment for that
+hour. Existing gzip segments remain readable. Allocation is exclusive under a
+brief directory advisory lock, shared with compression publication/removal;
+no existing plain/compressed file is reopened for writing. The canonical hour
+sorts first, then fixed-width segment numbers, independent of compression suffix.
+Stream/session counters retain event-order authority, with deterministic raw
+enumeration supplying the existing tie-breaker; timestamps do not infer order.
+
+Both existing readers discover `*.jsonl*`; the additive names need no new
+directory discovery or record schema. Coverage final validation recognizes
+exact segment names and retains exact per-session paths/SHA-256/size. Replay
+representation-transition recognition accepts the same exact names, preserving
+whole-attempt retries and each segment's distinct logical identity/ranges.
+Legacy conversion rejects sibling representation ambiguity, preventing duplicate
+ingestion after an interrupted publication. Retirement remains conservative:
+multi-owner dates still defer, and the 72-entry raw-directory bound is unchanged.
+
+Compression uses a sibling `.compress-<source-stem>-<32-hex-nonce>.pending` file
+(never a `*.jsonl*` input). A pending artifact blocks readers/validation
+until inspected; handled prepublication
+failures remove only their own temporary output. Publication hard-links the
+closed, verified, fsynced temporary inode to the final name without replacement,
+fsyncs the directory, verifies the final identity, and only then removes the
+source. Crash residue/dual representations remain visible failures, never
+automatic repair or ownership reassignment. No historical manifest is rewritten.
+
 ### No New Docs Files Without Contract Amendment
 
 The docs structure is intentionally **fixed at 12 files**. Before creating any
@@ -411,6 +447,7 @@ schema, replay encoding, or catalog semantics.
 
 | Date | Change |
 |---|---|
+| 2026-10-17 | Issue #30 explicitly authorizes additive sequential same-hour raw segment filenames and non-input compression pending artifacts, preserving existing directories, historical names, record schemas and exact coverage/source identities. No new top-level package or documentation file. |
 | 2026-10-08 | Allow root `recording_coverage.py` for durable session evidence and its shared fail-closed reader; recorder lifecycle state does not belong in build-only `pipeline/` or replay-only `stores/`. No new folder or docs file. |
 | 2026-06-17 | Initial structure contract created; `validators/` removed, `converter/trade_coverage.py` added; audit CLIs moved from `pipeline/` to `validation/` |
 | 2026-06-17 | Added AI/deployment infrastructure: root files `AGENTS.md`, `VERSION`, `CHANGELOG.md`; `.github/copilot-instructions.md`; deployment/status docs; per-service systemd units; `scripts/deploy_linux_server.sh`; `tests/test_agent_infrastructure.py` |

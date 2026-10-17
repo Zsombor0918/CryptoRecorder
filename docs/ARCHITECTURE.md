@@ -742,7 +742,7 @@ and exact original record hashes remain authoritative. See REPLAY_STORE.md
 for the retained owner/handoff-final size limitation.
 
 Bounds are 4,096 ledger entries, 64 MiB of serialized ledger records, 250,000
-session file identities, and 72 entries per selected raw-hour directory.
+session file identities, and 72 entries per selected raw day directory.
 Overflow fails closed and requires a separately designed ledger maintenance
 procedure; no automatic evidence pruning is implemented.
 
@@ -753,5 +753,69 @@ additionally verifies the ledger head's local raw-root binding (path/device/
 inode digest), preventing a copied ledger from silently starting another
 recorder. The reader supports a read-only transferred bundle; recorder root
 migration/rebinding is separate work. See OPERATIONS.md for bootstrap and
-rollback limits. Raw JSONL schemas, naming, event-time selection, replay rows,
-and `convert_day.py` are unchanged.
+rollback limits. Raw JSONL schemas, event-time selection, replay rows, and `convert_day.py`
+are unchanged; the additive Issue #30 naming extension is described below.
+
+
+## Same-hour raw preservation (Issue #30)
+
+The additive filename contract is recorded in REPO_STRUCTURE.md. The first
+allocation keeps `YYYY-MM-DDTHH.jsonl`; every subsequent allocation for the
+same venue/channel/symbol/day/hour uses `.segment-000001.jsonl`, then
+`.segment-000002.jsonl`, etc. Existing artifacts are never appended, rewritten,
+renamed, or assigned to a newer session. Plain, Zstandard and historical gzip
+representations all reserve their ordinal; an exclusive create and brief
+Linux directory advisory lock serialize allocation with publication/removal.
+Unsafe existing hour entries or exhausted ordinals fail visibly. The existing
+recorder lifetime ledger lock still prevents concurrent recorder processes.
+No extra raw lock file or external dependency is introduced.
+
+The hourly name cannot safely represent several immutable artifacts. Safe
+continuation would require rewriting previously hashed compressed bytes, or
+mutating an old plain file and mixing ownership; appending Zstandard frames
+would likewise invalidate previous hashes and introduce interrupted-append
+ambiguity. Separate ordered segments preserve both bytes and identities without
+a raw record/schema change. Counters retain event ordering; canonical-first,
+fixed-width ordinal enumeration preserves the existing raw-index tie-breaker
+without using receive timestamps to infer ordering. Ordinals are monotonic
+among retained/reserved artifacts, not time-derived or session-ID encodings.
+The ledger assigns each segment by its exact touched relative path and bytes.
+
+Writers flush/fsync/close before scheduling the existing compression workers.
+A worker locks its source inode, fsyncs it, streams compression to an exclusive
+`.compress-<source-stem>-<nonce>.pending` sibling with Zstandard frame checksum,
+fsyncs the closed output, and verifies decoded SHA-256 against source bytes.
+It atomically hard-links the temporary inode to the final `.jsonl.zst` name;
+any existing destination, including a symlink, prevents publication. It fsyncs
+the directory, removes/fsyncs its temporary link, checks the final single-link
+artifact with the unchanged coverage identity validator, rechecks source
+metadata, and only then unlinks the source and fsyncs the directory again.
+The potentially large hashing/compression reads hold no directory lock.
+
+Handled prepublication failures remove only the worker's disposable output,
+retaining source bytes. After publication, uncertainty retains the source and
+any remaining pending/dual representations; no completed identity is cached.
+A crash or shutdown timeout can leave work in flight or residue. New allocations
+never reuse its source identity. No automatic recovery infers clean closure.
+Readers reject pending files and representation ambiguity before consuming
+records; a live pending file can safely defer/fail a replay attempt, requiring
+a later invocation after completion/inspection. Existing bounded whole-attempt
+plain-to-compressed retries also recognize exact segment names.
+
+Legacy full-L2 and replay readers already enumerate `*.jsonl*` in lexical order:
+old hourly files and ordered segments coexist and are read exactly once when
+unambiguous. T00/T23 readiness now checks **all segments** of the boundary hour;
+a compressed canonical file cannot mask an active same-hour segment. The
+existing later-hour closure policy, event-time repartitioning, source range
+semantics, Parquet schemas and builder versions stay intact. Historical
+single-hour files and manifests need no rewrite or migration.
+
+Coverage final validation accepts only the exact positive six-digit extension,
+with all existing path, universe, hash, size, ownership and closure predicates.
+Earlier session evidence remains immutable. Retirement still requires a single
+owner of all selected raw inputs; multi-session dates conservatively defer
+without D+1. Its 72-entry directory limit is unchanged: a closed 24-hour day
+leaves at most 48 extra segment entries, fewer during transient coexistence.
+Overflow remains a blocker, not a reason to delete evidence or raise the limit.
+Pre-fix coverage validators reject new segment final records; update consumers
+before producing segments, and follow OPERATIONS.md for rollback constraints.

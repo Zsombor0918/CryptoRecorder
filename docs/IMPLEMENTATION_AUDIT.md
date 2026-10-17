@@ -1424,3 +1424,45 @@ outside the repository at
 `measurements.json`. The matching CHANGE_AUDIT entry records test and CLI
 results. No production command, real recorder, existing raw modification,
 service action, dependency change, merge or push was performed.
+
+
+## 2026-10-17 development correction — same-hour raw preservation (#30)
+
+At baseline `ac9d51f`, a temporary two-session storage/ledger regression failed:
+A's depth SHA-256 `50fe9b536eba39a1b55b8403684194f586c3bf1bc53cb180b1a2603661381653`
+became `2bf8c1dd75474f7b01b63cd63a87850cd1c646a87b69166918596cb8f6d10596`;
+trade `edd0932f055a45640cf574e8014a25bf80447772568c6816d4c384ef2e7cd5bf`
+became `b1a018899d289a45ee615cbb27301502c92eb9c893944181efb9dc1293ffa0ae`.
+Depth identities (1,1)/(1,2) and trade (1,1) vanished, leaving only session 2.
+The earlier final no longer described the actual bytes. This demonstrates the
+code path; it does not prove that production historical loss occurred.
+
+`storage.py` now reserves fresh canonical/positive six-digit segment paths,
+never inherits an existing file, and uses the existing compression workers to
+publish verified, fsynced files without replacement. Exact filename validation
+in `recording_coverage.py`, raw representation-transition recognition and
+boundary-hour readiness are extended without weakening ownership or retirement.
+Legacy readers reject pending/dual representations; source identities retain
+per-segment checksums and deterministic contribution ranges. No recorder/feed,
+raw record, Parquet schema, normalization builder or convert_day.py change.
+
+Baseline locked suite: 1002 passed, 3 skipped. Final locked suite: 1015 passed,
+3 skipped; focused storage/coverage/replay/reconstruction/structure set:
+187 passed, 1 skipped. Fault injection covers pre-existing destinations,
+publication-time collision, temporary fsync and post-publication fsync;
+sources/prior archives survive and incomplete output is not finalized.
+Two concurrent allocators and twelve same-hour rotations with in-flight real
+compression preserve distinct paths and ordered records. New/old replay builds
+are byte-deterministic; segmented exact-transition retries cover pre-identity,
+streaming and post-identity. Modified evidence still fails, and 73 raw-directory
+entries still exceed the unchanged 72-entry retirement bound.
+
+External fixture/evidence root:
+`/tmp/cryptorecorder-issue30-20261017-_5vxnep8`. Daily CLI: built then
+skipped_valid (4 depth, 2 trades), replay audit: exact counts/checksums, ordered,
+zero duplicate sequence keys; explicit deep integrity passes. Full-L2 CLI:
+passed, 2/2 TradeTicks, 10/10 flattened deltas, 4/4 Depth10, 7/7 checkpoints,
+exact instruments/continuity/fences/raw metadata. This tiny synthetic fixture
+contains real writer-generated canonical and segmented archives plus explicit
+closed D+1 witnesses. It is not a production-day or real-data acceptance gate.
+See CHANGE_AUDIT.md for commands, intermediate failures and remaining limits.

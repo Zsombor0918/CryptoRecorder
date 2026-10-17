@@ -512,3 +512,35 @@ def test_schema_v0_v1_v2_use_identical_repartitioned_input(tmp_path):
         assert result["status"] == "success", (version, result)
         counts[version] = result["depth_count"]
     assert counts[0] == counts[1] == counts[2] == 2
+
+
+def test_readiness_requires_every_first_and_last_hour_segment_closed(tmp_path):
+    from pipeline.build_replay_store import check_depth_repartition_readiness
+    import zstandard as zstd
+
+    directory = tmp_path / "BINANCE_SPOT/depth_v2/ADAUSDT/2026-01-02"
+    directory.mkdir(parents=True)
+    def reason(strict=False):
+        return check_depth_repartition_readiness("BINANCE_SPOT", "ADAUSDT", "2026-01-01", tmp_path,
+                                                require_complete_next_day=strict)
+    for hour in ("00", "23"):
+        canonical = directory / f"2026-01-02T{hour}.jsonl.zst"
+        canonical.write_bytes(zstd.ZstdCompressor().compress(b"{}\n"))
+    first = directory / "2026-01-02T00.segment-000001.jsonl"
+    first.write_text("{}\n")
+    # A later *hour* still proves earlier plain segments closed, as before.
+    assert reason() is None
+    last = directory / "2026-01-02T23.segment-000001.jsonl"
+    last.write_text("{}\n")
+    assert reason(True) is not None
+    last.with_suffix(".jsonl.zst").write_bytes(zstd.ZstdCompressor().compress(last.read_bytes()))
+    assert "ambiguous" in reason(True)
+    last.unlink()
+    assert reason(True) is None
+    # With no later hour, the first-hour segment itself must be closed.
+    for path in directory.glob("2026-01-02T23*"):
+        path.unlink()
+    assert reason() is not None
+    first.with_suffix(".jsonl.zst").write_bytes(zstd.ZstdCompressor().compress(first.read_bytes()))
+    first.unlink()
+    assert reason() is None

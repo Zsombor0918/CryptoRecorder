@@ -408,3 +408,13 @@ shutdown/successor overlap and lock timeout tests verify that conversion does
 not retain a shared ledger lock, the canonical rename is guarded, changed
 evidence prevents publication, and lock contention retries are bounded.
 Synthetic timings and full-L2 CLI results remain development evidence only.
+
+
+Issue #30 storage regressions in `tests/test_storage_rotation.py` exercise two
+same-hour writer/ledger sessions, in-flight rotations, concurrent allocation,
+no-replace publication and fsync faults, and mixed legacy/segment replay
+source ranges/determinism. Existing retirement, representation-transition and
+boundary-readiness test files extend their checks to exact segment names;
+no assertion or closure bound is weakened. The mandatory full suite and tiny
+synthetic full-L2 CLI comparison are recorded in CHANGE_AUDIT.md. Real production
+restart/durability and broader real-data gates remain separate.
