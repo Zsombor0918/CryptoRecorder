@@ -356,3 +356,20 @@ raw schemas/layout, replay encoding, and `convert_day.py` remain intact.
 Deployment and real-server closure/retirement acceptance remain pending;
 historical October 1/2 partitions without markers remain deferred. This adds
 no top50/multi-day, archive, Syncthing, restore, or v2.0.0 validation claim.
+
+
+## Issue #30 same-hour preservation — development checkpoint (2026-10-17)
+
+Same-hour overwrite was reproduced using temporary native-shaped records: both
+session-A archives were replaced by session B, invalidating earlier ledger
+hashes. The development fix uses exclusive sequential segments and verified,
+atomic no-replace compression publication, retaining historical hourly input
+compatibility. The full locked suite passed 1015 tests with 3 pre-existing
+real-data skips. A tiny mixed hourly/segmented ADAUSDT fixture built/reused,
+passed replay audit/deep integrity and full-L2 CLI equivalence against unchanged
+`convert_day.py` (2 trades, 10 flattened deltas, 4 Depth10, 7 checkpoints).
+
+This is synthetic development evidence only. Production deployment, actual
+historical-loss forensics/repair, real-server restart/durability/performance,
+Issue #31 and broad top50/multi-day acceptance remain outside this change.
+Multi-owner retirement still defers; no coverage predicate or bound was relaxed.

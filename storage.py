@@ -4,10 +4,16 @@ Storage management: file rotation, compression, and writing.
 from __future__ import annotations
 
 import asyncio
+import fcntl
+import hashlib
 import json
 import logging
 import os
+import re
+import stat
 import time
+import uuid
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
@@ -34,6 +40,21 @@ from config import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def _raw_directory_lock(directory: Path):
+    """Serialize allocation with publication, never the compression work itself."""
+    fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
+def _file_stamp(info):
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
 
 
 class CompressionManager:
@@ -95,20 +116,69 @@ class CompressionManager:
         loop = asyncio.get_running_loop()
 
         def compress() -> dict:
-            dst = Path(f"{file_path}.zst")
-            with open(file_path, "rb") as f_in:
-                with zstd.open(str(dst), "wb", cctx=zstd.ZstdCompressor(level=3)) as f_out:
-                    f_out.write(f_in.read())
             from recording_coverage import file_identity, _fsync_dir
-            fd = os.open(dst, os.O_RDONLY | os.O_NOFOLLOW)
+
+            dst = Path(f"{file_path}.zst")
+            pending = file_path.with_name(f".compress-{file_path.stem}-{uuid.uuid4().hex}.pending")
+            published = False
+            pending_created = False
             try:
-                os.fsync(fd)
-            finally:
-                os.close(fd)
-            identity = file_identity(dst)
-            os.remove(file_path)
-            _fsync_dir(dst.parent)
-            return identity
+                source_fd = os.open(file_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                with os.fdopen(source_fd, "rb") as f_in:
+                    fcntl.flock(f_in, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    before = os.fstat(f_in.fileno())
+                    if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+                        raise RuntimeError(f"unsafe compression source: {file_path}")
+                    os.fsync(f_in.fileno())
+                    if os.path.lexists(dst) or os.path.lexists(f"{file_path}.gz"):
+                        raise FileExistsError(f"compression destination already exists: {dst}")
+                    # The pending name cannot match any historical *.jsonl* reader.
+                    with pending.open("xb") as raw_out:
+                        pending_created = True
+                        digest = hashlib.sha256()
+                        with zstd.ZstdCompressor(level=3, write_checksum=True).stream_writer(raw_out, closefd=False) as f_out:
+                            for chunk in iter(lambda: f_in.read(128 * 1024), b""):
+                                digest.update(chunk)
+                                f_out.write(chunk)
+                        raw_out.flush()
+                        os.fsync(raw_out.fileno())
+                    decoded = hashlib.sha256()
+                    with zstd.open(pending, "rb") as check:
+                        for chunk in iter(lambda: check.read(128 * 1024), b""):
+                            decoded.update(chunk)
+                    if decoded.digest() != digest.digest():
+                        raise RuntimeError(f"compression verification failed: {file_path}")
+                    identity = file_identity(pending)
+                    with _raw_directory_lock(file_path.parent):
+                        if (_file_stamp(before) != _file_stamp(os.fstat(f_in.fileno())) or
+                                _file_stamp(before) != _file_stamp(file_path.lstat())):
+                            raise RuntimeError(f"compression source changed: {file_path}")
+                        if os.path.lexists(f"{file_path}.gz"):
+                            raise FileExistsError(f"compressed alternative already exists: {file_path}")
+                        # link() is atomic and refuses every pre-existing destination,
+                        # including dangling symlinks; replace()/wb would destroy it.
+                        os.link(pending, dst)
+                        published = True
+                        _fsync_dir(dst.parent)
+                        pending.unlink()
+                        _fsync_dir(dst.parent)
+                    # Retain the existing single-link coverage invariant. The
+                    # potentially large verification read holds no directory lock.
+                    if file_identity(dst) != identity:
+                        raise RuntimeError(f"published compression identity mismatch: {dst}")
+                    with _raw_directory_lock(file_path.parent):
+                        if _file_stamp(before) != _file_stamp(file_path.lstat()):
+                            raise RuntimeError(f"compression source changed: {file_path}")
+                        file_path.unlink()
+                        _fsync_dir(dst.parent)
+                    return identity
+            except BaseException:
+                # After publication retain crash/dual-representation evidence.
+                # Before publication only this invocation's disposable output is removed.
+                if pending_created and not published:
+                    pending.unlink()
+                    _fsync_dir(pending.parent)
+                raise
 
         identity = await loop.run_in_executor(None, compress)
         from recording_coverage import MAX_RAW_FILES
@@ -213,7 +283,9 @@ class FileRotator:
             key_parts = self._parts_from_key(key)
             if key_parts is not None:
                 venue, symbol, channel = key_parts
-                if file_path != self.get_file_path(venue, symbol, channel):
+                canonical = self.get_file_path(venue, symbol, channel)
+                if (file_path.parent != canonical.parent or
+                        file_path.name.split(".", 1)[0] != canonical.stem):
                     return True
 
             elapsed_min = (time.time() - creation_time) / 60
@@ -234,7 +306,11 @@ class FileRotator:
 
             if key in self.file_handles:
                 try:
-                    self.file_handles[key].close()
+                    try:
+                        self.file_handles[key].flush()
+                        os.fsync(self.file_handles[key].fileno())
+                    finally:
+                        self.file_handles[key].close()
                 except Exception as exc:
                     self.closure_errors.append(f"file close failed: {file_path}: {exc}")
                     logger.warning("Error closing file %s: %s", file_path, exc)
@@ -270,10 +346,36 @@ class FileRotator:
 
         async with self.lock:
             if key not in self.file_handles:
-                file_path = self.get_file_path(venue, symbol, channel)
-                if file_path not in self.touched_files and any(os.path.lexists(p) for p in (file_path, Path(f"{file_path}.zst"), Path(f"{file_path}.gz"))):
-                    self.preexisting_files.add(file_path)
-                handle = open(file_path, "a", encoding="utf-8")
+                canonical = self.get_file_path(venue, symbol, channel)
+                from recording_coverage import _fsync_dir, _safe_path
+                _safe_path(canonical.parent, directory=True)
+                with _raw_directory_lock(canonical.parent):
+                    pattern = re.compile(re.escape(canonical.stem) + r"(?:\.segment-([0-9]{6}))?\.jsonl(?:\.zst|\.gz)?")
+                    ordinals = []
+                    # Keep removed/empty paths reserved within this rotator as well.
+                    names = {p.name for p in canonical.parent.iterdir()} | {
+                        p.name for p in self.touched_files if p.parent == canonical.parent}
+                    for name in names:
+                        if not name.startswith(canonical.stem):
+                            continue
+                        match = pattern.fullmatch(name)
+                        if match is None or match.group(1) == "000000":
+                            raise RuntimeError(f"unknown raw hour artifact: {name}")
+                        existing = canonical.parent / name
+                        if os.path.lexists(existing):
+                            _safe_path(existing)
+                        ordinals.append(int(match.group(1) or 0))
+                    ordinal = max(ordinals) + 1 if ordinals else 0
+                    if ordinal > 999999:
+                        raise RuntimeError(f"raw segment ordinal exhausted: {canonical}")
+                    file_path = (canonical if ordinal == 0 else
+                                 canonical.with_name(f"{canonical.stem}.segment-{ordinal:06d}.jsonl"))
+                    handle = open(file_path, "x", encoding="utf-8")
+                    try:
+                        _fsync_dir(file_path.parent)
+                    except BaseException:
+                        handle.close()
+                        raise
                 self.file_handles[key] = handle
                 self.current_files[key] = (file_path, time.time())
                 from recording_coverage import MAX_RAW_FILES
@@ -631,7 +733,7 @@ class StorageManager:
         return files
 
     def coverage_unowned_files(self) -> list[str]:
-        """Existing hourly bytes cannot be retroactively owned by this session."""
+        """Legacy API: exclusive allocation no longer inherits existing raw bytes."""
         return sorted(Path(f"{p}.zst").relative_to(DATA_ROOT).as_posix()
                       for p in self.rotator.preexisting_files
                       if p.relative_to(DATA_ROOT).parts[1] in {DEPTH_V2_CHANNEL, TRADE_V2_CHANNEL})

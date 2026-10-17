@@ -650,3 +650,23 @@ and the normalization builder version (`v2.0.1`) are unchanged. Existing
 v2.0.0 compatibility/replacement policy is unchanged. No ordinary partition
 requires migration. See OPERATIONS.md for locking, persistence and resource
 limits, and IMPLEMENTATION_AUDIT.md for synthetic measurements.
+
+
+## Same-hour raw compatibility (Issue #30)
+
+New raw files can include `.segment-NNNNNN` before `.jsonl`, as authorized in
+REPO_STRUCTURE.md. Canonical-hour-first then fixed-width ordinal enumeration
+preserves deterministic source ranges/tie-breakers; committed stream/session
+counters continue to control event order. Each segment is a separate logical
+source with its own path, exact on-disk SHA-256, size and contribution range.
+No raw record, replay schema, builder-version or manifest migration is required.
+Historical files/partitions stay readable and are not rewritten.
+
+Exact segment plain-to-compressed transitions use the existing bounded
+whole-attempt retries. Pending compression or persistent sibling ambiguity
+fails closed. T00/T23 readiness considers every segment of that boundary hour;
+an older compressed canonical cannot hide an active segment. The ordinary
+D+1 policy and conservative single-owner retirement proof remain unchanged;
+multi-owner dates defer when D+1 is absent. The 72-entry retirement directory
+bound is retained; extra segments consume it. See OPERATIONS.md for recovery,
+rollout and pre-fix validator/rollback limits.

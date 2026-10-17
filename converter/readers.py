@@ -39,7 +39,16 @@ def stream_raw_records(
     day_path = root / venue / channel / symbol / date_str
     if not day_path.exists():
         return
-    for file_path in sorted(day_path.glob("*.jsonl*")):
+    if any(day_path.glob(".compress-*.pending")):
+        raise RuntimeError(f"unfinished raw compression requires inspection: {day_path}")
+    files = sorted(day_path.glob("*.jsonl*"))
+    logical = set()
+    for path in files:
+        name = path.name[:-4] if path.name.endswith(".zst") else path.name[:-3] if path.name.endswith(".gz") else path.name
+        if name in logical:
+            raise RuntimeError(f"ambiguous raw compression variants: {path}")
+        logical.add(name)
+    for file_path in files:
         try:
             if file_path.suffix == ".zst":
                 opener = lambda p=file_path: zstd.open(p, "rt", errors="ignore")

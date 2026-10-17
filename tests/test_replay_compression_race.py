@@ -44,11 +44,16 @@ def _assert_clean(replay: Path) -> None:
 
 
 @pytest.mark.parametrize("phase", ["pre_identity", "stream", "post_identity"])
+@pytest.mark.parametrize("segmented", [False, True])
 def test_exact_compression_transition_restarts_whole_partition(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str, segmented: bool,
 ) -> None:
     raw, replay = tmp_path / "raw", tmp_path / "replay"
     _depth, trade = _raw(raw, SYMBOL)
+    if segmented:
+        segment = trade.with_name(f"{DATE}T00.segment-000001.jsonl")
+        trade.rename(segment)
+        trade = segment
     monkeypatch.setattr(builder.time, "sleep", lambda _seconds: None)
     attempts: list[int] = []
     real_attempt = builder._build_replay_for_symbol_locked
@@ -100,7 +105,7 @@ def test_exact_compression_transition_restarts_whole_partition(
     assert result["depth_count"] == 1
     assert result["trade_count"] == 1
     assert [entry["path"] for entry in manifest["source_identity"]["channels"]["trade_v2"]] == [
-        f"{VENUE}/trade_v2/{SYMBOL}/{DATE}/{DATE}T00.jsonl.zst"
+        f"{VENUE}/trade_v2/{SYMBOL}/{DATE}/{trade.name}.zst"
     ]
     _assert_clean(replay)
 

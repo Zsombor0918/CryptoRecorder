@@ -34,6 +34,13 @@ adjacent-day enclosure. The repository owner preserved that original gate in
 rather than weakening it. `v2.0.0` is not declared, and `convert_day.py`
 remains the production reference for full-L2 Nautilus catalogs.
 
+Raw recording preserves the original hourly filenames and allocates additional
+`.segment-NNNNNN.jsonl[.zst]` files for same-hour restarts/rotations. Compression
+publishes verified files without replacement. Pending/ambiguous output fails
+closed; see [storage compatibility](docs/ARCHITECTURE.md#same-hour-raw-preservation-issue-30)
+and [recovery/rollout](docs/OPERATIONS.md#same-hour-raw-storage-recovery-and-rollout-issue-30).
+This fix is development-tested; production deployment remains pending.
+
 ## Quick Start
 
 ```bash

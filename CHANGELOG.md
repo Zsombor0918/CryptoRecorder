@@ -67,6 +67,16 @@ passes.** Until then, broader full-L2 equivalence stays **deferred** (see
 
 ## [Unreleased]
 
+### Fixed (Issue #30 — same-hour raw preservation)
+- Preserve prior raw archives across restarts/rotations with exclusive sequential
+  `.segment-NNNNNN` filenames under the existing hourly directory hierarchy.
+  Compress to a verified/fsynced pending file and publish atomically without
+  replacement; retain sources/evidence on uncertainty. Extend exact coverage,
+  replay-transition and boundary-hour checks; reject pending/dual raw inputs.
+  Historical names and raw/replay schemas remain compatible. Synthetic replay
+  audit/full-L2 equivalence pass; production deployment/forensics and Issue #31
+  are outside this development fix.
+
 ### Added — recording retirement evidence
 - Durable, versioned recorder start/final evidence under the state root,
   explicit storage closure results and compressed-file hashes, and a

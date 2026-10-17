@@ -62,7 +62,7 @@ def _logical_raw_path(path: Path) -> Path:
 def _is_exact_hour(path: Path) -> bool:
     """Limit transition recovery to an hourly file in its own UTC-day directory."""
     return re.fullmatch(
-        rf"{re.escape(path.parent.name)}T(?:[01][0-9]|2[0-3])\.jsonl",
+        rf"{re.escape(path.parent.name)}T(?:[01][0-9]|2[0-3])(?:\.segment-(?!000000)[0-9]{{6}})?\.jsonl",
         path.name,
     ) is not None
 
@@ -205,6 +205,8 @@ def _iter_consumed_raw_files(channel_dir: Path) -> "list[Path]":
     not replay inputs merely because they happen to live beside the JSONL
     files.
     """
+    if any(channel_dir.glob(".compress-*.pending")):
+        raise RuntimeError(f"unfinished raw compression requires inspection: {channel_dir}")
     return [
         path
         for path in sorted(channel_dir.glob("*.jsonl*"))

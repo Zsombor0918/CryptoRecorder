@@ -368,7 +368,7 @@ def validate_final(start: dict, final: dict) -> None:
         if venue not in VENUES or channel not in {"depth_v2", "trade_v2"} or symbol not in start["universe"].get(venue, []):
             raise CoverageError("raw file outside selected universe")
         datetime.strptime(date, "%Y-%m-%d")
-        if not re.fullmatch(re.escape(date) + r"T(?:[01][0-9]|2[0-3])\.jsonl\.zst", name):
+        if not re.fullmatch(re.escape(date) + r"T(?:[01][0-9]|2[0-3])(?:\.segment-(?!000000)[0-9]{6})?\.jsonl\.zst", name):
             raise CoverageError("raw file is not final compressed hour")
         if not isinstance(identity, dict) or set(identity) != {"sha256", "size_bytes"} or not isinstance(identity["sha256"], str) or not SHA.fullmatch(identity["sha256"]) or type(identity["size_bytes"]) is not int or identity["size_bytes"] <= 0:
             raise CoverageError("invalid raw identity")

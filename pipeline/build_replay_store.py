@@ -126,6 +126,15 @@ def check_depth_repartition_readiness(
             "partition until at least the next day's first hourly raw file "
             "is written."
         )
+    from pipeline.raw_manifest import _assert_no_compression_variants, _is_exact_hour, _logical_raw_path
+
+    def with_segments(base, paths):
+        segments = [p for p in sorted(base.parent.glob(f"{base.stem}.segment-*.jsonl*"))
+                    if p.is_file() and _is_exact_hour(_logical_raw_path(p))]
+        return paths + segments
+
+    if any(next_dir.glob(".compress-*.pending")):
+        return f"unfinished raw compression at {next_dir}; defer until inspected or completed"
     first_hour_base = next_dir / f"{next_date}T00.jsonl"
     first_hour_variants = [
         path
@@ -149,7 +158,10 @@ def check_depth_repartition_readiness(
     # closed .jsonl source. Seeing both variants can mean compression is
     # still in progress (or failed part-way), and stream_raw_records() would
     # select both. Refuse that ambiguous layout.
-    if len(first_hour_variants) != 1:
+    first_hour_variants = with_segments(first_hour_base, first_hour_variants)
+    try:
+        _assert_no_compression_variants(first_hour_variants, context=str(next_dir))
+    except RuntimeError:
         return (
             f"depth_v2 first-hour raw file for {next_date} has multiple "
             f"coexisting variants at {next_dir}: "
@@ -158,8 +170,8 @@ def check_depth_repartition_readiness(
             "stable variant remains."
         )
 
-    first_hour_path = first_hour_variants[0]
-    first_hour_closed = first_hour_path.suffix in {".zst", ".gz"}
+    first_hour_path = next((p for p in first_hour_variants if p.suffix == ".jsonl"), first_hour_variants[0])
+    first_hour_closed = all(p.suffix in {".zst", ".gz"} for p in first_hour_variants)
     if first_hour_closed:
         # The recorder removes the .jsonl source only after the compressed
         # writer has closed successfully, so a sole compressed variant is
@@ -198,15 +210,22 @@ def check_depth_repartition_readiness(
         )
         if path.is_file()
     ]
-    if len(last_hour_variants) != 1:
+    canonical_last_hour_present = bool(last_hour_variants)
+    last_hour_variants = with_segments(last_hour_base, last_hour_variants)
+    try:
+        _assert_no_compression_variants(last_hour_variants, context=str(next_dir))
+        last_hour_unambiguous = True
+    except RuntimeError:
+        last_hour_unambiguous = False
+    if not canonical_last_hour_present or not last_hour_unambiguous:
         return (
             f"offline validation requires exactly one closed last-hour raw "
             f"file for {next_date}, but found "
             f"{[path.name for path in last_hour_variants]} at {next_dir}. "
             "Refusing to treat a partial or ambiguous D+1 scope as complete."
         )
-    last_hour_path = last_hour_variants[0]
-    if last_hour_path.suffix in {".zst", ".gz"}:
+    last_hour_path = next((p for p in last_hour_variants if p.suffix == ".jsonl"), last_hour_variants[0])
+    if all(p.suffix in {".zst", ".gz"} for p in last_hour_variants):
         return None
 
     following_date = _depth_date_shift(next_date, 1)

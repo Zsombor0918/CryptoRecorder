@@ -93,6 +93,171 @@ An entry may be skipped **only** for:
 - <or "none — task fully completed">
 ```
 
+## 2026-10-17 — Issue #30 lossless same-hour raw storage (development only)
+
+### Change summary
+- Reproduce destructive same-hour restart on current main `ac9d51f`, then
+  preserve every session/rotation in an exclusively allocated canonical or
+  sequential `.segment-NNNNNN` artifact. Never reopen pre-existing raw bytes.
+- Publish streamed, decoded-hash-verified, fsynced Zstandard output by atomic
+  no-replace hard link. Retain source until final single-link identity and
+  durable publication are verified. Keep failed/interrupted evidence visible.
+- Extend exact coverage filenames, bounded whole-attempt transition recognition
+  and T00/T23 readiness to segments; reject pending/ambiguous legacy consumption.
+  Preserve stream counters, schemas, source ranges/checksums and retirement gates.
+- Document the explicitly authorized additive filename amendment before source
+  edits. Retain historical names, directories and every old audit entry.
+
+### Files/packages touched
+- `storage.py`: exclusive ordinal allocation, directory/source coordination,
+  flush/fsync closure, verified atomic no-clobber compression and failure residue.
+- `recording_coverage.py`: exact positive six-digit segment filename acceptance;
+  no ownership, ledger, retirement-proof, or bound relaxation.
+- `pipeline/raw_manifest.py`: exact segment representation transitions and
+  pending-artifact refusal; unchanged logical-path/range/fingerprint contracts.
+- `pipeline/build_replay_store.py`: boundary-hour readiness inspects all segments.
+- `converter/readers.py`: reject pending output and duplicate representations
+  before enumeration; preserve existing valid historical/segment reading order.
+- `tests/test_storage_rotation.py`: native-shaped two-session reproduction,
+  concurrent allocation, twelve in-flight rotations, collision/fsync faults,
+  legacy-plus-segment replay determinism/source mapping.
+- `tests/test_recording_coverage.py`: segmented ownership, mutation and 72-entry
+  limit; `tests/test_replay_compression_race.py`: reuse the three existing phase
+  regressions for segmented names; `tests/test_replay_depth_repartitioning.py`:
+  active/ambiguous first/last-hour segment refusal.
+- `README.md`, `CHANGELOG.md`; existing docs listed below. No new docs/files.
+
+### Docs reviewed
+- [x] AGENTS.md
+- [x] docs/REPO_STRUCTURE.md
+- [x] docs/PROJECT_STATUS.md
+- [x] docs/IMPLEMENTATION_AUDIT.md
+- [x] docs/FULL_L2_REPLAY_CATALOG_PLAN.md
+- [x] docs/OPERATIONS.md
+- [x] docs/AI_WORKFLOW.md
+- [x] CHANGELOG.md
+- [x] relevant feature docs: ARCHITECTURE.md, VALIDATION.md, REPLAY_STORE.md,
+  DAILY_BUILD_PIPELINE.md and historical retirement/compression/rebase entries.
+- Issue #30 and comments read completely. Reviewed issue #23/#25 and PR #26/#28
+  descriptions/discussion, merged main and actual implementation/tests.
+
+### Docs updated
+- [x] CHANGELOG.md
+- [x] README.md
+- [x] docs/PROJECT_STATUS.md
+- [x] docs/REPO_STRUCTURE.md
+- [x] relevant feature docs: ARCHITECTURE.md (design/alternatives/durability),
+  OPERATIONS.md (recovery, backups, safe rollout/rollback), IMPLEMENTATION_AUDIT.md
+  (hashes and evidence), REPLAY_STORE.md, DAILY_BUILD_PIPELINE.md, VALIDATION.md.
+- FULL_L2_REPLAY_CATALOG_PLAN.md needs no update: its semantic/release gates did
+  not change. No dependency, version, service, configuration or folder change.
+
+### Status / validation impact
+- Validated status changed: synthetic development evidence only, no production
+  or broad full-L2 promotion.
+- Deferred status changed: no. Multi-owner retirement stays fail-closed, as do
+  historical October 1/2 deferrals. No forensic/historical repair claim.
+- New claims added: same-hour storage preservation and tiny synthetic integration.
+- Evidence: baseline `1002 passed, 3 skipped`; failing old-code regression below
+  lost both A archives; final `1015 passed, 3 skipped`. Three skips are the
+  pre-existing optional real-data gates, not skipped regressions. Focused set
+  `187 passed, 1 skipped`; post-doc infrastructure/structure `61 passed`.
+- Before fix, A depth hash `50fe9b536eba39a1b55b8403684194f586c3bf1bc53cb180b1a2603661381653`
+  became `2bf8c1dd75474f7b01b63cd63a87850cd1c646a87b69166918596cb8f6d10596`;
+  trade `edd0932f055a45640cf574e8014a25bf80447772568c6816d4c384ef2e7cd5bf`
+  became `b1a018899d289a45ee615cbb27301502c92eb9c893944181efb9dc1293ffa0ae`.
+  Only depth (2,1)/(2,2), trade (2,1) survived; A (1,1)/(1,2), trade (1,1)
+  disappeared, and A final hashes mismatched disk. After fix both sessions'
+  records survive; A bytes/identities remain unchanged and B owns distinct files.
+- Chosen design: ordered immutable segments. Continuation/frame append would
+  mutate previously hashed artifacts and mix ownership/crash states; fail-fast
+  alone cannot continue recording. No recompression/combining of old archives.
+
+### Tests run
+```bash
+uv lock --check
+UV_PROJECT_ENVIRONMENT=/home/zsom/.cache/cryptorecorder-issue30-dev uv sync --frozen --no-default-groups --extra reconstruction --group dev
+/home/zsom/.cache/cryptorecorder-issue30-dev/bin/python -m pytest tests/ -q
+# Baseline: 1002 passed, 3 skipped.
+/home/zsom/.cache/cryptorecorder-issue30-dev/bin/python -m pytest tests/test_storage_rotation.py::test_same_hour_restart_preserves_records_and_immutable_coverage -q -s
+# BEFORE source fix: 1 failed, expected, actual SHA and record loss captured.
+/home/zsom/.cache/cryptorecorder-issue30-dev/bin/python -m pytest tests/test_storage_rotation.py tests/test_writer_backpressure.py tests/test_recording_coverage.py -q
+# Intermediate: 5 failed, 109 passed because final verification correctly refused
+# the temporary second hard link. Fixed by removing/fsyncing only the temporary
+# link before calling the unchanged single-link identity validator. Rerun: 114 passed.
+/home/zsom/.cache/cryptorecorder-issue30-dev/bin/python -m pytest tests/test_storage_rotation.py tests/test_replay_compression_race.py tests/test_replay_depth_repartitioning.py -q
+# 40 passed.
+/home/zsom/.cache/cryptorecorder-issue30-dev/bin/python -m pytest tests/test_storage_rotation.py tests/test_recording_coverage.py tests/test_replay_compression_race.py tests/test_replay_depth_repartitioning.py tests/test_replay_store.py tests/test_replay_catalog_reconstruct.py tests/test_catalog_equivalence.py tests/test_writer_backpressure.py tests/test_repo_structure.py -q
+# 187 passed, 1 skipped.
+/home/zsom/.cache/cryptorecorder-issue30-dev/bin/python -m pytest tests/ -q
+# Final source: 1015 passed, 3 skipped, 13 existing deprecation warnings; 28.96 s.
+/home/zsom/.cache/cryptorecorder-issue30-dev/bin/python -m pytest tests/test_repo_structure.py tests/test_agent_infrastructure.py -q
+# 61 passed after documentation updates.
+uv lock --check
+git diff --check
+# An added trailing blank line was removed; final whitespace check passes.
+```
+
+### Validation CLIs run
+
+All commands used the external locked Python above from the isolated worktree
+`/home/zsom/CryptoRecorder-issue30`. `PY` and `SMOKE` below are exactly the
+executable/root used. Fixture creation reused
+`tests.test_storage_rotation.record_same_hour_session` for sessions 1 and 2,
+under `pytest.MonkeyPatch.context()` and `asyncio.run()`. It added fixture-only
+exchangeInfo (ADA/USDT, 0.01 price/quantity filters) and compressed empty D+1
+T00/T23 boundary witnesses. All data is synthetic and outside the repository.
+The four full argv arrays/logs are retained as `command-0..3.json/.log`.
+
+```bash
+PY=/home/zsom/.cache/cryptorecorder-issue30-dev/bin/python
+SMOKE=/tmp/cryptorecorder-issue30-20261017-_5vxnep8
+$PY -m pipeline.daily_build --date 2026-01-01 --symbols ADAUSDT --venues BINANCE_SPOT --schema-version 2 --backlog-days 1 --max-build-dates 1 --data-root "$SMOKE/raw" --replay-root "$SMOKE/replay" --report-root "$SMOKE/reports-built"
+$PY -m pipeline.daily_build --date 2026-01-01 --symbols ADAUSDT --venues BINANCE_SPOT --schema-version 2 --backlog-days 1 --max-build-dates 1 --data-root "$SMOKE/raw" --replay-root "$SMOKE/replay" --report-root "$SMOKE/reports-reuse"
+$PY -m validation.audit_replay_store --date 2026-01-01 --symbols ADAUSDT --venues BINANCE_SPOT --replay-root "$SMOKE/replay" --report-path "$SMOKE/audit.json"
+CRYPTO_RECORDER_DATA_ROOT="$SMOKE/raw" $PY -m validation.validate_catalog_equivalence --date 2026-01-01 --symbols ADAUSDT --venues BINANCE_SPOT --data-root "$SMOKE/raw" --work-root "$SMOKE/equivalence" --old-catalog-root "$SMOKE/equivalence/old" --replay-root "$SMOKE/equivalence/replay" --new-catalog-root "$SMOKE/equivalence/new" --report-path "$SMOKE/equivalence/report.json" --profile full_l2 --schema-version 2
+$PY -m validation.audit_change_compliance --staged
+```
+- Every build/audit/equivalence CLI exited 0. Build then reuse: built then
+  skipped_valid, 4 depth and 2 trade rows; counts/checksums/order exact, zero
+  duplicate sequence keys and no residual staging/backup. Explicit
+  `audit_partition_deep` returned `[]` (saved `deep.json`).
+- Full-L2: 2/2 trades, 10/10 flattened deltas, 4/4 Depth10, 7/7 checkpoints,
+  instruments/precision/continuity/fences/raw metadata all pass unchanged
+  `convert_day.py`. No real-market fixture or broader production-day gate ran.
+- Replay audit report SHA-256:
+  `27a03d70029d86b1c4cdf8ca080602ad9d2e58566197d84b1ae2cf0d4b037da7`.
+  Equivalence report SHA-256:
+  `a490a2f9aa29e77eecb76fd76647caf35e76910a5161692424617a9d1fa9d73c`.
+- Mandatory staged change-compliance audit: **PASS**, 20 changed files. The
+  exact command above ran after staging this complete entry.
+
+### Known limitations / out of scope
+- No production connection, raw-data access/mutation, deployment, stop/restart,
+  systemd/env edit, archive repair, merge, force-push or issue closure. Issue #31
+  remains completely separate. Draft PR and normal topic-branch push only.
+- Raw JSONL records, depth/trade/lifecycle counters, native feeds, recorder.py,
+  convert_day.py, Parquet schemas/encoding, replay normalization, dependency lock,
+  retirement policy/bounds and VERSION remain unchanged. No new subsystem/docs.
+- Production filesystem hard-link/flock/fsync behavior, supervised restart and
+  resource/performance acceptance remain unverified; local tests are on WSL.
+  Compression adds decoded verification and directory durability I/O. Filesystems
+  lacking these primitives fail rather than fall back to clobbering writes.
+- Pending compression intentionally blocks a raw build until completion or
+  manual inspection. A crash after publication can retain pending/source/target;
+  no startup repair or success inference occurs. Timeout executor work can outlive
+  its task, but source names cannot be reused and the session remains untrusted.
+- Existing 72-entry day-directory bound is retained; 24 closed canonical hours
+  leave at most 48 extra compressed segment entries, fewer during coexistence.
+  Multi-session dates still cannot use single-owner retirement proof without D+1.
+- Older conversion discovery reads complete segments, but pre-fix coverage
+  validators reject segment finals. Incompatible recorder rollback must stay
+  inactive pending a compatible backport/fix-forward plan; never reset the ledger.
+  OPERATIONS.md records backup-before-old-shutdown precautions and future rollout.
+- Historical loss assessment/repair, Oct 1/2 recovery, broad top50/multi-day gate,
+  v2.0.0, archive/import/restore, automatic raw deletion and production acceptance
+  remain deferred. The synthetic reproduction proves the defect, not production loss.
+
 ## 2026-10-16 — retirement branch rebase onto current main
 
 ### Change summary

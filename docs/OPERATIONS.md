@@ -160,8 +160,9 @@ Use `state/heartbeat.json` → `writer_queue_telemetry` to inspect pressure:
 
 Hourly rotation closes old files quickly and queues compression in the
 background, so compression should not block the active ingest path. Any
-compression failures are left as uncompressed `.jsonl` files and surfaced in
-heartbeat telemetry.
+compression failures retain their `.jsonl` sources and surface in heartbeat
+telemetry. An interrupted publication can also leave pending/dual representations;
+see the Issue #30 recovery section below.
 
 ## Conversion
 
@@ -1090,8 +1091,8 @@ There is **no automatic cleanup or expiration** for coverage evidence or
 retired replay partitions. `CRYPTO_RECORDER_RAW_RETENTION_DAYS=7` only sets a
 proof-plan grace period; raw deletion remains disabled and unimplemented.
 The existing hard bounds are 4,096 ledger directory entries, 64 MiB of record
-bytes, 250,000 raw identities per session and 72 entries per selected hourly
-raw directory. Hitting a bound fails closed and needs a separately reviewed
+bytes, 250,000 raw identities per session and 72 entries per selected raw day
+directory. Hitting a bound fails closed and needs a separately reviewed
 maintenance plan. Do not delete evidence to regain capacity.
 
 Proof-backed replay no longer holds the ledger lock while reading/hashing
@@ -1245,3 +1246,96 @@ This forward-only rollout cannot resolve the original 21 October 1 or 12
 October 2 partitions. Real-server retirement acceptance, long-session evidence
 size/performance, ledger maintenance/root migration and broader top50/multi-day
 full-L2 acceptance remain separate pending work.
+
+
+## Same-hour raw storage recovery and rollout (Issue #30)
+
+New recordings use the additive `.segment-NNNNNN.jsonl[.zst]` filename contract
+in REPO_STRUCTURE.md. No env, service, directory hierarchy or record schema
+change is required. Existing hourly archives remain immutable; same-hour
+restart/rotation allocates a distinct ordinal, including while older work is
+compressing. `coverage_unowned_files` stays available but new exclusive writers
+do not inherit older files. A session's final lists only its own new artifacts.
+The authoritative ledger and all prior evidence must remain retained.
+
+Compression worker failures/timeouts remain unhealthy closure, surfaced through
+`compression.failed`/`last_error`, logs and untrusted session evidence. Partial
+output uses `.compress-<source-stem>-<nonce>.pending`, outside `*.jsonl*` input
+discovery. Both raw readers reject pending residue; legacy conversion additionally
+rejects duplicate representations. Never rename a pending file to `.jsonl.zst`
+or replace an existing destination to make validation pass. A live compression
+can cause a safe replay deferral/failure; rerun only after it completes or the
+residue is inspected. The existing three-attempt representation retries apply
+to exact legacy or segmented plain/compressed transitions, not generic failures.
+
+Recovery is manual and separately authorized, never part of recorder startup:
+
+1. Inspect telemetry and actual worker/process state. A timed-out executor may
+   still be running; do not manipulate its files. Preserve raw, pending, target,
+   coverage and log evidence in a new external backup with paths and hashes.
+2. A handled failure before publication leaves the original source alone and
+   unchanged, so compression may be retried after resolving the cause. An
+   existing `.zst`/`.gz`, even if apparently identical, causes explicit failure;
+   automatic retry never replaces it or discards the source.
+3. For crash residue, work on copied evidence first. Independently verify full
+   decompression, decoded byte length/hash versus source, and final file bytes,
+   type and link count. After a separately approved recovery, move disposable
+   pending/duplicate evidence out of raw discovery into the preserved external
+   evidence area, with durable directory transitions. Keep an authoritative
+   verified source/target. If any identity differs or ownership is ambiguous,
+   leave the live files untouched and request a forensic recovery decision.
+4. Never edit a failed/open session final into `closed_clean`, recompress a
+   historical immutable artifact, rewrite manifests, or delete evidence to
+   bypass the 72-entry raw-directory bound. Multi-owner retirement remains
+   deferred; ordinary D+1 closure continues to be the normal build route.
+
+### Future production rollout — NOT EXECUTED
+
+Only a separately approved operator may execute this plan. Use the existing
+Linux Server Layout values: server `zsomborsserver`, checkout
+`/home/zsombor0918/services/CryptoRecorder`, recorder
+`cryptorecorder-recorder.service`, raw `/data/cryptorecorder/data_raw`, state
+`/home/zsombor0918/status`, env `/etc/cryptorecorder/cryptorecorder.env`, replay
+`/home/zsombor0918/sync/replay_store`. Reconfirm actual installed overrides,
+coverage root, clean checkout, reviewed SHA, previous SHA, service/lock states,
+current universe and free capacity using the existing read-only preflight.
+
+Before **any old-recorder stop/restart**, preserve an operator-approved
+filesystem snapshot or verified independent copies of all existing compressed
+current-hour artifacts and a consistent snapshot of active plain raw plus the
+retained ledger. Record every relative path/size/SHA-256 and the cutover time.
+A plain hard link is not a backup: old `wb` truncation would destroy both links.
+The old shutdown itself can overwrite a same-hour destination, so do not rely
+on its `closed_clean` status or a backup taken only after stopping. If consistent
+snapshot/collision safeguards are unavailable, postpone rollout for a reviewed
+preservation plan; this development task does not authorize an improvised repair.
+
+Let active replay work finish, preserve timer state, and quiesce scheduled
+builds for the approved cutover. Stop the old recorder gracefully only after
+those safeguards, retain its logs/final evidence, and verify artifacts against
+the backup. Investigate any mismatch on copies; do not merge old bytes or
+rewrite a coverage final. With the recorder inactive, switch to the exact
+reviewed commit and validate the unchanged frozen production environment.
+A checkout-only update avoids unnecessary systemd/env changes. If using the
+deploy wrapper, first inspect `--target recorder --dry-run --install-only` with
+the exact installed app/user/env arguments; real wrapper execution needs its
+own approval because it also performs legacy-unit cleanup.
+
+Update all raw/coverage consumers before the new writer starts. On a supervised
+same-hour restart, require a durable new start before feeds, disjoint segment
+paths, zero writer drops/errors, healthy compression, a clean final, unchanged
+prior compressed hashes and exact per-session inventories. Repeat preservation
+checks across one UTC rollover. Build/audit one isolated post-cutover replay
+selection twice (`built`, then `skipped_valid`) before restoring the preserved
+timer state. Keep backup/evidence until separate owner acceptance. Production
+restart, filesystem durability/performance and long-session acceptance remain
+unverified by local tests.
+
+Rollback must preserve all new raw segments, ledger records, replay outputs,
+reports and backups. Stop admission/recorder under separate approval and inspect
+in-flight compression before switching code. A pre-fix binary can overwrite old
+archives and its coverage validator cannot read new segment final records:
+**restoring the previous checkout is not authorization to resume it** against
+this dataset/ledger. Leave it inactive for a reviewed compatible backport or
+fix-forward plan. Never reset the ledger, rename away segments, or discard new
+evidence to make an old binary start. No production step above was executed.
